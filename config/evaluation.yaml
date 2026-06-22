@@ -1,0 +1,99 @@
+# =============================================================================
+# 评测模块配置
+# =============================================================================
+# 包含评测指标、对比模式、输出路径等配置。
+# 第一版评测是 demo 内部 memory_on vs memory_off 对比，不是官方 nuScenes planning benchmark。
+# =============================================================================
+
+# ---- 评测模式 ----
+modes:
+  - "memory_on"  # 使用完整三层记忆
+  - "memory_off"  # 不使用记忆，仅使用当前帧信息
+
+# ---- 评测指标 ----
+metrics:
+  - "ADE"  # Average Displacement Error，平均位移误差
+  - "FDE"  # Final Displacement Error，终点位移误差
+  - "L2_1s"  # P6 新增：1s 时刻 L2 误差（UniAD/VAD 通用指标）
+  - "L2_2s"  # 2s 时刻
+  - "L2_3s"  # 3s 时刻
+  - "valid_trajectory_rate"  # 轨迹有效率
+  - "behavior_accuracy"  # 行为准确率（如果存在伪行为标签）
+
+# ---- 指标开关（可单独禁用某个指标） ----
+metric_enabled:
+  ade: true
+  fde: true
+  l2_per_horizon: true  # P6 新增
+  valid_trajectory_rate: true
+  behavior_accuracy: true
+
+# ---- 未来轨迹预测配置 ----
+prediction_horizon_seconds: 3.0  # 未来轨迹预测时间窗（秒），与真值构建一致
+
+# ---- L2 per horizon 配置（P6 新增） ----
+# 在指定时间点（秒）计算预测与真值的欧氏距离。
+# 注意：传入的是已经"重采样到 resample_num 个点"的轨迹，dt = horizon / (N-1)。
+# 默认与 displacement_metrics 共用 resample_num；horizons 单位秒。
+l2_per_horizon:
+  horizons_seconds: [1.0, 2.0, 3.0]
+  unit: "meter"
+
+# ---- ADE / FDE 配置 ----
+displacement_metrics:
+  resample_trajectory: true  # 是否将轨迹重采样到统一 waypoint 数再计算
+  resample_num: 25  # 重采样到 25 个 waypoint
+  unit: "meter"  # 误差单位：米
+
+# ---- 轨迹有效性判定 ----
+validity:
+  # 轨迹被认为有效的条件
+  min_waypoints: 20  # 至少包含 20 个 waypoint
+  max_waypoints: 30  # 最多 30 个 waypoint
+  max_displacement_per_step: 5.0  # 单步最大位移（米），超过则视为无效
+  must_contain_xy: true  # 每个 waypoint 必须包含 x 和 y 坐标
+
+# ---- 行为准确率配置 ----
+behavior_accuracy:
+  # 伪行为标签生成方式（与导航语义类似，通过真值轨迹推断）
+  # 注意：这不是人工标注真值，只是 demo 级伪行为标签。
+  # README 和 eval_report.md 中必须说明 behavior_accuracy 的限制。
+  use_pseudo_label: true  # 使用伪行为标签
+  # P6 新增：比较前是否对预测/映射后真值统一大写归一化。
+  # VLM 输出可能是 "keep_lane" / "KEEP_LANE" / "KeepLane"，统一处理避免假阴。
+  normalize_case: true
+  # 行为到导航语义的映射（用于从导航语义推断行为）
+  # nav lowercase -> behavior UPPERCASE
+  nav_to_behavior_map:
+    straight: "KEEP_LANE"
+    left_turn: "TURN_LEFT"
+    right_turn: "TURN_RIGHT"
+    lane_follow: "KEEP_LANE"
+    lane_change_left: "CHANGE_LANE_LEFT"
+    lane_change_right: "CHANGE_LANE_RIGHT"
+    slow_or_stop: "SLOW_DOWN"
+    unknown: "UNKNOWN"
+
+# ---- 分组统计 ----
+grouping:
+  enabled: true  # 是否按场景/天气/行为分组统计
+  group_by:
+    - "scene_id"  # 按场景类型分组
+    - "weather_id"  # 按天气类型分组
+    - "behavior"  # 按预测行为分组
+
+# ---- 后续预留接口 ----
+collision_proxy:
+  enabled: false  # 第一版不启用碰撞代理指标
+  description: "碰撞代理指标，需要 nuScenes bounding box 信息"
+
+offroad_proxy:
+  enabled: false  # 第一版不启用偏离道路代理指标
+  description: "偏离道路代理指标，需要 nuScenes 地图信息"
+
+# ---- 输出配置 ----
+output:
+  report_dir: "outputs/reports"  # 报告输出目录
+  csv_file: "eval_summary.csv"  # 汇总 CSV 文件名
+  detail_file: "eval_detail.jsonl"  # 详细结果 JSONL 文件名
+  report_file: "eval_report.md"  # Markdown 报告文件名

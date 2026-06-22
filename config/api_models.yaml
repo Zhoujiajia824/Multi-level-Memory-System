@@ -1,0 +1,57 @@
+# =============================================================================
+# VLM API 模型配置
+# =============================================================================
+# 第一版默认使用 OpenAI-compatible API 方式调用 VLM。
+# 推荐 Qwen-VL / Qwen 系列视觉模型。
+# 所有敏感信息（API Key）必须从环境变量读取，不允许硬编码。
+# =============================================================================
+
+# ---- 场景理解 VLM ----
+scene_understanding:
+  provider: "qwen"  # VLM 提供商：qwen / openai / other
+  api_key_env: "DASHSCOPE_API_KEY"  # API Key 对应的环境变量名
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"  # API base URL
+  model_name: "qwen3-vl-plus-2025-12-19"  # 模型名称qwen3-vl-plus
+  timeout: 60  # 请求超时（秒）
+  max_tokens: 2048  # 最大输出 token 数
+  temperature: 0.1  # 生成温度，低温度保证输出稳定性
+  retry_times: 3  # 失败重试次数
+  retry_interval_seconds: 5  # 重试间隔（秒）
+  # VLM prompt 必须要求只输出 JSON
+  system_prompt: |
+    你是一个自动驾驶场景分析专家。你需要分析前视角摄像头拍摄的驾驶场景图片，并严格按照要求的 JSON 格式输出场景理解结果。
+    不要输出任何 JSON 以外的内容。不要输出 Markdown 代码块标记。
+
+# ---- 决策 VLM ----
+decision:
+  provider: "qwen"  # VLM 提供商
+  api_key_env: "DASHSCOPE_API_KEY"  # API Key 对应的环境变量名
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"  # API base URL
+  model_name: "qwen3-vl-plus"  # 模型名称
+  timeout: 120  # 决策请求需要更长超时
+  max_tokens: 4096  # 决策输出需要更多 token
+  temperature: 0.1  # 低温度保证决策稳定性
+  retry_times: 3  # 失败重试次数
+  retry_interval_seconds: 5  # 重试间隔（秒）
+  system_prompt: |
+    你是一个自动驾驶决策规划专家。你需要根据提供的场景信息、记忆和自车状态，输出驾驶决策结果。
+    你必须严格按照要求的 JSON 格式输出，不要输出任何 JSON 以外的内容。不要输出 Markdown 代码块标记。
+    trajectory 必须包含 20 到 30 个 waypoint。坐标系为 ego-centric，x 轴前向，y 轴左向，单位米。
+    yaw 是自车航向与 x 轴正向的夹角，单位度，范围 -180 到 180。speed 单位为 m/s。
+    坐标和速度数值必须合理，不能过大或过小。例如，x 和 y 的绝对值通常不应超过 100 米，speed 不应超过 50 m/s。 
+    规划的轨迹路点应该符合驾驶常识，例如在直道上路点应该基本沿 x 轴分布，在弯道上路点应该形成合理的曲线。
+    不能一直是直行驶，除非场景完全没有弯道或障碍物。规划的路点速度应该与路点分布相匹配，例如在弯道上速度应该适当降低。
+
+# ---- API 通用配置 ----
+api_common:
+  # 如果用户使用其他 OpenAI-compatible API（如硅基流动、智谱、DeepSeek-VL），
+  # 只需修改 base_url 和 model_name，并设置对应的环境变量即可。
+  # 示例：
+  #   硅基流动: base_url = "https://api.siliconflow.cn/v1", api_key_env = "SILICONFLOW_API_KEY"
+  #   智谱: base_url = "https://open.bigmodel.cn/api/paas/v4", api_key_env = "ZHIPUAI_API_KEY"
+  supported_providers:
+    - "qwen"
+    - "openai"
+    - "siliconflow"
+    - "zhipuai"
+    - "deepseek"

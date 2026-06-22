@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vla-memory-demo"
+version = "0.1.0"
+description = "智能驾驶 VLA 路线的分层记忆系统 Demo — 离线研究 Demo，不用于实车控制"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "VLA Memory Demo Team"},
+]
+keywords = ["autonomous-driving", "vla", "memory-system", "vlm", "nuscenes", "faiss", "dinov2"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/YOUR_USERNAME/vla_memory_demo"
+Repository = "https://github.com/YOUR_USERNAME/vla_memory_demo"
+Issues = "https://github.com/YOUR_USERNAME/vla_memory_demo/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.1.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+markers = [
+    "integration: 集成测试，需要真实数据集或模型权重",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]

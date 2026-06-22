@@ -1,0 +1,63 @@
+# =============================================================================
+# 智能驾驶 VLA 分层记忆系统 - Conda 环境配置
+# =============================================================================
+# 使用方式:
+#   conda env create -f environment.yml
+#   conda activate mulmem
+# =============================================================================
+
+name: mulmem
+
+channels:
+  - conda-forge
+  - pytorch
+  - nvidia
+  - defaults
+
+dependencies:
+  - python=3.12
+  - pip>=23.0
+
+  # FAISS（推荐通过 conda-forge 安装）
+  - faiss-cpu>=1.7.0
+
+  # 系统依赖
+  - numpy>=1.26
+  - pillow>=10.0
+
+  # pip 安装的依赖
+  - pip:
+      # 数值计算
+      - pandas>=2.1.0
+
+      # 配置管理
+      - pyyaml>=6.0
+      - pydantic>=2.0
+
+      # 进度条
+      - tqdm>=4.66
+
+      # 图像处理
+      - opencv-python>=4.8.0
+
+      # 可视化
+      - matplotlib>=3.8.0
+
+      # 机器学习
+      - scikit-learn>=1.3.0
+
+      # 深度学习
+      - torch>=2.1.0
+      - torchvision>=0.16.0
+      - transformers>=4.36.0
+      - accelerate>=0.25.0
+
+      # VLM API
+      - openai>=1.6.0
+      - requests>=2.31.0
+
+      # nuScenes
+      - nuscenes-devkit>=1.1.0
+
+      # 测试
+      - pytest>=7.4.0

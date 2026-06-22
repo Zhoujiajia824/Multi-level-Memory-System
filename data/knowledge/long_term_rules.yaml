@@ -1,0 +1,195 @@
+# =============================================================================
+# 长期驾驶规则知识库
+# =============================================================================
+# 存储基于场景类型和天气条件的驾驶规则。
+# 每条规则包含：rule_id, scene_id, weather_id, title, content, priority
+# priority: 1 = 最高优先级, 5 = 最低优先级
+# =============================================================================
+
+rules:
+  # ---- 通用安全规则 ----
+  - rule_id: "RULE_001"
+    scene_id: "all"  # 适用于所有场景
+    weather_id: "all"
+    title: "保持安全车距"
+    content: |
+      在任何驾驶场景下，必须与前车保持安全距离。
+      城市道路建议保持至少 2 秒跟车距离。
+      高速道路建议保持至少 3 秒跟车距离。
+      雨雪天气应加倍安全距离。
+    priority: 1
+
+  - rule_id: "RULE_002"
+    scene_id: "all"
+    weather_id: "all"
+    title: "速度控制原则"
+    content: |
+      城市道路限速通常为 30-60 km/h。
+      住宅区和学校附近限速 30 km/h。
+      弯道和路口前应主动减速。
+      看到限速标志时必须遵守。
+    priority: 1
+
+  # ---- 路口场景规则 ----
+  - rule_id: "RULE_010"
+    scene_id: "intersection"
+    weather_id: "all"
+    title: "路口通行规则"
+    content: |
+      进入路口前应减速观察。
+      注意交通信号灯状态。
+      让行优先通行方向的车辆。
+      注意行人和非机动车。
+      转弯时使用转向灯。
+    priority: 1
+
+  - rule_id: "RULE_011"
+    scene_id: "intersection"
+    weather_id: "rainy"
+    title: "雨天路口安全"
+    content: |
+      雨天路口路面湿滑，制动距离增加。
+      应提前减速，避免紧急制动。
+      注意积水区域，防止水滑。
+      能见度降低，注意观察周围。
+    priority: 1
+
+  # ---- 直行场景规则 ----
+  - rule_id: "RULE_020"
+    scene_id: "straight_road"
+    weather_id: "all"
+    title: "直行车道保持"
+    content: |
+      在直行道路上保持车道居中行驶。
+      注意前方车辆动态，适时调整速度。
+      定期检查后视镜和盲区。
+    priority: 2
+
+  # ---- 跟车场景规则 ----
+  - rule_id: "RULE_030"
+    scene_id: "car_following"
+    weather_id: "all"
+    title: "跟车安全规则"
+    content: |
+      保持安全跟车距离，至少 2 秒。
+      注意前车刹车灯，提前做出反应。
+      前车减速时同步减速。
+      避免频繁变道超越。
+    priority: 1
+
+  # ---- 变道场景规则 ----
+  - rule_id: "RULE_040"
+    scene_id: "lane_change"
+    weather_id: "all"
+    title: "变道安全规则"
+    content: |
+      变道前必须观察后视镜和盲区。
+      提前打转向灯，至少 3 秒。
+      确认安全距离后平滑变道。
+      一次只变更一个车道。
+    priority: 1
+
+  - rule_id: "RULE_041"
+    scene_id: "lane_change"
+    weather_id: "night"
+    title: "夜间变道注意"
+    content: |
+      夜间变道更需谨慎。
+      注意后车灯光判断距离。
+      确保后视镜清晰可辨。
+    priority: 2
+
+  # ---- 转弯场景规则 ----
+  - rule_id: "RULE_050"
+    scene_id: "turning"
+    weather_id: "all"
+    title: "转弯驾驶规则"
+    content: |
+      转弯前减速，弯道中保持匀速或轻微加速。
+      左转弯注意对向来车。
+      右转弯注意右侧非机动车和行人。
+      转弯时保持在自己的车道内。
+    priority: 1
+
+  # ---- 避障场景规则 ----
+  - rule_id: "RULE_060"
+    scene_id: "obstacle_avoidance"
+    weather_id: "all"
+    title: "障碍物避让规则"
+    content: |
+      发现障碍物时首先减速。
+      评估是否可以安全绕行。
+      绕行时注意相邻车道车辆。
+      如果无法安全绕行，应停车等待。
+    priority: 1
+
+  # ---- 人行横道规则 ----
+  - rule_id: "RULE_070"
+    scene_id: "crosswalk"
+    weather_id: "all"
+    title: "人行横道让行规则"
+    content: |
+      接近人行横道时减速。
+      有行人正在通过时必须停车让行。
+      即使没有行人也要减速通过。
+      注意从两侧突然出现的行人。
+    priority: 1
+
+  # ---- 恶劣天气规则 ----
+  - rule_id: "RULE_080"
+    scene_id: "all"
+    weather_id: "rainy"
+    title: "雨天驾驶规则"
+    content: |
+      雨天路面湿滑，降低车速。
+      增加跟车距离至正常的 2 倍。
+      避免急加速和急刹车。
+      开启雾灯或近光灯。
+      注意路面积水区域。
+    priority: 1
+
+  - rule_id: "RULE_081"
+    scene_id: "all"
+    weather_id: "foggy"
+    title: "雾天驾驶规则"
+    content: |
+      雾天能见度低，大幅降低车速。
+      开启雾灯和危险报警闪光灯。
+      增加跟车距离。
+      避免超车和变道。
+      必要时靠边停车等待。
+    priority: 1
+
+  - rule_id: "RULE_082"
+    scene_id: "all"
+    weather_id: "night"
+    title: "夜间驾驶规则"
+    content: |
+      夜间能见度降低，注意灯光使用。
+      会车时切换近光灯。
+      注意行人穿着深色衣物不易发现。
+      路口和人行横道前额外减速。
+    priority: 1
+
+  # ---- 合流场景规则 ----
+  - rule_id: "RULE_090"
+    scene_id: "merge"
+    weather_id: "all"
+    title: "合流通行规则"
+    content: |
+      合流时注意主路车辆。
+      调整速度寻找合适的合流间隙。
+      使用转向灯提示意图。
+      合流后尽快加速到主路速度。
+    priority: 2
+
+  # ---- 死胡同场景规则 ----
+  - rule_id: "RULE_100"
+    scene_id: "dead_end"
+    weather_id: "all"
+    title: "死胡同/道路尽头处理"
+    content: |
+      发现前方为死胡同时减速。
+      在安全位置掉头或停车。
+      注意后方来车。
+    priority: 2

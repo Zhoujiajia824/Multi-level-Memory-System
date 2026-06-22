@@ -1,0 +1,71 @@
+# =============================================================================
+# nuScenes 数据集配置
+# =============================================================================
+# 第一版使用 nuScenes v1.0-mini 数据集。
+# 数据集路径、版本、摄像头、关键帧策略等配置。
+# 用户需要手动下载数据集并放置到指定目录。
+# =============================================================================
+
+# ---- 数据集根目录 ----
+dataroot: "data/nuscenes/raw"  # nuScenes 数据集根目录，相对于项目根目录
+version: "v1.0-mini"  # 数据集版本：v1.0-mini / v1.0-trainval / v1.0-test
+
+# ---- 摄像头配置 ----
+camera_name: "CAM_FRONT"  # 默认使用前视角摄像头
+# 后续可扩展：CAM_FRONT_LEFT, CAM_FRONT_RIGHT, CAM_BACK 等
+
+# ---- 关键帧策略 ----
+keyframe:
+  step: 1  # 每隔 1 个 nuScenes keyframe 取 1 个，实现约 2Hz 关键帧序列
+  # nuScenes keyframe 约为 2Hz，step=1 则为 2Hz
+  # 后续可替换为视频 10Hz 输入的关键帧提取策略
+
+# ---- 时间窗口配置 ----
+history_seconds: 5.0  # 最近 5 秒历史轨迹
+future_seconds: 3.0  # 未来 3 秒用于派生真值轨迹
+trajectory_dt: 0.1  # 轨迹采样时间间隔（秒），未来 3 秒 / 0.1s = 30 个 waypoint
+
+# ---- 自车状态配置 ----
+ego_state:
+  # P3 起：use_can_bus=true 时优先用 CAN bus 真值（pose.json + vehicle_monitor.json），
+  # 失败时按 can_bus.fallback_to_pose_diff 决定是否回退到 ego_pose 差分。
+  use_can_bus: true
+  coordinate_system: "ego_centric"  # ego-centric 坐标系
+  x_axis: "forward"  # x 轴方向：前向
+  y_axis: "left"  # y 轴方向：左向
+
+# ---- CAN bus 真值配置（P3 新增） ----
+can_bus:
+  enabled: true  # 总开关；与 ego_state.use_can_bus 任一为 False 即关闭
+  root: "data/nuscenes/raw/can_bus"  # CAN bus 文件根目录（相对项目根）
+  # 最近邻时间容差（微秒）。pose ~50Hz/20ms 一帧，60ms 足够覆盖。
+  # vehicle_monitor 是 ~2Hz/500ms 一帧，内部会自动放宽到 600ms。
+  tolerance_us: 60000
+  fallback_to_pose_diff: true  # 查询失败时是否回退到 ego_pose 差分
+
+# ---- 导航语义配置 ----
+navigation:
+  # nuScenes 不直接提供标准导航指令
+  # 第一版通过未来 ego trajectory / yaw 变化 / 横向位移 / 曲率粗略生成伪导航语义
+  # README 中必须说明这是 demo 级伪导航语义
+  pseudo_nav: true  # 使用伪导航语义
+  nav_categories:
+    - "straight"  # 直行
+    - "left_turn"  # 左转
+    - "right_turn"  # 右转
+    - "lane_follow"  # 车道跟随
+    - "lane_change_left"  # 左变道
+    - "lane_change_right"  # 右变道
+    - "slow_or_stop"  # 减速或停止
+    - "unknown"  # 未知
+  # 导航语义推断参数
+  yaw_threshold: 0.15  # 航向角变化阈值（弧度），超过此值判定为转弯
+  lateral_threshold: 2.0  # 横向位移阈值（米），超过此值判定为变道
+  curvature_threshold: 0.01  # 曲率阈值
+  speed_stop_threshold: 1.0  # 速度低于此值判定为停止（m/s）
+
+# ---- 数据子集配置（用于快速调试） ----
+subset:
+  enabled: false  # 是否启用子集模式
+  max_scenes: 5  # 最多处理的场景数
+  max_samples_per_scene: 50  # 每个场景最多处理的样本数

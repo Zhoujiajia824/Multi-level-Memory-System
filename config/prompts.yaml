@@ -1,0 +1,213 @@
+# =============================================================================
+# 提示词模板集中配置
+# =============================================================================
+# 所有 VLM 提示词在此处集中管理。修改提示词无需改 Python 代码。
+#
+# 占位符语法：Python str.format_map（即 {var_name}）。
+# 未定义的占位符在渲染时会抛 KeyError 提示，请保持变量名精确。
+#
+# 顶级 key 与代码对应关系：
+#   scene_understanding.*    —— src/vla_memory/perception/scene_understanding.py
+#   decision.*               —— src/vla_memory/decision/prompt_builder.py
+#   memory_integration.*     —— prompt_builder 中的记忆段落渲染
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 场景理解（Vision-Language Model）
+# -----------------------------------------------------------------------------
+scene_understanding:
+  # system 字段当前未独立使用（沿用 config/api_models.yaml 中的 system_prompt）。
+  # 如需替换，可在 SceneUnderstandingPipeline 中接入。
+  system: |
+    你是一个自动驾驶场景理解专家。请根据前视摄像头图像输出严格 JSON 结构化结果。
+    禁止输出 Markdown 代码块标记，禁止输出 JSON 以外的任何内容。
+
+  # user 字段是真正喂给 VLM 的主体提示词。
+  # P4 升级：要求 VLM 把检测结果按类别分桶输出（lanes / vehicles /
+  # pedestrians / traffic_lights / intersections），便于下游决策模型直接取用。
+  # 旧字段 surrounding_objects / lane_description 保留作为兼容回退。
+  user: |
+    请分析这张自动驾驶前视角摄像头拍摄的图片，并严格按照以下 JSON 格式输出场景理解结果。
+
+    要求：
+    1. 只输出 JSON，不要输出任何其他内容。
+    2. 不要使用 Markdown 代码块标记（不要写 ```json）。
+    3. 所有字段都必须存在，没有时填空数组 []、空对象、"unknown" 或 null。
+    4. 检测类字段（lanes/vehicles/pedestrians/traffic_lights）按"看到几个就输出几个对象"的方式给出，不必凑数。
+    5. 数值字段尽量给估计值（米、弧度等），无法估计时用 null。
+
+    要求的 JSON 格式：
+    {{
+        "scene_description": "驾驶场景的结构化描述，包括道路类型、交通状况、环境特征、当前路况概览",
+        "ego_status_text": "自车当前状态的自然语言描述，包括车道位置、行驶方向、速度感受",
+
+        "lanes": [
+            {{
+                "side": "ego/left/right/oncoming/unknown",
+                "type": "solid/dashed/double/merge/exit/unknown",
+                "color": "white/yellow/unknown",
+                "direction": "forward/left/right/unknown"
+            }}
+        ],
+        "vehicles": [
+            {{
+                "relative_position": "front/front_left/front_right/left/right/rear/unknown",
+                "distance_m": 12.5,
+                "type": "car/truck/bus/motorcycle/unknown",
+                "motion": "stationary/approaching/receding/crossing/unknown"
+            }}
+        ],
+        "pedestrians": [
+            {{
+                "relative_position": "10°/unknown",
+                "distance_m": 8.0,
+                "intent": "crossing/standing/walking_along/unknown"
+            }}
+        ],
+        "traffic_lights": [
+            {{
+                "state": "red/yellow/green/off/unknown",
+                "relative_position": "front/front_left/front_right/unknown",
+                "controls_ego_lane": true
+            }}
+        ],
+        "intersections": {{
+            "present": false,
+            "type": "four_way/three_way_T/three_way_Y/roundabout/unknown",
+            "distance_m": null,
+            "has_stop_sign": null
+        }},
+
+        "traffic_density": "low/medium/high/unknown",
+        "risk_factors": ["潜在风险1", "潜在风险2"],
+        "scene_id": "intersection/dead_end/lane_change/car_following/obstacle_avoidance/straight_road/turning/merge/crosswalk/unknown",
+        "weather_id": "sunny/rainy/snowy/foggy/night/cloudy/unknown",
+
+        "surrounding_objects": [],
+        "lane_description": ""
+    }}
+
+    Few-shot 示例（仅供格式参考，请按图片实际输出）：
+    {{
+        "scene_description": "城市直路，前方两辆轿车正常行驶，右侧人行道有行人",
+        "ego_status_text": "自车在最右侧车道直行",
+        "lanes": [
+            {{"side": "ego", "type": "dashed", "color": "white", "direction": "forward"}},
+            {{"side": "left", "type": "solid", "color": "white", "direction": "forward"}}
+        ],
+        "vehicles": [
+            {{"relative_position": "front", "distance_m": 15.0, "type": "car", "motion": "receding"}}
+        ],
+        "pedestrians": [
+            {{"relative_position": "10°", "distance_m": 6.0, "intent": "walking_along"}}
+        ],
+        "traffic_lights": [],
+        "intersections": {{"present": false, "type": null, "distance_m": null, "has_stop_sign": null}},
+        "traffic_density": "low",
+        "risk_factors": ["右侧行人需关注"],
+        "scene_id": "straight_road",
+        "weather_id": "sunny",
+        "surrounding_objects": [],
+        "lane_description": ""
+    }}
+
+    分析要点：
+    - 车道线分类（自车 / 左 / 右 / 对向）和虚实线
+    - 周围车辆位置 / 距离 / 运动状态
+    - 行人位置 / 距离 / 意图
+    - 信号灯状态及是否管控自车车道
+    - 路口是否存在 / 距离 / 类型
+    - 当前场景类型（路口、直路、变道等）和天气状况
+    - 距离的估计你要进行精确的数值估计（单位米），无法估计时用 null
+    - 场景类型非常的丰富，你需要根据图片内容进行合理判断，不要输出"unknown"除非实在无法判断，长尾场景非常重要
+    - 多有车辆感知系统能够检测到的内容你都要尽量输出，不要漏掉重要信息，例如车道线、行人、交通灯等，尤其是那些可能影响驾驶决策的细节
+    - 障碍物行人的距离、运动速度、行人意图等数值信息非常重要，你要像车辆感知系统一样进行精确输出，不要简单地输出"unknown"，除非实在无法判断
+    - relative_position 的角度划分要细致一些，例如前方车辆如果在左前方 10°，就输出 "10°" 而不是简单的 "front" 或 "front_left"，因为这个角度信息对于决策非常重要，正前方为0°，顺时针为正，逆时针为负
+  # 解析阶段需要的必填字段列表（缺失时降级填默认值并 warning）。
+  # P4 起新增 lanes / vehicles / pedestrians / traffic_lights / intersections，
+  # 缺失会自动降级为空列表/空对象而不是中断流程。
+  required_fields:
+    - scene_description
+    - ego_status_text
+    - lanes
+    - vehicles
+    - pedestrians
+    - traffic_lights
+    - intersections
+    - traffic_density
+    - risk_factors
+    - scene_id
+    - weather_id
+
+# -----------------------------------------------------------------------------
+# 决策推理（Vision-Language Model）
+# -----------------------------------------------------------------------------
+decision:
+  system: |
+    你是一个自动驾驶决策规划专家。请根据所有上下文信息输出严格 JSON 决策结果。
+    禁止输出 Markdown 代码块标记，禁止输出 JSON 以外的任何内容。
+
+  # user 是组装好的完整决策提示词。
+  # 占位符列表（全部必填，缺失会 KeyError）：
+  #   {scene_block}            —— 当前场景理解段（由 prompt_builder 渲染）
+  #   {ego_state_block}        —— 自车状态段（可为空字符串）
+  #   {nav_block}              —— 导航指令段（可为空字符串）
+  #   {history_block}          —— 历史轨迹段（可为空字符串）
+  #   {memory_block}           —— 三层记忆段（memory_off 时为空字符串）
+  #   {waypoint_min_num}       —— 来自 config/decision.yaml -> trajectory.waypoint_min_num
+  #   {waypoint_max_num}       —— 来自 config/decision.yaml -> trajectory.waypoint_max_num
+  #   {behavior_enum_str}      —— 行为枚举字符串（管道符分隔）
+  user: |
+    你是一个自动驾驶决策和轨迹规划专家。请根据以下信息输出驾驶决策。
+    你必须严格按照要求的 JSON 格式输出，不要输出 JSON 以外的内容。
+    不要使用 Markdown 代码块标记。
+
+    {scene_block}
+    {ego_state_block}
+    {nav_block}
+    {history_block}
+    {memory_block}
+    ## 请输出以下 JSON 格式的决策结果
+    {{
+        "behavior": "{behavior_enum_str}",
+        "behavior_reason": "简洁的因果摘要，说明决策原因和行为依据",
+        "target_speed": 5.0,
+        "risk_level": "low/medium/high",
+        "trajectory": [
+            {{"t": 0.1, "x": 0.5, "y": 0.1, "optional_v": 5.0}}
+        ],
+        "safety_notes": ["安全注意事项"]
+    }}
+
+    严格要求:
+    - trajectory 必须包含 {waypoint_min_num} 到 {waypoint_max_num} 个 waypoint
+    - target_speed 是期望的巡航速度，单位 m/s，每个 waypoint 都要有期望速度（optional_v）
+    - waypoint 应该符合驾驶常识，除非是笔直的道路，否则要呈现合理的曲线分布，不能一直是直行驶，以躲避障碍物安全驾驶为目标
+    - waypoint 的生成应该仿照自回归生成和扩散模型的思路，先生成稀疏 waypoint（例如每隔 0.5 秒一个），再根据这些 waypoint 生成更密集的轨迹点，保证轨迹平滑合理
+    - 坐标系为 ego-centric，x 前向，y 左向，单位米
+    - behavior_reason 要简洁可审计的因果摘要，不要输出冗长思维链，信息众多的可以适当增长但要尽量压缩
+    - 不要输出 Markdown 代码块标记（不要写 ```json）
+    - 只输出 JSON，不要输出任何其他内容
+    - 因为会有历史轨迹信息和前几秒的视觉图片信息和上下文信息，你需要综合这些信息进行决策，不能只根据当前场景理解结果进行决策
+    - 规划的waypoint应该符合车辆运动学，车辆能够进行精确的跟踪执行，不能出现过于激烈的转向或加减速，除非当前场景确实需要，例如紧急避障等
+# -----------------------------------------------------------------------------
+# 记忆段落渲染模板（被 prompt_builder 内部使用）
+# -----------------------------------------------------------------------------
+memory_integration:
+  # 短期记忆段落整体格式。占位符：{short_term_summary}
+  short_term_block: |
+    ## 短期记忆（最近关键帧上下文）
+    {short_term_summary}
+
+  # 中期记忆单条记录格式。
+  # 占位符：{index} {score} {scene_id} {weather_id} {decision_reason} {behavior}
+  mid_term_item: |
+    ### 经验 {index} (相似度: {score})
+    - 场景: {scene_id}, 天气: {weather_id}
+    - 决策原因: {decision_reason}
+    - 行为: {behavior}
+
+  # 长期规则段落整体格式。占位符：{long_term_rules_text}
+  long_term_block: |
+    ## 相关驾驶规则（长期记忆）
+    {long_term_rules_text}

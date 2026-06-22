@@ -1,0 +1,83 @@
+# =============================================================================
+# 决策模块配置
+# =============================================================================
+# 包含轨迹输出要求、坐标系定义、行为枚举、fallback 配置。
+# =============================================================================
+
+# ---- 轨迹输出要求 ----
+trajectory:
+  waypoint_min_num: 20  # 轨迹最少 waypoint 数
+  waypoint_max_num: 30  # 轨迹最多 waypoint 数
+  horizon_seconds: 3.0  # 轨迹时间范围（秒），与 data_nuscenes.yaml 的 future_seconds 对应
+  dt: 0.1  # waypoint 时间间隔（秒），3.0 / 0.1 = 30 个 waypoint
+  coordinate_system: "ego_centric"  # ego-centric 坐标系
+  x_axis: "forward"  # x 轴方向：前向
+  y_axis: "left"  # y 轴方向：左向
+  unit: "meter"  # 位置单位：米
+  resample_to_fixed_num: true  # 是否重采样到固定 waypoint 数
+  fixed_waypoint_num: 25  # 重采样后的固定 waypoint 数
+
+# ---- 行为枚举 ----
+behaviors:
+  valid_behaviors:
+    - "KEEP_LANE"  # 保持车道
+    - "FOLLOW"  # 跟车
+    - "SLOW_DOWN"  # 减速
+    - "STOP"  # 停车
+    - "TURN_LEFT"  # 左转
+    - "TURN_RIGHT"  # 右转
+    - "CHANGE_LANE_LEFT"  # 左变道
+    - "CHANGE_LANE_RIGHT"  # 右变道
+    - "AVOID_OBSTACLE"  # 避障
+    - "YIELD"  # 让行
+    - "UNKNOWN"  # 未知
+
+# ---- 风险等级 ----
+risk_levels:
+  valid_levels:
+    - "low"  # 低风险
+    - "medium"  # 中风险
+    - "high"  # 高风险
+
+# ---- Fallback 配置 ----
+fallback:
+  # 第一版允许规则 fallback，但仅限于 VLM 输出格式错误时生成可评测轨迹
+  # fallback 不能用于替代 VLM 决策
+  allow_rule_fallback_for_format_error: true
+  # fallback 生成策略：使用恒速直线运动
+  default_speed: 5.0  # 默认速度 m/s
+  default_behavior: "KEEP_LANE"  # 默认行为
+  default_risk_level: "medium"  # 默认风险等级
+
+# ---- 决策 Prompt 模板配置 ----
+prompt:
+  # 决策 prompt 中各信息段的最大长度（字符）
+  max_scene_description_length: 500
+  max_ego_state_length: 300
+  max_history_trajectory_length: 500
+  max_short_term_summary_length: 1000
+  max_mid_term_memory_length: 1500
+  max_long_term_rules_length: 800
+  max_nav_instruction_length: 200
+
+# ---- 决策 VLM 图像输入（P5 新增） ----
+# 决策模型一次接收多少张图：当前帧 + 短期记忆中的历史帧。
+# 例如 image_context_size=3, include_current_frame=true 时：
+#   - 取短期记忆中最近 2 张历史图 + 当前帧 → 共 3 张
+# 当前帧总是排在 image_paths 末尾，符合"最新"的视觉锚点。
+# Qwen-VL-Max 实测建议单次 ≤ 4 张图；超出会被自动截断为最近 N 张并 warning。
+vlm_inputs:
+  image_context_size: 4
+  include_current_frame: true
+  history_image_order: "oldest_first"  # oldest_first | newest_first
+  max_images_per_call: 6               # 实际拼接上限（防止 token 超限/服务报错）
+
+# ---- 后续预留 ----
+# dynamics_adapter 用于把轨迹转为方向盘转角、油门、刹车控制量
+# 第一版不实现
+dynamics_adapter:
+  enabled: false  # 第一版不启用
+  wheel_base: 2.8  # 轴距（米）
+  max_steer_angle: 0.6  # 最大方向盘转角（弧度）
+  max_acceleration: 3.0  # 最大加速度（m/s²）
+  max_deceleration: -5.0  # 最大减速度（m/s²）

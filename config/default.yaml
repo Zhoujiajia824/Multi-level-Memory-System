@@ -1,0 +1,42 @@
+# =============================================================================
+# 智能驾驶 VLA 分层记忆系统 - 默认配置
+# =============================================================================
+# 本文件包含项目级通用配置，所有路径均使用 pathlib 在运行时解析。
+# 不允许在核心代码中硬编码绝对路径。
+# =============================================================================
+
+project_name: "vla_memory_demo"
+run_id: "default"  # 运行标识，可通过 CLI 覆盖，如 --run_id exp001
+seed: 42  # 随机种子，保证可复现性
+device: "auto"  # 自动选择设备：cuda / mps / cpu，由代码检测
+model_cache_dir: ".cache/huggingface"  # 模型权重缓存目录（DINOv2 等）
+output_dir: "outputs"  # 输出根目录
+log_dir: "outputs/logs"  # 日志目录
+feature_dir: "outputs/features"  # 图像特征存储目录
+memory_db_dir: "outputs/memory_db"  # 中期记忆 FAISS 数据库目录
+
+# ---- 硬性要求标志 ----
+# 第一版必须使用真实 API、真实特征模型、真实 FAISS
+real_api_required: true  # 必须使用真实 VLM API，不允许 mock
+real_feature_required: true  # 必须使用真实 DINOv2 权重，不允许随机 embedding
+faiss_required: true  # 必须使用 FAISS，不允许降级到 numpy
+
+# ---- 图像特征模型配置 ----
+feature_extractor:
+  model_name: "facebook/dinov2-base"  # DINOv2 模型名称
+  cache_dir: ".cache/huggingface"  # 模型缓存目录
+  feature_dim: 768  # DINOv2-base 输出维度
+  batch_size: 8  # 批量提取特征时的 batch size
+  normalize: true  # 是否 L2 归一化特征向量
+
+# ---- 日志级别 ----
+logging:
+  level: "INFO"  # DEBUG / INFO / WARNING / ERROR
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+  file_enabled: true  # 是否写入日志文件
+  console_enabled: true  # 是否输出到控制台
+
+# ---- 数据划分 ----
+split:
+  train: "train"  # nuScenes train 场景
+  val: "val"  # nuScenes val 场景（v1.0-mini 使用 mini_train / mini_val）

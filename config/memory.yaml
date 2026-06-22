@@ -1,0 +1,83 @@
+# =============================================================================
+# 分层记忆系统配置
+# =============================================================================
+# 包含短期记忆、中期记忆、长期记忆的配置参数。
+# 中期记忆联合检索权重在此定义。
+# =============================================================================
+
+# ---- 短期记忆配置 ----
+short_term:
+  capacity: 10  # 滑动窗口大小，存储最近 10 个关键帧数据。FIFO 自动淘汰最旧帧。
+  # 短期记忆摘要用于拼接给决策 VLM
+  summary_max_length: 2000  # 短期记忆摘要最大字符长度
+  # P2 起：短期记忆条目保存图像绝对/相对路径，决策时按需读图喂给 VLM
+  store_image_paths: true
+
+# ---- 中期记忆配置 ----
+mid_term:
+  top_k: 3  # 返回最相似的 3 条候选记忆
+  faiss_index_type: "IndexFlatIP"  # FAISS 索引类型：IndexFlatIP（内积）
+  # 注意：使用 IndexFlatIP 时，特征向量需要先 L2 归一化
+  feature_dim: 768  # 特征向量维度，与 DINOv2-base 输出一致
+  save_interval: 100  # 每处理多少条记录自动保存一次 FAISS 索引
+
+  # ---- 联合检索权重 ----
+  # final_score = visual_weight * visual_score
+  #             + text_weight * text_score
+  #             + scene_weight * scene_score
+  #             + weather_weight * weather_score
+  #             + nav_weight * nav_score
+  #             + state_weight * state_score
+  # 所有权重之和应为 1.0
+  weights:
+    visual_weight: 0.40  # 视觉相似度权重（FAISS 检索）
+    text_weight: 0.10  # 文本相似度权重（TF-IDF / 简单文本相似度）
+    scene_weight: 0.20  # 场景类型匹配权重（scene_id）
+    weather_weight: 0.10  # 天气匹配权重（weather_id）
+    nav_weight: 0.10  # 导航语义匹配权重
+    state_weight: 0.10  # 自车状态相似度权重（速度、加速度、航向角）
+
+  # ---- 文本相似度配置 ----
+  text_similarity:
+    method: "tfidf"  # 第一版使用 TF-IDF：tfidf / cosine / jaccard
+    max_features: 1000  # TF-IDF 最大特征数
+
+  # ---- 状态相似度配置 ----
+  state_similarity:
+    speed_weight: 0.4  # 速度相似度权重
+    acceleration_weight: 0.3  # 加速度相似度权重
+    yaw_weight: 0.3  # 航向角相似度权重
+
+  # ---- 中期记忆持久化（P2 新增）----
+  # 总开关：是否在运行过程中把中期记忆（FAISS 索引 + 元数据）落盘。
+  # save_on_close 控制是否在 pipeline 退出时全量保存；
+  # auto_load_on_init 控制下次启动时是否自动加载历史索引；
+  # strict_load 控制加载失败的策略（True=抛错，False=warning 后从空开始）。
+  persistence:
+    enabled: true
+    save_on_close: true
+    auto_load_on_init: true
+    strict_load: false
+
+# ---- 长期记忆配置 ----
+long_term:
+  rules_file: "data/knowledge/long_term_rules.yaml"  # 长期规则存储文件
+  strategies_file: "data/knowledge/driving_strategies.yaml"  # 驾驶策略存储文件
+  top_k: 5  # 返回最匹配的 top_k 条规则
+  # 检索方式：使用 scene_id 进行匹配（P2 起严格按场景）。
+  knowledge_graph_dir: "data/knowledge/knowledge_graph"  # 知识图谱目录（第一版预留）
+
+  # ---- 严格场景匹配（P2 新增）----
+  # strict_scene_match=True 时，scene_id="all" 的通配规则不再匹配具体场景。
+  # 只有显式同 scene_id 的规则会被检索出来传给决策 VLM。
+  # strict_weather_match=False 保持原行为，允许 weather="all" 通配。
+  strict_scene_match: true
+  strict_weather_match: false
+
+# ---- 记忆持久化配置 ----
+persistence:
+  save_dir: "outputs/memory_db"  # 记忆数据库保存目录
+  short_term_file: "short_term_memory.pkl"  # 短期记忆保存文件名
+  mid_term_index_file: "mid_term_faiss.index"  # FAISS 索引文件名
+  mid_term_meta_file: "mid_term_meta.json"  # 中期记忆元数据文件名
+  long_term_cache_file: "long_term_cache.pkl"  # 长期记忆缓存文件名

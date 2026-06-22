@@ -1,0 +1,167 @@
+# =============================================================================
+# 驾驶策略知识库
+# =============================================================================
+# 存储基于场景类型的驾驶策略建议。
+# 这些策略为决策模块提供参考，用于生成更安全的驾驶轨迹。
+# =============================================================================
+
+strategies:
+  # ---- 跟车策略 ----
+  - strategy_id: "STRAT_001"
+    scene_id: "car_following"
+    title: "跟车速度调节策略"
+    description: |
+      根据前车速度动态调节自车速度。
+      前车加速则跟随加速，前车减速则同步减速。
+      保持恒定的安全时距（建议 2 秒）。
+    recommended_behavior: "FOLLOW"
+    target_speed_range: [5.0, 30.0]  # m/s
+    priority: 1
+
+  - strategy_id: "STRAT_002"
+    scene_id: "car_following"
+    title: "前车急刹应对策略"
+    description: |
+      检测到前车急刹时，立即执行减速操作。
+      如果距离充足，平滑减速至停车。
+      如果距离不足，执行紧急制动。
+    recommended_behavior: "SLOW_DOWN"
+    target_speed_range: [0.0, 10.0]
+    priority: 1
+
+  # ---- 路口策略 ----
+  - strategy_id: "STRAT_010"
+    scene_id: "intersection"
+    title: "路口直行策略"
+    description: |
+      绿灯直行通过路口时，保持稳定速度。
+      注意两侧可能闯红灯的车辆和行人。
+      进入路口前确认安全，通过时不加速。
+    recommended_behavior: "KEEP_LANE"
+    target_speed_range: [5.0, 20.0]
+    priority: 1
+
+  - strategy_id: "STRAT_011"
+    scene_id: "intersection"
+    title: "路口左转策略"
+    description: |
+      左转前减速，确认对向无来车。
+      转弯半径适当，不要切弯。
+      注意左侧行人和非机动车。
+      转弯后加速到正常速度。
+    recommended_behavior: "TURN_LEFT"
+    target_speed_range: [3.0, 10.0]
+    priority: 1
+
+  - strategy_id: "STRAT_012"
+    scene_id: "intersection"
+    title: "路口右转策略"
+    description: |
+      右转前减速，注意右侧非机动车道。
+      观察右侧盲区，确认无行人。
+      小角度转弯，保持车道。
+    recommended_behavior: "TURN_RIGHT"
+    target_speed_range: [3.0, 8.0]
+    priority: 1
+
+  # ---- 直行策略 ----
+  - strategy_id: "STRAT_020"
+    scene_id: "straight_road"
+    title: "直行车道保持策略"
+    description: |
+      在直行道路上保持车道居中。
+      使用前方道路标志线作为参考。
+      速度与道路限速匹配。
+      定期观察远处的交通状况。
+    recommended_behavior: "KEEP_LANE"
+    target_speed_range: [10.0, 30.0]
+    priority: 2
+
+  # ---- 变道策略 ----
+  - strategy_id: "STRAT_030"
+    scene_id: "lane_change"
+    title: "向左变道策略"
+    description: |
+      确认左后方安全距离内无车辆。
+      打左转向灯至少 3 秒。
+      平滑地向左偏移，不急打方向盘。
+      变道完成后关闭转向灯。
+    recommended_behavior: "CHANGE_LANE_LEFT"
+    target_speed_range: [5.0, 25.0]
+    priority: 1
+
+  - strategy_id: "STRAT_031"
+    scene_id: "lane_change"
+    title: "向右变道策略"
+    description: |
+      确认右后方安全距离内无车辆。
+      打右转向灯至少 3 秒。
+      平滑地向右偏移。
+      注意右侧可能存在的非机动车。
+    recommended_behavior: "CHANGE_LANE_RIGHT"
+    target_speed_range: [5.0, 25.0]
+    priority: 1
+
+  # ---- 避障策略 ----
+  - strategy_id: "STRAT_040"
+    scene_id: "obstacle_avoidance"
+    title: "静态障碍物绕行策略"
+    description: |
+      发现前方静态障碍物时，先减速。
+      评估相邻车道是否安全。
+      平滑绕行，保持与障碍物的安全距离。
+      绕行后回到原车道。
+    recommended_behavior: "AVOID_OBSTACLE"
+    target_speed_range: [3.0, 15.0]
+    priority: 1
+
+  - strategy_id: "STRAT_041"
+    scene_id: "obstacle_avoidance"
+    title: "动态障碍物避让策略"
+    description: |
+      发现前方有行人或动物突然出现时，立即减速。
+      评估停车距离是否足够。
+      不够则紧急制动。
+      避让时不要急打方向盘，防止侧翻。
+    recommended_behavior: "SLOW_DOWN"
+    target_speed_range: [0.0, 10.0]
+    priority: 1
+
+  # ---- 人行横道策略 ----
+  - strategy_id: "STRAT_050"
+    scene_id: "crosswalk"
+    title: "人行横道减速让行策略"
+    description: |
+      接近人行横道时主动减速。
+      检测到行人在人行横道上时停车等待。
+      行人完全通过后缓慢起步。
+      即使绿灯也要注意行人。
+    recommended_behavior: "YIELD"
+    target_speed_range: [0.0, 10.0]
+    priority: 1
+
+  # ---- 合流策略 ----
+  - strategy_id: "STRAT_060"
+    scene_id: "merge"
+    title: "匝道合流策略"
+    description: |
+      在匝道上加速到接近主路速度。
+      观察主路车流，寻找安全间隙。
+      使用转向灯提示合流意图。
+      平滑汇入主路，不强行插入。
+    recommended_behavior: "KEEP_LANE"
+    target_speed_range: [10.0, 30.0]
+    priority: 2
+
+  # ---- 恶劣天气通用策略 ----
+  - strategy_id: "STRAT_070"
+    scene_id: "all"
+    title: "恶劣天气通用减速策略"
+    description: |
+      雨雪雾天气下，路面附着系数降低。
+      所有速度操作都应比晴天更保守。
+      制动距离增加 50%-100%。
+      避免急转弯和急加速。
+    recommended_behavior: "SLOW_DOWN"
+    target_speed_range: [0.0, 15.0]
+    priority: 1
