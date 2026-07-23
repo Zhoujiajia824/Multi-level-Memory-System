@@ -9,11 +9,12 @@
 
 ### v0.1（当前版本）— 基础 Demo
 
-- ✅ nuScenes v1.0-mini + CAM_FRONT 单摄像头
+- ✅ nuScenes v1.0-mini / v1.0-trainval + CAM_FRONT 单前视（single_front）/ 六视角环视拼接（surround_mosaic）
 - ✅ DINOv2-base 图像特征提取（768 维）
 - ✅ Qwen-VL 场景理解（通过 DashScope API）
 - ✅ 短期记忆（deque 滑动窗口）
 - ✅ 中期记忆（FAISS IndexFlatIP + 6 维联合评分）
+- ✅ **中期记忆价值门控改造（阶段 1-7，已端到端验证）**：metadata schema v0.2（37+ 字段）+ 价值准入门控（MemoryAdmissionController）+ 容量淘汰（soft delete + FAISS rebuild）+ 价值感知检索重排 + 事件级记忆（连续高价值帧→event_memory）+ 冲突感知软更新 + 离线沉淀长期记忆候选（不覆盖正式库）。详见 [`docs/mid_term_memory_value_gating_plan.md`](mid_term_memory_value_gating_plan.md) 与各 `docs/stageN_*_design.md`
 - ✅ 长期记忆（YAML 规则匹配）
 - ✅ memory_on / memory_off 对比评测
 - ✅ ADE / FDE / 轨迹有效率 / 行为准确率指标
@@ -57,7 +58,7 @@
 - [ ] 基于运动检测的自适应关键帧采样（非固定 1Hz）
 - [ ] 基于场景变化的关键帧采样（场景切换、天气变化时增加采样密度）
 - [ ] 支持用户自定义关键帧策略（继承 BaseKeyframeSampler）
-- [ ] 多摄像头关键帧融合（CAM_FRONT + CAM_FRONT_LEFT + CAM_FRONT_RIGHT）
+- [x] 多摄像头关键帧融合 — **已部分实现**：surround_mosaic 把 6 相机拼成 2×3 环视图 + oracle 多相机 GT 投影（见 [perception_upgrade.md](perception_upgrade.md)）；真正的 BEV / 特征级融合仍待办
 - [ ] 关键帧质量评估（模糊检测、曝光检测）
 
 **依赖：** v0.1 基础架构。
@@ -140,7 +141,7 @@
 - [ ] 对接 nuScenes 官方 planning benchmark 评测协议
 - [ ] 支持 nuScenes trainval 完整数据集（1000+ 场景）
 - [ ] GPU FAISS 加速（faiss-gpu）
-- [ ] 多摄像头融合 + BEV 特征
+- [ ] 多摄像头融合 + BEV 特征（前半"环视拼接"已部分实现，BEV 特征级融合仍待办；见 [perception_upgrade.md](perception_upgrade.md)）
 - [ ] LiDAR 点云辅助感知
 - [ ] 与 nuScenes planning baseline 方法对比（UrbanDriver、PlanTF 等）
 - [ ] 论文级实验报告

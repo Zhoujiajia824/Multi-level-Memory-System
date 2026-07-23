@@ -40,11 +40,18 @@ class DecisionPromptBuilder:
         short_term_summary: str = "",
         mid_term_memories: Optional[List] = None,
         long_term_rules_text: str = "",
+        perception_objects: Optional[List[Dict]] = None,
+        image_layout: str = "",
     ) -> str:
         """构建完整的决策 prompt。
 
         当 short_term_summary / mid_term_memories / long_term_rules_text
         均为空时，自动切换为 memory_off 模式（不拼接记忆段落）。
+
+        Args:
+            perception_objects: oracle 感知对象列表（nuScenes GT 投影，dict 形式）；
+                非空时渲染为独立段落喂给决策 VLM，并显式标注为 oracle 来源。
+            image_layout: 输入图像布局描述串（single_front / surround_mosaic）。
         """
         loader = get_prompt_loader()
 
@@ -61,6 +68,8 @@ class DecisionPromptBuilder:
             mid_term_memories=mid_term_memories,
             long_term_rules_text=long_term_rules_text,
         )
+        image_layout_block = self._render_image_layout_block(image_layout)
+        perception_objects_block = self._render_perception_objects_block(perception_objects)
 
         # ------------------------------------------------------------
         # 2. 路点边界 / 行为枚举 / horizon （单一来源：decision.yaml）
@@ -84,6 +93,8 @@ class DecisionPromptBuilder:
             horizon_seconds=horizon_seconds,
             dt=dt,
             behavior_enum_str=behavior_enum_str,
+            image_layout_block=image_layout_block,
+            perception_objects_block=perception_objects_block,
         )
 
     # ================================================================
@@ -294,3 +305,48 @@ class DecisionPromptBuilder:
         if not sections:
             return ""
         return "\n\n".join(sections) + "\n"
+
+    def _render_image_layout_block(self, image_layout: str) -> str:
+        """渲染输入图像布局说明段（告知决策 VLM 当前图像是单图还是六视角 mosaic）。"""
+        if not image_layout:
+            return ""
+        return f"## 输入图像布局\n{image_layout}\n"
+
+    def _render_perception_objects_block(self, perception_objects) -> str:
+        """渲染 oracle 感知对象段（nuScenes GT 标注投影，非检测模型预测）。
+
+        显式标注 oracle 来源；速度/加速度标注可用性与来源；无对象时返回空串。
+        """
+        if not perception_objects:
+            return ""
+        lines = [
+            "## Oracle 感知对象（nuScenes GT 标注投影，非检测模型预测）",
+            f"共 {len(perception_objects)} 个目标（按到 ego 距离升序），坐标 ego-centric [x 前向, y 左向]：",
+        ]
+        for i, o in enumerate(perception_objects[:12], 1):  # 限 12 个避免 prompt 过长
+            if not isinstance(o, dict):
+                continue
+            vel = o.get("velocity")
+            vstr = (
+                f"speed={o.get('speed'):.2f}m/s vel={[round(v, 2) for v in vel]}"
+                if (o.get("velocity_available") and vel is not None)
+                else "unavailable(无历史)"
+            )
+            amag = o.get("acceleration_mag")
+            astr = (
+                f"{amag:.2f}m/s^2"
+                if (o.get("acceleration_available") and amag is not None)
+                else "unavailable"
+            )
+            pos = o.get("position_ego") or []
+            pos_str = f"[{pos[0]:.1f},{pos[1]:.1f}]" if len(pos) >= 2 else "?"
+            lines.append(
+                f"  {i}. [{o.get('category', '?')}/{o.get('semantic_label', '?')}] "
+                f"dist={o.get('distance_to_ego', 0):.1f}m pos={pos_str} "
+                f"{vstr} acc={astr} cams={o.get('visible_cameras', [])} "
+                f"kinematics={o.get('kinematics_source', '?')}"
+            )
+        if len(perception_objects) > 12:
+            lines.append(f"  ...（其余 {len(perception_objects) - 12} 个对象略）")
+        lines.append("")
+        return "\n".join(lines)

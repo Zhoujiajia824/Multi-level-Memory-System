@@ -8,11 +8,34 @@
 
 # ---- 数据集根目录 ----
 dataroot: "data/nuscenes/raw"  # nuScenes 数据集根目录，相对于项目根目录
-version: "v1.0-mini"  # 数据集版本：v1.0-mini / v1.0-trainval / v1.0-test
+version: "v1.0-trainval"  # 数据集版本：v1.0-mini / v1.0-trainval / v1.0-test
+dataset_name: "nuscenes"  # 数据集名称（Phase 1 新增：写入中期记忆 source_dataset 字段，配置驱动）
 
 # ---- 摄像头配置 ----
 camera_name: "CAM_FRONT"  # 默认使用前视角摄像头
 # 后续可扩展：CAM_FRONT_LEFT, CAM_FRONT_RIGHT, CAM_BACK 等
+
+# ---- 感知输入模式配置（六视角环视拼接 + Oracle 感知） ----
+perception:
+  mode: "surround_mosaic"        # single_front | surround_mosaic
+  # single_front：保持原有单张前视图行为（默认，向后兼容）
+  # surround_mosaic：把 6 相机拼成 2x3 单张 surround-view mosaic 图，
+  #   替代前视图进入 VLM 场景理解、决策、DINOv2 特征、短期/中期记忆、决策记录全流程
+  cameras:                    # 2x3 行优先顺序：上排前向三摄、下排后向三摄
+    - "CAM_FRONT_LEFT"
+    - "CAM_FRONT"
+    - "CAM_FRONT_RIGHT"
+    - "CAM_BACK_LEFT"
+    - "CAM_BACK"
+    - "CAM_BACK_RIGHT"
+  mosaic:
+    cell_width: 480           # 每子图 resize 宽（像素）
+    cell_height: 270          # 每子图 resize 高（像素，16:9）
+    label_subimages: true     # 是否在每个子图标相机名，便于 VLM 识别视角
+  oracle_objects: true       # 是否注入 nuScenes GT 投影的 perception_objects（oracle 感知，非模型预测）
+  oracle:
+    max_distance_m: 50.0      # 过滤距 ego 超过此距离的目标
+    box_visibility: "ANY"     # 投影可见性过滤：ALL | ANY | NONE
 
 # ---- 关键帧策略 ----
 keyframe:
@@ -66,6 +89,6 @@ navigation:
 
 # ---- 数据子集配置（用于快速调试） ----
 subset:
-  enabled: false  # 是否启用子集模式
-  max_scenes: 5  # 最多处理的场景数
+  enabled: true  # 是否启用子集模式（trainval 仅下前85场景，必须开启，否则 scene_tokens[:max_scenes] 不生效→跑到 scene-0086+ 崩溃）
+  max_scenes: 85  # 最多处理的场景数（Part1 = scene-0001~0085）
   max_samples_per_scene: 50  # 每个场景最多处理的样本数

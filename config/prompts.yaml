@@ -19,7 +19,7 @@ scene_understanding:
   # system 字段当前未独立使用（沿用 config/api_models.yaml 中的 system_prompt）。
   # 如需替换，可在 SceneUnderstandingPipeline 中接入。
   system: |
-    你是一个自动驾驶场景理解专家。请根据前视摄像头图像输出严格 JSON 结构化结果。
+    你是一个自动驾驶场景理解专家。请根据提供的驾驶场景图像输出严格 JSON 结构化结果。
     禁止输出 Markdown 代码块标记，禁止输出 JSON 以外的任何内容。
 
   # user 字段是真正喂给 VLM 的主体提示词。
@@ -27,7 +27,8 @@ scene_understanding:
   # pedestrians / traffic_lights / intersections），便于下游决策模型直接取用。
   # 旧字段 surrounding_objects / lane_description 保留作为兼容回退。
   user: |
-    请分析这张自动驾驶前视角摄像头拍摄的图片，并严格按照以下 JSON 格式输出场景理解结果。
+    请分析这张{image_layout}，并严格按照以下 JSON 格式输出场景理解结果。
+    （图像布局由系统按当前感知模式注入：single_front 为单张前视角图；surround_mosaic 为 nuScenes 六视角 2x3 拼接图。）
 
     要求：
     1. 只输出 JSON，不要输出任何其他内容。
@@ -157,11 +158,15 @@ decision:
   #   {waypoint_min_num}       —— 来自 config/decision.yaml -> trajectory.waypoint_min_num
   #   {waypoint_max_num}       —— 来自 config/decision.yaml -> trajectory.waypoint_max_num
   #   {behavior_enum_str}      —— 行为枚举字符串（管道符分隔）
+  #   {image_layout_block}     —— 输入图像布局说明段（single_front / surround_mosaic）
+  #   {perception_objects_block} —— oracle 感知对象段（nuScenes GT 投影；无对象时为空字符串）
   user: |
     你是一个自动驾驶决策和轨迹规划专家。请根据以下信息输出驾驶决策。
     你必须严格按照要求的 JSON 格式输出，不要输出 JSON 以外的内容。
     不要使用 Markdown 代码块标记。
 
+    {image_layout_block}
+    {perception_objects_block}
     {scene_block}
     {ego_state_block}
     {nav_block}

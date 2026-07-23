@@ -63,9 +63,19 @@ def run_prepare_nuscenes(config: Optional[Config] = None) -> Dict[str, Any]:
 
     # 加载数据集（P3 起：按 yaml 注入 CanBusLoader）
     can_bus_loader = _maybe_build_can_bus_loader(config)
+
+    # 感知输入模式（single_front / surround_mosaic）：决定多摄像头接线
+    perception_mode = config.get_nested("perception", "mode", default="single_front")
+    perception_cameras = config.get_nested("perception", "cameras", default=None)
+    camera_name = config.get("camera_name", "CAM_FRONT")
+    # surround_mosaic 模式启用多摄像头列表；single_front 仅主摄像头（camera_names=None 退化为 [主]）
+    camera_names = perception_cameras if perception_mode == "surround_mosaic" else None
+
     adapter = NuScenesAdapter(
         dataroot=dataroot,
         version=version,
+        camera_name=camera_name,
+        camera_names=camera_names,
         can_bus_loader=can_bus_loader,
         fallback_to_pose_diff=config.get_nested("can_bus", "fallback_to_pose_diff", default=True),
     )
@@ -73,6 +83,7 @@ def run_prepare_nuscenes(config: Optional[Config] = None) -> Dict[str, Any]:
     logger.info(f"nuScenes 数据集加载成功: {adapter.get_sample_count()} 个样本")
     if can_bus_loader is not None:
         logger.info("CAN bus 真值已启用 (data_nuscenes.yaml -> can_bus.enabled=true)")
+    logger.info(f"感知输入模式: {perception_mode} (camera_names={adapter.camera_names})")
 
     # 关键帧采样
     sampler = NuScenesKeyframeSampler(step=keyframe_step)

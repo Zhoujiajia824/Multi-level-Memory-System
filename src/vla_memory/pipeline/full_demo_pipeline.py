@@ -57,6 +57,21 @@ def enrich_keyframes_with_state(
     history_seconds = config.get("history_seconds", 5.0)
     future_seconds = config.get("future_seconds", 3.0)
 
+    # 感知输入模式（single_front / surround_mosaic）+ oracle 感知开关
+    perception_mode = config.get_nested("perception", "mode", default="single_front")
+    perception_cameras = config.get_nested("perception", "cameras", default=None) or []
+    oracle_enabled = bool(config.get_nested("perception", "oracle_objects", default=False))
+    mosaic_cell_w = int(config.get_nested("perception", "mosaic", "cell_width", default=480))
+    mosaic_cell_h = int(config.get_nested("perception", "mosaic", "cell_height", default=270))
+    mosaic_label = bool(config.get_nested("perception", "mosaic", "label_subimages", default=True))
+    oracle_cfg = config.get_nested("perception", "oracle", default={}) or {}
+    if perception_mode == "surround_mosaic":
+        logger.info(
+            "感知输入模式: surround_mosaic（六视角 2x3 拼接替代前视图）, oracle_objects=%s",
+            oracle_enabled,
+        )
+        from src.vla_memory.perception.surround_mosaic import build_surround_mosaic
+
     ego_builder = EgoStateBuilder()
     traj_builder = TrajectoryBuilder()
     route_infer = RouteInfer()
@@ -133,11 +148,38 @@ def enrich_keyframes_with_state(
                 current_speed=ego_state.speed,
             )
 
+            # 感知输入：surround_mosaic 模式拼六视角图替代 image_path（下游全自适应）
+            actual_image_path = image_path
+            image_paths_raw = list(frame.image_paths) if frame.image_paths else []
+            if perception_mode == "surround_mosaic" and image_paths_raw:
+                mosaic_out = str(config.root / "outputs" / "mosaic" / f"{sample_token}.jpg")
+                try:
+                    actual_image_path = build_surround_mosaic(
+                        image_paths_raw, perception_cameras,
+                        cell_width=mosaic_cell_w, cell_height=mosaic_cell_h,
+                        label_subimages=mosaic_label, out_path=mosaic_out,
+                    )
+                except Exception as e:
+                    logger.warning("mosaic 拼接失败 sample=%s，回退前视图: %s", sample_token[:8], e)
+                    actual_image_path = image_path
+
+            # oracle 感知对象（nuScenes GT 投影，非模型预测；is_oracle=True）
+            perception_objects: List[Dict[str, Any]] = []
+            if oracle_enabled:
+                try:
+                    perception_objects = adapter.get_perception_objects(sample_token, oracle_cfg)
+                except Exception as e:
+                    logger.warning("oracle perception 生成失败 sample=%s: %s", sample_token[:8], e)
+
             all_keyframes.append({
                 "sample_token": sample_token,
                 "scene_token": scene_token,
+                "scene_name": scene_name,  # Phase 1 新增：来源场景名（如 scene-0061），供中期记忆 source_scene_name 使用；can_bus 关闭时为 None
                 "timestamp": current_pose["timestamp"],
-                "image_path": image_path,
+                "image_path": actual_image_path,
+                "image_paths_raw": image_paths_raw,
+                "perception_mode": perception_mode,
+                "perception_objects": perception_objects,
                 "ego_state": ego_state.to_ego_centric(),
                 "history_trajectory": history_list,
                 "ground_truth_trajectory": gt_list,

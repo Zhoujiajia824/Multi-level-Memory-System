@@ -38,6 +38,7 @@ class NuScenesAdapter(BaseDrivingDataset):
         dataroot: str | Path = "data/nuscenes/raw",
         version: str = "v1.0-mini",
         camera_name: str = "CAM_FRONT",
+        camera_names: Optional[List[str]] = None,
         can_bus_loader: Optional[object] = None,
         fallback_to_pose_diff: bool = True,
     ):
@@ -45,7 +46,8 @@ class NuScenesAdapter(BaseDrivingDataset):
         Args:
             dataroot: nuScenes 数据集根目录。
             version: 数据集版本。
-            camera_name: 摄像头名称。
+            camera_name: 主摄像头名称（用于 ego_pose 关联与 single_front 模式）。
+            camera_names: 多摄像头名称列表（surround_mosaic 模式用）；None 时退化为 [camera_name]。
             can_bus_loader: P3 新增。可选 CanBusLoader 实例；提供时
                 ``get_ego_pose`` 优先返回 CAN bus 真值。
             fallback_to_pose_diff: CAN bus 查询失败时是否回退到差分（默认 True）。
@@ -53,6 +55,8 @@ class NuScenesAdapter(BaseDrivingDataset):
         self.dataroot = Path(dataroot)
         self.version = version
         self.camera_name = camera_name
+        # 多摄像头列表：surround_mosaic 模式下为 6 相机；否则退化为 [主摄像头]
+        self.camera_names: List[str] = list(camera_names) if camera_names else [camera_name]
         self._nusc = None  # 底层 NuScenes 对象
         self._loaded = False
 
@@ -173,6 +177,7 @@ class NuScenesAdapter(BaseDrivingDataset):
         for sample in samples:
             sample_token = sample["token"]
             image_path = self.get_frame_image_path(sample_token, self.camera_name)
+            image_paths = self.get_frame_image_paths(sample_token, self.camera_names)
             yield FrameMeta(
                 frame_id=f"{scene_token}_{sample_token}",
                 scene_token=scene_token,
@@ -180,6 +185,7 @@ class NuScenesAdapter(BaseDrivingDataset):
                 timestamp=sample["timestamp"],
                 camera_name=self.camera_name,
                 image_path=image_path,
+                image_paths=image_paths,
             )
 
     def get_sample_count(self) -> int:
@@ -205,6 +211,57 @@ class NuScenesAdapter(BaseDrivingDataset):
             )
         cam_data = self.nusc.get("sample_data", cam_token)
         return str(self.dataroot / cam_data["filename"])
+
+    def get_frame_image_paths(
+        self, sample_token: str, camera_names: Optional[List[str]] = None
+    ) -> List[str]:
+        """获取指定帧在多个摄像头下的图像文件绝对路径列表（surround_mosaic 模式用）。
+
+        按 ``camera_names`` 顺序返回各相机图像路径，保持顺序与 2x3 布局对齐。
+        某相机通道缺失（nuScenes 正常情况下不会发生）时填空串占位并 warning，
+        由 mosaic 拼接层将其作为缺图处理。
+
+        Args:
+            sample_token: 样本标识。
+            camera_names: 摄像头名称列表；None 时用 self.camera_names。
+
+        Returns:
+            图像绝对路径列表，顺序与 camera_names 一致。
+        """
+        cameras = camera_names if camera_names is not None else self.camera_names
+        sample = self.nusc.get("sample", sample_token)
+        paths: List[str] = []
+        for cam in cameras:
+            cam_token = sample["data"].get(cam)
+            if cam_token is None:
+                logger.warning("样本 %s 缺少相机 %s 的数据通道，该格将以缺图处理", sample_token, cam)
+                paths.append("")
+                continue
+            cam_data = self.nusc.get("sample_data", cam_token)
+            paths.append(str(self.dataroot / cam_data["filename"]))
+        return paths
+
+    def get_perception_objects(
+        self, sample_token: str, oracle_cfg: Optional[Dict[str, Any]] = None
+    ) -> List[dict]:
+        """生成 oracle perception_objects（nuScenes GT 投影）。
+
+        委托 oracle_perception 模块：基于 sample_annotation 投影到 6 相机 + 因果运动学。
+        所有对象的 is_oracle=True（GT 来源，非模型预测）。
+
+        Args:
+            sample_token: 样本标识。
+            oracle_cfg: oracle 配置 dict（max_distance_m/box_visibility/cameras）。
+
+        Returns:
+            PerceptionObject 序列化后的 dict 列表（便于 jsonl/prompt 直接使用）。
+        """
+        from src.vla_memory.data import oracle_perception
+        ego_pose = self._get_sample_ego_pose(sample_token)
+        objs = oracle_perception.get_perception_objects(
+            self.nusc, sample_token, ego_pose, oracle_cfg
+        )
+        return [o.to_serializable_dict() for o in objs]
 
     def get_ego_pose(self, sample_token: str) -> EgoState:
         """获取指定帧的自车位姿和运动状态。

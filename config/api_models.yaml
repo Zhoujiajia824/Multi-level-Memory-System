@@ -9,9 +9,9 @@
 # ---- 场景理解 VLM ----
 scene_understanding:
   provider: "qwen"  # VLM 提供商：qwen / openai / other
-  api_key_env: "DASHSCOPE_API_KEY"  # API Key 对应的环境变量名
+  api_key_env: "DASHSCOPE_API_KEY"  # API Key 对应的环境变量名"DASHSCOPE_API_KEY"
   base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"  # API base URL
-  model_name: "qwen3-vl-plus-2025-12-19"  # 模型名称qwen3-vl-plus
+  model_name: "qwen3.7-plus"  # 模型名称qwen3-vl-plus
   timeout: 60  # 请求超时（秒）
   max_tokens: 2048  # 最大输出 token 数
   temperature: 0.1  # 生成温度，低温度保证输出稳定性
@@ -19,15 +19,15 @@ scene_understanding:
   retry_interval_seconds: 5  # 重试间隔（秒）
   # VLM prompt 必须要求只输出 JSON
   system_prompt: |
-    你是一个自动驾驶场景分析专家。你需要分析前视角摄像头拍摄的驾驶场景图片，并严格按照要求的 JSON 格式输出场景理解结果。
+    你是一个自动驾驶场景分析专家。你需要分析提供的驾驶场景图片（具体图像布局见用户提示：可能是单张前视角图，也可能是 nuScenes 六视角 2x3 环视拼接图），并严格按照要求的 JSON 格式输出场景理解结果。
     不要输出任何 JSON 以外的内容。不要输出 Markdown 代码块标记。
 
 # ---- 决策 VLM ----
 decision:
   provider: "qwen"  # VLM 提供商
-  api_key_env: "DASHSCOPE_API_KEY"  # API Key 对应的环境变量名
+  api_key_env: "DASHSCOPE_API_KEY"  # API Key 对应的环境变量名"DASHSCOPE_API_KEY"
   base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"  # API base URL
-  model_name: "qwen3-vl-plus"  # 模型名称
+  model_name: "qwen3.7-plus-2026-05-26"  # 模型名称
   timeout: 120  # 决策请求需要更长超时
   max_tokens: 4096  # 决策输出需要更多 token
   temperature: 0.1  # 低温度保证决策稳定性

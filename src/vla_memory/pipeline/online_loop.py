@@ -115,6 +115,25 @@ class OnlineDrivingLoop:
         # resume 集合
         self._resume_set: Set[str] = set()
 
+        # ---- Phase 2 价值门控 ----
+        # admission_controller 在 setup() 中由 config 构建；prev_frame_ctx 是上一帧上下文快照，
+        # 供下一帧 admission 的"决策变化/动力学突变"检测（只存最近一帧，不持久化，不读未来）。
+        self._admission_controller = None
+        self._admission_enabled = False
+        self._admission_debug_memory_off = False
+        self._prev_frame_ctx: Optional[Dict[str, Any]] = None
+
+        # ---- Phase 5 事件级记忆 ----
+        # event_manager 有状态缓冲连续高价值帧；_prev_scene_token 用于 scene 切换 flush 事件。
+        self._event_manager = None
+        self._event_memory_enabled = False
+        self._prev_scene_token: str = ""
+
+        # ---- Phase 6 冲突感知更新 ----
+        # update_manager 在写入后对检索到的相似旧记忆做冲突检测与软更新（不物理删除）。
+        self._update_manager = None
+        self._update_enabled = False
+
         self._setup_done = False
 
     # ------------------------------------------------------------------
@@ -169,6 +188,15 @@ class OnlineDrivingLoop:
         feat_dim = cfg.get_nested("feature_extractor", "feature_dim", default=768)
         faiss_type = cfg.get_nested("mid_term", "faiss_index_type", default="IndexFlatIP")
         mt_persist = cfg.get_nested("mid_term", "persistence", default={}) or {}
+        mt_retrieval = cfg.get_nested("mid_term", "retrieval", default={}) or {}
+        # Phase 5：把 event_memory 的检索偏好并入 retrieval_cfg（供 search 加成）
+        _ev_cfg_early = cfg.get_nested("mid_term", "event_memory", default={}) or {}
+        if _ev_cfg_early.get("prefer_event_memory", True):
+            mt_retrieval = {
+                **mt_retrieval,
+                "prefer_event_memory": True,
+                "event_memory_bonus": float(_ev_cfg_early.get("event_memory_bonus", 0.10)),
+            }
         save_dir = self._resolve_memory_save_dir()
         self.mid_term = MidTermMemory(
             faiss_store=FAISSVectorStore(dimension=feat_dim, index_type=faiss_type),
@@ -176,6 +204,7 @@ class OnlineDrivingLoop:
             top_k=mt_top_k,
             persistence_cfg=mt_persist,
             save_dir=str(save_dir),
+            retrieval_cfg=mt_retrieval,
         )
 
         lt_rules = cfg.get_nested(
@@ -229,6 +258,74 @@ class OnlineDrivingLoop:
             cfg.get_nested("vlm_inputs", "max_images_per_call", default=4)
         )
 
+        # ---- 5.1 感知输入模式 + 图像布局描述（注入场景理解/决策 prompt） ----
+        self._perception_mode = cfg.get_nested("perception", "mode", default="single_front")
+        self._image_layout_desc = self._build_image_layout_desc(cfg)
+
+        # ---- 5.2 中期记忆 metadata 默认值（Phase 1：legacy 写入价值标记，配置驱动）----
+        # Phase 1 不做价值门控/事件识别/淘汰，只扩展 metadata 结构。以下属性在 step()
+        # 构造 MidTermMemoryRecord 时填充新字段：来源、视觉输入、legacy 准入标记等。
+        # 价值类字段（memory_value_score 等）Phase 1 不计算 → 保持 None，绝不伪造。
+        # 详见 docs/mid_term_memory_value_gating_plan.md §5、schemas/memory.py。
+        mt_meta = cfg.get_nested("mid_term", default={}) or {}
+        self._mt_metadata_version = mt_meta.get("metadata_schema_version", "v0.2")
+        self._mt_default_memory_type = mt_meta.get("default_memory_type", "frame_memory")
+        self._mt_default_status = mt_meta.get("default_status", "active")
+        self._mt_legacy_admission_score = float(mt_meta.get("legacy_admission_score", 1.0))
+        self._mt_legacy_admission_reason = mt_meta.get("legacy_admission_reason", "legacy_no_gating")
+        self._mt_legacy_admission_policy = mt_meta.get("legacy_admission_policy_version", "legacy")
+        # 来源数据集元数据（写入 source_dataset / source_version）
+        self._source_dataset = cfg.get("dataset_name", "nuscenes")
+        self._source_version = cfg.get("version", "")
+
+        # ---- 5.3 Phase 2 价值门控（MemoryAdmissionController）----
+        # 从 mid_term.admission 构建策略与控制器。enabled=false + store_all_when_disabled=true
+        # 时退化为阶段 1 逐帧全存。控制器纯逻辑，无 IO。详见 docs/stage2_admission_design.md。
+        from src.vla_memory.memory.admission import (
+            MemoryAdmissionController, MemoryAdmissionPolicy,
+        )
+        admission_cfg = cfg.get_nested("mid_term", "admission", default={}) or {}
+        admission_policy = MemoryAdmissionPolicy(admission_cfg)
+        self._admission_controller = MemoryAdmissionController(admission_policy)
+        self._admission_enabled = admission_policy.enabled
+        self._admission_debug_memory_off = admission_policy.debug_memory_off
+
+        # ---- 5.4 Phase 3 容量管理（价值评分 + 淘汰 + 压缩，依赖注入 mid_term）----
+        # capacity.enabled=false 时不注入淘汰器（无容量上限，向后兼容）。
+        # 详见 docs/stage3_eviction_design.md。
+        from src.vla_memory.memory.value_scorer import MemoryValueScorer
+        from src.vla_memory.memory.eviction import (
+            MemoryCompactionManager, MemoryEvictionManager,
+        )
+        capacity_cfg = cfg.get_nested("mid_term", "capacity", default={}) or {}
+        if capacity_cfg.get("enabled", True):
+            eviction_cfg = cfg.get_nested("mid_term", "eviction", default={}) or {}
+            compaction_cfg = cfg.get_nested("mid_term", "compaction", default={}) or {}
+            value_scorer = MemoryValueScorer(eviction_cfg)
+            compaction = MemoryCompactionManager(compaction_cfg)
+            eviction = MemoryEvictionManager(
+                capacity_cfg=capacity_cfg, eviction_cfg=eviction_cfg,
+                value_scorer=value_scorer, compaction=compaction,
+            )
+            self.mid_term.set_value_scorer(value_scorer)
+            self.mid_term.set_eviction_manager(eviction)
+            self.mid_term.set_compaction_manager(compaction)
+
+        # ---- 5.5 Phase 5 事件级记忆（EventMemoryManager）----
+        # enabled=false + store_frame_memory_when_event_disabled=true → 退化为阶段 2 逐帧 frame_memory。
+        # 详见 docs/stage5_event_memory_design.md。
+        from src.vla_memory.memory.event_memory import EventMemoryManager
+        event_cfg = cfg.get_nested("mid_term", "event_memory", default={}) or {}
+        self._event_manager = EventMemoryManager(event_cfg)
+        self._event_memory_enabled = bool(event_cfg.get("enabled", True))
+
+        # ---- 5.6 Phase 6 冲突感知更新（MemoryUpdateManager）----
+        # enabled=false → 无冲突更新（阶段 5 行为）。详见 docs/stage6_update_design.md。
+        from src.vla_memory.memory.update import MemoryUpdateManager
+        update_cfg = cfg.get_nested("mid_term", "update", default={}) or {}
+        self._update_manager = MemoryUpdateManager(update_cfg)
+        self._update_enabled = bool(update_cfg.get("enabled", True))
+
         # ---- 6. resume 扫描 ----
         if self.resume:
             self._resume_set = load_processed_sample_tokens(self.output_jsonl_path)
@@ -245,6 +342,17 @@ class OnlineDrivingLoop:
             self.mode, self.output_jsonl_path, len(self._resume_set),
             self._image_context_size, st_cap, mt_persist.get("enabled", False),
         )
+
+    def _build_image_layout_desc(self, cfg) -> str:
+        """根据 perception.mode 生成图像布局描述串（注入 VLM 场景理解/决策 prompt）。"""
+        mode = cfg.get_nested("perception", "mode", default="single_front")
+        if mode == "surround_mosaic":
+            return (
+                "nuScenes 六视角摄像头拼接图（2x3 环视布局：上排 CAM_FRONT_LEFT | CAM_FRONT | CAM_FRONT_RIGHT，"
+                "下排 CAM_BACK_LEFT | CAM_BACK | CAM_BACK_RIGHT；每个子图左上角已标注对应相机名）。"
+                "注意这是六个独立相机视角的网格拼接，不是连续全景图；前方三个相机在上排，后方三个相机在下排。"
+            )
+        return "自动驾驶前视角摄像头（CAM_FRONT）拍摄的图片"
 
     def _resolve_memory_save_dir(self) -> Path:
         """中期记忆持久化目录解析（与 P2 memory_pipeline 同样的策略）。"""
@@ -286,6 +394,7 @@ class OnlineDrivingLoop:
         # process_frame 内部会保存 .npy 特征
         perception = self.scene_pipeline.process_frame(
             sample_token=sample_token, image_path=image_path,
+            image_layout=self._image_layout_desc,
         )
         if perception is None:
             return self._handle_perception_failure(kf, sample_token)
@@ -321,18 +430,31 @@ class OnlineDrivingLoop:
             use_short_term=self.use_memory,
             use_mid_term=self.use_memory,
             use_long_term=self.use_memory,
+            now_ts=int(kf.get("timestamp", 0) or 0),  # Phase 3：更新检索命中统计
         )
 
         mid_results = memory_result.get("mid_term_results", [])
+        mid_stats = memory_result.get("mid_term_stats", {}) or {}
+        # Phase 4：提取检索候选/过滤统计 + 逐条记忆字段（供离线复盘价值感知检索）
+        retrieval_candidate_count = int(mid_stats.get("candidate_count", 0))
+        retrieval_active_candidate_count = int(mid_stats.get("active_candidate_count", 0))
+        retrieval_filtered_count = int(mid_stats.get("filtered_count", 0))
         retrieved_memory_ids = []
+        retrieved_memory_scores = []
+        retrieved_memory_value_scores = []
+        retrieved_memory_event_types = []
+        retrieved_memory_statuses = []
         for mr in mid_results:
             rec = mr.get("record")
-            if rec is not None:
-                rid = (
-                    rec.record_id if hasattr(rec, "record_id")
-                    else rec.get("record_id", "")
-                )
-                retrieved_memory_ids.append(rid)
+            rid = (
+                rec.record_id if (rec is not None and hasattr(rec, "record_id"))
+                else (rec.get("record_id", "") if isinstance(rec, dict) else "")
+            )
+            retrieved_memory_ids.append(rid)
+            retrieved_memory_scores.append(mr.get("final_score"))
+            retrieved_memory_value_scores.append(mr.get("memory_value_score"))
+            retrieved_memory_event_types.append(mr.get("event_type"))
+            retrieved_memory_statuses.append(mr.get("status"))
 
         lt_rules = memory_result.get("long_term_rules", [])
         long_term_rule_ids = [
@@ -370,6 +492,8 @@ class OnlineDrivingLoop:
                 short_term_summary=memory_result.get("short_term_summary", ""),
                 mid_term_memories=mid_results,
                 long_term_rules_text=rules_text,
+                perception_objects=kf.get("perception_objects"),
+                image_layout=self._image_layout_desc,
             )
         except EnvironmentError:
             raise
@@ -383,16 +507,104 @@ class OnlineDrivingLoop:
             nav_instruction=kf.get("nav_instruction", ""),
         )
 
+        # ---- e.1) 中期记忆价值门控（Phase 2：MemoryAdmissionController）----
+        # 决策完成后、写入前判断是否入库。先读后写：只读当前帧 + 已检索 memory_result（[0,i-1]）
+        # + prev_frame_ctx（i-1），不写、不读未来。memory_on 启用门控；memory_off 不入库
+        # （仅当 debug_memory_off 时算 debug，不影响决策）。enabled=false 退化为逐帧全存。
+        record_id = sample_token or f"frame_{len(self._resume_set)}"
+        frame_ts = int(kf.get("timestamp", 0) or 0)
+
+        # 组装 admission 上下文（max_mid_term_score 复用 step 开头的检索结果，不额外查 FAISS）
+        _mid_results = memory_result.get("mid_term_results", []) if memory_result else []
+        _max_sim = (
+            float(_mid_results[0].get("final_score", 0.0))
+            if _mid_results and isinstance(_mid_results[0], dict) else 0.0
+        )
+        admission_ctx = {
+            "parsed": parsed,
+            "scene_result": scene_result,
+            "ego_state": kf.get("ego_state"),
+            "perception_objects": kf.get("perception_objects") or [],
+            "max_mid_term_score": _max_sim,
+            "mid_term_empty": not bool(_mid_results),  # 空库时 long_tail 不触发（无基线判断稀有）
+            "timestamp": frame_ts,
+            "nav_instruction": kf.get("nav_instruction", ""),
+            "fallback_used": fallback_used,
+            "parser_status": parser_status,
+        }
+
+        # 运行门控
+        admission_result = None
+        if self.use_memory and self._admission_enabled:
+            admission_result = self._admission_controller.decide(
+                admission_ctx, self._prev_frame_ctx
+            )
+            mid_term_admit = admission_result.should_store
+        elif self.use_memory:
+            # admission 关闭 + store_all_when_disabled → 逐帧全存（阶段 1 行为）
+            mid_term_admit = True
+        else:
+            # memory_off：不入库；可选 debug（admission 在决策后运行，不影响 memory_off 决策）
+            if self._admission_debug_memory_off and self._admission_controller is not None:
+                admission_result = self._admission_controller.decide(
+                    admission_ctx, self._prev_frame_ctx
+                )
+            mid_term_admit = False
+
+        # 派生 jsonl / mt_record 准入字段（兼容：门控命中 / legacy 全存 / memory_off）
+        memory_admission_enabled = self._admission_enabled and self.use_memory
+        # Phase 6：冲突更新是否生效（静态标志；具体动作在 i.1 块写入后产生，记于旧记忆 update_history + 日志）
+        memory_update_enabled = self._update_enabled and self.use_memory
+        if admission_result is not None:
+            memory_admission_score = admission_result.admission_score
+            memory_admission_should_store = admission_result.should_store
+            memory_admission_reasons = admission_result.admission_reasons
+            memory_admission_reject_reasons = admission_result.reject_reasons
+            memory_event_type = admission_result.event_type
+            memory_scene_tags = admission_result.scene_tags
+            memory_risk_tags = admission_result.risk_tags
+            _mt_admission_policy = admission_result.policy_version
+        else:
+            # legacy 路径（admission 关闭或 memory_off 无 debug）
+            memory_admission_score = self._mt_legacy_admission_score if mid_term_admit else None
+            memory_admission_should_store = mid_term_admit
+            memory_admission_reasons = [self._mt_legacy_admission_reason] if mid_term_admit else []
+            memory_admission_reject_reasons = []
+            memory_event_type = "frame_memory"
+            memory_scene_tags = []
+            memory_risk_tags = []
+            _mt_admission_policy = self._mt_legacy_admission_policy
+
+        mid_term_memory_added = mid_term_admit
+        mid_term_memory_id = record_id if mid_term_admit else ""
+        memory_record_status = self._mt_default_status if mid_term_admit else ""
+        # Phase 5：jsonl memory_type 反映本帧 admission（事件模式=缓冲 event_buffered；帧模式=frame_memory）。
+        # 事件 finalize 在 i 块（jsonl 之后），event_id 见 mid_term_meta.json。
+        memory_type_added = (
+            ("event_buffered" if self._event_memory_enabled else "frame_memory")
+            if mid_term_admit else ""
+        )
+
         # ---- f) 组装 record ----
         record = {
             "frame_id": sample_token,
             "sample_token": sample_token,
             "scene_token": kf.get("scene_token", ""),
             "memory_mode": self.mode,
+            "perception_mode": self._perception_mode,
             "current_scene": scene_result,
+            "perception_objects": kf.get("perception_objects", []),
             "scene_id": scene_id,
             "weather_id": weather_id,
             "retrieved_memory_ids": retrieved_memory_ids,
+            # ---- Phase 4 价值感知检索统计与逐条字段（供离线复盘）----
+            "retrieval_candidate_count": retrieval_candidate_count,            # active 候选总数（过滤前）
+            "retrieval_active_candidate_count": retrieval_active_candidate_count,  # 过滤后候选池
+            "retrieval_filtered_count": retrieval_filtered_count,               # 被过滤器剔除数
+            "retrieved_memory_scores": retrieved_memory_scores,                 # 各结果 final_score（相似度）
+            "retrieved_memory_value_scores": retrieved_memory_value_scores,     # 各结果 memory_value_score
+            "retrieved_memory_event_types": retrieved_memory_event_types,       # 各结果 event_type
+            "retrieved_memory_statuses": retrieved_memory_statuses,             # 各结果 status
             "long_term_rule_ids": long_term_rule_ids,
             "decision_output": parsed,
             "parser_status": parser_status,
@@ -404,7 +616,23 @@ class OnlineDrivingLoop:
             "nav_instruction": kf.get("nav_instruction", ""),
             "history_trajectory": kf.get("history_trajectory"),
             "ground_truth_trajectory": kf.get("ground_truth_trajectory"),
-            "timestamp": int(kf.get("timestamp", 0) or 0),
+            "timestamp": frame_ts,
+            # ---- Phase 1/2 中期记忆准入元数据（供离线复盘价值门控）----
+            "mid_term_memory_added": mid_term_memory_added,        # 本帧是否入库中期记忆
+            "mid_term_memory_id": mid_term_memory_id,              # 入库记录的 record_id（= sample_token）
+            "memory_admission_enabled": memory_admission_enabled,  # 本帧门控是否生效（memory_on & enabled）
+            "memory_update_enabled": memory_update_enabled,        # Phase 6 冲突更新是否生效（动作见 update_history/日志）
+            "memory_admission_score": memory_admission_score,      # 价值分（0~1；legacy=1.0；memory_off 无 debug=None）
+            "memory_admission_should_store": memory_admission_should_store,  # 门控判定是否应入库
+            "memory_admission_reasons": memory_admission_reasons,  # 准入原因
+            "memory_admission_reject_reasons": memory_admission_reject_reasons,  # 拒绝原因（normal_cruise 等）
+            "memory_event_type": memory_event_type,                # 事件类型（lane_change/hard_brake/...）
+            "memory_scene_tags": memory_scene_tags,                # 场景标签列表
+            "memory_risk_tags": memory_risk_tags,                  # 风险标签列表
+            "memory_record_status": memory_record_status,          # 记忆状态（active；未入库=""）
+            # ---- Phase 5 事件级记忆：本帧入库类型（event_buffered/frame_memory/空）；event_id 见 mid_term_meta.json ----
+            "memory_type": memory_type_added,
+            "event_id": "",  # 事件 id 在事件 finalize 时生成（mid_term_meta.json 可查），单帧 jsonl 留空
         }
 
         # ---- g) 持久化 jsonl（必须在 push 记忆之前/之后都行，但放最前可保证中断不丢） ----
@@ -440,24 +668,154 @@ class OnlineDrivingLoop:
             except Exception as e:
                 logger.warning("短期记忆 push 失败 (frame=%s): %s", sample_token, e)
 
-            # ---- i) 更新中期记忆（含决策后字段） ----
-            try:
-                mt_record = MidTermMemoryRecord(
-                    record_id=sample_token or f"frame_{len(self._resume_set)}",
-                    image_feature_path=feat_path,
-                    scene_text=scene_description,
-                    scene_id=scene_id,
-                    weather_id=weather_id,
-                    nav_instruction=kf.get("nav_instruction"),
-                    ego_state=kf.get("ego_state"),
-                    history_trajectory=kf.get("history_trajectory"),
-                    decision_reason=(parsed or {}).get("behavior_reason", ""),
-                    behavior=(parsed or {}).get("behavior", ""),
-                    trajectory=(parsed or {}).get("trajectory"),
+            # ---- h.1) Phase 5 scene 切换 → flush 当前事件（事件结束条件之一）----
+            if self._event_memory_enabled:
+                cur_scene_token = kf.get("scene_token", "") or ""
+                if self._prev_scene_token and cur_scene_token != self._prev_scene_token:
+                    _flush_out = self._event_manager.flush()
+                    if _flush_out is not None:
+                        _fr, _ffeat = _flush_out
+                        try:
+                            self.mid_term.add_record(_fr, feature=_ffeat)
+                        except Exception as e:
+                            logger.warning("event_memory scene-flush add_record 失败: %s", e)
+                if cur_scene_token:
+                    self._prev_scene_token = cur_scene_token
+
+            # ---- i) 更新中期记忆 ----
+            # 先读后写：add_record 在 step 末尾（jsonl 之后），第 i 帧检索只看到 [0,i-1]。
+            # Phase 5：event_memory 启用时，高价值帧缓冲到事件，事件结束才入库 event_memory（peak 特征）；
+            #   否则退化为阶段 2 逐帧 frame_memory。短期记忆 push(h) 不受影响。
+            new_record_added = None  # Phase 6：本帧入库的记忆对象（供冲突更新建版本链）
+            if self._event_memory_enabled:
+                _feat_dim = (
+                    int(np.asarray(feature).reshape(-1).shape[0])
+                    if feature is not None else 0
                 )
-                self.mid_term.add_record(mt_record, feature=feature)
-            except Exception as e:
-                logger.warning("中期记忆 add_record 失败 (frame=%s): %s", sample_token, e)
+                frame_ctx = {
+                    "sample_token": sample_token,
+                    "scene_token": kf.get("scene_token", "") or "",
+                    "scene_name": kf.get("scene_name", "") or "",
+                    "image_path": image_path or "",
+                    "feature_path": feat_path or "",
+                    "feature_dim": _feat_dim,
+                    "visual_input_type": self._perception_mode,
+                    "source_dataset": self._source_dataset,
+                    "source_version": self._source_version,
+                    "source_mode": self.mode,
+                    "version": self._mt_metadata_version,
+                    "ego_state": kf.get("ego_state"),
+                    "history_trajectory": kf.get("history_trajectory"),
+                    "perception_objects": kf.get("perception_objects") or [],
+                    "scene_result": scene_result,
+                    "parsed": parsed,
+                    "scene_text": scene_description,
+                    "scene_id": scene_id,
+                    "weather_id": weather_id,
+                    "nav_instruction": kf.get("nav_instruction"),
+                    "timestamp": frame_ts,
+                    "admission_reasons": memory_admission_reasons,
+                    "admission_policy_version": _mt_admission_policy,
+                }
+                event_out = self._event_manager.on_frame(admission_result, frame_ctx)
+                if event_out is not None:
+                    ev_record, ev_feature = event_out
+                    try:
+                        self.mid_term.add_record(ev_record, feature=ev_feature)
+                        new_record_added = ev_record
+                    except Exception as e:
+                        logger.warning("event_memory add_record 失败: %s", e)
+            elif mid_term_admit:
+                # event_memory 关闭 → 阶段 2 逐帧 frame_memory
+                try:
+                    # feature_dim 从实际特征向量推导（兼容 (768,) / (1,768)）；无特征则 0
+                    feature_dim = (
+                        int(np.asarray(feature).reshape(-1).shape[0])
+                        if feature is not None else 0
+                    )
+                    mt_record = MidTermMemoryRecord(
+                        record_id=record_id,
+                        image_feature_path=feat_path,
+                        scene_text=scene_description,
+                        scene_id=scene_id,
+                        weather_id=weather_id,
+                        nav_instruction=kf.get("nav_instruction"),
+                        ego_state=kf.get("ego_state"),
+                        history_trajectory=kf.get("history_trajectory"),
+                        decision_reason=(parsed or {}).get("behavior_reason", ""),
+                        behavior=(parsed or {}).get("behavior", ""),
+                        trajectory=(parsed or {}).get("trajectory"),
+                        # ===== Phase 1/2 metadata（配置驱动；事件标签来自门控，不伪造价值）=====
+                        memory_id=record_id,
+                        memory_type=self._mt_default_memory_type,
+                        status=self._mt_default_status,
+                        version=self._mt_metadata_version,
+                        created_at=frame_ts,
+                        updated_at=frame_ts,
+                        source_dataset=self._source_dataset,
+                        source_version=self._source_version,
+                        source_scene_token=kf.get("scene_token", "") or "",
+                        source_scene_name=kf.get("scene_name", "") or "",
+                        source_sample_token=sample_token,
+                        source_frame_id=record_id,
+                        source_mode=self.mode,
+                        visual_input_type=self._perception_mode,
+                        image_path=image_path or "",
+                        feature_path=feat_path or "",
+                        feature_dim=feature_dim,
+                        event_type=memory_event_type,
+                        scene_tags=memory_scene_tags,
+                        risk_tags=memory_risk_tags,
+                        admission_score=(
+                            memory_admission_score
+                            if memory_admission_score is not None
+                            else self._mt_legacy_admission_score
+                        ),
+                        admission_reasons=memory_admission_reasons,
+                        admission_policy_version=_mt_admission_policy,
+                        # 6/7/8：记忆价值/使用统计/删除 保持默认（不伪造）
+                    )
+                    self.mid_term.add_record(mt_record, feature=feature)
+                    new_record_added = mt_record
+                except Exception as e:
+                    logger.warning("中期记忆 add_record 失败 (frame=%s): %s", sample_token, e)
+
+            # ---- i.1) Phase 6 冲突感知更新 ----
+            # 写入后对检索到的相似旧记忆做冲突检测与软更新（不物理删除；unsafe 新证据不覆盖安全旧）。
+            # 只读已检索 mid_results + 当前帧决策，不读未来，先读后写不变。
+            memory_update_actions = []
+            if self._update_enabled:
+                try:
+                    update_ctx = {
+                        "behavior": (parsed or {}).get("behavior", ""),
+                        "risk_level": (parsed or {}).get("risk_level", "medium"),
+                        "scene_id": scene_id,
+                        "nav_instruction": kf.get("nav_instruction", "") or "",
+                        "fallback_used": fallback_used,
+                        "parser_status": parser_status,
+                    }
+                    memory_update_actions = self._update_manager.process(
+                        update_ctx, mid_results, new_record_added, now_ts=frame_ts,
+                    )
+                except Exception as e:
+                    logger.warning("冲突更新异常 (frame=%s): %s", sample_token, e)
+            # 动作回填到本帧 jsonl（record 已写入，此处仅记内存变量供审计日志；下一帧 jsonl 不回溯）
+            if memory_update_actions:
+                logger.debug("frame=%s 冲突更新: %s", sample_token, memory_update_actions)
+
+        # ---- j) 更新上一帧上下文（供下一帧 admission 的变化检测；每帧都更新，含拒绝帧）----
+        # 只存最近一帧快照，不持久化、不读未来。memory_off 也更新（供 debug_memory_off 用）。
+        self._prev_frame_ctx = {
+            "behavior": (parsed or {}).get("behavior", ""),
+            "risk_level": (parsed or {}).get("risk_level", "medium"),
+            "target_speed": (parsed or {}).get("target_speed"),
+            "trajectory": (parsed or {}).get("trajectory"),
+            "ego_state": kf.get("ego_state") or {},
+            "scene_id": scene_id,
+            "traffic_density": (scene_result or {}).get("traffic_density", "unknown"),
+            "perception_objects": kf.get("perception_objects") or [],
+            "timestamp": frame_ts,
+        }
 
         return record
 
@@ -507,7 +865,16 @@ class OnlineDrivingLoop:
         return records
 
     def close(self) -> None:
-        """关闭：中期记忆按 yaml persistence 决定是否落盘。"""
+        """关闭：flush 残留事件 + 中期记忆按 yaml persistence 决定是否落盘。"""
+        # Phase 5：flush 尚未结束的事件（run 结束触发 finalize）
+        if self._event_memory_enabled and self._event_manager is not None:
+            try:
+                flush_out = self._event_manager.flush()
+                if flush_out is not None and self.mid_term is not None:
+                    _fr, _ffeat = flush_out
+                    self.mid_term.add_record(_fr, feature=_ffeat)
+            except Exception as e:
+                logger.warning("event_memory close-flush 异常: %s", e)
         if self.mid_term is not None:
             try:
                 self.mid_term.close()

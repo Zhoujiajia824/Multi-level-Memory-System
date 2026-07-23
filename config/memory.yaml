@@ -59,6 +59,209 @@ mid_term:
     auto_load_on_init: true
     strict_load: false
 
+  # ---- 元数据 schema（Phase 1 新增）----
+  # 控制 MidTermMemoryRecord 的 metadata 默认值与开关。所有新字段都有默认值，
+  # 旧 memory_db（12 字段）加载时经 Pydantic 自动补默认（见 schemas/memory.py）。
+  metadata_schema_version: "v0.2"     # 记录写入时的字段架构版本，写入 MemoryRecord.version
+  default_memory_type: "frame_memory" # 新记录默认 memory_type
+  default_status: "active"            # 新记录默认 status
+  enable_value_metadata: true         # 是否填充/持久化 value_* metadata（Phase 1 置 true；价值分数仍为 None）
+
+  # ---- Phase 1 legacy 写入价值标记（无门控时的默认准入元数据，配置驱动）----
+  # Phase 1 不做价值门控：memory_on 时逐帧全存（admit）。以下值作为每条记忆 admission_*
+  # 字段的默认值，明确标注来源为 legacy（无门控），绝不伪造价值分数。
+  # 后续阶段接入 MemoryAdmissionController 后，准入决策由门控覆盖，此处仅作回退默认。
+  # 详见 docs/mid_term_memory_value_gating_plan.md §3.2 / §5。
+  legacy_admission_score: 1.0                    # legacy 准入分数（逐帧全存 → 1.0）
+  legacy_admission_reason: "legacy_no_gating"    # legacy 准入原因标记（写入 admission_reasons）
+  legacy_admission_policy_version: "legacy"      # legacy 准入策略版本
+
+  # ---- Phase 2 价值门控写入（MemoryAdmissionController）----
+  # 每帧决策后、写入中期记忆前判断是否入库。enabled=false + store_all_when_disabled=true
+  # 时退化为阶段 1 逐帧全存（回归基线）。全部配置驱动，详见 docs/stage2_admission_design.md。
+  admission:
+    enabled: true                              # 总开关；false 则按 store_all_when_disabled 决定
+    policy_version: "value_gated_v0.1"         # 准入策略版本（写入记忆 admission_policy_version）
+    store_all_when_disabled: true              # enabled=false 时是否逐帧全存（true=阶段1行为）
+    debug_memory_off: false                    # memory_off 是否仍算 admission debug（默认 false 保持对照纯净）
+    score_threshold: 0.55                      # 价值分阈值：≥ 入库（非高价值事件、非低价值过滤时）
+    force_store_threshold: 0.80                # 价值分≥此值强制入库（即使无高价值事件标签）
+
+    # 6 信号权重（和=1.0）。final_score = Σ weight · signal
+    weights:
+      dynamics_surprise: 0.20      # 自车动态突变（速度/加速度/jerk/yaw_rate/目标速度变化）
+      scene_salience: 0.25         # 场景语义高价值（scene_id/交通密度/路口/行人/风险因子）
+      perception_change: 0.20      # 感知环境突变（对象数/最近距离/cut_in/行人/cyclist）
+      decision_change: 0.15        # 行为或决策变化（behavior/risk/target_speed/轨迹/fallback/解析失败）
+      memory_novelty: 0.15         # 记忆新颖性（1 - 与已有中期记忆最大相似度）
+      posthoc_outcome_value: 0.05  # 后验价值（只用当前帧决策质量代理，绝不读未来）
+
+    # 低价值过滤（仅在无高价值事件时生效，命中即拒绝）
+    low_value_filters:
+      filter_stable_stop: true       # 连续静止 + 低风险 + STOP
+      filter_normal_cruise: true     # 巡航 + 低风险 + 低密度 + 低动态 + 低感知变化
+      filter_redundant_frames: true  # 与已有记忆高度相似 + 无决策变化
+
+    # 高价值事件（任一命中即 force store，并填 event_type/scene_tags/risk_tags）
+    high_value_events:
+      lane_change: true
+      start: true                  # 起步（prev 静止 → 当前移动）
+      hard_brake: true             # 急停（前向加速度 < hard_brake_accel）
+      hard_acceleration: true      # 急起（前向加速度 > hard_accel_accel）
+      obstacle_avoidance: true
+      intersection: true
+      dense_traffic: true          # traffic_density=high
+      pedestrian_interaction: true # 行人 crossing+近距 / oracle pedestrian 近距
+      cyclist_interaction: true    # oracle cyclist 近距
+      cut_in: true                 # vehicles approaching + 前侧方位 + 近距
+      merge: true
+      turn_left: true
+      turn_right: true
+      crosswalk: true
+      decision_change: true        # 行为/决策变化（behavior变/risk升/target_speed大变/轨迹大变/fallback/parser失败）
+      occlusion: true              # risk_factors 关键词 best-effort（遮挡/盲区）
+      ghost_probing_risk: true     # risk_factors 关键词 best-effort（鬼探头/突发）
+      long_tail: true              # novelty 高且非普通巡航（需 mid_term 非空）
+
+    # 信号归一化阈值（配置驱动，可实测调参）
+    thresholds:
+      speed_change: 2.0            # m/s
+      accel_change: 2.0            # m/s²（加速度幅值变化）
+      jerk: 6.0                    # m/s³
+      yaw_rate: 0.3                # rad/s
+      yaw_change: 0.2              # rad
+      target_speed_change: 3.0     # m/s
+      stop_speed: 0.5              # m/s（低于此值判为静止）
+      move_speed: 1.0              # m/s（高于此值判为移动，起步检测用）
+      hard_brake_accel: -3.0       # m/s²（前向加速度低于此值→急停，用 ego_state.ax）
+      hard_accel_accel: 3.0        # m/s²（前向加速度高于此值→急起，用 ego_state.ax）
+      cut_in_distance: 15.0        # m
+      pedestrian_distance: 10.0    # m
+      cyclist_distance: 10.0       # m
+      object_count_change: 3       # 个
+      nearest_distance_shrink: 5.0 # m（最近目标距离缩小量）
+      redundant_sim: 0.85          # 与已有记忆最大相似度>此值→冗余
+      long_tail_novelty: 0.9       # novelty>此值且非巡航→长尾
+
+  # ---- Phase 3 容量上限与价值淘汰（MemoryEvictionManager）----
+  # 接近容量上限时按 memory_value_score 淘汰低价值记忆（soft delete），高价值/长尾/高风险受保护。
+  # inactive 记录比例过高时 rebuild FAISS 物理压缩。详见 docs/stage3_eviction_design.md。
+  capacity:
+    enabled: true                       # 总开关；false 则无容量上限（向后兼容）
+    max_records: 5000                   # active 记录数上限
+    max_disk_mb: 2048                   # 估算磁盘上限（MB；按 active×(特征字节+2KB) 估算，真磁盘 save 时才精确）
+    eviction_trigger_ratio: 0.80        # active≥max_records×此值→触发常规淘汰
+    eviction_target_ratio: 0.70         # 淘汰后 active 降到 max_records×此值附近
+    emergency_trigger_ratio: 0.95       # active≥max_records×此值→紧急淘汰（放宽保护）
+
+  # ---- Phase 3 淘汰策略 ----
+  eviction:
+    strategy: "value_based_soft_delete" # 淘汰策略（soft delete，保留元数据）
+    protect_long_tail: true             # 保护 long_tail 事件记忆
+    protect_high_risk: true             # 保护 risk_tags 非空的高风险记忆
+    protect_recent_high_value: true     # 保护 admission 高且近期性高的记忆
+    # 每类 event_type 至少保留 N 条（不够则跳过淘汰该类；emergency 也保留）
+    min_keep_per_event_type:
+      lane_change: 50
+      intersection: 50
+      obstacle_avoidance: 50
+      pedestrian_interaction: 50
+      cut_in: 30
+      ghost_probing_risk: 30
+      normal_cruise: 10
+      stable_stop: 5
+      frame_memory: 100
+    # memory_value_score 权重（admission+event_highvalue+recency+retrieval_utility+redundancy+confidence
+    # 为正贡献，conflict/lowvalue_penalty 为负贡献；和≈1）
+    weights:
+      admission: 0.25           # 写入价值（阶段2 admission_score）
+      event_highvalue: 0.20     # 高价值/长尾事件
+      recency: 0.15             # 近期性（last_retrieved_at/created_at 指数衰减）
+      retrieval_utility: 0.15   # 检索效用（hit_count 归一化）
+      redundancy: 0.10          # (1−冗余)，按 (scene_id,event_type) 组频率近似
+      confidence: 0.10          # 数据质量（behavior 非 UNKNOWN + trajectory 非空）
+      conflict: 0.05            # 冲突次数（负贡献）
+      lowvalue_penalty: 0.10    # 低价值事件 normal_cruise/stable_stop（负贡献）
+    thresholds:
+      recency_half_life_seconds: 300  # 近期性半衰期（秒）
+      high_value_admission: 0.7       # protect_recent_high_value 的 admission 阈值
+      retrieval_hit_cap: 5.0          # hit_count 归一化上限
+      redundancy_group_cap: 20.0      # 同 (scene_id,event_type) 组超过此数→满分冗余
+      conflict_cap: 3.0               # conflict_count 归一化上限
+
+  # ---- Phase 3 FAISS 压缩（MemoryCompactionManager）----
+  compaction:
+    rebuild_faiss_when_inactive_ratio: 0.20  # inactive 占比≥此值→rebuild FAISS（物理剔除 inactive 向量）
+    rebuild_after_eviction: false            # 每次淘汰后是否立即 rebuild（false=仅达比例阈值才 rebuild）
+
+  # ---- Phase 4 价值感知检索重排与多样性控制 ----
+  # 在原有 6 路相似度基础上：过滤无效记忆 → 取候选池 → 价值重排 → 多样性约束 → top-K → 更新命中。
+  # 不改变 FAISS 向量维度，不破坏 prompt 注入。详见 docs/memory_design.md §3.10。
+  retrieval:
+    enable_value_rerank: true          # 是否用 memory_value_score 重排（false=仅相似度）
+    candidate_pool_size: 20            # 候选池大小（先按相似度取 top-N，再重排/多样性到 top-K）
+    top_k: 3                           # 最终返回 top-K（覆盖 mid_term.top_k）
+
+    # 重排权重：value_aware_score = w_sim·final_score + w_val·memory_value_score
+    rerank_weights:
+      similarity_score: 0.80
+      memory_value_score: 0.20
+
+    # 多样性约束（避免 top-k 全是同一事件/连续重复帧）
+    diversity:
+      enabled: true
+      max_per_event_id: 1              # 同一 event_type 最多返回几条（"event_id"用 event_type 近似）
+      max_per_scene_token: 2           # 同一 source_scene_token 最多返回几条
+      suppress_near_duplicates: true   # 抑制近重复（同 event_type 且 final_score 差<(1-阈值)→判重）
+      duplicate_similarity_threshold: 0.95  # 近重复阈值（final_score 差 < 1-0.95=0.05 判重）
+
+    # 过滤器（在候选阶段剔除无效/低质量记忆）
+    filters:
+      exclude_inactive: true           # 排除 is_active=False（soft delete）
+      exclude_deleted: true            # 排除 status=deleted
+      exclude_deprecated: false        # 排除 superseded_by 非空（被取代）
+      min_confidence_score: 0.2        # confidence_score 低于此值排除（仅对已评分记忆生效，None 不排除）
+
+  # ---- Phase 5 事件级记忆（EventMemoryManager）----
+  # 连续高价值帧合并为一个 event_memory（start/peak/end 关键帧 + 结构化摘要）。
+  # enabled=false + store_frame_memory_when_event_disabled=true → 退化为阶段 2 逐帧 frame_memory。
+  # 详见 docs/memory_design.md §3.11、docs/stage5_event_memory_design.md。
+  event_memory:
+    enabled: true                          # 总开关
+    prefer_event_memory: true              # 检索优先返回 event_memory（value_aware 加成）
+    event_memory_bonus: 0.10               # event_memory 的 value_aware_score 加成
+    max_event_length_frames: 10            # 事件最长帧数（达此强制结束）
+    min_event_length_frames: 2             # 事件最短帧数（不足则丢弃，过滤孤立抖动；=1 保留全部）
+    event_end_patience_frames: 2           # 连续非高价值帧达此值→事件结束
+    keyframes_per_event: 3                 # 每事件关键帧数（start/peak/end）
+    store_frame_memory_when_event_disabled: true  # event_memory 关闭时是否退化为逐帧 frame_memory
+
+  # ---- Phase 6 冲突感知更新（MemoryUpdateManager）----
+  # 检索到相似记忆但当前决策/安全评价冲突时，对旧记忆软更新（降权/标记 deprecated/superseded/
+  # 增 conflict_count/版本化）。不物理删除；unsafe 新证据不覆盖安全旧记忆。
+  # 详见 docs/memory_design.md §3.12、docs/stage6_update_design.md。
+  update:
+    enabled: true                              # 总开关；false → 无冲突更新（阶段 5 行为）
+    conflict_detection_enabled: true           # 是否检测冲突
+    versioning_enabled: true                   # 是否建版本链（superseded_by/previous_versions）
+    soft_update_only: true                     # true=只软更新（不改 FAISS/不物理删）
+    min_similarity_for_conflict_check: 0.75    # 检索相似度≥此值才做冲突检查
+    confidence_decay_on_conflict: 0.10         # 每次冲突 confidence 衰减
+    supersede_after_conflicts: 3               # 累计冲突达此值→superseded
+
+  # ---- Phase 7 中期记忆沉淀为长期记忆候选（MemoryConsolidationManager）----
+  # 离线从中期记忆库挖掘高价值、稳定、可泛化经验，总结为长期记忆**候选**（pending_review）。
+  # 不自动覆盖正式长期记忆库（auto_promote_to_long_term=false）；需人工审核晋升。
+  # 详见 docs/memory_design.md §3.13、scripts/08_consolidate_long_term_candidates.py。
+  consolidation:
+    enabled: true                              # 总开关
+    source_memory_type: "event_memory"         # 沉淀来源记忆类型（event_memory 优先；可改 frame_memory）
+    min_evidence_count: 3                      # 同组最小证据数（< 此不生成候选）
+    min_average_memory_value_score: 0.70       # 组平均价值分下限（memory_value_score 缺失回退 admission_score）
+    min_confidence: 0.65                       # 候选 confidence 下限
+    output_path: "outputs/long_term_candidates/candidate_rules.yaml"  # 候选输出（不写 long_term_rules.yaml）
+    auto_promote_to_long_term: false           # 是否自动晋升为正式长期记忆（false=仅出候选，人工审核）
+
 # ---- 长期记忆配置 ----
 long_term:
   rules_file: "data/knowledge/long_term_rules.yaml"  # 长期规则存储文件

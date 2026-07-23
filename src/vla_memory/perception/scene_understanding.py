@@ -59,12 +59,14 @@ class SceneUnderstandingPipeline:
         self,
         sample_token: str,
         image_path: str,
+        image_layout: str = "",
     ) -> Optional[Dict[str, Any]]:
         """处理单个关键帧：提取特征 + VLM 场景理解。
 
         Args:
             sample_token: 样本 token（用于命名特征文件）。
-            image_path: 图像文件路径。
+            image_path: 图像文件路径（surround_mosaic 模式下为 mosaic 路径）。
+            image_layout: 输入图像布局描述串，注入场景理解 prompt 的 {image_layout}。
 
         Returns:
             包含 image_feature_path 和 scene_understanding 结果的字典。
@@ -88,7 +90,7 @@ class SceneUnderstandingPipeline:
             return None
 
         # ---- 2. VLM 场景理解 ----
-        scene_result = self._run_vlm_scene_understanding(image_path)
+        scene_result = self._run_vlm_scene_understanding(image_path, image_layout=image_layout)
         if scene_result is None:
             logger.error(f"场景理解最终失败: {sample_token}，停止当前样本处理。")
             return None
@@ -99,18 +101,22 @@ class SceneUnderstandingPipeline:
     def _run_vlm_scene_understanding(
         self,
         image_path: str,
+        image_layout: str = "",
     ) -> Optional[Dict[str, Any]]:
         """调用 VLM 进行场景理解，含重试。
 
         Args:
             image_path: 图像路径。
+            image_layout: 输入图像布局描述串，注入 {image_layout} 占位符。
 
         Returns:
             场景理解字典或 None。
         """
         last_error = None
         prompt_loader = get_prompt_loader()
-        scene_prompt = prompt_loader.render("scene_understanding.user")
+        scene_prompt = prompt_loader.render(
+            "scene_understanding.user", image_layout=image_layout
+        )
 
         for attempt in range(1, self.vlm_retry_times + 1):
             try:

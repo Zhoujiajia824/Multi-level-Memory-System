@@ -9,7 +9,7 @@ scene_understanding:
   system: |
     <场景理解 VLM 的 system 指令>
   user: |
-    <场景理解 user prompt，占位符 {image_meta} {ego_brief}（当前阶段未启用占位符）>
+    <场景理解 user prompt，占位符 {image_layout}（按 perception.mode 注入：single_front=单前视描述 / surround_mosaic=2×3 六视角布局描述）>
   required_fields:
     - scene_description
     - ego_status_text
@@ -28,6 +28,7 @@ decision:
     <决策 VLM 的 system 指令>
   user: |
     <完整决策 prompt，占位符：
+     {image_layout_block} {perception_objects_block}
      {scene_block} {ego_state_block} {nav_block} {history_block} {memory_block}
      {waypoint_min_num} {waypoint_max_num} {horizon_seconds} {dt}
      {behavior_enum_str}>
@@ -57,6 +58,8 @@ memory_integration:
 
 | 占位符 | 来源 | 说明 |
 |---|---|---|
+| `{image_layout_block}` | `prompt_builder._render_image_layout_block` | 输入图像布局说明（single_front=单前视 / surround_mosaic=2×3 六视角布局），告知决策 VLM 当前图是单图还是环视拼接图 |
+| `{perception_objects_block}` | `prompt_builder._render_perception_objects_block` | Oracle 感知对象段（nuScenes GT 投影，非模型预测；仅 `perception.oracle_objects=true` 时非空） |
 | `{scene_block}` | `prompt_builder._render_scene_block` | 当前场景理解段（含 P4 结构化字段：lanes/vehicles/pedestrians/traffic_lights/intersections） |
 | `{ego_state_block}` | `prompt_builder._render_ego_block` | 自车状态段（含 P3 CAN bus 字段：yaw_rate/steering/throttle/brake） |
 | `{nav_block}` | `prompt_builder._render_nav_block` | 导航指令段（无导航时为空字符串） |
@@ -125,6 +128,18 @@ vlm_inputs:
 2. （可选）在 [`schemas/scene.py`](../src/vla_memory/schemas/scene.py) 中加对应子模型 + 字段，让校验更严格。
 3. 在 [`scene_understanding.py::_parse_and_validate`](../src/vla_memory/perception/scene_understanding.py) 的 `defaults` 中加默认值，缺失时降级为空数组而非中断。
 4. （可选）在 [`prompt_builder.py::_render_scene_block`](../src/vla_memory/decision/prompt_builder.py) 中加渲染逻辑，把新字段展示到决策 prompt。
+
+### 切换六视角环视 / 单前视感知输入（不改 prompt 模板）
+
+感知模式由 [`config/data_nuscenes.yaml`](../config/data_nuscenes.yaml) 的 `perception` 块控制：
+```yaml
+perception:
+  mode: "surround_mosaic"   # single_front | surround_mosaic
+  oracle_objects: true      # 是否注入 nuScenes GT 投影的 oracle 感知对象
+```
+切换后，`{image_layout}` / `{image_layout_block}` 会自动注入对应的图像布局说明，
+`{perception_objects_block}` 在 oracle 开启时注入对象列表（标注为 GT 投影、非模型预测）。
+详见 [perception_upgrade.md](perception_upgrade.md)。
 
 ### 切换 VLM 提供商（不改 prompt 模板）
 

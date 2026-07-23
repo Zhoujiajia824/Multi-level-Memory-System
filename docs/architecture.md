@@ -72,11 +72,12 @@ VLA Memory Demo 采用**分层记忆驱动的自动驾驶决策架构**，核心
 
 | 模块 | 职责 |
 |------|------|
-| `nuscenes_adapter.py` | 加载 nuScenes 数据集，封装 nuscenes-devkit，提供场景遍历、帧迭代、ego_pose 查询 |
+| `nuscenes_adapter.py` | 加载 nuScenes 数据集，封装 nuscenes-devkit，提供场景遍历、帧迭代、多相机图像路径、ego_pose 查询、oracle 感知对象（`get_perception_objects`） |
 | `route_infer.py` | 根据未来轨迹推断伪导航语义（直行/左转/右转/变道/停车） |
 | `ego_state_builder.py` | 从 ego_pose / CAN bus 构建自车状态（P3 起优先 CAN bus 真值，差分回退） |
 | `can_bus_loader.py` | nuScenes CAN bus 真值加载器（pose.json + vehicle_monitor.json） |
 | `trajectory_builder.py` | 构建 ego-centric 坐标系下的历史轨迹和未来真值轨迹 |
+| `oracle_perception.py` | 基于 nuScenes GT 标注（sample_annotation）投影到 6 相机 + 因果运动学，生成 oracle `perception_objects`（GT 真值，非模型预测） |
 | `base_dataset.py` | 数据集抽象基类 |
 
 > ⚠️ P7 已移除 `video_adapter.py` 和 `image_sequence_adapter.py` —— 它们曾是空 stub
@@ -95,10 +96,11 @@ VLA Memory Demo 采用**分层记忆驱动的自动驾驶决策架构**，核心
 | `vlm_client.py` | VLM 客户端抽象基类 |
 | `openai_compatible_client.py` | OpenAI 兼容 VLM 客户端（支持 Qwen-VL 等所有兼容 API） |
 | `scene_understanding.py` | DINOv2 + VLM 集成的场景理解流水线 |
+| `surround_mosaic.py` | 六视角环视拼接（2×3 surround-view mosaic），surround_mosaic 模式下替代单前视图作为感知图像 |
 
 - **默认模型**：`facebook/dinov2-base`（768 维，L2 归一化）
 - **默认 VLM**：Qwen-VL（通过 DashScope API）
-- **输入**：图像文件路径
+- **输入**：图像文件路径（surround_mosaic 模式下为 `outputs/mosaic/<token>.jpg` 拼接图）
 - **输出**：归一化特征向量（numpy array）+ 场景结构化 JSON
 
 ### 2.3 记忆层 (`src/vla_memory/memory/`)
@@ -353,6 +355,11 @@ vla_memory_demo/
 ├── data/knowledge/             # 长期记忆知识文件
 └── outputs/                    # 输出结果目录
 ```
+
+> **六视角环视 + Oracle 感知特性**新增文件：`src/vla_memory/schemas/perception.py`
+> （`PerceptionObject`）、`src/vla_memory/data/oracle_perception.py`（GT 投影+因果运动学）、
+> `src/vla_memory/perception/surround_mosaic.py`（2×3 拼接）、产物目录 `outputs/mosaic/`、
+> 文档 `docs/perception_upgrade.md`。详见 [perception_upgrade.md](perception_upgrade.md)。
 
 ---
 

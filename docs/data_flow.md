@@ -294,6 +294,13 @@ Trajectory:
 | FAISS 索引 | `.index` | FAISS 二进制索引文件 |
 | 日志文件 | `.log` | 运行日志 |
 
+> **六视角环视 + Oracle 感知特性**带来的输出变化：
+> - 决策 jsonl（`outputs/decisions_<mode>_<run_id>.jsonl`）每帧新增字段 `perception_mode`
+>   （`single_front` / `surround_mosaic`）与 `perception_objects`（nuScenes GT 投影对象列表，
+>   `is_oracle=true`；仅 `perception.oracle_objects=true` 时非空）；
+> - surround_mosaic 模式下 `vlm_image_paths` 含 mosaic 路径，新产物目录 `outputs/mosaic/<token>.jpg`；
+> - 详见 [perception_upgrade.md](perception_upgrade.md)。
+
 ### 4.2 输出文件路径
 
 ```

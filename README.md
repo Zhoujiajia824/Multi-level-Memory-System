@@ -22,9 +22,12 @@
 |---|---|
 | **逐帧在线循环** | `OnlineDrivingLoop` 严格按时间顺序：感知→检索→决策→更新记忆。第 *i* 帧检索时索引里**只含 [0, i-1] 帧**，彻底消除批处理 demo 常见的 data leakage |
 | **三层记忆** | 短期（deque 滑窗）+ 中期（FAISS 6 路融合检索）+ 长期（YAML 规则按 scene_id 严格匹配） |
+| **价值门控事件记忆** | 中期记忆从"逐帧全存"升级为价值门控的事件经验库：6 信号准入门控（拒巡航/稳定停车/冗余帧，留变道/急停/路口/cut-in/行人交互等 17 类高价值事件）+ 容量淘汰（soft delete + FAISS rebuild）+ 价值感知检索重排 + 连续高价值帧→事件级记忆 + 冲突感知软更新 + 离线沉淀长期候选（不覆盖正式库）。✅ 已端到端验证，详见 [§9.2](#92-中期记忆-mid-term-memory) |
 | **CAN bus 真值自车状态** | 优先用 nuScenes `pose.json` + `vehicle_monitor.json`（含 yaw_rate / steering / throttle / brake），失败回退到 ego_pose 差分 |
 | **结构化场景理解** | VLM 输出 lanes / vehicles / pedestrians / traffic_lights / intersections 等独立列表，不再是混合 JSON |
 | **多图决策上下文** | 决策 VLM 收到当前帧 + N-1 张历史图（默认 3 张可配） |
+| **六视角环视拼接** | 可选 `surround_mosaic` 模式：6 相机拼成 2×3 单张图替代前视图，进入 VLM/特征/记忆全流程（向后兼容 `single_front`） |
+| **Oracle 感知对象** | 可选注入 nuScenes GT 标注投影的 `perception_objects`（检测框/语义/速度/加速度），明确标注为 oracle 真值（非模型预测，研究/评测用） |
 | **完整提示词模板化** | 所有 VLM 提示词集中在 `config/prompts.yaml`，改提示词无需改 Python |
 | **中断恢复** | jsonl append + fsync；重启时扫已写记录自动跳过；中期记忆可选磁盘持久化跨次累积 |
 | **智驾标准评测** | ADE / FDE / **L2@1s/2s/3s** / 轨迹有效率 / 行为准确率 |
@@ -34,8 +37,8 @@
 
 | 维度 | 第一版 | 后续规划 |
 |---|---|---|
-| 数据集 | nuScenes v1.0-mini | trainval、CARLA、自录数据 |
-| 摄像头 | 仅 CAM_FRONT | 多摄像头融合 |
+| 数据集 | nuScenes v1.0-mini / v1.0-trainval | CARLA、自录数据 |
+| 摄像头 | 默认 CAM_FRONT，可选六视角环视拼接（surround_mosaic） | 真 BEV / 特征级多摄像头融合 |
 | 图像特征 | DINOv2-base (768 维) | 支持其他 backbone |
 | VLM | OpenAI 兼容 API（Qwen-VL 默认） | 本地模型 / 更多 provider |
 | 向量检索 | FAISS-CPU IndexFlatIP | IndexIVF / HNSW；GPU FAISS |
@@ -327,6 +330,7 @@ mid_term:
 | `03_run_scene_understanding.py` | **独立**跑 DINOv2 + 场景理解 | 仅调试用；主流程已被 `07` 内部调用 |
 | `06_run_evaluation.py` | 评测决策结果 | 跑完 07 之后 |
 | `07_run_full_demo.py` | **主入口**：跑在线循环 demo | 主流程 |
+| `08_consolidate_long_term_candidates.py` | 中期记忆→长期记忆候选沉淀（Phase 7；离线，不需 VLM/FAISS） | 跑完 07 之后 |
 
 ### 5.2 CLI 参数全集
 
@@ -344,6 +348,10 @@ mid_term:
 --resume                        启动扫已写 jsonl 跳过已处理帧（默认开启）
 --no-resume                     强制重跑，删掉已有 jsonl
 ```
+
+> **感知输入模式**（`single_front` / `surround_mosaic`）与 oracle 感知对象由 `config/data_nuscenes.yaml`
+> 的 `perception` 块控制，**不是 CLI 参数**。详见 [§6.5](#65-感知输入模式六视角环视拼接--oracle-感知对象)。
+> ⚠️ 该脚本**没有 `--run-id`** 参数；要避免覆盖既有 jsonl，请用 `--output` 指定独立输出路径。
 
 #### `scripts/06_run_evaluation.py`（评测）
 
@@ -413,7 +421,7 @@ python scripts/06_run_evaluation.py --max-frames 10 --compare \
 | `default.yaml` | 项目级默认 | `project_name`, `run_id`, `seed`, `device`, `output_dir` |
 | `api_models.yaml` | VLM API 模型 | `scene_understanding` / `decision` 的 `provider`, `model_name`, `api_key_env`, `base_url`, `system_prompt` |
 | **`prompts.yaml`** | **所有 VLM 提示词模板** | `scene_understanding.user`, `decision.user`, `memory_integration.*`；详见 [docs/prompts.md](docs/prompts.md) |
-| `data_nuscenes.yaml` | nuScenes 数据 | `dataroot`, `version`, `camera_name`, `keyframe.step`, `history_seconds`, `future_seconds`, `ego_state.use_can_bus`, `can_bus.{enabled, root, tolerance_us, fallback_to_pose_diff}` |
+| `data_nuscenes.yaml` | nuScenes 数据 | `dataroot`, `version`, `camera_name`, `keyframe.step`, `history_seconds`, `future_seconds`, `ego_state.use_can_bus`, `can_bus.{enabled, root, tolerance_us, fallback_to_pose_diff}`, `perception.{mode, cameras, mosaic, oracle_objects, oracle}`（六视角+oracle，详见 [§6.5](#65-感知输入模式六视角环视拼接--oracle-感知对象) 与 [docs/perception_upgrade.md](docs/perception_upgrade.md)） |
 | `memory.yaml` | 记忆系统 | `short_term.{capacity, store_image_paths}`, `mid_term.{top_k, weights, persistence.*}`, `long_term.{strict_scene_match, strict_weather_match, rules_file}` |
 | `decision.yaml` | 决策模块 | `trajectory.{waypoint_min_num, waypoint_max_num, horizon_seconds, dt}`, `vlm_inputs.{image_context_size, include_current_frame, max_images_per_call}`, `fallback.allow_rule_fallback` |
 | `evaluation.yaml` | 评测 | `prediction_horizon_seconds`, `displacement_metrics.resample_num`, `l2_per_horizon.horizons_seconds`, `behavior_accuracy.{nav_to_behavior_map, normalize_case}`, `output.report_dir` |
@@ -433,6 +441,43 @@ python scripts/06_run_evaluation.py --max-frames 10 --compare \
 | 切换 VLM provider/模型 | `api_models.yaml -> scene_understanding.* / decision.*` |
 | 改短期记忆滑窗大小 | `memory.yaml -> short_term.capacity`（默认 10） |
 | 改中期记忆 6 路融合权重 | `memory.yaml -> mid_term.weights.{visual,text,scene,weather,nav,state}_weight` |
+| 切换单前视 / 六视角环视 | `data_nuscenes.yaml -> perception.mode`（`single_front` / `surround_mosaic`） |
+| 开/关 oracle 感知对象 | `data_nuscenes.yaml -> perception.oracle_objects`（GT 投影，非模型预测） |
+
+---
+
+## 6.5 感知输入模式（六视角环视拼接 + Oracle 感知对象）
+
+> 详细设计见 [docs/perception_upgrade.md](docs/perception_upgrade.md)。
+
+本 demo 支持**两种感知输入模式**，由 `config/data_nuscenes.yaml` 的 `perception` 块切换，**无需改代码**：
+
+| 模式 | `perception.mode` | 主感知图像 | 说明 |
+|---|---|---|---|
+| **单前视**（默认，向后兼容） | `single_front` | 单张 CAM_FRONT 图 | 原有行为 |
+| **六视角环视拼接** | `surround_mosaic` | 6 相机拼成的 2×3 surround-view mosaic | 替代前视图进入 VLM 场景理解/决策/DINOv2/记忆全流程 |
+
+**2×3 布局**（每个子图左上角标注相机名，便于 VLM 识别视角）：
+
+```
+上排：CAM_FRONT_LEFT | CAM_FRONT | CAM_FRONT_RIGHT
+下排：CAM_BACK_LEFT  | CAM_BACK  | CAM_BACK_RIGHT
+```
+
+**Oracle 感知对象**（`perception.oracle_objects: true` 时开启）：基于 nuScenes **GT 标注
+（`sample_annotation`）投影**到 6 相机，为每帧生成结构化 `perception_objects`（检测框/类别/
+位置/速度/加速度），喂给决策 VLM 并写入 jsonl。⚠️ 这些是 **nuScenes 真值标注投影**，
+**不是检测模型预测**——用于研究/评测下为决策提供准确感知先验，每个对象 `is_oracle=true`。
+速度/加速度严格满足**在线因果性**（仅用当前+历史帧，缺历史置空标记不可用，禁止假值）。
+
+运行（**务必用 `--output` 指定独立 jsonl，避免覆盖 `default` 基线**）：
+```bash
+# 六视角环视 + oracle（先在 config 设 perception.mode=surround_mosaic, oracle_objects=true）
+python scripts/07_run_full_demo.py --mode memory_on --max-scenes 1 --max-frames 1 \
+  --output outputs/decisions_memory_on_mosaic_test.jsonl
+```
+
+每帧 jsonl 新增字段：`perception_mode`、`perception_objects`；新产物目录 `outputs/mosaic/`。
 
 ---
 
@@ -561,12 +606,14 @@ vla_memory_demo/
 │   ├── data_flow.md
 │   ├── evaluation.md
 │   ├── api_config.md
-│   └── future_work.md
+│   ├── future_work.md
+│   └── perception_upgrade.md           # 【新增】六视角环视 + Oracle 感知特性
 │
 └── outputs/                            # 运行产物（gitignored）
     ├── decisions_<mode>_<run_id>.jsonl # 决策结果（每帧 append）
     ├── features/                       # DINOv2 特征 .npy
     ├── memory_db/                      # 中期记忆持久化（可选）
+    ├── mosaic/                         # 【新增】surround_mosaic 拼接图（六视角模式）
     ├── logs/                           # 各模块日志 + 单帧审计 dump
     └── reports/                        # 评测报告 (CSV / JSONL / MD)
 ```
@@ -595,6 +642,7 @@ vla_memory_demo/
 | `EgoState` | `ego_state.py` | `x/y/z, yaw, speed, acceleration` + CAN bus 字段 `yaw_rate / steering_angle / throttle / brake / gear / source` |
 | `Trajectory` | `trajectory.py` | `points: List[TrajectoryPoint(t,x,y,optional_v)]` |
 | `SceneUnderstandingResult` | `scene.py` | `scene_id / weather_id / lanes / vehicles / pedestrians / traffic_lights / intersections / risk_factors` |
+| `PerceptionObject` | `perception.py` | oracle 感知对象：`category / position_ego / distance_to_ego / boxes_2d / velocity / acceleration / kinematics_source / is_oracle` |
 | `ShortTermMemoryItem` | `memory.py` | 11 字段（含 image_path / scene_understanding_result） |
 | `MemoryRecord` (= `MidTermMemoryRecord`) | `memory.py` | 12 字段（含 behavior / decision_reason / trajectory） |
 | `LongTermRule` | `memory.py` | `rule_id / scene_id / weather_id / title / content / priority` |
@@ -606,11 +654,12 @@ vla_memory_demo/
 | 类 | 文件 | 关键方法 | 用途 |
 |---|---|---|---|
 | `BaseDrivingDataset` | `base_dataset.py` | 抽象接口 | 数据源抽象 |
-| `NuScenesAdapter` | `nuscenes_adapter.py` | `load()`, `iter_frames()`, `get_ego_pose()`, `get_future_ego_trajectory()` | nuScenes 数据访问 |
+| `NuScenesAdapter` | `nuscenes_adapter.py` | `load()`, `iter_frames()`, `get_frame_image_paths()`, `get_ego_pose()`, `get_future_ego_trajectory()`, `get_perception_objects()` | nuScenes 数据访问（多相机 + oracle） |
 | `CanBusLoader` | `can_bus_loader.py` | `load_scene()`, `query_at(scene, utime, tolerance_us)` | CAN bus 真值加载，含单位换算 |
 | `EgoStateBuilder` | `ego_state_builder.py` | `build()` (dispatcher), `build_from_can_bus()`, `build_from_poses()` | 自车状态构造（CAN bus 优先，差分回退） |
 | `TrajectoryBuilder` | `trajectory_builder.py` | `build_history_trajectory()`, `build_future_trajectory()` | ego-centric 历史 / 未来轨迹 |
 | `RouteInfer` | `route_infer.py` | `infer(future_poses, current_speed)` | 伪导航语义（straight / left_turn / 等） |
+| `get_perception_objects()` | `oracle_perception.py` | 6 相机 GT 投影 + 因果运动学 | 生成 oracle `perception_objects`（nuScenes 真值，非模型预测） |
 
 ### 8.4 `perception/` — 感知
 
@@ -620,7 +669,8 @@ vla_memory_demo/
 | `DINOv2Extractor` | `dinov2_extractor.py` | `load_model()`, `extract(image_path)`, `save_feature()` | DINOv2 768-d 特征 + L2 归一 |
 | `VLMClient` | `vlm_client.py` | 抽象 | VLM 抽象 |
 | `OpenAICompatibleVLMClient` | `openai_compatible_client.py` | `understand_scene()`, `decide(prompt, image_paths)` | OpenAI 兼容 API（base64 图像编码） |
-| `SceneUnderstandingPipeline` | `scene_understanding.py` | `process_frame(sample_token, image_path)` | DINOv2 + VLM 组合，输出结构化 JSON |
+| `SceneUnderstandingPipeline` | `scene_understanding.py` | `process_frame(sample_token, image_path, image_layout)` | DINOv2 + VLM 组合，输出结构化 JSON |
+| `build_surround_mosaic` | `surround_mosaic.py` | `build_surround_mosaic(image_paths, cameras, ...)` | 六视角 2×3 环视拼接（surround_mosaic 模式替代前视图） |
 
 ### 8.5 `memory/` — 三层记忆
 
@@ -631,6 +681,12 @@ vla_memory_demo/
 | `LongTermMemory` | `long_term_memory.py` | `load()`, `search_rules(scene_id, weather_id)`, `format_rules_text()` | YAML 规则严格 scene_id 匹配 |
 | `MemoryRetriever` | `retrieval.py` | `retrieve(query_feature, scene_id, ..., use_short/mid/long_term)` | 三层统一入口 |
 | `FAISSVectorStore` | `faiss_store.py` | `add(vectors, ids)`, `search(query, top_k)`, `save()/load()` | IndexFlatIP 封装 |
+| `MemoryAdmissionController` | `admission.py` | `decide(ctx) -> AdmissionResult` | Phase 2 价值门控（6 信号 + 17 高价值事件 + 3 低价值过滤） |
+| `MemoryValueScorer` | `value_scorer.py` | `score(record)` | Phase 3 存量价值评分（admission+事件+近期性+检索效用+冗余+置信+冲突） |
+| `MemoryEvictionManager` / `MemoryCompactionManager` | `eviction.py` | `evict()`, `rebuild_index(reconstruct_n)` | Phase 3 容量淘汰（soft delete）+ FAISS 物理压缩 |
+| `EventMemoryManager` | `event_memory.py` | `on_frame_admitted()`, `finalize_event()` | Phase 5 连续高价值帧→事件级记忆（关键帧+摘要） |
+| `MemoryUpdateManager` | `update.py` | `process(new, candidates)` | Phase 6 冲突感知软更新（5 类冲突+版本链+unsafe 保护） |
+| `MemoryConsolidationManager` | `consolidation.py` | `consolidate(records)` | Phase 7 离线沉淀长期记忆候选（pending_review，不覆盖正式库） |
 
 ### 8.6 `decision/` — 决策
 
@@ -656,7 +712,7 @@ vla_memory_demo/
 | 函数 / 类 | 文件 | 关键 API |
 |---|---|---|
 | `run_prepare_nuscenes(config)` | `prepare_nuscenes.py` | → `{adapter, keyframe_index, total_keyframes}` |
-| `enrich_keyframes_with_state(adapter, keyframe_index, config)` | `full_demo_pipeline.py` | per-frame 数据准备（ego_state / history / nav） |
+| `enrich_keyframes_with_state(adapter, keyframe_index, config)` | `full_demo_pipeline.py` | per-frame 数据准备（ego_state / history / nav）；surround_mosaic 模式下在此拼 mosaic 落盘并改写 image_path；oracle_objects 在此注入 keyframe |
 | `OnlineDrivingLoop` | `online_loop.py` | `setup()`, `step(kf)`, `run(keyframes)`, `close()` |
 | `run_full_demo(config, mode, resume)` | `full_demo_pipeline.py` | 薄壳：prepare → enrich → OnlineDrivingLoop |
 | `run_eval_pipeline(results, mode, ...)` | `eval_pipeline.py` | 单 mode 评测 |
@@ -693,7 +749,7 @@ vla_memory_demo/
 |---|---|---|
 | `frame_id` | str | sample_token |
 | `timestamp` | int | 微秒级时间戳 |
-| `image_path` | str | **图像绝对路径**（不存字节，节省内存） |
+| `image_path` | str | **图像绝对路径**（surround_mosaic 模式下为拼接图 mosaic 路径；不存字节，节省内存） |
 | `image_feature_path` | str | `.npy` 文件路径 |
 | `scene_description` | str | VLM 自由文本描述 |
 | `scene_id` / `weather_id` | str | 场景 / 天气枚举 |
@@ -730,6 +786,125 @@ MidTermMemory（内存）
 
 `record_id` / `scene_id` / `weather_id` / `nav_instruction` / `ego_state` / `scene_text` /
 `history_trajectory` / `image_feature_path` / **`decision_reason`** / **`behavior`** / **`trajectory`** / `frame_meta`。
+
+> ✅ **价值门控事件记忆系统（阶段 1-7）已端到端验证**：memory_on 烟雾测试中，连续高价值帧正确
+> 合并为 `event_memory`（含 start/peak/end 关键帧 + ego/perception/decision 摘要），准入门控识别
+> `intersection` / `ghost_probing_risk` 等高价值事件（score 0.6-0.8，`admission_policy_version=value_gated_v0.1`），
+> 阶段 1-7 流程全跑通；阶段 3 淘汰/6 冲突/7 沉淀因数据量小未触发（属预期，需更多场景）。
+> 快速验证（需 `DASHSCOPE_API_KEY`）：
+> ```bash
+> python scripts/07_run_full_demo.py --mode memory_on --max-scenes 1 --max-frames 5 --output outputs/decisions_smoke.jsonl
+> ```
+
+#### Phase 1 metadata 扩展（schema v0.2，为价值门控做准备）
+
+每条记录在上述 12 字段基础上新增 **8 类共 37 个 metadata 字段**（基础状态 / 来源 / 视觉输入 /
+场景标签 / 写入价值 / 记忆价值 / 使用统计 / 更新与删除），全部带默认值，**旧 `mid_term_meta.json`
+可正常加载**（缺字段自动补默认）。Phase 1 不改写入触发逻辑（memory_on 仍逐帧全存），价值类字段
+保持 `None` 绝不伪造，准入标记为 `legacy`。每帧 jsonl 同步新增 `mid_term_memory_added` /
+`mid_term_memory_id` / `memory_admission_score` / `memory_admission_reasons` /
+`memory_record_status` 5 个字段。字段清单与配置见 [`docs/memory_design.md §3.7`](docs/memory_design.md)，
+价值门控改造路线见 [`docs/mid_term_memory_value_gating_plan.md`](docs/mid_term_memory_value_gating_plan.md)。
+
+#### Phase 2 价值门控写入（MemoryAdmissionController）
+
+中期记忆不再逐帧全存：每帧决策后、写入前由 `MemoryAdmissionController` 判断是否入库。低价值帧
+（普通巡航 / 稳定停车 / 冗余帧）拒绝，高价值事件（变道 / 起步 / 急停 / 避障 / 路口 / cut-in / 行人交互 /
+长尾等 17 类）强制写入。综合价值分由 6 信号加权得到（dynamics_surprise / scene_salience /
+perception_change / decision_change / memory_novelty / posthoc_outcome_value）。`enabled=false` 时
+退化为逐帧全存（回归基线）。先读后写与 memory_on/off 公平性不变（门控只在 memory_on 写入路径生效，
+短期记忆不受门控）。每帧 jsonl 记录 `memory_admission_should_store` / `memory_admission_reasons` /
+`memory_admission_reject_reasons` / `memory_event_type` 等。设计与配置见
+[`docs/stage2_admission_design.md`](docs/stage2_admission_design.md) 与
+[`docs/memory_design.md §3.8`](docs/memory_design.md)。
+
+**写入率统计**（开启门控后应显著 < 100%）：
+```bash
+# 记录数 / 帧数
+python -c "import json; m=json.load(open('outputs/memory_db/mid_term_meta.json',encoding='utf-8')); print('memories:', len(m))"
+wc -l outputs/decisions_memory_on_*.jsonl | awk '{print "frames:", $1}'
+```
+
+#### Phase 3 容量上限与价值淘汰（MemoryEvictionManager）
+
+中期记忆设容量上限（`capacity.max_records` / `max_disk_mb`）；接近上限时按 `memory_value_score` 淘汰
+低价值记忆（soft delete：`is_active=False` / `status=deleted` / `deleted_reason`，元数据保留），高价值/长尾/
+高风险记忆受保护（`protect_*` + `min_keep_per_event_type`）。检索过滤 inactive；inactive 比例过高时 rebuild
+FAISS 物理压缩（`IndexFlatIP` 用 `reconstruct_n` 重建）。存量价值由 `MemoryValueScorer` 综合 admission/事件/
+近期性/检索效用/冗余/置信/冲突计算。`capacity.enabled=false` 时无容量上限（回归阶段 2）。先读后写与
+memory_on/off 公平性不变（淘汰只在 `add_record` 写入路径触发）。设计与配置见
+[`docs/stage3_eviction_design.md`](docs/stage3_eviction_design.md) 与 [`docs/memory_design.md §3.9`](docs/memory_design.md)。
+
+**小规模测试**（人为设小上限验证淘汰）：
+```bash
+# 编辑 config/memory.yaml: mid_term.capacity.max_records: 5, eviction_trigger_ratio: 0.8, eviction_target_ratio: 0.7
+python scripts/07_run_full_demo.py --mode memory_on --max-frames 20
+# 检查淘汰：inactive 记录数 > 0，active 记录数 ≤ 5×0.7≈3，高价值事件未被淘汰
+python -c "import json; d=json.load(open('outputs/memory_db/mid_term_meta.json',encoding='utf-8')); \
+a=[r for r in d.values() if r.get('is_active',True)]; i=[r for r in d.values() if not r.get('is_active',True)]; \
+print('active:',len(a),'inactive(soft-deleted):',len(i)); \
+print('evicted reasons:', set(r.get('deleted_reason') for r in i))"
+```
+
+#### Phase 4 价值感知检索重排与多样性（检索增强）
+
+中期记忆检索在原 6 路相似度基础上升级：过滤 inactive/deleted/deprecated/低置信 → 取候选池 top-N →
+价值重排（`value_aware_score = 0.8·相似度 + 0.2·memory_value_score`）→ 多样性约束（同 event_type /
+同 scene_token 限流 + 近重复抑制）→ top-K → 更新命中统计。inactive 始终不返回。每帧 jsonl 记录
+`retrieval_candidate_count` / `retrieval_active_candidate_count` / `retrieved_memory_value_scores` 等。
+`enable_value_rerank=false` 退化为仅相似度。设计与配置见 [`docs/memory_design.md §3.10`](docs/memory_design.md)。
+
+#### Phase 5 事件级记忆（EventMemory）
+
+中期记忆从帧级升级为事件级：连续高价值帧合并为一个 `event_memory`（只存 start/peak/end 关键帧 +
+结构化摘要 `ego/perception/decision/admission_summary`），显著降低 memory_db 规模。事件结束条件：
+高价值信号消失 / 达最大长度 / scene 切换 / run 结束。检索优先返回 event_memory（`prefer_event_memory` 加成）。
+`event_memory.enabled=false` 退化为阶段 2 逐帧 frame_memory；旧 frame_memory 记录仍兼容（可混存）。
+事件 `event_id`/关键帧/摘要见 `outputs/memory_db/mid_term_meta.json`（`memory_type=event_memory`）。
+设计与配置见 [`docs/stage5_event_memory_design.md`](docs/stage5_event_memory_design.md) 与
+[`docs/memory_design.md §3.11`](docs/memory_design.md)。
+
+**查看事件级记忆**：
+```bash
+python -c "import json; d=json.load(open('outputs/memory_db/mid_term_meta.json',encoding='utf-8')); \
+ev=[r for r in d.values() if r.get('memory_type')=='event_memory']; fm=[r for r in d.values() if r.get('memory_type','frame_memory')=='frame_memory']; \
+print('event_memory:',len(ev),'frame_memory:',len(fm)); \
+[print(' ',e.get('event_id'),'|',e.get('event_type'),'|',e.get('admission_summary')) for e in ev[:5]]"
+```
+
+#### Phase 6 冲突感知更新（MemoryUpdateManager）
+
+中期记忆支持"改"：检索到相似记忆但当前决策/安全评价冲突时，对旧记忆软更新（降权 / 标记
+deprecated/superseded / 增 conflict_count / 版本化），新记忆作为新版本或替代。冲突分类：policy_conflict
+（跨类别策略不同）、style_conflict（同类别风格不同，两条都保留）、context_mismatch（情境不同，不冲突）、
+unsafe_old_memory（旧涉险）、unsafe_new_evidence（新不安全，**不覆盖旧**）。**不物理删除**；
+unsafe 新证据绝不覆盖安全旧记忆。更新记录于旧记忆 `update_history`（`mid_term_meta.json` 可查）+ 日志。
+`update.enabled=false` 退化为阶段 5 行为。设计与配置见
+[`docs/stage6_update_design.md`](docs/stage6_update_design.md) 与 [`docs/memory_design.md §3.12`](docs/memory_design.md)。
+
+**查看冲突更新**：
+```bash
+python -c "import json; d=json.load(open('outputs/memory_db/mid_term_meta.json',encoding='utf-8')); \
+upd=[r for r in d.values() if r.get('update_history')]; \
+print('memories with update_history:', len(upd)); \
+[print(' ',r.get('memory_id'),'| status=',r.get('status'),'| conflicts=',r.get('conflict_count'),'| history=',len(r.get('update_history',[]))) for r in upd[:5]]"
+```
+
+#### Phase 7 中期记忆沉淀为长期记忆候选（MemoryConsolidationManager）
+
+离线从中期记忆库挖掘高价值、稳定、可泛化经验，总结为长期记忆**候选**规则（`status=pending_review`），
+写入 `outputs/long_term_candidates/candidate_rules.yaml`，**不自动覆盖**正式长期记忆库
+`data/knowledge/long_term_rules.yaml`（需人工审核晋升）。按 `(event_type, risk_tags)` 分组，找多次出现
+（≥ `min_evidence_count`）且价值高的模式，生成 safety/strategy/style 三类候选，带 evidence memory_ids、
+confidence、safety_guard。危险偏好（高风险变道）剔除；风格候选不得覆盖安全规则。设计与配置见
+[`docs/memory_design.md §3.13`](docs/memory_design.md)。
+
+**生成候选长期记忆**（跑完 memory_on demo 后）：
+```bash
+python scripts/08_consolidate_long_term_candidates.py
+# 查看候选
+cat outputs/long_term_candidates/candidate_rules.yaml
+```
 
 #### 持久化：3 个文件（yaml 开关控制）
 
@@ -835,7 +1010,7 @@ grep -A 60 "AUDIT frame=<sample_token>" outputs/logs/online_loop_*.log
 
 | 输入 | 来源 | 格式 |
 |---|---|---|
-| 图像（**1 张当前帧**） | `kf["image_path"]` | base64 编码后包成 `data:image/jpeg;base64,...` 嵌入 `image_url` block |
+| 图像（**1 张当前帧**） | `kf["image_path"]`（surround_mosaic 模式下为 `outputs/mosaic/<token>.jpg` 拼接图） | base64 编码后包成 `data:image/jpeg;base64,...` 嵌入 `image_url` block |
 | user prompt | [`config/prompts.yaml -> scene_understanding.user`](config/prompts.yaml) | 静态文本模板（每帧都一样） |
 | system prompt | [`config/api_models.yaml -> scene_understanding.system_prompt`](config/api_models.yaml) | "场景分析专家..." |
 
@@ -858,7 +1033,7 @@ grep -A 60 "AUDIT frame=<sample_token>" outputs/logs/online_loop_*.log
 
 | # | 输入 | 来源 | prompt 位置 | memory_off 时 |
 |---|---|---|---|---|
-| 1 | **图像（1-N 张）** | 短期记忆滑窗最近 N-1 张 + 当前帧 | `image_url` blocks | 仅当前帧 1 张 |
+| 1 | **图像（1-N 张）** | 短期记忆滑窗最近 N-1 张 + 当前帧（mosaic 模式为拼接图） | `image_url` blocks | 仅当前帧 1 张 |
 | 2 | **当前场景理解** | 本帧场景 VLM 的 JSON 输出 | `## 当前场景理解` 段 | 同左 |
 | 3 | **自车状态** | `EgoStateBuilder.build()` 输出 | `## 自车状态` 段 | 同左 |
 | 4 | **历史轨迹** | `TrajectoryBuilder` 过去 5s | `## 最近历史轨迹` 段 | 同左 |
@@ -867,6 +1042,8 @@ grep -A 60 "AUDIT frame=<sample_token>" outputs/logs/online_loop_*.log
 | 7 | **中期记忆 top-3** | `mid_term.search()` 6 路融合 | `## 相似历史经验` 段（4 字段） | **空（不出现）** |
 | 8 | **长期规则文本** | `long_term.search_rules()` 严格 scene 匹配 | `## 相关驾驶规则` 段 | **空（不出现）** |
 | 9 | **system prompt** | [`config/api_models.yaml -> decision.system_prompt`](config/api_models.yaml) | 独立 `system` 消息 | 同左 |
+| 10 | **图像布局说明** | `online_loop._build_image_layout_desc`（按 `perception.mode`） | `## 输入图像布局` 段 | 同左（mosaic 模式描述六视角 2×3 布局） |
+| 11 | **Oracle 感知对象** | `oracle_perception.get_perception_objects`（nuScenes GT 投影） | `## Oracle 感知对象` 段 | 同左（仅 `oracle_objects=true` 时非空，`is_oracle=true`） |
 
 **image_paths 张数控制**：
 
@@ -1129,6 +1306,12 @@ A: 可以。但 `06_run_evaluation.py --compare` 需要两条 jsonl；单 mode �
 
 **Q: jsonl 写到一半 Ctrl+C，下次怎么继续？**
 A: 直接重跑同样命令；默认 `--resume` 会扫已写 sample_token 自动跳过。强制重跑加 `--no-resume`。
+
+**Q: 怎么切换六视角环视 / 单前视感知输入？**
+A: 改 `config/data_nuscenes.yaml -> perception.mode`（`single_front` / `surround_mosaic`），无需改代码；详见 [§6.5](#65-感知输入模式六视角环视拼接--oracle-感知对象) 与 [docs/perception_upgrade.md](docs/perception_upgrade.md)。
+
+**Q: `perception_objects` 是检测模型的预测结果吗？**
+A: **不是**。它是 nuScenes **GT 标注（`sample_annotation`）投影**到 6 相机得到的 oracle 真值（每个对象 `is_oracle=true`），用于研究/评测下为决策提供准确感知先验。速度/加速度沿标注 `prev` 链因果差分，缺历史置空标记不可用，不填假值。
 
 **Q: 中期记忆怎么跨次会话累积？**
 A: 改 `config/memory.yaml -> mid_term.persistence.enabled: true`。详见 §9.2「数据库形态」。
@@ -1513,8 +1696,8 @@ parser.add_argument(
 
 * 接入 CARLA 闭环（实现 `DynamicsPlanner.plan()`）
 * 多模态轨迹规划（实现 `TrajectorySampler.select()`，配合扩散 / AR 规划器）
-* 多摄像头融合（不仅 CAM_FRONT）
-* 接入 nuScenes trainval / 自录数据
+* 多摄像头融合 — ⚡ **部分已实现**：六视角 surround_mosaic 2×3 拼接 + oracle 多相机 GT 投影（见 [§6.5](#65-感知输入模式六视角环视拼接--oracle-感知对象) / [docs/perception_upgrade.md](docs/perception_upgrade.md)）；真 BEV / 特征级融合仍待办
+* 接入 nuScenes trainval / 自录数据 — ⚡ **trainval 已支持**（`config/data_nuscenes.yaml -> version: v1.0-trainval`）；自录数据仍待办
 * 接入官方 nuScenes planning benchmark
 
 ---

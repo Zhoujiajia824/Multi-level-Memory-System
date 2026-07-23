@@ -46,7 +46,11 @@ class FrameMeta(BaseModel):
     )
     image_path: str = Field(
         ...,
-        description="前视角图像文件的绝对路径",
+        description="前视角图像文件的绝对路径（surround_mosaic 模式下该字段被 mosaic 路径覆盖）",
+    )
+    image_paths: list[str] = Field(
+        default_factory=list,
+        description="多摄像头图像绝对路径列表（surround_mosaic 为 6 路径；single_front 可为空或单元素）",
     )
 
     def to_index_dict(self) -> dict:
@@ -62,4 +66,5 @@ class FrameMeta(BaseModel):
             "timestamp": self.timestamp,
             "camera_name": self.camera_name,
             "image_path": self.image_path,
+            "image_paths": list(self.image_paths),
         }
