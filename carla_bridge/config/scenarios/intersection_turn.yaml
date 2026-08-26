@@ -1,0 +1,20 @@
+# 路口连续转弯场景（验证 nav 派生 + 转向控制）
+scenario_name: "intersection_turn"
+map: "Town01"
+duration_s: 60
+seed: 7
+
+weather:
+  preset: "ClearNoon"
+
+ego:
+  blueprint: "vehicle.tesla.model3"
+  spawn: {x: null, y: null, yaw: null}
+
+traffic:
+  num_vehicles: 15                # 交通流减半，降低渲染/物理负载防 UE4 崩溃
+  num_walkers: 4
+
+route:
+  length_m: 300
+  turns: ["right", "left", "straight"]   # 路过路口依次转向

@@ -1,0 +1,23 @@
+# 直行 + 交通流场景
+scenario_name: "straight_traffic"
+map: "Town04"                # CARLA 地图
+duration_s: 60               # 单场景 sim 时长（秒）
+seed: 42
+
+weather:
+  preset: "ClearNoon"
+
+ego:
+  blueprint: "vehicle.tesla.model3"
+  spawn:                     # null = 用地图第一个 spawn point
+    x: null
+    y: null
+    yaw: null
+
+traffic:
+  num_vehicles: 8
+  num_walkers: 3
+
+route:
+  length_m: 250              # 路由长度（米）
+  turns: []                  # 路口转向序列：空 = 全程直行

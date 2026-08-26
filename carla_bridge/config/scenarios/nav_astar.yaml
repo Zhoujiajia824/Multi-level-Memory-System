@@ -1,0 +1,27 @@
+# A* 全局路径规划示例：起点 -> 终点导航
+# 用 CARLA GlobalRoutePlanner（A* over 地图拓扑）规划全局路由，模拟地图导航。
+# start/end 用 spawn_point 索引指定（地图预定义生成点，保证在路上）。
+scenario_name: "nav_astar"
+map: "Town04"
+duration_s: 60
+seed: 42
+
+weather:
+  preset: "ClearNoon"
+
+ego:
+  blueprint: "vehicle.tesla.model3"
+  spawn: null                       # null + route.start 指定 -> ego spawn 在路由起点
+
+traffic:
+  num_vehicles: 15
+  num_walkers: 3
+
+route:
+  # === A* 全局规划（推荐，模拟导航）===
+  start: {spawn_point: 0}           # 起点（= ego spawn）；也可 {x, y, z}
+  end:   {spawn_point: 80}          # 终点：A* 自动规划路线到这里
+  sampling_resolution: 2.0          # A* 采样间隔（米）
+  # === end 为空时回退：沿路前进 + 路口转向（无全局目标）===
+  length_m: 300
+  turns: []

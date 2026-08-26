@@ -1,0 +1,26 @@
+# NOA2 场景：Town06 高速公路 + 无车流/无人流/无交通灯/少路口/无长尾事件
+# Town06 是大型高速公路图（长直道 + 立体交叉，几乎没有信号灯，路口极少）。
+# 无背景车流/人流，纯 ego 独享道路；route 用 walk-forward 沿所在道路直行，
+# turns:[] 在路口选“最直”出口，避免主动转向进匝道/路口，进一步减少路口与红绿灯遭遇。
+scenario_name: "NOA2"
+map: "Town06"
+duration_s: 60
+seed: 7
+
+weather:
+  preset: "ClearNoon"
+
+ego:
+  blueprint: "vehicle.tesla.model3"
+  spawn: null                  # null -> ego spawn 在 route.start
+
+traffic:
+  num_vehicles: 0              # 无背景车流
+  num_walkers: 0               # 无人流
+
+route:
+  start: {spawn_point: 5}      # 起点（非 0）
+  end:   null                  # null -> walk-forward 沿路直行（不规划到特定终点，减少路口）
+  sampling_resolution: 2.0     # walk-forward 步长（米）
+  length_m: 400                # 沿高速主线前进 400 米
+  turns: []                    # 路口选最直出口（高速主线直行，不转进匝道）

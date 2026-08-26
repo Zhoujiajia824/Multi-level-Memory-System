@@ -1,0 +1,41 @@
+# 长尾场景示例：城市导航 + 自定义事件（行人/ACC车/障碍物/信号灯）
+# 事件按 ego 离起点的距离（at_distance 米）触发，由 EventScheduler 每 tick 检查。
+scenario_name: "longtail_city"
+map: "Town01"
+duration_s: 60
+seed: 7
+
+weather:
+  preset: "ClearNoon"
+
+ego:
+  blueprint: "vehicle.tesla.model3"
+  spawn: null                     # null -> spawn 在 route.start
+
+traffic:
+  num_vehicles: 10               # 交通流减半，降低渲染/物理负载防 UE4 崩溃
+  num_walkers: 2
+
+route:
+  start: {spawn_point: 0}
+  end:   {spawn_point: 60}        # A* 全局路由（Town03 spawn_point 数量与 Town05 不同，用较小索引；越界自动回退 walk-forward 不崩）
+  sampling_resolution: 2.0
+  length_m: 400
+  turns: []
+
+# === 长尾事件序列（ego 离起点 at_distance 米时触发）===
+events:
+  # 1. 路边行人：ego 起步 15m 后，右前方路边生成行人沿路走
+  - {type: pedestrian_roadside, at_distance: 15, side: right, ahead_m: 15, walk_ahead_m: 30}
+
+  # 2. ACC/NOA 交通车：40m 后左前方生成一辆 scripted 车，沿车道走(NOA)+跟车(ACC)，速度 8 m/s
+  - {type: scripted_vehicle, at_distance: 40, blueprint: "vehicle.audi.etron", lane: left, ahead_m: 25, speed: 8, acc: true, route_len_m: 120}
+
+  # 3. 行人过马路：70m 后右前方行人过马路（鬼探头）
+  - {type: pedestrian_crossing, at_distance: 70, side: right, ahead_m: 20, cross_dist: 8}
+
+  # 4. 障碍物突现：100m 后前方 20m 生成路障
+  - {type: obstacle, at_distance: 100, prop: "static.prop.barrier", ahead_m: 20}
+
+  # 5. 强制信号灯：130m 后前方信号灯强制红灯 15s
+  - {type: traffic_light_force, at_distance: 130, state: red, duration: 15, ahead_m: 30}

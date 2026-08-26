@@ -1,0 +1,31 @@
+# 长尾场景（轻量）：NOA.py 风格六视角 + 减少交通流/人流 + 长尾事件
+# ego 用 cybertruck（NOA.py 同款），六视角相机 transform/FOV 在 carla.yaml -> carla.cameras
+# （已对齐 NOA.py）。交通流和人流都减少，聚焦长尾事件。
+scenario_name: "longtail_light"
+map: "Town01"
+duration_s: 60
+seed: 7
+
+weather:
+  preset: "ClearNoon"
+
+ego:
+  blueprint: "vehicle.tesla.cybertruck"   # NOA.py 同款车
+  spawn: null                              # null -> spawn 在 route.start
+
+traffic:
+  num_vehicles: 0                          # 减少交通流（NOA.py 无交通流，这里给少量背景车）
+  num_walkers: 0                           # 减少人流
+
+route:
+  start: {spawn_point: 0}
+  end:   {spawn_point: 60}                 # A* 全局路由（Town03 用较小索引；越界自动回退 walk-forward）
+  sampling_resolution: 2.0
+  length_m: 300
+  turns: []
+
+# 长尾事件（按 ego 离起点距离触发）
+# events:
+#   - {type: pedestrian_crossing, at_distance: 20, side: right, ahead_m: 18, cross_dist: 8}
+#   - {type: scripted_vehicle, at_distance: 50, blueprint: "vehicle.audi.etron", lane: left, ahead_m: 25, speed: 6, acc: true, route_len_m: 100}
+#   - {type: obstacle, at_distance: 80, prop: "static.prop.barrier", ahead_m: 20}

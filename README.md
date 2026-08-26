@@ -10,6 +10,31 @@
 
 ---
 
+## 🚗 CARLA 闭环集成（v1.0 新增）
+
+在离线 nuScenes 记忆系统之上，新增 **CARLA 0.9.15 闭环驾驶**集成（`carla_bridge/`，
+**不改 `src/vla_memory/` 一行**）：用 CARLA 实时感知（六视角图像 / GT 障碍物 / 天气 / 导航）替代
+离线 nuScenes，决策轨迹实时回控 CARLA，实现自定义环境下的闭环驾驶，并支持驾驶视频录制回看。
+
+- **3s 周期全量认知** + **每周期 5 次 raw 捕获**（短期记忆时刻最新）+ **10Hz Pure Pursuit/PID 回控**
+- **同步模式**：VLM 思考期间 CARLA 冻结，wall-clock 慢但 sim 时间连续正确
+- **自定义场景**：地图 / 天气 / 交通流 / 车辆 / 路由，全 Python API
+- **驾驶视频录制**：跳过 VLM 冻结期，视频时长 = 仿真实际驾驶时间
+- 独立环境 `mulmem_carla`(Python 3.9)，与 nuScenes 的 `mulmem`(3.12) 互不干扰
+
+> 完整框架 / 模块介绍 / 操作指令 / 故障排查见 **[carla_bridge/README.md](carla_bridge/README.md)**。
+
+快速跑闭环（先手动启动 CARLA 服务器 `CarlaUE4.exe`）：
+```bash
+conda activate mulmem_carla
+export DASHSCOPE_API_KEY=你的key    # Git Bash(MINGW64) 用 export，不是 set
+python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_on
+```
+
+> 下文 §1–§14 为**离线 nuScenes 记忆系统**的完整文档（v0.1，环境 `mulmem`/Python 3.12）。
+
+---
+
 ## 1. 项目简介
 
 本项目是一个 **VLA（Vision-Language-Action）驾驶 Agent 多层记忆系统**的 v0.1 离线 demo。
@@ -31,18 +56,19 @@
 | **完整提示词模板化** | 所有 VLM 提示词集中在 `config/prompts.yaml`，改提示词无需改 Python |
 | **中断恢复** | jsonl append + fsync；重启时扫已写记录自动跳过；中期记忆可选磁盘持久化跨次累积 |
 | **智驾标准评测** | ADE / FDE / **L2@1s/2s/3s** / 轨迹有效率 / 行为准确率 |
+| **CARLA 闭环驾驶** | `carla_bridge/` 接入 CARLA 0.9.15：3s 认知 + 10Hz 回控 + raw 捕获 + 驾驶视频录制，自定义场景闭环（v1.0，不改 src/） |
 | **预留接口** | `DynamicsPlanner`（轨迹→控制量，给 CARLA 闭环）+ `TrajectorySampler`（多模态轨迹选择，给扩散/AR 模型） |
 
 ### 1.2 第一版边界
 
 | 维度 | 第一版 | 后续规划 |
 |---|---|---|
-| 数据集 | nuScenes v1.0-mini / v1.0-trainval | CARLA、自录数据 |
+| 数据集 | nuScenes v1.0-mini / v1.0-trainval | ✅ CARLA 0.9.15（carla_bridge）、自录数据 |
 | 摄像头 | 默认 CAM_FRONT，可选六视角环视拼接（surround_mosaic） | 真 BEV / 特征级多摄像头融合 |
 | 图像特征 | DINOv2-base (768 维) | 支持其他 backbone |
 | VLM | OpenAI 兼容 API（Qwen-VL 默认） | 本地模型 / 更多 provider |
 | 向量检索 | FAISS-CPU IndexFlatIP | IndexIVF / HNSW；GPU FAISS |
-| 输出 | ego-centric 轨迹点列 | 控制量 / 多模态轨迹簇 |
+| 输出 | ego-centric 轨迹点列 | ✅ 控制量回控 CARLA（carla_bridge）/ 多模态轨迹簇 |
 | 评测 | 内部 memory_on vs memory_off 对比 | 接入官方 nuScenes planning benchmark |
 
 ---
@@ -179,6 +205,8 @@ import faiss; print('OK | faiss', faiss.__version__, \
 $env:DASHSCOPE_API_KEY = "sk-bad8c24f654042ddbb506eb4dd9bfbd9"
 # Windows CMD:
 set DASHSCOPE_API_KEY=sk-bad8c24f654042ddbb506eb4dd9bfbd9
+# GIT bash:
+export DASHSCOPE_API_KEY=sk-bad8c24f654042ddbb506eb4dd9bfbd9
 # Linux / macOS:
 export DASHSCOPE_API_KEY="your-api-key-here"
 ```
@@ -592,6 +620,20 @@ vla_memory_demo/
 │       ├── __init__.py
 │       ├── dynamics_planner.py         # 轨迹 → 控制量（CARLA 闭环预留）
 │       └── trajectory_sampler.py       # 多模态轨迹选择（扩散/AR 预留）
+│
+├── carla_bridge/                       # 【v1.0 新增】CARLA 0.9.15 闭环集成（不改 src/）
+│   ├── README.md                       #   CARLA 集成完整文档（框架/模块/指令/排查）
+│   ├── setup_env.sh                    #   一键建 mulmem_carla(Python 3.9) 环境
+│   ├── closed_loop.py                  #   主驱动：3s 认知 + 10Hz 回控 + raw 捕获 + 视频
+│   ├── run_carla_demo.py               #   入口（python -m carla_bridge.run_carla_demo）
+│   ├── config/{carla.yaml, scenarios/} #   连接/相机/控制器/视频 + 场景 YAML
+│   ├── env/                            #   连接+同步+场景(ego/交通流/天气/路由)+spectator
+│   ├── sensors/                        #   6 相机 mosaic + GT 感知对象
+│   ├── state/                          #   坐标变换(手性) + 自车状态 + 历史位姿
+│   ├── control/                        #   Pure Pursuit(横向) + PID(纵向)
+│   ├── memory_adapter/                 #   kf dict 构建 + 封装 OnlineDrivingLoop
+│   ├── metrics/                        #   碰撞/违规/路线/舒适度 + 报告
+│   └── video/                          #   驾驶视频录制（跳过 VLM 冻结期）
 │
 ├── tests/                              # 28 个测试模块（pytest）
 │   ├── test_can_bus_loader.py
@@ -1326,8 +1368,7 @@ A: 编辑 `config/prompts.yaml`，所有提示词在此集中。详见 [docs/pro
 A: P6 已修复（默认 nav_to_behavior_map 自动注入 + 大小写归一化）。若仍为 0%，检查 jsonl 中 `behavior` 字段是否非空。
 
 **Q: 怎么接入 CARLA 闭环？**
-A: 实现 `src/vla_memory/planning/dynamics_planner.py` 的 `DynamicsPlanner.plan()`（轨迹 → ControlCommand），
-然后在 CARLA tick 循环中调用。
+A: 已实现（v1.0），见 `carla_bridge/`（[carla_bridge/README.md](carla_bridge/README.md)）。`python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_on` 即可。记忆系统零改动，CARLA 数据经 `KeyframeBuilder` 喂 `OnlineDrivingLoop.step()`，决策轨迹由 Pure Pursuit+PID 回控。`src/vla_memory/planning/dynamics_planner.py` 的 `DynamicsPlanner` 仍是预留 stub（CARLA 控制器在 `carla_bridge/control/` 独立实现，不依赖它）。
 
 **Q: FAISS 装不上怎么办？**
 A: 见 §3.4 故障排查表，**固定 `faiss-cpu==1.9.0`**，不要装 1.14.x。
@@ -1347,7 +1388,12 @@ A: `grep -A 60 "AUDIT frame=<sample_token>" outputs/logs/online_loop_*.log`。
 ## 14. 贡献新数据集适配器
 
 本节给出"把项目接入新数据源（CARLA / 视频 / 自录数据集等）"的标准流程。
-设计上整个 demo 的「数据访问」与「主流程」是解耦的——
+设计上整个 demo 的「数据访问」与「主流程」是解耦的--
+
+> ✅ **CARLA 已接入**（v1.0）：见 `carla_bridge/`。它不走 `BaseDrivingDataset`，而是直接构建 kf dict
+> 喂 `OnlineDrivingLoop.step()`——因为 CARLA 在线闭环没有未来真值轨迹，`BaseDrivingDataset` 的
+> `get_future_ego_trajectory` 不适用。本节流程适用于**离线数据源**（视频 / 自录数据集等）。
+
 只要你实现 [`BaseDrivingDataset`](src/vla_memory/data/base_dataset.py) 的全部抽象方法，
 就能让 `OnlineDrivingLoop` 透明地跑在新数据源上，**不需要改 pipeline / 决策 / 记忆 / 评测中任何代码**。
 

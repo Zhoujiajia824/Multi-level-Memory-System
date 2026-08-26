@@ -1,0 +1,27 @@
+# 城市交通场景：起点 -> 终点 A* 导航
+# 含：直行 + 转向（A* 路由）、交通路口 + 交通灯（Town03 地图自带，自动循环）、
+#     交通流（TM autopilot 车辆能动）、人流（AI walker 能动）
+scenario_name: "city_traffic"
+map: "Town01"                  # 城市路网：多路口 + 信号灯（Town05 在 0.9.15 渲染崩，换 Town03）
+duration_s: 60
+seed: 7
+
+weather:
+  preset: "ClearNoon"
+
+ego:
+  blueprint: "vehicle.tesla.model3"
+  spawn: null                  # null -> ego spawn 在 route.start
+
+traffic:
+  num_vehicles: 0             # 城市交通流（Traffic Manager autopilot，自动跟车/停灯/换道）
+  num_walkers: 0               # 城市人流（AI walker，随机走动过街）
+
+route:
+  # A* 全局规划：起点 -> 终点，路由会穿过多个路口（含直行 + 左/右转）
+  start: {spawn_point: 0}      # 起点（= ego spawn）
+  end:   {spawn_point: 60}     # 终点：A* 自动规划城市路线到这里（Town03 用较小索引；越界自动回退 walk-forward）
+  sampling_resolution: 2.0     # A* 采样间隔（米）
+  # end 为空时回退用：
+  length_m: 400
+  turns: []

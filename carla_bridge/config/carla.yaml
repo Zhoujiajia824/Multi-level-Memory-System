@@ -1,0 +1,118 @@
+# =============================================================================
+# CARLA 闭环集成配置（carla_bridge）
+# =============================================================================
+# 与 src/vla_memory 的 config/*.yaml 解耦：本文件由 carla_bridge 入口脚本
+# 通过 load_config(overrides=<本文件内容>) 深合并进主配置，不改 src/、
+# 不改现有 config/。carla_bridge 代码用 config.get_nested("carla", ...) 读取。
+# =============================================================================
+
+# ---- 顶层：数据集标识（写入中期记忆 source_dataset，与 nuScenes 区分）----
+dataset_name: "carla"
+version: "0.9.15"
+
+# ⚠️ bridge 侧 workaround（不改 src）：mid_term_memory.search 的 final_score 用
+# f"{key}_weight"（如 visual_score_weight）查权重，而 memory.yaml 的键名是
+# visual_weight —— 键名错位导致所有运行 final_score=0、检索排序退化。此处注入
+# 别名键（深合并共存），使加权求和真正生效。src 修复后可删除本块。
+mid_term:
+  weights:
+    visual_score_weight: 0.40
+    text_score_weight: 0.10
+    scene_score_weight: 0.20
+    weather_score_weight: 0.10
+    nav_score_weight: 0.10
+    state_score_weight: 0.10
+
+# CARLA 用独立的中期记忆库，避免与 nuScenes 的 outputs/memory_db 互相污染
+# （否则 auto_load_on_init 会把 nuScenes 记忆加载进 CARLA 运行）
+memory_db_dir: "outputs/memory_db_carla"
+
+# ---- 感知输入：固定六视角环视（复用 src 现有 surround_mosaic 路径）----
+perception:
+  mode: "surround_mosaic"
+  cameras:                       # 2x3 行优先顺序：上排前向三摄、下排后向三摄
+    - "CAM_FRONT_LEFT"
+    - "CAM_FRONT"
+    - "CAM_FRONT_RIGHT"
+    - "CAM_BACK_LEFT"
+    - "CAM_BACK"
+    - "CAM_BACK_RIGHT"
+  mosaic:
+    cell_width: 480
+    cell_height: 270
+    label_subimages: true
+  oracle_objects: true           # 注入 CARLA GT 感知对象（is_oracle=True）
+  oracle:
+    max_distance_m: 100.0         # 过滤距 ego 超过此距离的目标
+
+carla:
+  # ---- 连接 ----
+  host: "127.0.0.1"
+  port: 2000
+  timeout_s: 30.0
+  python_api_dir: "D:/software/carla/WindowsNoEditor/PythonAPI/carla"  # agents 模块路径（A* GlobalRoutePlanner）
+  # ---- 同步模式 ----
+  synchronous: true
+  fixed_delta_seconds: 0.1       # 10 Hz（20Hz 在 Town05 大图物理算不完易触发 UE4 fatal，降为 10Hz 稳定）
+  # ---- 闭环节奏 ----
+  replan_interval_s: 3.0         # VLM 每 3s 重规划（= decision.trajectory.horizon_seconds）
+  max_duration_s: 60.0           # 单场景最长 sim 时间
+  # ---- 卡死检测（低速且无路线进展 → 警告 → 提前终止，防卡死后空烧 VLM）----
+  stuck_detection:
+    enabled: true
+    speed_thresh_mps: 0.3
+    warn_after_s: 10.0
+    terminate_after_s: 20.0
+  # ---- 路由中心线注入决策 prompt（米制回正锚点）----
+  # VLM 无法从 480×270 图像定量判断横向偏移（车道线仅 2-3px、无标定参考），
+  # 避让后 KEEP_LANE 只会沿偏移位置平行直行、误差永不收敛。A* 路由点即 CARLA
+  # 车道中心，转 ego-centric 后以 route_center 伪对象注入 perception_objects
+  # （prompt 按"照参考点写轨迹"可直接抄写米制回正量）。对 memory_on/off 同等生效。
+  route_injection:
+    enabled: true
+    num_points: 6              # 注入前方中心点数
+    step_m: 2.0                # 点间距（米），5×8=40m 覆盖 3s 规划域
+  # ---- ego 车辆 ----
+  ego:
+    blueprint: "vehicle.tesla.model3"
+    spawn_point: null            # null = 由场景 YAML 指定或随机
+  # ---- 6 相机布置（相对 ego 的 transform；P1 实测调参）----
+  # CARLA: x 前、y 右、z 上；yaw 正=顺时针(向右，+y=右)（实测，与 nuScenes 相反）。
+  cameras:
+    - {name: "CAM_FRONT_LEFT",  x:  1.0, y: -1.0, z: 1.4, pitch: 0, yaw:  -45, roll: 0, fov: 100, width: 640, height: 360}
+    - {name: "CAM_FRONT",       x:  1.2, y:  0.0, z: 2.0, pitch: 0, yaw:    0, roll: 0, fov: 120, width: 640, height: 360}
+    - {name: "CAM_FRONT_RIGHT", x:  1.0, y:  1.0, z: 1.4, pitch: 0, yaw:   45, roll: 0, fov: 100, width: 640, height: 360}
+    - {name: "CAM_BACK_LEFT",   x: -1.0, y: -1.0, z: 1.4, pitch: 0, yaw: -135, roll: 0, fov: 100, width: 640, height: 360}
+    - {name: "CAM_BACK",        x: -2.8, y:  0.0, z: 1.8, pitch: 0, yaw:  180, roll: 0, fov: 100, width: 640, height: 360}
+    - {name: "CAM_BACK_RIGHT",  x: -1.0, y:  1.0, z: 1.4, pitch: 0, yaw:  135, roll: 0, fov: 100, width: 640, height: 360}
+  # ---- 图像/产物落盘 ----
+  output:
+    image_dir: "outputs/carla_images"
+    mosaic_dir: "outputs/mosaic"
+  # ---- 控制器（Pure Pursuit 横向 + PID 纵向）----
+  controller:
+    wheelbase_m: 2.8
+    max_steer_rad: 0.6
+    lookahead_min_m: 3.0
+    lookahead_max_m: 12.0
+    lookahead_k: 0.5             # lookahead = clamp(min + k*speed, min, max)
+    pid:
+      kp: 1.6                # 原 1.0 偏软：2 m/s 误差油门仅 0.2，起步肉
+      ki: 0.05
+      kd: 0.05
+      max_throttle: 0.75
+      max_brake: 0.8
+      deadband_mps: 0.15     # 死区：小误差滑行，防油门/刹车抖动
+    control_dt_s: 0.1        # 控制周期 = fixed_delta_seconds（scripted NPC PID 用）
+    steer_sign: -1               # 项目 steer_rad 左正 ↔ CARLA VehicleControl.steer 右正（+yaw=右转，实测），故取反
+  # ---- 驾驶视频录制（独立小功能，默认关）----
+  # 仅在 CARLA 推进 tick 取帧（跳过 VLM 冻结期），视频时长 = 仿真实际驾驶时间
+  video:
+    enabled: true
+    fps: 10                      # = 1/fixed_delta（=0.1s），视频按 sim 实时速度播放
+    width: 1280                   # Town05 大图降视频相机分辨率（1280×720→640×360）防 UE4 崩溃
+    height: 720
+    view: "chase"                # chase（后上方第三人称）| front（前视角）
+  # ---- 场景 ----
+  scenario_dir: "carla_bridge/config/scenarios"
+  default_scenario: "straight_traffic"

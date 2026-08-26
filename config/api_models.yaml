@@ -9,9 +9,9 @@
 # ---- 场景理解 VLM ----
 scene_understanding:
   provider: "qwen"  # VLM 提供商：qwen / openai / other
-  api_key_env: "DASHSCOPE_API_KEY"  # API Key 对应的环境变量名"DASHSCOPE_API_KEY"
-  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"  # API base URL
-  model_name: "qwen3.7-plus"  # 模型名称qwen3-vl-plus
+  api_key_env: "DASHSCOPE_API_KEY"  # API Key 对应的环境变量名
+  base_url: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"  # API base URL
+  model_name: "qwen3.6-flash"  # 模型名称
   timeout: 60  # 请求超时（秒）
   max_tokens: 2048  # 最大输出 token 数
   temperature: 0.1  # 生成温度，低温度保证输出稳定性
@@ -26,8 +26,8 @@ scene_understanding:
 decision:
   provider: "qwen"  # VLM 提供商
   api_key_env: "DASHSCOPE_API_KEY"  # API Key 对应的环境变量名"DASHSCOPE_API_KEY"
-  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"  # API base URL
-  model_name: "qwen3.7-plus-2026-05-26"  # 模型名称
+  base_url: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"  # API base URL
+  model_name: "qwen3.6-flash"
   timeout: 120  # 决策请求需要更长超时
   max_tokens: 4096  # 决策输出需要更多 token
   temperature: 0.1  # 低温度保证决策稳定性

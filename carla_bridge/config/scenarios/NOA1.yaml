@@ -1,0 +1,26 @@
+# NOA1 场景：少量车流 + 非零起点 + 无长尾事件
+# ego 从非 0 的 spawn_point 起步，A* 路由到终点；Town01 是密集网格城市图，
+# 任意 spawn_point 出发几十米内就有信号灯路口，start->end 的 A* 路径必经红绿灯
+# （Town01 自带信号灯自动循环，无需 traffic_light_force 事件）。
+scenario_name: "NOA1"
+map: "Town01"
+duration_s: 60
+seed: 7
+
+weather:
+  preset: "ClearNoon"
+
+ego:
+  blueprint: "vehicle.tesla.model3"
+  spawn: null                  # null -> ego spawn 在 route.start
+
+traffic:
+  num_vehicles: 0              # 少量背景车流（Traffic Manager autopilot，自动跟车/停灯/换道）
+  num_walkers: 0               # 少量人流
+
+route:
+  start: {spawn_point: 10}     # 起点（非 0）
+  end:   {spawn_point: 50}     # 终点：A* 自动规划路径，经过红绿灯路口
+  sampling_resolution: 2.0     # A* 采样间隔（米）
+  length_m: 300                # end 为空时回退用
+  turns: []
