@@ -9,7 +9,7 @@ nuScenes 数据，决策轨迹实时回控 CARLA，实现自定义环境下的�
 * 复用 ``src.vla_memory.pipeline.OnlineDrivingLoop``（setup/step/close），每 3s
   用 CARLA 实时数据组装成与 nuScenes 同构的 ``kf`` dict 喂给 ``step()``，拿到
   决策轨迹。
-* 同步模式 + 20Hz Pure Pursuit/PID 跟踪轨迹回控 CARLA。
+* 同步模式 + 10Hz Pure Pursuit/PID 跟踪轨迹回控 CARLA。
 * 所有新代码都在本包内，``src/vla_memory`` 与现有 ``config/`` 不动。
 
 架构与使用见 ``carla_bridge/README.md``。

@@ -13,9 +13,9 @@
 | 项 | 说明 |
 |---|---|
 | **记忆系统零改动** | 复用 `OnlineDrivingLoop`（setup/step/close），CARLA 数据经 `KeyframeBuilder` 组装成与 nuScenes 同构的 `kf` dict 喂入 |
-| **1Hz 全量认知** | 每 1s sim 做一次完整 DINOv2 + 场景VLM + 三层记忆检索 + 决策VLM（与 nuScenes keyframe 一致） |
-| **~5Hz raw 捕获** | 控制阶段以 ~5Hz 捕获原始感知（图像+ego+障碍物，不跑 VLM）push 进短期记忆，队列时刻最新 |
-| **20Hz 回控** | Pure Pursuit(横向) + PID(纵向) 跟踪决策轨迹，同步模式 |
+| **3s 全量认知** | 每 3s sim 做一次完整 DINOv2 + 场景VLM + 三层记忆检索 + 决策VLM（与 nuScenes keyframe 一致） |
+| **每周期 5 次 raw 捕获** | 控制阶段每周期 5 次（≈1.67Hz）捕获原始感知（图像+ego+障碍物，不跑 VLM）push 进短期记忆，队列时刻最新 |
+| **10Hz 回控** | Pure Pursuit(横向) + PID(纵向) 跟踪决策轨迹，同步模式 |
 | **同步模式** | VLM 思考期间 CARLA 冻结（不 tick），wall-clock 慢但 sim 时间连续正确 |
 | **驾驶视频录制** | 仅在 CARLA 推进 tick 取帧（跳过 VLM 冻结期），视频时长 = 仿真实际驾驶时间 |
 | **CARLA 全优势** | 自定义地图/天气/交通流/车辆/路由，全 Python API |
@@ -28,7 +28,7 @@
 CARLA server (CarlaUE4.exe, 端口2000, 手动启动, 同步模式)
         │   传感器/GT ↓   carla.VehicleControl ↑
         ▼
-carla_bridge.closed_loop  ──每 1s sim──>  keyframe_builder
+carla_bridge.closed_loop  ──每 3s sim──>  keyframe_builder
         │                                    │  组装 kf dict（与 nuScenes 同构）
         │                                    ▼
         │                 src.vla_memory.pipeline.OnlineDrivingLoop.step(kf)  【不改】
@@ -42,12 +42,12 @@ trajectory_tracker (Pure Pursuit + PID)  ->  carla.VehicleControl  ->  vehicle.a
         └── video: 每个 CARLA 推进 tick 取一帧（跳过 VLM 冻结）写视频
 ```
 
-**单周期时序（每 1s sim）：**
+**单周期时序（每 3s sim）：**
 ```
-[1 捕获]  tick -> 6 相机 mosaic + ego + GT 感知 + nav         (推进 0.05s)
+[1 捕获]  tick -> 6 相机 mosaic + ego + GT 感知 + nav         (推进 0.1s)
 [2 认知]  loop.step(kf) -> 决策轨迹                           (sim 冻结, wall 5-30s)
-[3 控制]  20Hz × 20 tick：Pure Pursuit+PID 回控 CARLA          (推进 1.0s)
-          其中 ~5Hz raw 捕获 push 进短期记忆；其余 tick drain 相机防堆积
+[3 控制]  10Hz × 30 tick：Pure Pursuit+PID 回控 CARLA          (推进 3.0s)
+          其中每周期 5 次 raw 捕获 push 进短期记忆；其余 tick drain 相机防堆积
 [4 记录]  逐 tick 指标采集 + 视频取帧
 ```
 
@@ -60,7 +60,7 @@ carla_bridge/
 ├── README.md                       # 本文件
 ├── __init__.py
 ├── setup_env.sh                    # 一键建 mulmem_carla(3.9) 环境
-├── closed_loop.py                  # 【主驱动】同步 tick + 1Hz 重规划 + raw 捕获 + 视频
+├── closed_loop.py                  # 【主驱动】同步 tick + 3s 重规划 + raw 捕获 + 视频
 ├── run_carla_demo.py               # 【入口】CLI -> ClosedLoop
 │
 ├── config/
@@ -110,11 +110,11 @@ carla_bridge/
 ## 4. 功能模块
 
 ### 4.1 `env/` 环境与场景
-- **`carla_client.py`**：连接 CARLA（127.0.0.1:2000），设同步模式 + `fixed_delta_seconds=0.05`（20Hz）；`tick()` 推进；`load_map()` 切地图后重应用同步设置；`set_spectator_follow()` 把视角摆到 ego 后上方第三人称。
+- **`carla_client.py`**：连接 CARLA（127.0.0.1:2000），设同步模式 + `fixed_delta_seconds=0.1`（10Hz）；`tick()` 推进；`load_map()` 切地图后重应用同步设置；`set_spectator_follow()` 把视角摆到 ego 后上方第三人称。
 - **`scenario_manager.py`**：读场景 YAML，依次设地图/天气/ego/路由/交通流；`from_yaml` 类方法加载；`destroy()` 清理。
 - **`traffic_spawner.py`**：Traffic Manager 生成 N 辆 autopilot 车辆 + M 个 AI 行人（best-effort）。
 - **`weather_controller.py`**：**动态枚举** `carla.WeatherParameters` 预设（0.9.15 的 `MidRainyNoon`/`MidRainSunset` 命名不统一，硬编码会踩坑），支持预设名或自定义参数。
-- **`route_planner.py`**：**A* 全局路径规划**（CARLA `GlobalRoutePlanner`，起点->终点，模拟地图导航）；从路由 `RoadOption` 派生 `nav_instruction`（straight/left_turn/...）；`progress_fraction()` 路线完成度。`end` 为空时回退沿路前进。
+- **`route_planner.py`**：**自实现 A\* 全局路径规划**（不依赖 agents.GlobalRoutePlanner，起点->终点，模拟地图导航）；由相邻 waypoint 的 yaw 差派生 `nav_instruction`（straight/left_turn/...）；`progress_fraction()` 路线完成度。`end` 为空时回退沿路前进。
 - **`walker_controller.py`**：行人生成 + 行为控制（`spawn_crossing` 过马路 / `spawn_roadside` 路边走），用 `controller.ai.walker`。
 - **`event_scheduler.py`**：**长尾事件调度器**，按 ego 离起点距离触发事件（行人/ACC 车/障碍物/信号灯），每 tick 驱动 scripted 车。
 
@@ -142,7 +142,7 @@ carla_bridge/
 - **`run_reporter.py`**：写 Markdown + JSON 报告到 `outputs/carla_runs/`。
 
 ### 4.7 `video/` 驾驶视频录制
-- **`recorder.py`**：挂一个 chase/front 相机到 ego，每个 CARLA 推进 tick 取一帧写视频（20fps）；VLM 冻结期不 tick 不取帧 -> **视频时长 = 仿真实际驾驶时间**；`flush()` 中断时保存。
+- **`recorder.py`**：挂一个 chase/front 相机到 ego，每个 CARLA 推进 tick 取一帧写视频（10fps）；VLM 冻结期不 tick 不取帧 -> **视频时长 = 仿真实际驾驶时间**；`flush()` 中断时保存。
 
 ### 4.8 主驱动与入口
 - **`closed_loop.py`**：`ClosedLoop` 类，编排上述全部模块；含 fail-fast（API key）、SSL_CERT_FILE 自动修复、异常捕获打印 traceback、spectator 跟随。
@@ -204,7 +204,7 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
 ```yaml
   video:
     enabled: true
-    fps: 20
+    fps: 10
     width: 1280
     height: 720
     view: "chase"      # chase（后上方第三人称）| front（前视角）
@@ -212,7 +212,7 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
 跑完（或 Ctrl+C）视频在 `outputs/carla_videos/drive_<场景>_<模式>.mp4`，时长 = 仿真实际驾驶时间（跳过 VLM 冻结期）。
 
 ### 6.5 首测建议
-1Hz 下 60s sim ≈ 60 次 VLM（每次 5-30s wall）。首测先把场景 YAML 的 `duration_s` 改成 `10`（约 3-5 分钟 wall），确认闭环通了再加长。
+3s 周期下 60s sim ≈ 20 次 VLM（每次 5-30s wall）。首测先把场景 YAML 的 `duration_s` 改成 `10`（约 2-3 分钟 wall），确认闭环通了再加长。
 
 ---
 
@@ -222,8 +222,8 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `carla.host`/`port` | 127.0.0.1/2000 | CARLA 服务器 |
-| `carla.synchronous`/`fixed_delta_seconds` | true/0.05 | 同步模式 + 20Hz |
-| `carla.replan_interval_s` | 1.0 | 1Hz 全量捕获（与 nuScenes 一致） |
+| `carla.synchronous`/`fixed_delta_seconds` | true/0.1 | 同步模式 + 10Hz |
+| `carla.replan_interval_s` | 3.0 | 3s 全量捕获（= decision.trajectory.horizon_seconds） |
 | `carla.max_duration_s` | 60.0 | 单场景最长 sim 时间 |
 | `carla.cameras` | 6 相机 | 640×360，2×3 布局（P1 可调 transform） |
 | `carla.controller` | — | wheelbase/max_steer/lookahead/PID 增益/`steer_sign` |
@@ -323,10 +323,10 @@ CARLA 全局：x 前、y 右、z 上。项目 ego-centric：x 前、**y 左**。
 - [x] P0 环境/骨架：`mulmem_carla`(3.9) 已建并验证（carla+faiss+torch+记忆系统导入 OK）；coords/carla_client/config
 - [x] P1 感知接入：6 相机 + ego 状态 + GT 感知 + 天气
 - [x] P2 记忆管线对接：keyframe_builder + loop_runner（复用 `OnlineDrivingLoop`，不改 src/）
-- [x] P3 闭环控制：轨迹转全局 + Pure Pursuit + PID + `closed_loop` 20Hz 跟踪
+- [x] P3 闭环控制：轨迹转全局 + Pure Pursuit + PID + `closed_loop` 10Hz 跟踪
 - [x] P4 场景系统：YAML + Python 场景类 + 交通流 + 天气 + 路由 + nav 派生
 - [x] P5 评测：碰撞/违规/路线/舒适度 + 报告（已接入 `closed_loop`）
-- [x] 1Hz 捕获 + 控制阶段 ~5Hz raw 捕获（短期记忆时刻最新）+ 相机防堆积
+- [x] 3s 捕获 + 控制阶段每周期 5 次 raw 捕获（短期记忆时刻最新）+ 相机防堆积
 - [x] spectator 第三人称跟随
 - [x] 驾驶视频录制（跳过 VLM 冻结期，时长=仿真驾驶时间，中断保存）
 - [x] fail-fast API key + SSL_CERT_FILE 自动修复 + 异常 traceback 打印

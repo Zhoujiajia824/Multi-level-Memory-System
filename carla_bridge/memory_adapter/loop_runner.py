@@ -50,9 +50,13 @@ class LoopRunner:
     def add_short_term_item(self, item) -> None:
         """直接往短期记忆 push 一个 item（供控制阶段 raw 捕获用，不经 VLM）。
 
-        CARLA 闭环在控制阶段以 ~5Hz 做原始感知捕获，沿用上次 VLM 场景结果，
-        使短期记忆队列时刻保持最新；完整 VLM 仍在 ``step`` 里 1Hz 跑。
+        CARLA 闭环在控制阶段每周期做数次原始感知捕获，沿用上次 VLM 场景结果，
+        使短期记忆队列时刻保持最新；完整 VLM 仍在 ``step`` 里按 replan_interval_s 跑。
+        memory_off 模式下不写入短期记忆，保持对照基线纯净（与 retriever 的
+        use_short_term=False 一致）。
         """
+        if not self.loop.use_memory:
+            return
         self.loop.short_term.add(item)
 
     def close(self) -> None:

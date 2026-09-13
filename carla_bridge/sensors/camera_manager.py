@@ -118,11 +118,11 @@ class CameraManager:
             self._save_image(image, path)
             image_paths.append(path)
         if missing:
-            # 聚合为单次 warning，避免 6 相机各自刷屏
+            # 缺失相机已在 image_paths 对应位置占位 ""，build_surround_mosaic 会以深灰
+            # "missing" 缺图格处理，无需（也不应）在此额外落盘。旧实现复用循环变量
+            # name/image，会把最后一张图重复保存到错误路径，且最后一台相机缺帧时会对
+            # None 调用 _save_image 抛异常。聚合为单次 warning 即可。
             logger.warning("相机取图超时（%d/%d 缺帧）: %s", len(missing), len(names), missing)
-            path = str(self.image_dir / f"{sample_token}_{name}.jpg")
-            self._save_image(image, path)
-            image_paths.append(path)
 
         mosaic_path = str(self.mosaic_dir / f"{sample_token}.jpg")
         build_surround_mosaic(

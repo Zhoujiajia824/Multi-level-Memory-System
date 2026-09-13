@@ -10,18 +10,9 @@
 dataset_name: "carla"
 version: "0.9.15"
 
-# ⚠️ bridge 侧 workaround（不改 src）：mid_term_memory.search 的 final_score 用
-# f"{key}_weight"（如 visual_score_weight）查权重，而 memory.yaml 的键名是
-# visual_weight —— 键名错位导致所有运行 final_score=0、检索排序退化。此处注入
-# 别名键（深合并共存），使加权求和真正生效。src 修复后可删除本块。
-mid_term:
-  weights:
-    visual_score_weight: 0.40
-    text_score_weight: 0.10
-    scene_score_weight: 0.20
-    weather_score_weight: 0.10
-    nav_score_weight: 0.10
-    state_score_weight: 0.10
+# ⚠️ 历史 workaround 已移除：src/vla_memory/memory/mid_term_memory.py 的检索权重键名
+# 错位（f"{key}_weight" 查 visual_score_weight，而 memory.yaml 定义 visual_weight）已修复，
+# 无需再注入视觉/文本/…的别名权重键。
 
 # CARLA 用独立的中期记忆库，避免与 nuScenes 的 outputs/memory_db 互相污染
 # （否则 auto_load_on_init 会把 nuScenes 记忆加载进 CARLA 运行）
@@ -50,7 +41,7 @@ carla:
   host: "127.0.0.1"
   port: 2000
   timeout_s: 30.0
-  python_api_dir: "D:/software/carla/WindowsNoEditor/PythonAPI/carla"  # agents 模块路径（A* GlobalRoutePlanner）
+  python_api_dir: "D:/software/carla/WindowsNoEditor/PythonAPI/carla"  # 兼容保留；自实现 A*（route_planner.py）后不再使用 agents.GlobalRoutePlanner，可删除
   # ---- 同步模式 ----
   synchronous: true
   fixed_delta_seconds: 0.1       # 10 Hz（20Hz 在 Town05 大图物理算不完易触发 UE4 fatal，降为 10Hz 稳定）
@@ -71,7 +62,7 @@ carla:
   route_injection:
     enabled: true
     num_points: 6              # 注入前方中心点数
-    step_m: 2.0                # 点间距（米），5×8=40m 覆盖 3s 规划域
+    step_m: 2.0                # 点间距（米）；num_points×step_m = 6×2 = 12m 覆盖前方规划域
   # ---- ego 车辆 ----
   ego:
     blueprint: "vehicle.tesla.model3"

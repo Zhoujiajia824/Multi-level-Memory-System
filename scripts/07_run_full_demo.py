@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
         "--version",
         type=str,
         default=None,
-        help="nuScenes 数据集版本（默认 v1.0-mini）",
+        help="nuScenes 数据集版本（默认 v1.0-trainval，见 config/data_nuscenes.yaml）",
     )
     parser.add_argument(
         "--max-scenes",

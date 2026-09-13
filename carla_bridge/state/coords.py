@@ -9,9 +9,10 @@ CARLA(Unreal) 全局坐标系：x 前向、y 右向、z 上向，yaw 单位度�
 
 约定
 ----
-* CARLA yaw：0° = 朝 +x（前），**正方向逆时针（向左）**。若 P1 实测发现左右
-  镜像（CARLA 在该版本是顺时针为正），把模块常量 ``YAW_SIGN`` 改成 -1 即可，
-  无需改其它代码。
+* CARLA 0.9.15 实测 yaw：0° = 朝 +x（前），**正方向顺时针（向右，+y=右）**，与
+  nuScenes / 标准数学约定（逆时针=左）相反。该手性已被测试钉死
+  （test_trajectory_tracker_sign / test_route_planner_nav / test_walker_geometry），
+  勿再按"逆时针"理解。若后续 CARLA 版本手性改变，改 ``YAW_SIGN`` 即可。
 * ego-centric：x 前向、y 左向（与 ``src/vla_memory`` 完全一致）。
 * 所有角度在项目内部一律用弧度；只在进出 CARLA API 时用度。
 """
@@ -20,8 +21,9 @@ from __future__ import annotations
 import math
 from typing import Tuple
 
-# CARLA yaw 正方向：+1 = 逆时针(向左)为正（标准数学约定，多数 CARLA 版本如此）。
-# 实测若左右镜像，改成 -1。**全项目唯一的手性开关**。
+# CARLA 0.9.15 实测 yaw 正方向：+yaw = 顺时针（向右）。YAW_SIGN 为全项目唯一手性
+# 开关；本版本实测手性=顺时针，与旧注释"逆时针"相反，已按实测修正。换 CARLA 版本
+# 若出现左右镜像，改成 -1 即可，无需改其它代码。
 YAW_SIGN: int = 1
 
 
