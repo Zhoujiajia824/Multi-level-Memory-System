@@ -26,8 +26,8 @@
 | **CAN bus 真值自车状态** | 优先用 nuScenes `pose.json` + `vehicle_monitor.json`（含 yaw_rate / steering / throttle / brake），失败回退到 ego_pose 差分 |
 | **结构化场景理解** | VLM 输出 lanes / vehicles / pedestrians / traffic_lights / intersections 等独立列表，不再是混合 JSON |
 | **多图决策上下文** | 决策 VLM 收到当前帧 + N-1 张历史图（默认 3 张可配） |
-| **六视角环视拼接** | 可选 `surround_mosaic` 模式：6 相机拼成 2×3 单张图替代前视图，进入 VLM/特征/记忆全流程（向后兼容 `single_front`） |
-| **Oracle 感知对象** | 可选注入 nuScenes GT 标注投影的 `perception_objects`（检测框/语义/速度/加速度），明确标注为 oracle 真值（非模型预测，研究/评测用） |
+| **六视角环视拼接** | **默认** `surround_mosaic` 模式：6 相机拼成 2×3 单张图替代前视图，进入 VLM/特征/记忆全流程（可切 `single_front` 向后兼容） |
+| **Oracle 感知对象** | 注入 nuScenes GT 标注投影的 `perception_objects`（检测框/语义/速度/加速度），**默认开启**（`oracle_objects: true`），明确标注为 oracle 真值（非模型预测，研究/评测用） |
 | **完整提示词模板化** | 所有 VLM 提示词集中在 `config/prompts.yaml`，改提示词无需改 Python |
 | **中断恢复** | jsonl append + fsync；重启时扫已写记录自动跳过；中期记忆可选磁盘持久化跨次累积 |
 | **智驾标准评测** | ADE / FDE / **L2@1s/2s/3s** / 轨迹有效率 / 行为准确率 |
@@ -38,7 +38,7 @@
 | 维度 | 第一版 | 后续规划 |
 |---|---|---|
 | 数据集 | nuScenes v1.0-mini / v1.0-trainval | CARLA、自录数据 |
-| 摄像头 | 默认 CAM_FRONT，可选六视角环视拼接（surround_mosaic） | 真 BEV / 特征级多摄像头融合 |
+| 摄像头 | 默认六视角环视拼接（surround_mosaic，6 相机 2×3），可切单前视 single_front / CAM_FRONT | 真 BEV / 特征级多摄像头融合 |
 | 图像特征 | DINOv2-base (768 维) | 支持其他 backbone |
 | VLM | OpenAI 兼容 API（Qwen-VL 默认） | 本地模型 / 更多 provider |
 | 向量检索 | FAISS-CPU IndexFlatIP | IndexIVF / HNSW；GPU FAISS |
@@ -340,7 +340,7 @@ mid_term:
 --mode {memory_on,memory_off}   ← 必填
 --config CONFIG                 配置文件路径（可选）
 --dataroot DATAROOT             覆盖 config 的 dataroot
---version VERSION               覆盖 nuScenes 版本（默认 v1.0-mini）
+--version VERSION               覆盖 nuScenes 版本（默认 v1.0-trainval，见 config/data_nuscenes.yaml）
 --max-scenes MAX_SCENES         调试用，最多处理几个场景
 --max-frames MAX_FRAMES         调试用，每场景最多几帧
 --output OUTPUT                 决策 jsonl 输出路径
@@ -454,8 +454,8 @@ python scripts/06_run_evaluation.py --max-frames 10 --compare \
 
 | 模式 | `perception.mode` | 主感知图像 | 说明 |
 |---|---|---|---|
-| **单前视**（默认，向后兼容） | `single_front` | 单张 CAM_FRONT 图 | 原有行为 |
-| **六视角环视拼接** | `surround_mosaic` | 6 相机拼成的 2×3 surround-view mosaic | 替代前视图进入 VLM 场景理解/决策/DINOv2/记忆全流程 |
+| **六视角环视拼接**（默认） | `surround_mosaic` | 6 相机拼成的 2×3 surround-view mosaic | 替代前视图进入 VLM 场景理解/决策/DINOv2/记忆全流程 |
+| **单前视**（向后兼容） | `single_front` | 单张 CAM_FRONT 图 | 原有行为 |
 
 **2×3 布局**（每个子图左上角标注相机名，便于 VLM 识别视角）：
 
@@ -464,7 +464,7 @@ python scripts/06_run_evaluation.py --max-frames 10 --compare \
 下排：CAM_BACK_LEFT  | CAM_BACK  | CAM_BACK_RIGHT
 ```
 
-**Oracle 感知对象**（`perception.oracle_objects: true` 时开启）：基于 nuScenes **GT 标注
+**Oracle 感知对象**（默认 `perception.oracle_objects: true` 已开启）：基于 nuScenes **GT 标注
 （`sample_annotation`）投影**到 6 相机，为每帧生成结构化 `perception_objects`（检测框/类别/
 位置/速度/加速度），喂给决策 VLM 并写入 jsonl。⚠️ 这些是 **nuScenes 真值标注投影**，
 **不是检测模型预测**——用于研究/评测下为决策提供准确感知先验，每个对象 `is_oracle=true`。
@@ -472,7 +472,7 @@ python scripts/06_run_evaluation.py --max-frames 10 --compare \
 
 运行（**务必用 `--output` 指定独立 jsonl，避免覆盖 `default` 基线**）：
 ```bash
-# 六视角环视 + oracle（先在 config 设 perception.mode=surround_mosaic, oracle_objects=true）
+# 六视角环视 + oracle（默认已开启：perception.mode=surround_mosaic, oracle_objects=true）
 python scripts/07_run_full_demo.py --mode memory_on --max-scenes 1 --max-frames 1 \
   --output outputs/decisions_memory_on_mosaic_test.jsonl
 ```
@@ -593,11 +593,7 @@ vla_memory_demo/
 │       ├── dynamics_planner.py         # 轨迹 → 控制量（CARLA 闭环预留）
 │       └── trajectory_sampler.py       # 多模态轨迹选择（扩散/AR 预留）
 │
-├── tests/                              # 28 个测试模块（pytest）
-│   ├── test_can_bus_loader.py
-│   ├── test_phase_refactor_online_loop.py
-│   ├── test_phase{2,4,5,6,7}_*.py
-│   └── ... (其他模块单元测试)
+├── tests/                              # （暂无单元测试：根级 tests/ 已随重构移除）
 │
 ├── docs/                               # 详细设计文档
 │   ├── architecture.md                 # 完整架构 + 时序图
@@ -1613,7 +1609,7 @@ parser.add_argument(
 
 #### Step 6：写 fixture 和单元测试
 
-参照 [`tests/test_nuscenes_adapter.py`](tests/test_nuscenes_adapter.py) 写
+参照 `NuScenesAdapter` 的接口约定写
 `tests/test_carla_adapter.py`：
 
 * 用 `pytest.mark.skipif(not _carla_available(), reason="CARLA 未安装")` 保护集成测试

@@ -3,7 +3,7 @@ nuScenes 数据集适配器
 =====================
 实现 BaseDrivingDataset 接口，封装 nuscenes-devkit 的数据访问。
 提供场景遍历、帧迭代、图像路径获取、位姿查询、轨迹构建等功能。
-第一版使用 v1.0-mini，默认 CAM_FRONT。
+第一版默认 v1.0-trainval（config 可切 v1.0-mini），感知模式 surround_mosaic（config 可切 single_front）。
 
 数据集路径不存在时必须 hard fail，输出中文说明，不允许使用假数据。
 """

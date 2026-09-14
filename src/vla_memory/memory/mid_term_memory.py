@@ -213,7 +213,13 @@ class MidTermMemory:
             sub_scores["weather_score"] = 1.0 if weather_id and record.weather_id == weather_id else 0.0
             sub_scores["nav_score"] = 1.0 if nav_instruction and record.nav_instruction == nav_instruction else 0.0
             sub_scores["state_score"] = self._compute_state_similarity(ego_state, record.ego_state)
-            final_score = sum(self.weights.get(f"{key}_weight", 0.0) * s for key, s in sub_scores.items())
+            # 权重键：sub_scores 的 key 形如 visual_score，而 memory.yaml 的 mid_term.weights
+            # 定义的是 visual_weight（无 _score 后缀）。旧实现 f"{key}_weight" 会查
+            # visual_score_weight 等错位键名 → 权重全 0、final_score 恒 0。用 removesuffix 修正。
+            final_score = sum(
+                self.weights.get(f"{key.removesuffix('_score')}_weight", 0.0) * s
+                for key, s in sub_scores.items()
+            )
 
             mvs = getattr(record, "memory_value_score", None)
             candidates.append({

@@ -12,7 +12,7 @@
       决策 VLM(图像+历史+记忆) -> parse -> 更新短期/中期记忆 -> append jsonl
 
 前置条件：
-  - nuScenes v1.0-mini 数据集已放置到 data/nuscenes/raw/
+  - nuScenes 数据集已放置到 data/nuscenes/raw/（默认 v1.0-trainval）
   - DINOv2 模型权重已下载（运行 00_prepare_models.py）
   - VLM API Key 已设置（DASHSCOPE_API_KEY 环境变量）
   - FAISS 已安装（pip install faiss-cpu==1.9.0）
@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
         "--version",
         type=str,
         default=None,
-        help="nuScenes 数据集版本（默认 v1.0-mini）",
+        help="nuScenes 数据集版本（默认 v1.0-trainval，见 config/data_nuscenes.yaml）",
     )
     parser.add_argument(
         "--max-scenes",
