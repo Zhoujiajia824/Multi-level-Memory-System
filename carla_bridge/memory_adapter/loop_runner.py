@@ -55,7 +55,7 @@ class LoopRunner:
         memory_off 模式下不写入短期记忆，保持对照基线纯净（与 retriever 的
         use_short_term=False 一致）。
         """
-        if not self.loop.use_memory:
+        if not self.loop.use_short_term:
             return
         self.loop.short_term.add(item)
 

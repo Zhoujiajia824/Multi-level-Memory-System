@@ -10,26 +10,52 @@
 
 ---
 
-## 🚗 CARLA 闭环集成（v1.0 新增）
+## 🚗 CARLA 闭环集成（carla-integration 分支）
 
-在离线 nuScenes 记忆系统之上，新增 **CARLA 0.9.15 闭环驾驶**集成（`carla_bridge/`，
-**不改 `src/vla_memory/` 一行**）：用 CARLA 实时感知（六视角图像 / GT 障碍物 / 天气 / 导航）替代
-离线 nuScenes，决策轨迹实时回控 CARLA，实现自定义环境下的闭环驾驶，并支持驾驶视频录制回看。
+本分支将 **CARLA 0.9.15** 接入多层记忆系统：六视角相机、GT 感知、自车状态和导航
+经 `KeyframeBuilder` 喂入 `OnlineDrivingLoop`，决策轨迹由 Pure Pursuit + PID 回控。
+默认 10 Hz 控制、约 3 秒仿真时间重规划一次，VLM 推理期间同步仿真暂停。
 
-- **3s 周期全量认知** + **每周期 5 次 raw 捕获**（短期记忆时刻最新）+ **10Hz Pure Pursuit/PID 回控**
-- **同步模式**：VLM 思考期间 CARLA 冻结，wall-clock 慢但 sim 时间连续正确
-- **自定义场景**：地图 / 天气 / 交通流 / 车辆 / 路由，全 Python API
-- **驾驶视频录制**：跳过 VLM 冻结期，视频时长 = 仿真实际驾驶时间
-- 独立环境 `mulmem_carla`(Python 3.9)，与 nuScenes 的 `mulmem`(3.12) 互不干扰
+本次更新包括：
 
-> 完整框架 / 模块介绍 / 操作指令 / 故障排查见 **[carla_bridge/README.md](carla_bridge/README.md)**。
+- 补齐并纳入版本管理的 `carla_bridge/env/`：连接、场景、路由、交通流和长尾事件。
+- 修正横向控制曲率、前瞻点选择及轨迹耗尽制动；六路相机按帧号同步，缺帧制动。
+- 每轮独立输出、唯一帧 ID、异常清理和运行状态记录。
+- 记忆库可持续积累、按路径选择、只读检索或复制为独立实验库；短期记忆单独控制。
+- 本地 **69 项测试通过**，覆盖控制、路由、读写权限、产物隔离和部分初始化失败。
+  **真实 CARLA 闭环效果仍待服务器验证**，单元测试通过不代表驾驶效果已通过验收。
 
-快速跑闭环（先手动启动 CARLA 服务器 `CarlaUE4.exe`）：
+服务器更新（在仓库根目录执行，已有本地修改时先妥善保留）：
+
 ```bash
+git fetch origin
+git switch carla-integration
+git pull --ff-only origin carla-integration
 conda activate mulmem_carla
-export DASHSCOPE_API_KEY=你的key    # Git Bash(MINGW64) 用 export，不是 set
-python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_on
+python -m pytest -q -p no:cacheprovider
 ```
+
+已有可用环境可直接复用；新环境见 [环境搭建](carla_bridge/README.md#5-环境搭建)。
+CARLA 使用 Python 3.9 环境，离线 nuScenes 的 Python 3.12 说明不适用于此入口。
+完整的服务器预检、短场景测试、结果位置和排查步骤见
+[服务器拉取与首轮验收](carla_bridge/README.md#服务器拉取与首轮验收)。
+
+先启动现有部署的 CARLA 0.9.15 服务，确认 `carla_bridge/config/carla.yaml` 的 host/port，
+并在当前终端设置 `config/api_models.yaml` 所指定的 API Key。以下为 Bash 示例：
+
+```bash
+export DASHSCOPE_API_KEY='你的key'
+# 连续积累：后续运行使用同一路径即可续用旧库
+python -m carla_bridge.run_carla_demo --scenario straight_traffic --memory-bank outputs/memory_banks/general
+# 只检索：库文件和命中统计保持不变；本轮短期记忆默认启用
+python -m carla_bridge.run_carla_demo --scenario straight_traffic --memory-bank outputs/memory_banks/general --memory-access read_only
+```
+
+省略 `--memory-bank` 时使用本轮独立空库；不会自动加载旧的 `outputs/memory_db_carla`。
+若要续用旧库，请明确指定该路径。每轮结果位于 `outputs/carla_runs/<run_id>/`，
+包含 `manifest.json`、决策、报告、视频和日志。可写库引用的图像与特征保存在库内 `assets/`。
+
+> 完整参数与使用方式见 **[carla_bridge/README.md](carla_bridge/README.md)**。
 
 > 下文 §1–§14 为**离线 nuScenes 记忆系统**的完整文档（v0.1，环境 `mulmem`/Python 3.12）。
 
@@ -56,7 +82,7 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
 | **完整提示词模板化** | 所有 VLM 提示词集中在 `config/prompts.yaml`，改提示词无需改 Python |
 | **中断恢复** | jsonl append + fsync；重启时扫已写记录自动跳过；中期记忆可选磁盘持久化跨次累积 |
 | **智驾标准评测** | ADE / FDE / **L2@1s/2s/3s** / 轨迹有效率 / 行为准确率 |
-| **CARLA 闭环驾驶** | `carla_bridge/` 接入 CARLA 0.9.15：3s 认知 + 10Hz 回控 + raw 捕获 + 驾驶视频录制，自定义场景闭环（v1.0，不改 src/） |
+| **CARLA 闭环驾驶** | `carla_bridge/` 接入 CARLA 0.9.15：3s 认知 + 10Hz 回控 + raw 捕获 + 驾驶视频录制，自定义场景闭环（carla-integration 分支） |
 | **预留接口** | `DynamicsPlanner`（轨迹→控制量，给 CARLA 闭环）+ `TrajectorySampler`（多模态轨迹选择，给扩散/AR 模型） |
 
 ### 1.2 第一版边界
@@ -621,11 +647,12 @@ vla_memory_demo/
 │       ├── dynamics_planner.py         # 轨迹 → 控制量（CARLA 闭环预留）
 │       └── trajectory_sampler.py       # 多模态轨迹选择（扩散/AR 预留）
 │
-├── carla_bridge/                       # 【v1.0 新增】CARLA 0.9.15 闭环集成（不改 src/）
+├── carla_bridge/                       # 【v1.0 新增】CARLA 0.9.15 闭环集成
 │   ├── README.md                       #   CARLA 集成完整文档（框架/模块/指令/排查）
 │   ├── setup_env.sh                    #   一键建 mulmem_carla(Python 3.9) 环境
 │   ├── closed_loop.py                  #   主驱动：3s 认知 + 10Hz 回控 + raw 捕获 + 视频
 │   ├── run_carla_demo.py               #   入口（python -m carla_bridge.run_carla_demo）
+│   ├── run_session.py                  #   运行隔离、记忆库选择和进程锁
 │   ├── config/{carla.yaml, scenarios/} #   连接/相机/控制器/视频 + 场景 YAML
 │   ├── env/                            #   连接+同步+场景(ego/交通流/天气/路由)+spectator
 │   ├── sensors/                        #   6 相机 mosaic + GT 感知对象
@@ -635,11 +662,11 @@ vla_memory_demo/
 │   ├── metrics/                        #   碰撞/违规/路线/舒适度 + 报告
 │   └── video/                          #   驾驶视频录制（跳过 VLM 冻结期）
 │
-├── tests/                              # pytest：仅 carla_bridge/tests/（8 个模块）
+├── tests/                              # pytest：仅 carla_bridge/tests/（9 个模块）
 │   ├── （根级 src 单元测试已随 v1.0 批处理瀑布重构删除）
 │   └── 当前唯一保留：carla_bridge/tests/ 下 coords / pure_pursuit / pid /
 │       history_buffer / trajectory_tracker_sign / route_planner_nav /
-│       walker_geometry / route_injection（坐标/控制/路由；前 4 个纯逻辑、后 4 个需 carla 包）
+│       walker_geometry / route_injection / run_safety（控制、路由、记忆权限、运行隔离和清理）
 │
 ├── docs/                               # 详细设计文档
 │   ├── architecture.md                 # 完整架构 + 时序图
@@ -1368,7 +1395,7 @@ A: 编辑 `config/prompts.yaml`，所有提示词在此集中。详见 [docs/pro
 A: P6 已修复（默认 nav_to_behavior_map 自动注入 + 大小写归一化）。若仍为 0%，检查 jsonl 中 `behavior` 字段是否非空。
 
 **Q: 怎么接入 CARLA 闭环？**
-A: 已实现（v1.0），见 `carla_bridge/`（[carla_bridge/README.md](carla_bridge/README.md)）。`python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_on` 即可。记忆系统零改动，CARLA 数据经 `KeyframeBuilder` 喂 `OnlineDrivingLoop.step()`，决策轨迹由 Pure Pursuit+PID 回控。`src/vla_memory/planning/dynamics_planner.py` 的 `DynamicsPlanner` 仍是预留 stub（CARLA 控制器在 `carla_bridge/control/` 独立实现，不依赖它）。
+A: 已实现（v1.0），见 `carla_bridge/`（[carla_bridge/README.md](carla_bridge/README.md)）。`python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_on` 即可。记忆管线支持独立读写权限，CARLA 数据经 `KeyframeBuilder` 喂 `OnlineDrivingLoop.step()`，决策轨迹由 Pure Pursuit+PID 回控。`src/vla_memory/planning/dynamics_planner.py` 的 `DynamicsPlanner` 仍是预留 stub（CARLA 控制器在 `carla_bridge/control/` 独立实现，不依赖它）。
 
 **Q: FAISS 装不上怎么办？**
 A: 见 §3.4 故障排查表，**固定 `faiss-cpu==1.9.0`**，不要装 1.14.x。

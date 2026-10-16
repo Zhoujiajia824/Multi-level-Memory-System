@@ -1,10 +1,152 @@
 # CARLA 闭环集成（carla_bridge）
 
-把多层次记忆系统（`src/vla_memory`，**不改一行**）接入 CARLA 0.9.15：用 CARLA 实时
+把多层次记忆系统（`src/vla_memory`）接入 CARLA 0.9.15：用 CARLA 实时
 感知（六视角图像 / GT 障碍物 / 天气 / 导航 / 自车状态）替代离线 nuScenes，决策轨迹
 实时回控 CARLA，实现**自定义环境下的闭环驾驶**，并支持驾驶视频录制回看。
 
 > ⚠️ 研究用离线/仿真 Demo，**不可用于实车**。
+
+
+## 服务器拉取与首轮验收
+
+以下命令在服务器的**仓库根目录**执行。此分支包含之前漏入库的 `carla_bridge/env/`，
+新机器拉取后无需再手工补目录。若服务器已有同名未跟踪文件或本地配置修改，先备份或保存，
+不要使用强制覆盖命令。Git 检查到冲突时会停止更新。
+
+```bash
+git fetch origin
+git switch carla-integration
+git pull --ff-only origin carla-integration
+git status --short --branch
+git log -1 --oneline
+conda activate mulmem_carla
+```
+
+**先检查环境，不连接仿真器或调用 API：**
+
+```bash
+python -c "import sys, carla, faiss, torch, pydantic; from carla_bridge.closed_loop import ClosedLoop; print('Python:', sys.version); print('CUDA:', torch.cuda.is_available()); print('IMPORT_OK')"
+python -m carla_bridge.run_carla_demo --help
+python -m pytest -q -p no:cacheprovider
+```
+
+本次本地验证为 **69 passed**（Windows / Python 3.9 / `mulmem_carla`）。
+测试使用本地 CARLA Python 绑定和 FAISS，不启动 CARLA、不下载模型、不调用 VLM。
+已有 Pydantic 兼容性警告不等同测试失败。服务器需单独执行以上检查。
+使用已有环境时不必重新运行创建环境脚本；新环境见下文第 5 节。
+
+**再检查运行配置：**
+
+- 按服务器原有方式启动 CARLA 0.9.15，确认场景使用的 Town04 / Town01 地图可加载。
+  `carla_bridge/config/carla.yaml` 默认连接 `127.0.0.1:2000`，异机部署需修改 host。
+- 保持 `synchronous: true`。同一个 CARLA world 同时只运行一个闭环驱动客户端。
+- 检查 `config/api_models.yaml` 的服务地址、模型名、`api_key_env`，在运行终端设置对应密钥。
+  默认 `DASHSCOPE_API_KEY`：Bash 用 `export DASHSCOPE_API_KEY='你的key'`，
+  PowerShell 用 `$env:DASHSCOPE_API_KEY='你的key'`。
+- DINOv2 模型需已缓存或能下载；`CUDA: False` 不代表导入失败，但推理性能需另行评估。
+- 当前视频默认开启；显存不足时在 `carla.video` 中关闭视频或降低分辨率。
+
+**先做 10 秒仿真冒烟，再跑完整场景。** 为避免修改版本管理中的场景文件，
+以下 Bash 命令在忽略的 outputs 目录创建测试场景（Windows 可按同样内容手工复制修改）：
+
+```bash
+python - <<'PY'
+from pathlib import Path
+import yaml
+source = Path('carla_bridge/config/scenarios/straight_traffic.yaml')
+cfg = yaml.safe_load(source.read_text(encoding='utf-8'))
+cfg['scenario_name'] = 'smoke_straight'
+cfg['duration_s'] = 10
+out = Path('outputs/scenarios/smoke_straight.yaml')
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding='utf-8')
+PY
+python -m carla_bridge.run_carla_demo --scenario outputs/scenarios/smoke_straight.yaml --mode memory_off
+```
+
+冒烟通过后依次测试：
+
+```bash
+# 直行：指定库积累经验；重复此命令继续积累
+python -m carla_bridge.run_carla_demo --scenario straight_traffic --memory-bank outputs/memory_banks/server_straight
+# 同库只读：验证能检索且不修改库
+python -m carla_bridge.run_carla_demo --scenario straight_traffic --memory-bank outputs/memory_banks/server_straight --memory-access read_only
+# 转弯：独立场景库，重点观察左右转与轨迹末端制动
+python -m carla_bridge.run_carla_demo --scenario intersection_turn --memory-bank outputs/memory_banks/server_intersection
+```
+
+每轮记录新增的 `<run_id>`，按以下项目检查：
+
+| 检查项 | 文件或观察点 |
+|---|---|
+| 是否正常结束 | `manifest.json` 的 `status`；`completed` 表示运行到时长上限，不代表路线成功或零碰撞 |
+| 图像同步 | 决策 JSONL 中的 `carla_frame_id` / `sim_time_s`；报告中的 `capture_failures` |
+| 记忆是否参与 | 决策 JSONL 的 `retrieved_memory_ids`、`memory_retrieval_enabled`、`memory_write_enabled` |
+| 驾驶效果 | 报告的路线完成度、碰撞次数；视频中的左右转、回正和制动行为 |
+| 异常定位 | 运行目录的 `logs/`，连同服务器 CARLA 日志一起保留 |
+| 多轮隔离 | 两次运行目录不同；明确指定的共享库路径保持一致 |
+
+记忆准入有价值门控，短时或普通直行场景可能没有记录入库；不能仅凭库为空判定写入失败。
+报告中的闯红灯等指标采用启发式判定，回归评估时应结合视频。
+如出现问题，保留对应运行目录、场景配置及 CARLA 日志；**无需分享 API Key**。
+
+### 运行状态与定位
+
+| 状态 / 报错 | 处理方式 |
+|---|---|
+| `sensor_failure` | 连续采集失败；检查相机日志、渲染负载与是否存在其他 tick 客户端，再评估 `capture_timeout_s`，不要通过额外 tick 绕过同步 |
+| `stuck` | 低速且路线无进展触发提前终止；结合决策、交通灯与轨迹判断，合法长时间等待也可能触发 |
+| `memory_save_failed` | 检查库的写权限、磁盘空间和保存日志；本轮结果不能视为已成功积累 |
+| `failed` / `interrupted` | 运行异常或主动中断；查看 manifest 的 `error_type` 与日志，清理会自动执行 |
+| 库正在被其他运行使用 | 等当前使用者退出；不要删除活动锁文件强行并发 |
+| ID 重复、维度不符、资料缺失 | 保留原库，先使用新库验证；不要覆盖旧库来消除错误 |
+
+## 运行隔离与记忆库选择（当前入口行为）
+
+在仓库根目录、`mulmem_carla` 环境运行。每次生成独立的
+`outputs/carla_runs/<run_id>/`，包含 manifest、决策、报告、视频和日志。
+manifest 记录实际配置、场景、代码提交号、工作区修改状态、记忆库来源和结束状态。
+`run_id` 是短 UUID，帧编号包含它，重复运行同一场景不会覆盖产物。
+
+```powershell
+# 独立实验：本轮从空库开始，也在本轮持续学习
+python -m carla_bridge.run_carla_demo --scenario straight_traffic
+
+# 连续积累：多次运行都指定同一个库，加载历史并继续更新
+python -m carla_bridge.run_carla_demo --scenario straight_traffic --memory-bank outputs/memory_banks/general
+
+# 指定场景库：库的选择由参数明确指定，与场景文件名不自动绑定
+python -m carla_bridge.run_carla_demo --scenario intersection_turn --memory-bank outputs/memory_banks/intersection
+
+# 只检索已有库：不会新增、更新、淘汰或写回检索统计
+python -m carla_bridge.run_carla_demo --scenario intersection_turn --memory-bank outputs/memory_banks/intersection --memory-access read_only
+
+# 从历史库复制一个独立实验库（目标必须不存在；省略目标则使用本轮库）
+python -m carla_bridge.run_carla_demo --scenario intersection_turn --memory-seed outputs/memory_banks/intersection --memory-bank outputs/memory_banks/experiment_a
+
+# 无记忆对照：不读取、不写入库，也不使用短期记忆
+python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_off
+```
+
+- `--no-short-term`：关闭本轮短期记忆；默认只读模式仍维护本轮短期上下文。
+- `--no-memory-retrieval`：关闭中长期检索，但保留按写入策略积累记忆的能力；
+  续写仍会加载旧库以保留历史记录。固定长期规则仍由原有 `long_term` 配置管理。
+- 相对库路径以仓库根目录解析。未指定库时使用本轮 `memory_db/`，不会隐式使用旧的
+  `outputs/memory_db_carla`；需要续用旧库时明确传入该路径。
+- 可写库将本轮图像与特征保存到库内 `assets/`；只读/对照模式保存到运行目录。
+  清理日志时保留记忆库及其 assets。旧版库已有的外部资料引用需继续保留；
+  `--memory-seed` 会将有效的外部资料一起复制入新库，缺失资料则明确报错。
+- 同一库的访问由进程锁串行保护（只读运行也持锁，避免读到保存一半的索引）。
+  退出或进程结束后锁自动释放；库旁的 `.lock` 文件保留，不要手动删除正在使用的锁文件。
+  该约定覆盖新版 CARLA 入口，不覆盖旧脚本或手工直接修改数据库。
+- `read_only` 必须指定已有库。损坏、重复 ID 或模型维度不匹配的库会报错，避免静默覆盖。
+- 图像按照 `tick()` 帧号同步，六路共享 `capture_timeout_s` 截止时间；缺帧则制动，
+  连续 `max_capture_failures` 次失败结束运行。记录同时包含绝对记忆时间戳与仿真秒数。
+- 控制器修正 Pure Pursuit 曲率，并按剩余轨迹选择前瞻点；无有效前向目标时制动。
+  初始化失败和中断均执行清理，结束状态写入 manifest；无需额外 tick 等待图像。
+
+验证：单元与模拟依赖回归测试无需启动 CARLA 或调用模型 API。
+真实 CARLA 的相机超时阈值、弯道横向偏差和转向参数仍应通过闭环场景验证。
 
 ---
 
@@ -12,12 +154,12 @@
 
 | 项 | 说明 |
 |---|---|
-| **记忆系统零改动** | 复用 `OnlineDrivingLoop`（setup/step/close），CARLA 数据经 `KeyframeBuilder` 组装成与 nuScenes 同构的 `kf` dict 喂入 |
+| **复用记忆管线** | 复用 `OnlineDrivingLoop`（setup/step/close），CARLA 数据经 `KeyframeBuilder` 组装成与 nuScenes 同构的 `kf` dict 喂入 |
 | **3s 全量认知** | 每 3s sim 做一次完整 DINOv2 + 场景VLM + 三层记忆检索 + 决策VLM（与 nuScenes keyframe 一致） |
 | **每周期 5 次 raw 捕获** | 控制阶段每周期 5 次（≈1.67Hz）捕获原始感知（图像+ego+障碍物，不跑 VLM）push 进短期记忆，队列时刻最新 |
 | **10Hz 回控** | Pure Pursuit(横向) + PID(纵向) 跟踪决策轨迹，同步模式 |
 | **同步模式** | VLM 思考期间 CARLA 冻结（不 tick），wall-clock 慢但 sim 时间连续正确 |
-| **驾驶视频录制** | 仅在 CARLA 推进 tick 取帧（跳过 VLM 冻结期），视频时长 = 仿真实际驾驶时间 |
+| **驾驶视频录制** | 仅在 CARLA 推进 tick 取帧（跳过 VLM 冻结期），按仿真帧率编码，丢帧时视频可能短于仿真时长 |
 | **CARLA 全优势** | 自定义地图/天气/交通流/车辆/路由，全 Python API |
 
 ---
@@ -31,7 +173,7 @@ CARLA server (CarlaUE4.exe, 端口2000, 手动启动, 同步模式)
 carla_bridge.closed_loop  ──每 3s sim──>  keyframe_builder
         │                                    │  组装 kf dict（与 nuScenes 同构）
         │                                    ▼
-        │                 src.vla_memory.pipeline.OnlineDrivingLoop.step(kf)  【不改】
+        │                 src.vla_memory.pipeline.OnlineDrivingLoop.step(kf)
         │                                    │  DINOv2 + 场景VLM + 三层记忆 + 决策VLM
         │                                    ▼  decision = {behavior, trajectory(ego-centric)}
         │  ◀──  trajectory  ────────────────
@@ -61,7 +203,8 @@ carla_bridge/
 ├── __init__.py
 ├── setup_env.sh                    # 一键建 mulmem_carla(3.9) 环境
 ├── closed_loop.py                  # 【主驱动】同步 tick + 3s 重规划 + raw 捕获 + 视频
-├── run_carla_demo.py               # 【入口】CLI -> ClosedLoop
+├── run_carla_demo.py               # 【入口】CLI -> RunSession -> ClosedLoop
+├── run_session.py                  # 产物隔离、记忆库选择、进程锁与 manifest
 │
 ├── config/
 │   ├── carla.yaml                  # 连接/同步/相机/ego/控制器/视频 配置
@@ -139,10 +282,10 @@ carla_bridge/
 
 ### 4.6 `metrics/` 评测
 - **`collector.py`**：碰撞（collision sensor）、闯红灯、逆行、超速、路线完成度、舒适度（jerk/加速度）逐 tick 采集。
-- **`run_reporter.py`**：写 Markdown + JSON 报告到 `outputs/carla_runs/`。
+- **`run_reporter.py`**：写 Markdown + JSON 报告到 `outputs/carla_runs/<run_id>/`。
 
 ### 4.7 `video/` 驾驶视频录制
-- **`recorder.py`**：挂一个 chase/front 相机到 ego，每个 CARLA 推进 tick 取一帧写视频（10fps）；VLM 冻结期不 tick 不取帧 -> **视频时长 = 仿真实际驾驶时间**；`flush()` 中断时保存。
+- **`recorder.py`**：挂一个 chase/front 相机到 ego，每个 CARLA 推进 tick 取一帧写视频（10fps）；VLM 冻结期不 tick 不取帧 -> **按仿真帧率编码，丢帧时视频可能短于仿真时长**；`flush()` 中断时保存。
 
 ### 4.8 主驱动与入口
 - **`closed_loop.py`**：`ClosedLoop` 类，编排上述全部模块；含 fail-fast（API key）、SSL_CERT_FILE 自动修复、异常捕获打印 traceback、spectator 跟随。
@@ -197,7 +340,7 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
 python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_on
 python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_off
 ```
-报告在 `outputs/carla_runs/`，对比碰撞率/路线完成度等量化记忆增益。
+报告在 `outputs/carla_runs/<run_id>/`，对比碰撞率/路线完成度等量化记忆增益。
 
 ### 6.4 驾驶视频录制
 在 [config/carla.yaml](config/carla.yaml) 的 `carla.video` 块设 `enabled: true`：
@@ -209,10 +352,10 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
     height: 720
     view: "chase"      # chase（后上方第三人称）| front（前视角）
 ```
-跑完（或 Ctrl+C）视频在 `outputs/carla_videos/drive_<场景>_<模式>.mp4`，时长 = 仿真实际驾驶时间（跳过 VLM 冻结期）。
+跑完（或 Ctrl+C）视频在 `outputs/carla_runs/<run_id>/carla_videos/drive_<场景>_<模式>.mp4`，按仿真帧率编码，丢帧时可能短于仿真时长（跳过 VLM 冻结期）。
 
 ### 6.5 首测建议
-3s 周期下 60s sim ≈ 20 次 VLM（每次 5-30s wall）。首测先把场景 YAML 的 `duration_s` 改成 `10`（约 2-3 分钟 wall），确认闭环通了再加长。
+60s 仿真约包含 20 个认知周期，每周期包含场景理解与决策两次 VLM 调用，实际墙钟耗时取决于模型和服务。首测使用本文开头的独立 10s 场景，确认闭环通路后再加长。
 
 ---
 
@@ -225,13 +368,15 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
 | `carla.synchronous`/`fixed_delta_seconds` | true/0.1 | 同步模式 + 10Hz |
 | `carla.replan_interval_s` | 3.0 | 3s 全量捕获（= decision.trajectory.horizon_seconds） |
 | `carla.max_duration_s` | 60.0 | 单场景最长 sim 时间 |
+| `carla.capture_timeout_s` | 2.0 | 六路相机共享等待上限（墙钟秒） |
+| `carla.max_capture_failures` | 3 | 连续缺帧达到阈值时结束运行 |
 | `carla.cameras` | 6 相机 | 640×360，2×3 布局（P1 可调 transform） |
 | `carla.controller` | — | wheelbase/max_steer/lookahead/PID 增益/`steer_sign` |
-| `carla.video` | enabled:false | 视频录制开关与参数 |
-| `memory_db_dir` | outputs/memory_db_carla | CARLA 独立中期记忆库（不污染 nuScenes） |
+| `carla.video` | enabled:true | 视频录制开关与参数 |
+| `--memory-bank` | 本轮 memory_db/ | 指定需要复用的中期记忆库 |
 | `perception.mode` | surround_mosaic | 固定六视角环视 |
 
-> carla.yaml 由入口 `load_config(overrides=...)` 深合并进主配置，**不改 `src/` 与现有 `config/`**。
+> carla.yaml 由入口 `load_config(overrides=...)` 深合并进主配置，由 RunSession 进一步设置运行目录和记忆访问策略。
 
 ### 7.2 `config/scenarios/*.yaml`
 ```yaml
@@ -300,7 +445,7 @@ CARLA 全局：x 前、y 右、z 上。项目 ego-centric：x 前、**y 左**。
 | 闯红灯 / 逆行 / 超速 | 近红灯仍前进 / 与车道反向 / 超限速 |
 | 最大速度 / 加速度 / jerk | 舒适度 |
 
-报告：`outputs/carla_runs/carla_run_<场景>_<模式>.md` / `.json`。
+报告：`outputs/carla_runs/<run_id>/carla_run_<场景>_<模式>.md` / `.json`。
 
 ---
 
@@ -313,7 +458,7 @@ CARLA 全局：x 前、y 右、z 上。项目 ego-centric：x 前、**y 左**。
 | `time-out waiting for the simulator` | CARLA 服务器没启动/卡死。`taskkill //F //IM CarlaUE4.exe` 后重启，等加载完 |
 | 内存卡死 / CARLA 崩 | 6 相机已降到 640×360 + 控制阶段 `drain()` 防堆积；若仍崩，降 `carla.video` 分辨率或关视频 |
 | VLM 调用久无日志 | 正常（5-30s/次），期间 sim 冻结。**别 Ctrl+C**，等 `[SCENE_UNDERSTANDING] raw_response` 出现 |
-| 车倒着开 / 转向反 | 改 `state/coords.py` 的 `YAW_SIGN` 或 `carla.yaml` 的 `controller.steer_sign` 为 `-1` |
+| 转向异常 / 弯道偏离 | 当前默认 `steer_sign=-1` 已有回归测试；先核对轨迹、坐标和配置，保留视频，不要直接翻转符号掩盖问题 |
 | CARLA 窗口看不到车 | `set_spectator_follow` 每 tick 跟随；若没跟，确认 CARLA 已加载完且 ego 已生成 |
 
 ---
@@ -322,7 +467,7 @@ CARLA 全局：x 前、y 右、z 上。项目 ego-centric：x 前、**y 左**。
 
 - [x] P0 环境/骨架：`mulmem_carla`(3.9) 已建并验证（carla+faiss+torch+记忆系统导入 OK）；coords/carla_client/config
 - [x] P1 感知接入：6 相机 + ego 状态 + GT 感知 + 天气
-- [x] P2 记忆管线对接：keyframe_builder + loop_runner（复用 `OnlineDrivingLoop`，不改 src/）
+- [x] P2 记忆管线对接：keyframe_builder + loop_runner（复用 `OnlineDrivingLoop`）
 - [x] P3 闭环控制：轨迹转全局 + Pure Pursuit + PID + `closed_loop` 10Hz 跟踪
 - [x] P4 场景系统：YAML + Python 场景类 + 交通流 + 天气 + 路由 + nav 派生
 - [x] P5 评测：碰撞/违规/路线/舒适度 + 报告（已接入 `closed_loop`）
@@ -332,4 +477,5 @@ CARLA 全局：x 前、y 右、z 上。项目 ego-centric：x 前、**y 左**。
 - [x] fail-fast API key + SSL_CERT_FILE 自动修复 + 异常 traceback 打印
 - [x] 导入冒烟测试通过（carla_bridge + src 全部导入 OK，坐标数学往返一致）
 - [x] 长尾事件系统：EventScheduler + scripted 车(NOA+ACC) + 行人(过马路/路边) + 障碍物 + 信号灯控制
+- [x] 修复回归：69 项本地测试通过（包含库读写、隔离、帧同步与异常清理）
 - [ ] P6 运行验证：启动 CARLA + 设 key 后跑 memory_on/off 闭环对比，调控制器/坐标手性

@@ -69,6 +69,8 @@ class VideoRecorder:
         self._writer = cv2.VideoWriter(
             self.output_path, fourcc, self.fps, (self.width, self.height)
         )
+        if not self._writer.isOpened():
+            raise RuntimeError(f"无法打开视频输出: {self.output_path}")
         logger.info(
             "视频录制开始: %s (%dx%d @ %dfps, view=%s)",
             self.output_path, self.width, self.height, self.fps, self.view,

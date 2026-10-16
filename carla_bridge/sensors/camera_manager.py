@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import queue
+import time
 from pathlib import Path
 from typing import Dict, List
 
@@ -44,6 +45,7 @@ class CameraManager:
         mosaic_cell_w: int = 480,
         mosaic_cell_h: int = 270,
         label_subimages: bool = True,
+        capture_timeout_s: float = 2.0,
     ):
         self.world = world
         self.ego = ego_vehicle
@@ -58,6 +60,8 @@ class CameraManager:
         self._sensors: Dict[str, carla.Sensor] = {}
         self._queues: Dict[str, "queue.Queue"] = {}
         self._installed = False
+        self.capture_timeout_s = capture_timeout_s
+        self.last_frame_id = None
 
     def install(self) -> None:
         """生成 6 个相机 actor 挂到 ego，每个绑定独立 queue。"""
@@ -78,9 +82,9 @@ class CameraManager:
             )
             sensor = self.world.spawn_actor(bp, tf, attach_to=self.ego)
             q: "queue.Queue" = queue.Queue()
-            sensor.listen(q.put)
             self._sensors[name] = sensor
             self._queues[name] = q
+            sensor.listen(q.put)
         self._installed = True
         logger.info("6 相机已挂载: %s", list(self._sensors.keys()))
 
@@ -89,47 +93,43 @@ class CameraManager:
         for _ in range(n_frames):
             self.world.tick()
 
-    def capture(self, sample_token: str) -> str:
-        """从 6 路 queue 取图落盘 + 拼 mosaic，返回 mosaic 路径。
+    def capture(self, sample_token: str, frame_id: int) -> str:
+        """Wait for exactly one tick across all views, under a shared deadline.
 
-        须在 ``world.tick()`` 之后调用。``sample_token`` 用于命名文件。
+        Late/old images are discarded. No simulation tick is issued here.
+        A missing view fails the whole observation rather than producing a mixed mosaic.
         """
         assert self._installed, "先 install()"
         names = [c["name"] for c in self.cameras_cfg]
-        image_paths: List[str] = []
-        missing: List[str] = []
+        if len(names) != 6 or len(set(names)) != 6:
+            raise ValueError("闭环采集必须配置六路不同名称的相机")
+        deadline = time.monotonic() + self.capture_timeout_s
+        images = []
         for name in names:
-            q = self._queues[name]
-            # 排空旧帧（控制 tick 期间堆积的帧），取最新一帧；队列为空则等待
-            image = None
-            try:
-                while True:
-                    image = q.get_nowait()
-            except queue.Empty:
-                pass
-            if image is None:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"相机 {name} 未收到目标帧 {frame_id}")
                 try:
-                    image = q.get(timeout=0.5)
-                except Exception:
-                    missing.append(name)
-                    image_paths.append("")
+                    image = self._queues[name].get(timeout=remaining)
+                except queue.Empty as exc:
+                    raise TimeoutError(f"相机 {name} 未收到目标帧 {frame_id}") from exc
+                if image.frame < frame_id:
                     continue
+                if image.frame > frame_id:
+                    raise TimeoutError(f"相机 {name} 跳过目标帧 {frame_id}，收到 {image.frame}")
+                images.append(image)
+                break
+        paths = []
+        for name, image in zip(names, images):
             path = str(self.image_dir / f"{sample_token}_{name}.jpg")
             self._save_image(image, path)
-            image_paths.append(path)
-        if missing:
-            # 缺失相机已在 image_paths 对应位置占位 ""，build_surround_mosaic 会以深灰
-            # "missing" 缺图格处理，无需（也不应）在此额外落盘。旧实现复用循环变量
-            # name/image，会把最后一张图重复保存到错误路径，且最后一台相机缺帧时会对
-            # None 调用 _save_image 抛异常。聚合为单次 warning 即可。
-            logger.warning("相机取图超时（%d/%d 缺帧）: %s", len(missing), len(names), missing)
-
+            paths.append(path)
         mosaic_path = str(self.mosaic_dir / f"{sample_token}.jpg")
-        build_surround_mosaic(
-            image_paths, names,
-            cell_width=self.mosaic_cell_w, cell_height=self.mosaic_cell_h,
-            label_subimages=self.label_subimages, out_path=mosaic_path,
-        )
+        build_surround_mosaic(paths, names, cell_width=self.mosaic_cell_w,
+                              cell_height=self.mosaic_cell_h,
+                              label_subimages=self.label_subimages, out_path=mosaic_path)
+        self.last_frame_id = frame_id
         return mosaic_path
 
     def drain(self) -> None:
@@ -162,6 +162,9 @@ class CameraManager:
         for s in self._sensors.values():
             try:
                 s.stop()
+            except Exception:
+                pass
+            try:
                 s.destroy()
             except Exception:
                 pass

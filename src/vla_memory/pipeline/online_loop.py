@@ -92,6 +92,11 @@ class OnlineDrivingLoop:
         self.config = config
         self.mode = mode
         self.use_memory = (mode == "memory_on")
+        access = config.get("memory_access", {}) or {}
+        self.retrieve_memory = self.use_memory and bool(access.get("retrieve", True))
+        self.write_memory = self.use_memory and bool(access.get("write", True))
+        self.use_short_term = self.use_memory and bool(access.get("short_term", True))
+        self._closed = False
         self.output_jsonl_path = (
             Path(output_jsonl_path) if output_jsonl_path
             else default_output_path(config, mode)
@@ -187,7 +192,11 @@ class OnlineDrivingLoop:
         mt_weights = cfg.get_nested("mid_term", "weights", default={})
         feat_dim = cfg.get_nested("feature_extractor", "feature_dim", default=768)
         faiss_type = cfg.get_nested("mid_term", "faiss_index_type", default="IndexFlatIP")
-        mt_persist = cfg.get_nested("mid_term", "persistence", default={}) or {}
+        mt_persist = dict(cfg.get_nested("mid_term", "persistence", default={}) or {})
+        if not self.write_memory:
+            mt_persist["save_on_close"] = False
+        if not self.retrieve_memory and not self.write_memory:
+            mt_persist["auto_load_on_init"] = False
         mt_retrieval = cfg.get_nested("mid_term", "retrieval", default={}) or {}
         # Phase 5：把 event_memory 的检索偏好并入 retrieval_cfg（供 search 加成）
         _ev_cfg_early = cfg.get_nested("mid_term", "event_memory", default={}) or {}
@@ -205,6 +214,7 @@ class OnlineDrivingLoop:
             persistence_cfg=mt_persist,
             save_dir=str(save_dir),
             retrieval_cfg=mt_retrieval,
+            read_only=not self.write_memory,
         )
 
         lt_rules = cfg.get_nested(
@@ -298,7 +308,7 @@ class OnlineDrivingLoop:
             MemoryCompactionManager, MemoryEvictionManager,
         )
         capacity_cfg = cfg.get_nested("mid_term", "capacity", default={}) or {}
-        if capacity_cfg.get("enabled", True):
+        if self.write_memory and capacity_cfg.get("enabled", True):
             eviction_cfg = cfg.get_nested("mid_term", "eviction", default={}) or {}
             compaction_cfg = cfg.get_nested("mid_term", "compaction", default={}) or {}
             value_scorer = MemoryValueScorer(eviction_cfg)
@@ -317,14 +327,14 @@ class OnlineDrivingLoop:
         from src.vla_memory.memory.event_memory import EventMemoryManager
         event_cfg = cfg.get_nested("mid_term", "event_memory", default={}) or {}
         self._event_manager = EventMemoryManager(event_cfg)
-        self._event_memory_enabled = bool(event_cfg.get("enabled", True))
+        self._event_memory_enabled = self.write_memory and bool(event_cfg.get("enabled", True))
 
         # ---- 5.6 Phase 6 冲突感知更新（MemoryUpdateManager）----
         # enabled=false → 无冲突更新（阶段 5 行为）。详见 docs/stage6_update_design.md。
         from src.vla_memory.memory.update import MemoryUpdateManager
         update_cfg = cfg.get_nested("mid_term", "update", default={}) or {}
         self._update_manager = MemoryUpdateManager(update_cfg)
-        self._update_enabled = bool(update_cfg.get("enabled", True))
+        self._update_enabled = self.write_memory and bool(update_cfg.get("enabled", True))
 
         # ---- 6. resume 扫描 ----
         if self.resume:
@@ -427,9 +437,9 @@ class OnlineDrivingLoop:
             weather_id=weather_id,
             nav_instruction=kf.get("nav_instruction", ""),
             ego_state=kf.get("ego_state"),
-            use_short_term=self.use_memory,
-            use_mid_term=self.use_memory,
-            use_long_term=self.use_memory,
+            use_short_term=self.use_short_term,
+            use_mid_term=self.retrieve_memory,
+            use_long_term=self.retrieve_memory,
             now_ts=int(kf.get("timestamp", 0) or 0),  # Phase 3：更新检索命中统计
         )
 
@@ -468,7 +478,7 @@ class OnlineDrivingLoop:
 
         # ---- c) 组装 image_paths（短期窗口 + 当前帧） ----
         image_paths: List[str] = []
-        if self.use_memory and self._image_context_size > 0:
+        if self.use_short_term and self._image_context_size > 0:
             history_n = self._image_context_size - (
                 1 if self._include_current_frame else 0
             )
@@ -535,12 +545,12 @@ class OnlineDrivingLoop:
 
         # 运行门控
         admission_result = None
-        if self.use_memory and self._admission_enabled:
+        if self.write_memory and self._admission_enabled:
             admission_result = self._admission_controller.decide(
                 admission_ctx, self._prev_frame_ctx
             )
             mid_term_admit = admission_result.should_store
-        elif self.use_memory:
+        elif self.write_memory:
             # admission 关闭 + store_all_when_disabled → 逐帧全存（阶段 1 行为）
             mid_term_admit = True
         else:
@@ -552,9 +562,9 @@ class OnlineDrivingLoop:
             mid_term_admit = False
 
         # 派生 jsonl / mt_record 准入字段（兼容：门控命中 / legacy 全存 / memory_off）
-        memory_admission_enabled = self._admission_enabled and self.use_memory
+        memory_admission_enabled = self._admission_enabled and self.write_memory
         # Phase 6：冲突更新是否生效（静态标志；具体动作在 i.1 块写入后产生，记于旧记忆 update_history + 日志）
-        memory_update_enabled = self._update_enabled and self.use_memory
+        memory_update_enabled = self._update_enabled and self.write_memory
         if admission_result is not None:
             memory_admission_score = admission_result.admission_score
             memory_admission_should_store = admission_result.should_store
@@ -591,6 +601,9 @@ class OnlineDrivingLoop:
             "sample_token": sample_token,
             "scene_token": kf.get("scene_token", ""),
             "memory_mode": self.mode,
+            "memory_write_enabled": self.write_memory,
+            "memory_retrieval_enabled": self.retrieve_memory,
+            "short_term_enabled": self.use_short_term,
             "perception_mode": self._perception_mode,
             "current_scene": scene_result,
             "perception_objects": kf.get("perception_objects", []),
@@ -617,6 +630,8 @@ class OnlineDrivingLoop:
             "history_trajectory": kf.get("history_trajectory"),
             "ground_truth_trajectory": kf.get("ground_truth_trajectory"),
             "timestamp": frame_ts,
+            "carla_frame_id": kf.get("carla_frame_id"),
+            "sim_time_s": kf.get("sim_time_s"),
             # ---- Phase 1/2 中期记忆准入元数据（供离线复盘价值门控）----
             "mid_term_memory_added": mid_term_memory_added,        # 本帧是否入库中期记忆
             "mid_term_memory_id": mid_term_memory_id,              # 入库记录的 record_id（= sample_token）
@@ -650,7 +665,7 @@ class OnlineDrivingLoop:
             logger.debug("审计日志生成失败 (frame=%s): %s", sample_token, e)
 
         # ---- h) 更新短期记忆（push 当前帧；memory_off 也不 push，保持纯净对照） ----
-        if self.use_memory:
+        if self.use_short_term:
             try:
                 self.short_term.add(ShortTermMemoryItem(
                     frame_id=sample_token,
@@ -668,6 +683,7 @@ class OnlineDrivingLoop:
             except Exception as e:
                 logger.warning("短期记忆 push 失败 (frame=%s): %s", sample_token, e)
 
+        if self.write_memory:
             # ---- h.1) Phase 5 scene 切换 → flush 当前事件（事件结束条件之一）----
             if self._event_memory_enabled:
                 cur_scene_token = kf.get("scene_token", "") or ""
@@ -850,6 +866,9 @@ class OnlineDrivingLoop:
                     "frame_id": sample_token,
                     "sample_token": sample_token,
                     "memory_mode": self.mode,
+                    "memory_write_enabled": self.write_memory,
+                    "memory_retrieval_enabled": self.retrieve_memory,
+                    "short_term_enabled": self.use_short_term,
                     "parser_status": "step_error",
                     "parser_errors": [str(e)],
                     "fallback_used": False,
@@ -866,6 +885,10 @@ class OnlineDrivingLoop:
 
     def close(self) -> None:
         """关闭：flush 残留事件 + 中期记忆按 yaml persistence 决定是否落盘。"""
+        if self._closed:
+            return
+        self._closed = True
+        flush_error = None
         # Phase 5：flush 尚未结束的事件（run 结束触发 finalize）
         if self._event_memory_enabled and self._event_manager is not None:
             try:
@@ -874,12 +897,16 @@ class OnlineDrivingLoop:
                     _fr, _ffeat = flush_out
                     self.mid_term.add_record(_fr, feature=_ffeat)
             except Exception as e:
+                flush_error = e
                 logger.warning("event_memory close-flush 异常: %s", e)
         if self.mid_term is not None:
             try:
                 self.mid_term.close()
-            except Exception as e:
-                logger.warning("mid_term.close 异常: %s", e)
+            except Exception:
+                logger.exception("mid_term.close 保存失败")
+                raise
+        if flush_error is not None:
+            raise RuntimeError("结束事件记忆入库失败") from flush_error
 
     # ------------------------------------------------------------------
     # 辅助
@@ -1066,6 +1093,9 @@ class OnlineDrivingLoop:
             "frame_id": sample_token,
             "sample_token": sample_token,
             "memory_mode": self.mode,
+            "memory_write_enabled": self.write_memory,
+            "memory_retrieval_enabled": self.retrieve_memory,
+            "short_term_enabled": self.use_short_term,
             "parser_status": "perception_failed",
             "fallback_used": False,
             "decision_output": None,

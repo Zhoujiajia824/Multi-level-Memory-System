@@ -58,6 +58,9 @@ Thumbs.db
 # ---- 虚拟环境 ----
 venv/
 env/
+!carla_bridge/env/
+!carla_bridge/env/**
+carla_bridge/env/__pycache__/
 .venv/
 
 # ---- 系统文件 ----

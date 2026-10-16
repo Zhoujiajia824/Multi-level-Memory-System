@@ -77,6 +77,10 @@ class ScriptedVehicleController:
                 target = min(target, lead_speed)
 
         steer_rad = self.pp.compute_steer(loc.x, loc.y, yaw, speed, self._global_wps)
+        if not self.pp.target_valid:
+            self._finished = True
+            self.vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
+            return
         throttle, brake = self.pid.compute(target - speed, dt=self.dt)
         steer_norm = max(-1.0, min(1.0, (steer_rad / self.max_steer_rad) * self.steer_sign))
         self.vehicle.apply_control(

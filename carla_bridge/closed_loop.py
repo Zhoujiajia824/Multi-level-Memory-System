@@ -48,6 +48,13 @@ class ClosedLoop:
     def __init__(self, config: Config, scenario_yaml: str, mode: str = "memory_on"):
         self.config = config
         self.mode = mode
+        self.run_id = config.get("run_id", "")
+        self.timestamp_origin_us = int(config.get("timestamp_origin_us", 0))
+        self.run_status = "setup_failed"
+        self._closed = False
+        self._capture_failures = 0
+        self._capture_failure_total = 0
+        self._termination_reason = ""
         ccfg = config.get_nested("carla", default={}) or {}
         self.ccfg = ccfg
         self.replan_interval_s = float(ccfg.get("replan_interval_s", 1.0))
@@ -114,12 +121,14 @@ class ClosedLoop:
             timeout_s=float(self.ccfg.get("timeout_s", 30.0)),
             synchronous=bool(self.ccfg.get("synchronous", True)),
             fixed_delta_seconds=self.fixed_delta,
-        ).connect()
+        )
+        self.carla_client.connect()
 
         # 2. 场景
         self.scenario = ScenarioManager.from_yaml(
             self.carla_client, self.ccfg, self.scenario_yaml
-        ).setup()
+        )
+        self.scenario.setup()
         world = self.scenario.world
         ego = self.scenario.ego_vehicle
         # 交通流刚 spawn：tick 几帧让 Traffic Manager 与所有 NPC 完成初始化后再挂相机，
@@ -136,6 +145,7 @@ class ClosedLoop:
             mosaic_cell_w=int(mosaic_cfg.get("cell_width", 480)),
             mosaic_cell_h=int(mosaic_cfg.get("cell_height", 270)),
             label_subimages=bool(mosaic_cfg.get("label_subimages", True)),
+            capture_timeout_s=float(self.ccfg.get("capture_timeout_s", 2.0)),
         )
         self.cameras.install()
         self.cameras.warmup(n_frames=2)
@@ -152,7 +162,7 @@ class ClosedLoop:
             history_seconds=float(self.config.get("history_seconds", 5.0))
         )
         self.tracker = TrajectoryTracker(self.controller_cfg, control_dt_s=self.fixed_delta)
-        self.kf_builder = KeyframeBuilder(scenario_name=self.scenario.scenario_name())
+        self.kf_builder = KeyframeBuilder(scenario_name=self.scenario.scenario_name(), run_id=self.run_id)
 
         # 5. 碰撞传感器 + 指标采集
         self._setup_collision_sensor(world, ego)
@@ -209,22 +219,18 @@ class ClosedLoop:
 
     def run(self) -> None:
         assert self.loop and self.carla_client and self.scenario
-        try:
-            dur = min(self.max_duration_s, self.scenario.duration_s())
-            while self._elapsed < dur:
-                self._replan_cycle()
-                if self._early_terminated:
-                    break
-            prog = (self.scenario.route.progress_fraction() * 100.0) if self.scenario.route else 0.0
-            logger.info(
-                "闭环结束: sim=%.1fs, 碰撞=%d, 路线完成度=%.1f%%",
-                self._elapsed, self._collision_count, prog,
-            )
-            self._write_report()
-        finally:
-            self.close()
+        self.run_status = "running"
+        dur = min(self.max_duration_s, self.scenario.duration_s())
+        while self._elapsed < dur:
+            self._replan_cycle()
+            if self._early_terminated:
+                break
+        self.run_status = self._termination_reason if self._early_terminated else "completed"
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         if self.recorder is not None:
             try:
                 self.recorder.flush()
@@ -239,10 +245,19 @@ class ClosedLoop:
             try:
                 self.loop.close()
             except Exception as e:
-                logger.warning("loop close: %s", e)
+                self.run_status = "memory_save_failed"
+                logger.error("loop close: %s", e)
+        if self.metrics is not None:
+            try:
+                self._write_report()
+            except Exception as exc:
+                logger.warning("report: %s", exc)
         if self._collision_sensor is not None:
             try:
                 self._collision_sensor.stop()
+            except Exception:
+                pass
+            try:
                 self._collision_sensor.destroy()
             except Exception:
                 pass
@@ -270,23 +285,28 @@ class ClosedLoop:
         ego = self.scenario.ego_vehicle
 
         # ---- [1 捕获] ----
-        self.carla_client.tick()
+        if self.event_scheduler is not None:
+            self.event_scheduler.tick()
+        frame_id = self.carla_client.tick()
         self._elapsed += self.fixed_delta
         self._drain_collisions()
         self.carla_client.set_spectator_follow(ego)
         if self.recorder is not None:
             self.recorder.on_tick()
-        if self.event_scheduler is not None:
-            self.event_scheduler.tick()
-
         sample_token = self.kf_builder.next_token()
-        mosaic_path = self.cameras.capture(sample_token)
+        try:
+            mosaic_path = self.cameras.capture(sample_token, frame_id)
+        except (TimeoutError, OSError) as exc:
+            self._on_capture_failure(ego, exc)
+            return
+        self._capture_failures = 0
 
         tf = ego.get_transform()
         ego_yaw = coords.carla_yaw_deg_to_rad(tf.rotation.yaw)
         self.history.update(ego, self._elapsed)
         yr = self.history.yaw_rate(self._elapsed, ego_yaw)
         ego_state = self.ego_provider.build(ego, self._elapsed, yaw_rate=yr)
+        ego_state.timestamp = self.timestamp_origin_us + int(self._elapsed * 1e6)
         hist = self.history.build_ego_centric(
             self._elapsed, tf.location.x, tf.location.y, ego_yaw
         )
@@ -296,13 +316,15 @@ class ClosedLoop:
 
         kf = self.kf_builder.build(
             sample_token=sample_token,
-            timestamp_us=int(self._elapsed * 1e6),
+            timestamp_us=self.timestamp_origin_us + int(self._elapsed * 1e6),
             mosaic_path=mosaic_path,
             ego_state=ego_state.to_ego_centric(),
             history_trajectory=hist,
             nav_instruction=nav,
             perception_objects=objs,
         )
+        kf["carla_frame_id"] = frame_id
+        kf["sim_time_s"] = self._elapsed
         logger.info(
             "[replan] t=%.1fs token=%s nav=%s objs=%d speed=%.1f",
             self._elapsed, sample_token, nav, len(objs), ego_state.speed,
@@ -332,20 +354,25 @@ class ClosedLoop:
         n_ticks = max(1, int(round(self.replan_interval_s / self.fixed_delta)))
         raw_every = max(1, int(round(n_ticks / 5.0)))  # 每周期 5 次 raw 捕获（≈1.67Hz @3s/10Hz）
         dur = min(self.max_duration_s, self.scenario.duration_s())
+        # Apply the new decision before advancing physics (including emergency braking).
+        v = ego.get_velocity()
+        ego.apply_control(self.tracker.compute_control(tf.location.x, tf.location.y, ego_yaw,
+                                                       (v.x * v.x + v.y * v.y) ** 0.5))
         for i in range(n_ticks):
-            self.carla_client.tick()
+            if self.event_scheduler is not None:
+                self.event_scheduler.tick()
+            frame_id = self.carla_client.tick()
+            self._elapsed += self.fixed_delta
+            self.history.update(ego, self._elapsed)
             if i % raw_every == 0:
-                self._raw_capture(ego)  # raw 捕获：mosaic+ego+感知 push 进短期记忆
+                if not self._raw_capture(ego, frame_id):
+                    return  # raw 捕获：mosaic+ego+感知 push 进短期记忆
             else:
                 self.cameras.drain()  # 其余 tick 丢弃相机帧，防堆积
-            self._elapsed += self.fixed_delta
             self._drain_collisions()
             self.carla_client.set_spectator_follow(ego)
             if self.recorder is not None:
                 self.recorder.on_tick()
-            if self.event_scheduler is not None:
-                self.event_scheduler.tick()
-            self.history.update(ego, self._elapsed)
             tf2 = ego.get_transform()
             yaw2 = coords.carla_yaw_deg_to_rad(tf2.rotation.yaw)
             v = ego.get_velocity()
@@ -376,6 +403,7 @@ class ClosedLoop:
                         stuck_for, speed, prog * 100.0,
                     )
                     self._early_terminated = True
+                    self._termination_reason = "stuck"
                     return
                 if stuck_for >= self._stuck_warn_s:
                     logger.warning(
@@ -454,23 +482,25 @@ class ClosedLoop:
     # raw 捕获（控制阶段，不跑 VLM）
     # ------------------------------------------------------------------
 
-    def _raw_capture(self, ego) -> None:
+    def _raw_capture(self, ego, frame_id: int) -> bool:
         """控制阶段 raw 捕获：存 mosaic + ego + GT 感知，push 进短期记忆。
 
         不跑 DINOv2/VLM；场景字段（scene_id/weather/description）沿用上次 VLM 结果，
-        使短期记忆队列在控制阶段也时刻保持最新（图像+ego+感知），完整 VLM 仍 1Hz。
+        使短期记忆队列在控制阶段也时刻保持最新（图像+ego+感知），完整 VLM 按 replan_interval_s 运行。
         """
         self._raw_counter += 1
-        token = f"carla_raw_{self.scenario.scenario_name()}_{self._raw_counter:06d}"
+        token = f"carla_raw_{self.run_id or self.scenario.scenario_name()}_{self._raw_counter:06d}"
         try:
-            mosaic_path = self.cameras.capture(token)
-        except Exception as e:
-            logger.debug("raw 捕获 mosaic 失败: %s", e)
-            return
+            mosaic_path = self.cameras.capture(token, frame_id)
+        except (TimeoutError, OSError) as exc:
+            self._on_capture_failure(ego, exc)
+            return False
+        self._capture_failures = 0
         tf = ego.get_transform()
         ego_yaw = coords.carla_yaw_deg_to_rad(tf.rotation.yaw)
         yr = self.history.yaw_rate()
         ego_state = self.ego_provider.build(ego, self._elapsed, yaw_rate=yr)
+        ego_state.timestamp = self.timestamp_origin_us + int(self._elapsed * 1e6)
         try:
             objs = self.perception.get_objects(ego, tf.location.x, tf.location.y, ego_yaw)
         except Exception:
@@ -478,7 +508,7 @@ class ClosedLoop:
         sc = self._last_scene_result or {}
         item = ShortTermMemoryItem(
             frame_id=token,
-            timestamp=int(self._elapsed * 1e6),
+            timestamp=self.timestamp_origin_us + int(self._elapsed * 1e6),
             image_path=mosaic_path,
             image_feature_path="",
             scene_description=sc.get("scene_description", ""),
@@ -493,6 +523,19 @@ class ClosedLoop:
             self.loop.add_short_term_item(item)
         except Exception as e:
             logger.debug("raw short_term push 失败: %s", e)
+        return True
+
+    def _on_capture_failure(self, ego, exc):
+        self._capture_failures += 1
+        self._capture_failure_total += 1
+        tf = ego.get_transform()
+        self.tracker.set_trajectory([], tf.location.x, tf.location.y,
+                                    coords.carla_yaw_deg_to_rad(tf.rotation.yaw), 0.0)
+        ego.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
+        logger.error("同步采集失败，已制动 (%d): %s", self._capture_failures, exc)
+        if self._capture_failures >= int(self.ccfg.get("max_capture_failures", 3)):
+            self._early_terminated = True
+            self._termination_reason = "sensor_failure"
 
     # ------------------------------------------------------------------
     # 碰撞
@@ -505,8 +548,8 @@ class ClosedLoop:
         if sensor is None:
             logger.warning("碰撞传感器 spawn 失败，本次运行不计碰撞指标")
             return
-        sensor.listen(self._coll_q.put)
         self._collision_sensor = sensor
+        sensor.listen(self._coll_q.put)
 
     def _drain_collisions(self) -> None:
         """碰撞事件去重：同 actor 2s 冷却内只计 1 次。
@@ -550,6 +593,9 @@ class ClosedLoop:
             return
         summary = self.metrics.summary()
         run_info = {
+            "run_id": self.run_id,
+            "status": self.run_status,
+            "capture_failures": self._capture_failure_total,
             "scenario": self.scenario.scenario_name(),
             "mode": self.mode,
             "duration_s": round(self._elapsed, 2),
@@ -559,10 +605,10 @@ class ClosedLoop:
                 {a for a in self._collision_actors if a is not None}
             ),
             "early_terminated": self._early_terminated,
-            "early_terminated_reason": "stuck" if self._early_terminated else "",
+            "early_terminated_reason": self._termination_reason,
         }
         out_dir = self.config.get("output_dir") or Path("outputs")
-        report_dir = Path(out_dir) / "carla_runs"
+        report_dir = Path(out_dir)
         try:
             md_path, _json_path = write_report(summary, run_info, str(report_dir))
             logger.info("闭环报告已写: %s", md_path)

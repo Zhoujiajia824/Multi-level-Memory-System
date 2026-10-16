@@ -16,15 +16,17 @@ from typing import Any, Dict, List
 class KeyframeBuilder:
     """组装 OnlineDrivingLoop.step() 所需的 kf dict。"""
 
-    def __init__(self, scenario_name: str, scene_token: str = ""):
+    def __init__(self, scenario_name: str, scene_token: str = "", run_id: str = ""):
         self.scenario_name = scenario_name
         self._scene_token = scene_token or scenario_name
+        self.run_id = run_id
         self._counter = 0
 
     def next_token(self) -> str:
         """生成下一个 sample_token（单调递增，跨 tick 唯一）。"""
         self._counter += 1
-        return f"carla_{self.scenario_name}_{self._counter:06d}"
+        namespace = self.run_id or self.scenario_name
+        return f"carla_{namespace}_{self._counter:06d}"
 
     def build(
         self,

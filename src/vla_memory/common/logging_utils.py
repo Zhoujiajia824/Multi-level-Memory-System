@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import Optional
 
 
+_DEFAULT_LOG_DIR = Path("outputs/logs")
+_MANAGED_LOGGERS = set()
+
 def setup_logger(
     name: str = "vla_memory",
     level: str = "INFO",
@@ -37,6 +40,7 @@ def setup_logger(
     Returns:
         配置好的 Logger 实例。
     """
+    _MANAGED_LOGGERS.add(name)
     logger = logging.getLogger(name)
 
     # 避免重复添加 handler
@@ -93,8 +97,21 @@ def get_logger(name: str = "vla_memory") -> logging.Logger:
         return setup_logger(
             name=name,
             level="INFO",
-            log_dir=Path("outputs/logs"),
+            log_dir=_DEFAULT_LOG_DIR,
             console_enabled=True,
             file_enabled=True,
         )
     return logger
+
+
+def set_log_directory(path: Path) -> None:
+    """Redirect this project's existing and future loggers into one run directory."""
+    global _DEFAULT_LOG_DIR
+    _DEFAULT_LOG_DIR = Path(path)
+    for name in list(_MANAGED_LOGGERS):
+        logger = logging.getLogger(name)
+        level = logging.getLevelName(logger.level)
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+        setup_logger(name=name, level=level, log_dir=_DEFAULT_LOG_DIR)

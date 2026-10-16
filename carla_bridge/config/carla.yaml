@@ -14,8 +14,8 @@ version: "0.9.15"
 # 错位（f"{key}_weight" 查 visual_score_weight，而 memory.yaml 定义 visual_weight）已修复，
 # 无需再注入视觉/文本/…的别名权重键。
 
-# CARLA 用独立的中期记忆库，避免与 nuScenes 的 outputs/memory_db 互相污染
-# （否则 auto_load_on_init 会把 nuScenes 记忆加载进 CARLA 运行）
+# 兼容直接使用 Config 的默认值。命令行入口由 RunSession 覆盖：
+# 未指定 --memory-bank 时使用本轮独立库；指定路径则复用该库。
 memory_db_dir: "outputs/memory_db_carla"
 
 # ---- 感知输入：固定六视角环视（复用 src 现有 surround_mosaic 路径）----
@@ -45,6 +45,8 @@ carla:
   # ---- 同步模式 ----
   synchronous: true
   fixed_delta_seconds: 0.1       # 10 Hz（20Hz 在 Town05 大图物理算不完易触发 UE4 fatal，降为 10Hz 稳定）
+  capture_timeout_s: 2.0       # 六路相机共享的等待截止时间，不推进仿真
+  max_capture_failures: 3      # 连续采集失败时结束本轮，失败期间全刹
   # ---- 闭环节奏 ----
   replan_interval_s: 3.0         # VLM 每 3s 重规划（= decision.trajectory.horizon_seconds）
   max_duration_s: 60.0           # 单场景最长 sim 时间

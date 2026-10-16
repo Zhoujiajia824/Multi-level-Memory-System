@@ -60,6 +60,7 @@ class TrajectoryTracker:
         self._global_wps = coords.trajectory_ego_to_global(
             ego_centric_trajectory, capture_ego_x, capture_ego_y, capture_ego_yaw_rad
         )
+        self.pp.reset()
         self._target_speed = float(target_speed or 0.0)
         self.pid.soft_reset()  # 保留积分（起步助力），只清微分防踢
 
@@ -75,6 +76,8 @@ class TrajectoryTracker:
         steer_rad = self.pp.compute_steer(
             ego_x, ego_y, ego_yaw_rad, current_speed, self._global_wps
         )
+        if not self.pp.target_valid:
+            return carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0)
         throttle, brake = self.pid.compute(
             self._target_speed - current_speed, dt=self.control_dt
         )

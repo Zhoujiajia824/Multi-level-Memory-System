@@ -21,8 +21,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import yaml
 
 from src.vla_memory.common.config import load_config
-from src.vla_memory.common.logging_utils import setup_logger
+from src.vla_memory.common.logging_utils import setup_logger, set_log_directory
 from carla_bridge.closed_loop import ClosedLoop
+from carla_bridge.run_session import RunSession
 
 
 def _resolve_scenario_path(scenario_arg: str, config) -> Path:
@@ -50,6 +51,11 @@ def main() -> None:
         "--mode", choices=["memory_on", "memory_off"], default="memory_on",
         help="memory_on 用三层记忆，memory_off 对照基线",
     )
+    ap.add_argument("--memory-bank", help="持久化记忆库路径；省略时为本轮独立库")
+    ap.add_argument("--memory-access", choices=["read_write", "read_only"], default="read_write")
+    ap.add_argument("--memory-seed", help="复制已有库到新目标库，原始库保持不变")
+    ap.add_argument("--no-memory-retrieval", action="store_true", help="不检索中长期记忆，仍按写入开关积累")
+    ap.add_argument("--no-short-term", action="store_true", help="关闭本轮短期记忆")
     args = ap.parse_args()
 
     # 修复 Anaconda/conda 常见坑：SSL_CERT_FILE 指向不存在的 cacert.pem 会让
@@ -65,7 +71,6 @@ def main() -> None:
     with open(carla_yaml, "r", encoding="utf-8") as f:
         carla_cfg = yaml.safe_load(f)
     config = load_config(overrides=carla_cfg)
-    config.ensure_output_dirs()
 
     # fail-fast：VLM API Key 缺失立即报错（避免跑完 CARLA+DINOv2 setup 才在第一次 VLM 调用崩）
     import os as _os
@@ -88,20 +93,40 @@ def main() -> None:
             f"设好后与运行命令在同一个终端执行。"
         )
 
-    setup_logger(
-        name="carla_demo",
-        level=config.get_nested("logging", "level", default="INFO"),
-        log_dir=config.get_path("log_dir"),
-    )
-
     scenario_name = args.scenario or config.get_nested(
         "carla", "default_scenario", default="straight_traffic"
     )
     scenario_path = _resolve_scenario_path(scenario_name, config)
 
-    loop = ClosedLoop(config=config, scenario_yaml=str(scenario_path), mode=args.mode)
-    loop.setup()
-    loop.run()
+    session = RunSession(config, scenario_path, args.mode, memory_bank=args.memory_bank,
+                         memory_access=args.memory_access, memory_seed=args.memory_seed,
+                         short_term=not args.no_short_term, retrieve=not args.no_memory_retrieval)
+    loop = None
+    try:
+        session.prepare()
+        set_log_directory(config.get_path("log_dir"))
+        setup_logger(name="carla_demo", level=config.get_nested("logging", "level", default="INFO"),
+                     log_dir=config.get_path("log_dir"))
+        loop = ClosedLoop(config=config, scenario_yaml=str(scenario_path), mode=args.mode)
+        session.set_status("initializing")
+        loop.setup()
+        session.set_status("running")
+        loop.run()
+    except BaseException as exc:
+        if loop is not None:
+            loop.run_status = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
+        if session.run_dir.exists():
+            session.set_status("interrupted" if isinstance(exc, KeyboardInterrupt) else "failed", exc)
+        raise
+    finally:
+        try:
+            if loop is not None:
+                loop.close()
+                session.set_status(loop.run_status)
+        finally:
+            session.close()
+    if loop is not None and loop.run_status in ("memory_save_failed", "sensor_failure"):
+        raise RuntimeError(f"运行未成功结束: {loop.run_status}，详见 {session.run_dir}")
 
 
 if __name__ == "__main__":

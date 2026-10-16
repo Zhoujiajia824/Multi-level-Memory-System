@@ -11,6 +11,7 @@
 必须使用 FAISS，不允许降级到 numpy 检索。
 """
 from __future__ import annotations
+import copy
 import math
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
@@ -48,7 +49,9 @@ class MidTermMemory:
         persistence_cfg: Optional[Dict[str, Any]] = None,
         save_dir: Optional[str] = None,
         retrieval_cfg: Optional[Dict[str, Any]] = None,
+        read_only: bool = False,
     ):
+        self.read_only = read_only
         self.faiss_store = faiss_store
         self.top_k = top_k
 
@@ -87,6 +90,8 @@ class MidTermMemory:
         """初始化时自动加载已有的持久化索引 (安静模式)。"""
         meta_path = Path(save_dir) / "mid_term_meta.json"
         index_path = Path(save_dir) / "mid_term_faiss.index"
+        if self.persistence_cfg.get("strict_load") and index_path.exists() and not meta_path.exists():
+            raise ValueError("记忆库存在索引但缺少元数据，拒绝覆盖")
         if meta_path.exists():
             try:
                 self.load(str(index_path), str(meta_path))
@@ -96,6 +101,10 @@ class MidTermMemory:
                     raise
                 logger.warning("中期记忆自动加载失败 (跳过): %s", e)
 
+    def _require_writable(self) -> None:
+        if self.read_only:
+            raise PermissionError("只读记忆库禁止修改")
+
     def add_record(self, record: MidTermMemoryRecord, feature: Optional[np.ndarray] = None) -> None:
         """添加一条中期记忆记录。
 
@@ -103,6 +112,9 @@ class MidTermMemory:
             record: 中期记忆记录。
             feature: 对应的图像特征向量（可选）。
         """
+        self._require_writable()
+        if record.record_id in self._records:
+            raise ValueError(f"重复的记忆 ID: {record.record_id}")
         self._records[record.record_id] = record
         if record.scene_text:
             self._text_corpus[record.record_id] = record.scene_text
@@ -289,7 +301,7 @@ class MidTermMemory:
             results = pool[:top_k]
 
         # 6. 命中统计（元数据簿记，不改本次结果，不破坏先读后写）
-        if now_ts is not None:
+        if now_ts is not None and not self.read_only:
             for r in results:
                 rec = r["record"]
                 try:
@@ -298,6 +310,8 @@ class MidTermMemory:
                 except Exception as e:
                     logger.debug("命中统计更新失败 (rid=%s): %s", getattr(rec, "record_id", "?"), e)
 
+        if self.read_only:
+            results = copy.deepcopy(results)
         return {"results": results, "stats": stats}
 
     @staticmethod
@@ -355,7 +369,7 @@ class MidTermMemory:
 
     def get_all_records(self) -> Dict[str, MidTermMemoryRecord]:
         """获取所有中期记忆记录（含 inactive，保留元数据）。"""
-        return self._records
+        return copy.deepcopy(self._records) if self.read_only else self._records
 
     def size(self) -> int:
         """获取记录数量（含 inactive；用于 compaction 的 inactive_ratio 分母）。"""
@@ -375,7 +389,7 @@ class MidTermMemory:
 
     def get_active_records(self) -> Dict[str, MidTermMemoryRecord]:
         """获取 active 记录（is_active=True）。"""
-        return {rid: r for rid, r in self._records.items() if getattr(r, "is_active", True)}
+        return {rid: r for rid, r in self.get_all_records().items() if getattr(r, "is_active", True)}
 
     def soft_delete(self, record_id: str, reason: str, deleted_at: int = 0) -> bool:
         """soft delete：置 is_active=False / status=deleted / deleted_reason / deleted_at。
@@ -386,6 +400,7 @@ class MidTermMemory:
         Returns:
             是否实际执行（记录存在且原本 active）。
         """
+        self._require_writable()
         rec = self._records.get(record_id)
         if rec is None or not getattr(rec, "is_active", True):
             return False
@@ -403,6 +418,7 @@ class MidTermMemory:
         IndexFlatIP 不支持原生删除，故用 ``reconstruct_n`` 取回全部向量 → 过滤 active →
         新建 IndexFlatIP 重新 add + 重写 _ids。inactive 元数据仍保留在 ``_records``。
         """
+        self._require_writable()
         store = self.faiss_store
         n = store.size()
         if n == 0:
@@ -453,13 +469,11 @@ class MidTermMemory:
             index_path: FAISS 索引文件路径（如 outputs/memory_db/mid_term_faiss.index）。
             meta_path: 元数据 JSON 文件路径（如 outputs/memory_db/mid_term_meta.json）。
         """
+        self._require_writable()
         from src.vla_memory.memory.memory_record_io import save_mid_term_meta
 
         # 保存 FAISS 索引
-        if self.faiss_store.size() > 0:
-            self.faiss_store.save(index_path)
-        else:
-            logger.warning("FAISS 索引为空，跳过索引保存。")
+        self.faiss_store.save(index_path)
 
         # 保存元数据（MemoryRecord 列表）
         save_mid_term_meta(self._records, meta_path)
@@ -483,13 +497,25 @@ class MidTermMemory:
 
         # 加载 FAISS 索引
         if idx_path.exists():
+            expected_dim = self.faiss_store.dimension
             self.faiss_store.load(str(idx_path))
+            if self.persistence_cfg.get("strict_load"):
+                if self.faiss_store.dimension != expected_dim:
+                    raise ValueError("记忆库特征维度与当前模型不一致")
+                ids = self.faiss_store._ids
+                if len(ids) != self.faiss_store.size() or len(set(ids)) != len(ids):
+                    raise ValueError("记忆库向量 ID 缺失或重复，需要先修复历史库")
             logger.info(f"FAISS 索引已加载: {self.faiss_store.size()} 条向量")
         else:
             logger.warning(f"FAISS 索引文件不存在: {idx_path}")
 
         # 加载元数据并重建文本语料库
         self._records = load_mid_term_meta(str(meta_path))
+        if self.persistence_cfg.get("strict_load"):
+            if any(rid not in self._records for rid in self.faiss_store._ids):
+                raise ValueError("记忆库向量 ID 与元数据不匹配")
+            if not idx_path.exists() and any(r.image_feature_path or r.feature_path for r in self._records.values()):
+                raise ValueError("记忆库包含视觉特征记录但索引缺失")
         self._text_corpus = {
             rid: rec.scene_text
             for rid, rec in self._records.items()
@@ -511,6 +537,7 @@ class MidTermMemory:
         Args:
             save_dir: 目标目录。None 时使用 self.save_dir。
         """
+        self._require_writable()
         target = save_dir or self.save_dir
         if not target:
             logger.warning("save_full 调用时未提供 save_dir，跳过保存。")
@@ -523,7 +550,7 @@ class MidTermMemory:
 
     def close(self) -> None:
         """关闭中期记忆。若 persistence.enabled 且 save_on_close，则全量落盘。"""
-        if self.persistence_cfg.get("enabled") and self.persistence_cfg.get("save_on_close", True):
+        if not self.read_only and self.persistence_cfg.get("enabled") and self.persistence_cfg.get("save_on_close", True):
             self.save_full()
         else:
             logger.debug("close(): 持久化未启用或 save_on_close=False，跳过保存。")
