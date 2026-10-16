@@ -28,6 +28,7 @@ class LoopRunner:
         output_jsonl_path: Optional[str] = None,
         resume: bool = False,
         decision_validator=None,
+        decision_processor=None,
     ):
         output_path = (
             Path(output_jsonl_path) if output_jsonl_path
@@ -39,6 +40,7 @@ class LoopRunner:
             output_jsonl_path=output_path,
             resume=resume,
             decision_validator=decision_validator,
+            decision_processor=decision_processor,
         )
         self.output_path = output_path
 

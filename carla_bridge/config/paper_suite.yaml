@@ -1,0 +1,94 @@
+# Custom research suite, not an official CARLA/Leaderboard benchmark.
+# Run paper_suite prepare on the server to resolve and freeze actual road geometry.
+suite: paper_v1
+splits:
+  train: [11, 22, 33]
+  eval: [101, 202, 303]
+defaults:
+  duration_s: 900
+  sampling_resolution: 2.0
+  ego_blueprint: vehicle.tesla.model3
+  weather: {preset: ClearNoon}
+  traffic: {num_vehicles: 60, num_walkers: 20, vehicle_radius_m: 10000, walker_radius_m: 500}
+profiles:
+  town03:
+    map: Town03
+    length_m: 800
+    turns: [right, left, straight, right]
+    start_candidates: [0, 10, 20, 30, 40, 50, 60, 70]
+    anchors: {}
+  town04:
+    map: Town04
+    length_m: 1200
+    turns: [straight, straight, straight]
+    start_candidates: [0, 10, 20, 30, 40, 50, 60, 70]
+    anchors: {}
+  town05:
+    map: Town05
+    length_m: 900
+    turns: [straight, right, left, straight]
+    start_candidates: [0, 10, 20, 30, 40, 50, 60, 70]
+    anchors:
+      crossing: {type: pedestrian_crossing, search_from_m: 180, search_to_m: 350, lead_distance_m: 25, speed_mps: 1.4}
+      blocked_lane: {type: stationary_vehicle, search_from_m: 500, search_to_m: 650, blueprint: vehicle.audi.etron}
+  town10:
+    map: Town10HD
+    length_m: 700
+    turns: [right, straight, left]
+    start_candidates: [0, 10, 20, 30, 40, 50, 60, 70]
+    anchors:
+      crossing: {type: pedestrian_crossing, search_from_m: 180, search_to_m: 350, lead_distance_m: 25, speed_mps: 1.4}
+cases:
+  R03_urban:
+    profile: town03
+    category: regular
+    description: 城市路网与混合交通；是否经过环岛以实际路线为准
+  R04_extended:
+    profile: town04
+    category: regular
+    description: 1200米较长路线；不预设为全高速路线
+  R05_multilane:
+    profile: town05
+    category: regular
+    description: 城市多车道路网与背景交通
+  R10_downtown:
+    profile: town10
+    category: regular
+    description: 高细节城区日间驾驶
+  L05_crossing:
+    profile: town05
+    category: longtail
+    paired_control: R05_multilane
+    events: [crossing]
+    description: 预置路边行人，在沿路线距离阈值开始横穿；非遮挡鬼探头
+  L05_blocked_lane:
+    profile: town05
+    category: longtail
+    paired_control: R05_multilane
+    events: [blocked_lane]
+    description: 预置同向占道停车，需要减速和可行的绕行决策
+  L10_night_rain:
+    profile: town10
+    category: longtail
+    paired_control: R10_downtown
+    weather: {cloudiness: 90, precipitation: 70, precipitation_deposits: 60, wind_intensity: 20, sun_altitude: -20, wetness: 80, fog_density: 10, fog_distance: 40}
+    description: 夜间降雨视觉分布变化；不宣称改变轮胎摩擦
+  L03_fog:
+    profile: town03
+    category: longtail
+    paired_control: R03_urban
+    weather: {cloudiness: 80, sun_altitude: 20, fog_density: 70, fog_distance: 15, wetness: 20}
+    description: 低能见度视觉分布变化
+  C05_crossing_blocked:
+    profile: town05
+    category: compound
+    paired_control: R05_multilane
+    events: [crossing, blocked_lane]
+    description: 同一路线先后遇到行人横穿与占道停车
+  C10_night_crossing:
+    profile: town10
+    category: compound
+    paired_control: R10_downtown
+    events: [crossing]
+    weather: {cloudiness: 90, precipitation: 70, precipitation_deposits: 60, wind_intensity: 20, sun_altitude: -20, wetness: 80, fog_density: 10, fog_distance: 40}
+    description: 夜雨环境下的行人横穿，与单独夜雨场景共同分析

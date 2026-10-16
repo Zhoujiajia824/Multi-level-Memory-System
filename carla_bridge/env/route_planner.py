@@ -309,6 +309,25 @@ class RoutePlanner:
             self._progress = RouteProgress(self._route, self._completion_tolerance_m, self._tracking_tolerance_m)
         return self._progress.update(self.ego.get_location())
 
+    def distance_completed_m(self) -> float:
+        fraction = self.progress_fraction()
+        return fraction * self._progress.lengths[-1] if self._progress else 0.0
+
+    def load_fixed_points(self, points) -> None:
+        """Use a server-prepared route unchanged across experimental conditions."""
+        self._route = [carla.Location(x=p["x"], y=p["y"], z=p["z"]) for p in points]
+        self._progress = RouteProgress(self._route, self._completion_tolerance_m, self._tracking_tolerance_m)
+        self._progress.update(self.ego.get_location())
+        self._mode = "astar"
+        self._options = []
+        for i, p in enumerate(self._route):
+            current = self.map.get_waypoint(p, project_to_road=True)
+            ahead = self.map.get_waypoint(self._route[min(i + 5, len(self._route) - 1)], project_to_road=True)
+            if current is None or ahead is None:
+                raise ValueError("prepared route does not match the loaded map")
+            self._options.append(self._infer_nav(coords.carla_yaw_deg_to_rad(current.transform.rotation.yaw), ahead)
+                                 if current.is_junction or ahead.is_junction else NAV_LANE_FOLLOW)
+
     def is_complete(self) -> bool:
         self.progress_fraction()
         return bool(self._progress and self._progress.completed)

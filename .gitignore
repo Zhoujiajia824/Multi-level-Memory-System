@@ -62,6 +62,8 @@ env/
 !carla_bridge/env/**
 carla_bridge/env/__pycache__/
 .venv/
+# Local editable third-party planner sources (not vendored)
+.deps/
 
 # ---- 系统文件 ----
 desktop.ini

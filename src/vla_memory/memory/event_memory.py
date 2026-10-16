@@ -130,6 +130,8 @@ class EventMemoryManager:
                 decision_reason=parsed.get("behavior_reason", ""),
                 behavior=parsed.get("behavior", ""),
                 trajectory=parsed.get("trajectory"),
+                semantic_decision=parsed.get("semantic_decision"),
+                planning_context=parsed.get("planning_context"),
                 # ---- 阶段 1 metadata（从 peak 帧填充）----
                 memory_id=event_id,
                 memory_type="event_memory",

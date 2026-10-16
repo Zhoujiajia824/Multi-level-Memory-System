@@ -45,6 +45,8 @@ class MemoryRecord(BaseModel):
     decision_reason: Optional[str] = Field(None, description="决策原因摘要")
     behavior: Optional[str] = Field(None, description="行为决策")
     trajectory: Optional[List[dict]] = Field(None, description="决策输出轨迹")
+    semantic_decision: Optional[dict] = Field(None, description="模型请求的横纵向语义；不代表已执行")
+    planning_context: Optional[dict] = Field(None, description="轨迹来源、语义影响开关及实际候选选择")
 
     # ===================== Phase 1 新增：metadata 字段（37 个）=====================
     # 向后兼容：所有新字段都有默认值；旧 mid_term_meta.json（12 字段）加载时经

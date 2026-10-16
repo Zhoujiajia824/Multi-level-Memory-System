@@ -40,8 +40,11 @@ def _render_md(run_info: dict, s: dict) -> str:
         f"- 采集失败次数: {run_info.get('capture_failures', 0)}",
         f"- 场景: `{run_info.get('scenario')}`",
         f"- 模式: `{run_info.get('mode')}`",
+        f"- 轨迹后端: `{run_info.get('planner_backend', 'vlm_trajectory')}`",
+        f"- 语义影响候选选择: {run_info.get('semantic_influence', False)}",
         f"- 仿真时长: {run_info.get('duration_s')} s",
-        f"- 重规划间隔: {run_info.get('replan_interval_s')} s",
+        f"- 全量认知间隔: {run_info.get('replan_interval_s')} s",
+        f"- PDM 重规划间隔: {run_info.get('pdm_replan_interval_s')} s",
     ]
     if run_info.get("early_terminated"):
         lines.append(

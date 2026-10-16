@@ -3,16 +3,18 @@
 整合当前感知、记忆、导航、自车状态、历史轨迹，构建决策 VLM 的输入 prompt。
 支持 memory_on（包含三层记忆）和 memory_off（仅当前帧感知）两种模式。
 
-P1 重构：所有提示词文本来源迁移到 config/prompts.yaml，路点边界从
-config/decision.yaml 读取，做到「一次修改、全链生效」。
+通用轨迹模板位于 config/prompts.yaml；CARLA 语义模板与路点边界位于
+config/decision.yaml，语义模式复用上下文而不拼接数值轨迹输出要求。
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional
 
 from src.vla_memory.common.prompt_loader import get_prompt_loader
 from src.vla_memory.decision.config_access import (
     get_horizon_and_dt,
+    get_semantic_prompt_template,
     get_valid_behaviors,
     get_waypoint_bounds,
 )
@@ -53,7 +55,8 @@ class DecisionPromptBuilder:
             perception_objects: oracle 感知对象列表（nuScenes GT 投影，dict 形式）；
                 非空时渲染为独立段落喂给决策 VLM，并显式标注为 oracle 来源。
             image_layout: 输入图像布局描述串（single_front / surround_mosaic）。
-            planning_constraints: 可选闭环动力学约束；仅仿真调用方提供时生效。
+            planning_constraints: 可选闭环动力学约束；decision_mode=semantic
+                时仅输出横纵向意图，其余轨迹物理约束交由下游规划器处理。
         """
         loader = get_prompt_loader()
 
@@ -72,6 +75,24 @@ class DecisionPromptBuilder:
         )
         image_layout_block = self._render_image_layout_block(image_layout)
         perception_objects_block = self._render_perception_objects_block(perception_objects)
+
+        # Keep the complete scene, image, navigation and memory context, but do
+        # not render any of the legacy numerical trajectory output contract.
+        if (planning_constraints or {}).get("decision_mode") == "semantic":
+            from src.vla_memory.decision.semantic_output_parser import (
+                LATERAL_DECISIONS, LONGITUDINAL_DECISIONS,
+            )
+            return get_semantic_prompt_template().format_map({
+                "scene_block": scene_block,
+                "ego_state_block": ego_state_block,
+                "nav_block": nav_block,
+                "history_block": history_block,
+                "memory_block": memory_block,
+                "image_layout_block": image_layout_block,
+                "perception_objects_block": perception_objects_block,
+                "lateral_enum": " / ".join(LATERAL_DECISIONS),
+                "longitudinal_enum": " / ".join(LONGITUDINAL_DECISIONS),
+            })
 
         # ------------------------------------------------------------
         # 2. 路点边界 / 行为枚举 / horizon （单一来源：decision.yaml）
@@ -326,6 +347,9 @@ class DecisionPromptBuilder:
                         behavior=behavior,
                     ).rstrip()
                 )
+                planning_memory = self._render_planning_memory_context(record)
+                if planning_memory:
+                    mid_lines.append(planning_memory)
             sections.append("\n".join(mid_lines))
 
         if long_term_rules_text:
@@ -339,6 +363,52 @@ class DecisionPromptBuilder:
         if not sections:
             return ""
         return "\n\n".join(sections) + "\n"
+
+    @staticmethod
+    def _render_planning_memory_context(record) -> str:
+        """Preserve requested semantics and the selected plan as separate facts.
+
+        A memory is written after plan validation but before the subsequent
+        control cycle. Even ``executed_behavior`` names the selected command;
+        it does not, by itself, establish successful execution or causality.
+        Older records without these optional fields keep their old rendering.
+        """
+        read = record.get if isinstance(record, dict) else (
+            lambda key, default=None: getattr(record, key, default)
+        )
+        semantic = read("semantic_decision")
+        context = read("planning_context")
+        if not isinstance(semantic, dict) and not isinstance(context, dict):
+            return ""
+
+        lines = []
+        if isinstance(semantic, dict):
+            requested = {
+                key: semantic[key] for key in (
+                    "lateral_decision", "longitudinal_decision", "behavior_reason",
+                    "risk_level", "safety_notes",
+                ) if key in semantic
+            }
+            lines.append(
+                "- 历史模型建议（请求意图，不代表已执行或成功）: "
+                + json.dumps(requested, ensure_ascii=False)
+            )
+        if isinstance(context, dict):
+            selected = {
+                key: context[key] for key in (
+                    "backend", "semantic_influence", "selected_id", "executed_behavior",
+                    "selected_lateral", "selected_longitudinal", "record_stage",
+                ) if key in context
+            }
+            lines.append(
+                "- 规划器最终选择记录: " + json.dumps(selected, ensure_ascii=False)
+            )
+            if context.get("semantic_influence") is False:
+                lines.append("- 此历史帧关闭语义影响；模型建议未参与该帧候选评分。")
+            elif context.get("semantic_influence") is True:
+                lines.append("- 此历史帧开启语义影响；请求意图仍受规划器安全约束限制。")
+        lines.append("- 上述选择记录不能单独证明动作已完成、驾驶成功或模型建议被采纳。")
+        return "\n".join(lines)
 
     def _render_image_layout_block(self, image_layout: str) -> str:
         """渲染输入图像布局说明段（告知决策 VLM 当前图像是单图还是六视角 mosaic）。"""

@@ -36,14 +36,35 @@ class TrafficSpawner:
         self._vehicles: List = []
         self._walkers: List = []
         self._walker_controllers: List = []
+        self.strict = False
+        self.reserved_locations = []
+        self.spawn_manifest = {"vehicles": [], "walkers": []}
+        self.night_lights = False
+
+    def configure_reproducibility(self, seed, reserved_locations):
+        self.strict = True
+        if not self._tm_synchronous:
+            raise RuntimeError("paper experiments require synchronous Traffic Manager")
+        self.tm.set_random_device_seed(int(seed))
+        self.world.set_pedestrians_seed(int(seed))
+        self.reserved_locations = reserved_locations
+        self.night_lights = self.world.get_weather().sun_altitude_angle < 0
 
     def spawn_vehicles(self, num: int, radius: float = 80.0) -> int:
         bp_lib = self.world.get_blueprint_library()
         vehicle_bps = list(bp_lib.filter("vehicle.*"))
+        if self.strict:
+            vehicle_bps = sorted([bp for bp in vehicle_bps if bp.has_attribute("number_of_wheels")
+                                  and bp.get_attribute("number_of_wheels").as_int() == 4], key=lambda bp: bp.id)
+            if not vehicle_bps:
+                raise RuntimeError("no four-wheel traffic vehicle blueprints")
         spawn_points = self.world.get_map().get_spawn_points()
         ego_loc = self.ego.get_location()
         candidates = [p for p in spawn_points if p.location.distance(ego_loc) < radius]
-        if not candidates:
+        if self.strict:
+            candidates = [p for p in candidates if p.location.distance(ego_loc) > 8 and
+                          all(p.location.distance(site) > 8 for site in self.reserved_locations)]
+        if not candidates and not self.strict:
             candidates = spawn_points
         self.rng.shuffle(candidates)
 
@@ -61,6 +82,10 @@ class TrafficSpawner:
                 continue
             self._vehicles.append(veh)
             veh.set_autopilot(True, self.tm_port)
+            if self.night_lights:
+                veh.set_light_state(carla.VehicleLightState(carla.VehicleLightState.Position | carla.VehicleLightState.LowBeam))
+            self.spawn_manifest["vehicles"].append({"id": veh.id, "blueprint": bp.id,
+                "x": sp.location.x, "y": sp.location.y, "z": sp.location.z, "yaw": sp.rotation.yaw})
             try:
                 self.tm.vehicle_percentage_speed_difference(veh, self.rng.uniform(-10, 20))
             except Exception:
@@ -79,6 +104,8 @@ class TrafficSpawner:
             return 0
         bp_lib = self.world.get_blueprint_library()
         walker_bps = list(bp_lib.filter("walker.pedestrian.*"))
+        if self.strict:
+            walker_bps.sort(key=lambda bp: bp.id)
         if not walker_bps:
             return 0
         try:
@@ -110,6 +137,8 @@ class TrafficSpawner:
                 controller = self.world.spawn_actor(controller_bp, carla.Transform(), attach_to=walker)
                 self._walker_controllers.append(controller)
                 pending.append((walker, controller, target))
+                self.spawn_manifest["walkers"].append({"id": walker.id, "blueprint": bp.id,
+                    "start": [loc.x, loc.y, loc.z], "target": [target.x, target.y, target.z]})
             except Exception as e:
                 logger.debug("行人生成失败: %s", e)
                 self._discard_walker(walker, controller)

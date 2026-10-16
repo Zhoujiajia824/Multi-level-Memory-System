@@ -4,10 +4,11 @@
 
     每个 replan 周期（默认 3s sim）：
       [1 捕获] tick -> 6 相机 mosaic + ego 状态 + GT 感知 + nav
-      [2 认知] loop_runner.step(kf) -> 决策轨迹（sim 冻结，wall-clock 5-30s）
+      [2 认知] loop_runner.step(kf) -> 语义决策 -> PDM轨迹（sim 冻结）
       [3 控制] 10Hz × N tick：Pure Pursuit + PID 跟踪轨迹回控 CARLA
                其中每周期 5 次 raw 捕获（≈1.67Hz；mosaic+ego+感知，不跑 VLM）
                push 进短期记忆，使队列在控制阶段也保持最新；完整 VLM 仍 3s 一次。
+               PDM 默认每 0.2s 根据最新 world 状态重规划，保持最近合法语义。
       [4 记录] 逐 tick 指标采集（碰撞/违规/路线/舒适度）+ 卡死检测
       [视频]  每个 CARLA 推进 tick 取一帧写视频（跳过 VLM 冻结期），
               视频时长 = 仿真实际驾驶时间；中断 flush 保存。
@@ -19,6 +20,8 @@ from __future__ import annotations
 
 import queue
 import math
+import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Optional
 
@@ -61,6 +64,20 @@ class ClosedLoop:
         self._final_summary = None
         ccfg = config.get_nested("carla", default={}) or {}
         self.ccfg = ccfg
+        self.planning_cfg = dict(ccfg.get("planning") or {})
+        self.planner_backend = self.planning_cfg.get("backend", "vlm_trajectory")
+        if self.planner_backend not in ("pdm_closed", "vlm_trajectory"):
+            raise ValueError("Unknown CARLA planning.backend")
+        self.semantic_influence = self.planning_cfg.get("semantic_influence", True)
+        if type(self.semantic_influence) is not bool:
+            raise ValueError("planning.semantic_influence must be a boolean")
+        if self.planner_backend == "vlm_trajectory":
+            self.semantic_influence = False
+        self.pdm_planner = None
+        self._active_semantics = None
+        self._semantic_frame_id = None
+        self._next_pdm_replan_at = 0.0
+        self._pdm_plan_count = 0
         self.replan_interval_s = float(ccfg.get("replan_interval_s", 1.0))
         self.fixed_delta = float(ccfg.get("fixed_delta_seconds", 0.05))
         self.max_duration_s = float(ccfg.get("max_duration_s", 300.0))
@@ -71,6 +88,11 @@ class ClosedLoop:
             raise ValueError("replan_interval_s cannot be shorter than one physics tick")
         self._cycle_ticks = max(1, round(self.replan_interval_s / self.fixed_delta))
         self._execution_horizon = self._cycle_ticks * self.fixed_delta
+        self._pdm_interval = float(self.planning_cfg.get("replan_interval_s", 0.2))
+        if self.planner_backend == "pdm_closed" and (
+                not math.isfinite(self._pdm_interval) or self._pdm_interval < self.fixed_delta
+                or self._pdm_interval > self._execution_horizon):
+            raise ValueError("PDM replan interval must be between physics tick and semantic interval")
         self.trajectory_validator = TrajectoryValidator(ccfg.get("trajectory_validation"))
         self._trajectory_rejections = 0
         self._consecutive_trajectory_rejections = 0
@@ -131,6 +153,9 @@ class ClosedLoop:
     # ------------------------------------------------------------------
 
     def setup(self) -> None:
+        if self.planner_backend == "pdm_closed":
+            from carla_bridge.planning.pdm_planner import validate_dependencies
+            validate_dependencies()
         # 1. CARLA 连接
         self.carla_client = CarlaClient(
             host=self.ccfg.get("host", "127.0.0.1"),
@@ -148,6 +173,13 @@ class ClosedLoop:
         self.scenario.setup()
         world = self.scenario.world
         ego = self.scenario.ego_vehicle
+        if (self.scenario.cfg.get("experiment") or {}).get("suite") == "paper_v1":
+            from carla_bridge.env.paper_events import PaperEventScheduler
+            # Preserve the partial scheduler for cleanup if actor setup fails.
+            self.event_scheduler = PaperEventScheduler(world, ego, self.scenario.route,
+                self.scenario.cfg.get("events", []), elapsed=lambda: self._elapsed,
+                audit_path=Path(self.config.get("output_dir")) / "events.json")
+            self.event_scheduler.setup()
         # 交通流刚 spawn：tick 几帧让 Traffic Manager 与所有 NPC 完成初始化后再挂相机，
         # 否则 6 相机首次 BeginPlay 与大量未初始化 actor 竞态，Town05 上触发引擎崩溃
         for _ in range(5):
@@ -179,6 +211,11 @@ class ClosedLoop:
             history_seconds=float(self.config.get("history_seconds", 5.0))
         )
         self.tracker = TrajectoryTracker(self.controller_cfg, control_dt_s=self.fixed_delta)
+        if self.planner_backend == "pdm_closed":
+            from carla_bridge.planning.pdm_planner import CarlaPDMPlanner
+            planner_cfg = dict(self.planning_cfg)
+            planner_cfg["horizon_s"] = max(float(planner_cfg.get("horizon_s", 4.0)), self._execution_horizon)
+            self.pdm_planner = CarlaPDMPlanner(world, ego, self.scenario.route, planner_cfg)
         self.kf_builder = KeyframeBuilder(scenario_name=self.scenario.scenario_name(), run_id=self.run_id)
 
         # 5. 碰撞传感器 + 指标采集
@@ -194,6 +231,7 @@ class ClosedLoop:
         self.loop = LoopRunner(
             self.config, mode=self.mode, output_jsonl_path=out_path, resume=False,
             decision_validator=self._validate_decision,
+            decision_processor=self._plan_semantic_decision if self.planner_backend == "pdm_closed" else None,
         )
         self.loop.setup()
 
@@ -219,7 +257,7 @@ class ClosedLoop:
 
         # 9. 长尾事件调度器（若场景声明了 events）
         events_cfg = (self.scenario.cfg or {}).get("events") or []
-        if events_cfg:
+        if events_cfg and self.event_scheduler is None:
             from carla_bridge.env.event_scheduler import EventScheduler
             ctrl_cfg = dict(self.controller_cfg)
             ctrl_cfg["control_dt_s"] = self.fixed_delta  # scripted NPC PID 的真实 dt
@@ -254,12 +292,20 @@ class ClosedLoop:
         """Success is measured route completion; elapsed time is only a guard."""
         if self._early_terminated:
             return True
+        from carla_bridge.env.paper_events import PaperEventScheduler
+        if isinstance(self.event_scheduler, PaperEventScheduler) and self.event_scheduler.has_failed():
+            self._termination_reason = "scenario_invalid"
+            self._early_terminated = True
+            self._apply_brake()
+            return True
         route = self.scenario.route
         if route is not None:
             self.route_completion = route.progress_fraction()
             self.route_completed = route.is_complete()
         if self.route_completed:
-            self._termination_reason = "route_completed"
+            valid_events = (not isinstance(self.event_scheduler, PaperEventScheduler)
+                            or self.event_scheduler.summary()["valid"])
+            self._termination_reason = "route_completed" if valid_events else "scenario_invalid"
         elif self._elapsed + self.fixed_delta > min(self.max_duration_s, self.scenario.duration_s()) + 1e-8:
             self._termination_reason = "timeout"
         else:
@@ -278,16 +324,121 @@ class ClosedLoop:
         return self.trajectory_validator.validate(
             decision.get("trajectory"), decision.get("target_speed"),
             (kf.get("ego_state") or {}).get("speed", 0.0), self._execution_horizon,
+            use_speed_profile=self.planner_backend == "pdm_closed",
         ).to_dict()
+
+    def _is_planned_stop(self, decision: dict) -> bool:
+        if self.planner_backend != "pdm_closed":
+            return float(decision.get("target_speed", 0.0)) <= self._stuck_speed_thresh
+        # Terminal speed alone may be zero even when this control interval must
+        # accelerate towards a distant stop line. Inspect the near-term profile.
+        points = decision.get("trajectory") or []
+        near = [float(p["optional_v"]) for p in points
+                if float(p["t"]) <= self._pdm_interval + self.fixed_delta + 1e-8]
+        return not near or max(near) <= self._stuck_speed_thresh
+
+    def _plan_semantic_decision(self, decision: dict, kf: dict) -> dict:
+        """Plan and audit before the memory layer can admit this frame."""
+        self._active_semantics = None
+        if decision.get("parser_status") != "success" or decision.get("decision_mode") != "semantic":
+            raise ValueError("A valid semantic decision is required for PDM planning")
+        semantic = {key: deepcopy(decision[key]) for key in (
+            "lateral_decision", "longitudinal_decision", "behavior_reason", "risk_level", "safety_notes")}
+        self._semantic_frame_id = kf.get("sample_token")
+        plan = self.pdm_planner.plan(semantic, semantic_enabled=self.semantic_influence)
+        result = self._merge_plan(decision, semantic, plan)
+        validation = self._validate_decision(result, kf)
+        self._audit_pdm_plan(result, validation, "semantic_update")
+        if validation["accepted"]:
+            self._active_semantics = semantic
+            self._next_pdm_replan_at = self._elapsed + self._pdm_interval
+        return result
+
+    def _merge_plan(self, decision: dict, semantic: dict, plan: dict) -> dict:
+        if not isinstance(plan, dict) or not isinstance(plan.get("planner_diagnostics"), dict):
+            raise ValueError("PDM returned no auditable plan")
+        diagnostics = plan["planner_diagnostics"]
+        target = float(plan["target_speed"])
+        lateral = plan.get("selected_lateral", diagnostics.get("selected_lateral", "FOLLOW_ROUTE"))
+        longitudinal = plan.get("selected_longitudinal", diagnostics.get("selected_longitudinal", "CRUISE"))
+        if target <= self._stuck_speed_thresh:
+            selected_behavior = "STOP"
+        elif lateral in ("CHANGE_LANE_LEFT", "CHANGE_LANE_RIGHT"):
+            selected_behavior = lateral
+        else:
+            selected_behavior = {"FOLLOW": "FOLLOW", "DECELERATE": "SLOW_DOWN",
+                                 "YIELD": "YIELD", "STOP": "STOP"}.get(longitudinal, "KEEP_LANE")
+        context = {"backend": "pdm_closed", "semantic_influence": self.semantic_influence,
+                   "selected_id": diagnostics.get("selected_id"),
+                   "executed_behavior": selected_behavior,
+                   "selected_lateral": lateral, "selected_longitudinal": longitudinal,
+                   "record_stage": "selected_before_execution"}
+        return {**decision, **plan, "trajectory_source": "pdm_closed",
+                "semantic_decision": deepcopy(semantic), "planning_context": context,
+                "behavior": selected_behavior,
+                "behavior_reason": "PDM selected candidate %s; semantic influence=%s. Execution outcome is not yet known."
+                                   % (context["selected_id"], self.semantic_influence)}
+
+    def _audit_pdm_plan(self, decision: dict, validation: dict, source: str) -> None:
+        self._pdm_plan_count += 1
+        path = Path(self.config.get("output_dir") or "outputs") / "planner.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        audit = {"sim_time_s": self._elapsed, "sequence": self._pdm_plan_count,
+                 "source": source, "semantic_frame_id": self._semantic_frame_id,
+                 "semantic_decision": decision.get("semantic_decision"),
+                 "semantic_influence": self.semantic_influence,
+                 "planner_diagnostics": decision.get("planner_diagnostics"),
+                 "trajectory": decision.get("trajectory"), "validation": validation}
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(audit, ensure_ascii=False, allow_nan=False) + "\n")
+
+    def _refresh_pdm_control(self, tf, yaw: float, speed: float) -> None:
+        """Replan against current actors between expensive semantic VLM calls."""
+        if (self.planner_backend != "pdm_closed" or self._active_semantics is None
+                or self._elapsed + 1e-8 < self._next_pdm_replan_at):
+            return
+        self._next_pdm_replan_at = self._elapsed + self._pdm_interval
+        try:
+            plan = self.pdm_planner.plan(self._active_semantics, semantic_enabled=self.semantic_influence)
+            result = self._merge_plan({}, self._active_semantics, plan)
+            validation = self._validate_decision(result, {"ego_state": {"speed": speed}})
+            self._audit_pdm_plan(result, validation, "control_update")
+            if not validation["accepted"]:
+                raise ValueError("PDM trajectory rejected: %s" % validation["reasons"])
+            self.tracker.set_trajectory(result["trajectory"], tf.location.x, tf.location.y, yaw,
+                                        result["target_speed"], follow_speed_profile=True)
+            self._planned_stop = self._is_planned_stop(result)
+            self._consecutive_trajectory_rejections = 0
+        except Exception as exc:
+            # Apply the brake before attempting further logging: a full disk or
+            # broken audit path must never leave the previous throttle applied.
+            self._apply_brake()
+            self.tracker.set_trajectory([], tf.location.x, tf.location.y, yaw, 0.0)
+            self._planned_stop = True
+            self._trajectory_rejections += 1
+            self._consecutive_trajectory_rejections += 1
+            try:
+                self._audit_pdm_plan({}, {"accepted": False, "reasons": ["pdm_control_update_error"],
+                                         "details": {"error": str(exc)}}, "control_error")
+            except Exception:
+                logger.error("PDM error audit could not be written; vehicle already braking")
+            logger.error("PDM control update failed; braking: %s", exc)
+            if self._consecutive_trajectory_rejections >= int(self.ccfg.get("max_trajectory_rejections", 3)):
+                self._early_terminated = True
+                self._termination_reason = "invalid_trajectory"
 
     def outcome(self) -> dict:
         """Cached result is safe to read after CARLA actors have been destroyed."""
+        from carla_bridge.env.paper_events import PaperEventScheduler
+        event_result = self.event_scheduler.summary() if isinstance(self.event_scheduler, PaperEventScheduler) else None
         return {"success": self.run_status == "route_completed" and self.route_completed,
                 "route_completed": self.route_completed,
                 "route_completion": self.route_completion,
                 "duration_s": round(self._elapsed, 3),
                 "trajectory_rejections": self._trajectory_rejections,
-                "cleanup_errors": list(self._cleanup_errors)}
+                "planner_backend": self.planner_backend, "semantic_influence": self.semantic_influence,
+                "pdm_plan_count": self._pdm_plan_count,
+                "cleanup_errors": list(self._cleanup_errors), "experiment_events": event_result}
 
     def close(self) -> None:
         if self._closed:
@@ -392,6 +543,7 @@ class ClosedLoop:
         kf["carla_frame_id"] = frame_id
         kf["sim_time_s"] = self._elapsed
         kf["planning_constraints"] = {
+            "decision_mode": "semantic" if self.planner_backend == "pdm_closed" else "trajectory",
             "required_horizon_s": self._execution_horizon,
             **{key: getattr(self.trajectory_validator, key) for key in (
                 "max_speed_mps", "max_acceleration_mps2", "max_deceleration_mps2",
@@ -416,7 +568,7 @@ class ClosedLoop:
                 self._consecutive_trajectory_rejections = 0
                 traj = decision.get("trajectory") or []
                 target_speed = float(decision.get("target_speed", 0.0) or 0.0)
-                self._planned_stop = target_speed <= self._stuck_speed_thresh
+                self._planned_stop = self._is_planned_stop(decision)
             else:
                 traj, target_speed = [], 0.0
                 self._planned_stop = True
@@ -427,13 +579,15 @@ class ClosedLoop:
                     self._early_terminated = True
                     self._termination_reason = "invalid_trajectory"
             self.tracker.set_trajectory(
-                traj, tf.location.x, tf.location.y, ego_yaw, target_speed
+                traj, tf.location.x, tf.location.y, ego_yaw, target_speed,
+                **({"follow_speed_profile": True} if self.planner_backend == "pdm_closed" and accepted else {})
             )
         except Exception as e:
             # 认知步骤异常（如 VLM 调用失败）：打印完整 traceback 便于定位，本周期全刹，继续下一周期
             logger.error("认知步骤异常（本周期全刹，继续下一周期）: %s", e, exc_info=True)
             self.tracker.set_trajectory([], tf.location.x, tf.location.y, ego_yaw, 0.0)
             self._planned_stop = True
+            self._active_semantics = None
 
         if self._early_terminated:
             self._apply_brake()
@@ -470,6 +624,10 @@ class ClosedLoop:
             yaw2 = coords.carla_yaw_deg_to_rad(tf2.rotation.yaw)
             v = ego.get_velocity()
             speed = (v.x * v.x + v.y * v.y) ** 0.5
+            self._refresh_pdm_control(tf2, yaw2, speed)
+            if self._early_terminated:
+                self._apply_brake()
+                return
             ctrl = self.tracker.compute_control(tf2.location.x, tf2.location.y, yaw2, speed)
             ego.apply_control(ctrl)
 
@@ -702,6 +860,7 @@ class ClosedLoop:
             "mode": self.mode,
             "duration_s": round(self._elapsed, 2),
             "replan_interval_s": self.replan_interval_s,
+            "pdm_replan_interval_s": self._pdm_interval if self.planner_backend == "pdm_closed" else None,
             "collision_raw_events": self._collision_raw,
             "collision_unique_actors": len(
                 {a for a in self._collision_actors if a is not None}

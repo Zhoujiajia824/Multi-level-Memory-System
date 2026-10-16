@@ -67,15 +67,15 @@ class TrajectoryValidator:
             raise ValueError("max_initial_heading_deg must be below 90 for forward-only control")
 
     def validate(self, trajectory: Any, target_speed: Any, current_speed: Any,
-                 required_horizon_s: float) -> TrajectoryValidationResult:
+                 required_horizon_s: float, *, use_speed_profile: bool = False) -> TrajectoryValidationResult:
         """Return JSON-friendly reasons and measurements; do not mutate inputs."""
         try:
-            return self._validate(trajectory, target_speed, current_speed, required_horizon_s)
+            return self._validate(trajectory, target_speed, current_speed, required_horizon_s, use_speed_profile)
         except ArithmeticError:
             # A JSON number can be finite but far beyond physical arithmetic.
             return TrajectoryValidationResult(False, ["numeric_range_exceeded"], {})
 
-    def _validate(self, trajectory, target_speed, current_speed, required_horizon_s):
+    def _validate(self, trajectory, target_speed, current_speed, required_horizon_s, use_speed_profile=False):
         result = TrajectoryValidationResult(True, details={"violations": []})
 
         def reject(code: str, index: Optional[int] = None, **values: Any) -> None:
@@ -117,6 +117,8 @@ class TrajectoryValidator:
                 reject("non_monotonic_time", i)
             previous_t = t
             speed = point.get("optional_v")
+            if use_speed_profile and speed is None:
+                reject("missing_speed_profile", i)
             if speed is not None:
                 if not _finite_number(speed) or speed < 0:
                     reject("invalid_waypoint_speed", i)
@@ -139,6 +141,13 @@ class TrajectoryValidator:
         # Keep a measured high current speed in the envelope: a braking plan must
         # remain possible even if the car is already above the configured limit.
         cruise_cap = max(current_speed, target_speed)
+        if use_speed_profile:
+            # PDM target_speed is the terminal speed, not a cap for the whole
+            # horizon. A valid plan may accelerate then stop at a red light.
+            # All profile values were checked above; segment dynamics below
+            # still enforce acceleration, braking and geometry consistency.
+            cruise_cap = max(cruise_cap, max(float(point[3]) for point in points))
+            result.details["speed_profile_peak_mps"] = cruise_cap
         previous = (0.0, 0.0, 0.0, current_speed)
         previous_mean_speed = current_speed
         previous_mid_t = 0.0

@@ -16,6 +16,7 @@ parse_decision_output / generate_fallback_decision。
 from __future__ import annotations
 
 import os
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -87,6 +88,7 @@ class OnlineDrivingLoop:
         output_jsonl_path: Optional[Path | str] = None,
         resume: bool = True,
         decision_validator=None,
+        decision_processor=None,
     ):
         if mode not in self.VALID_MODES:
             raise ValueError(f"mode 必须是 {self.VALID_MODES}，实际: {mode!r}")
@@ -106,6 +108,9 @@ class OnlineDrivingLoop:
         # Optional simulator-specific physical validation; offline datasets keep
         # their existing behavior when no callback is supplied.
         self.decision_validator = decision_validator
+        # Turn a semantic request into an executable plan before validation and
+        # memory admission. The original model output is kept separately.
+        self.decision_processor = decision_processor
 
         # ---- setup 后填充的组件 ----
         self.feature_extractor: Optional[DINOv2Extractor] = None
@@ -527,9 +532,12 @@ class OnlineDrivingLoop:
             raw_response=raw_response,
             ego_state=kf.get("ego_state"),
             nav_instruction=kf.get("nav_instruction", ""),
+            decision_mode=(kf.get("planning_constraints") or {}).get("decision_mode", "trajectory"),
         )
 
-        decision_validation = self._validate_decision(parsed, kf)
+        model_decision = deepcopy(parsed)
+        parsed, processing_error = self._process_decision(parsed, kf)
+        decision_validation = processing_error or self._validate_decision(parsed, kf)
         decision_accepted = decision_validation is None or decision_validation["accepted"]
 
         # ---- e.1) 中期记忆价值门控（Phase 2：MemoryAdmissionController）----
@@ -643,6 +651,8 @@ class OnlineDrivingLoop:
             "retrieved_memory_statuses": retrieved_memory_statuses,             # 各结果 status
             "long_term_rule_ids": long_term_rule_ids,
             "decision_output": parsed,
+            "model_decision_output": model_decision,
+            "planning_output": (parsed or {}).get("planner_diagnostics"),
             "decision_validation": decision_validation,
             "parser_status": parser_status,
             "parser_errors": errors,
@@ -785,6 +795,8 @@ class OnlineDrivingLoop:
                         decision_reason=(parsed or {}).get("behavior_reason", ""),
                         behavior=(parsed or {}).get("behavior", ""),
                         trajectory=(parsed or {}).get("trajectory"),
+                        semantic_decision=(parsed or {}).get("semantic_decision"),
+                        planning_context=(parsed or {}).get("planning_context"),
                         # ===== Phase 1/2 metadata（配置驱动；事件标签来自门控，不伪造价值）=====
                         memory_id=record_id,
                         memory_type=self._mt_default_memory_type,
@@ -860,6 +872,22 @@ class OnlineDrivingLoop:
         }
 
         return record
+
+    def _process_decision(self, parsed, kf):
+        processor = getattr(self, "decision_processor", None)
+        if processor is None:
+            if (kf.get("planning_constraints") or {}).get("decision_mode") == "semantic":
+                return parsed, {"accepted": False, "reasons": ["semantic_planner_missing"], "details": {}}
+            return parsed, None
+        try:
+            result = processor(deepcopy(parsed), kf)
+            if not isinstance(result, dict):
+                raise ValueError("decision_processor must return a dictionary")
+            return result, None
+        except Exception as exc:
+            logger.exception("轨迹规划失败，禁止执行/写入决策记忆")
+            return parsed, {"accepted": False, "reasons": ["decision_processor_error"],
+                            "details": {"error_type": type(exc).__name__, "error": str(exc)}}
 
     def _validate_decision(self, parsed, kf):
         """Run an optional actuation validator before any decision memory write.
@@ -969,8 +997,18 @@ class OnlineDrivingLoop:
         raw_response: Optional[str],
         ego_state: Optional[Dict[str, Any]],
         nav_instruction: str,
+        decision_mode: str = "trajectory",
     ):
         """parse + 兜底 fallback 的统一逻辑。"""
+        if decision_mode == "semantic":
+            from src.vla_memory.decision.semantic_output_parser import parse_semantic_decision_output
+            parsed, errors = parse_semantic_decision_output(raw_response)
+            if parsed is not None:
+                return parsed, [], "success", False
+            # Never fabricate a semantic instruction or numerical VLM fallback.
+            return {"decision_mode": "semantic", "behavior": "UNKNOWN", "trajectory": [],
+                    "behavior_reason": "Invalid semantic model output", "risk_level": "high",
+                    "parser_status": "failed", "fallback_used": False}, errors, "failed", False
         allow_fallback = self.config.get_nested(
             "fallback", "allow_rule_fallback_for_format_error", default=True,
         )

@@ -13,8 +13,11 @@
 ## 🚗 CARLA 闭环集成（carla-integration 分支）
 
 本分支将 **CARLA 0.9.15** 接入多层记忆系统：六视角相机、GT 感知、自车状态和导航
-经 `KeyframeBuilder` 喂入 `OnlineDrivingLoop`，决策轨迹由 Pure Pursuit + PID 回控。
-默认 10 Hz 控制、约 3 秒仿真时间重规划一次，VLM 推理期间同步仿真暂停。
+经 `KeyframeBuilder` 喂入 `OnlineDrivingLoop`。CARLA 默认由 VLM 输出横纵向语义，
+由官方 PDM-Closed 核心的 CARLA 适配层生成、仿真和评分候选轨迹，再用 Pure Pursuit + PID 回控。
+默认 10 Hz 控制、0.2 秒 PDM 规划、3 秒语义推理；VLM 推理期间同步仿真暂停。
+首次使用需安装额外 PDM 依赖，见 [PDM 接入与消融](carla_bridge/README.md#13-语义决策与-pdm-closed)。
+`--semantic-influence on|off` 控制语义是否影响候选选择；`--planner vlm_trajectory` 可运行旧轨迹输出路径。
 
 闭环入口支持：
 
@@ -72,6 +75,11 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --memory-bank 
 包含 `manifest.json`、决策、报告、视频和日志。可写库引用的图像与特征保存在库内 `assets/`。
 
 > 完整参数与使用方式见 **[carla_bridge/README.md](carla_bridge/README.md)**。
+
+论文实验使用新的 [paper_v1 场景套件](carla_bridge/README.md#12-服务器论文实验套件-paper_v1)：
+基于服务器已安装的 Town03/04/05/10HD，定义常规、单类长尾和组合条件。
+先在空闲服务器运行 `python -m carla_bridge.paper_suite prepare --output outputs/paper_v1`，
+生成通过实际地图几何预检的固定路线/事件 YAML，再运行驾驶实验；训练/评估种子分离，评估库只读。
 
 > 下文 §1–§14 为**离线 nuScenes 记忆系统**的完整文档（v0.1，环境 `mulmem`/Python 3.12）。
 

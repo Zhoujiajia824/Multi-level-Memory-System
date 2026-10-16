@@ -1,8 +1,9 @@
 # CARLA 闭环集成（carla_bridge）
 
 把多层次记忆系统（`src/vla_memory`）接入 CARLA 0.9.15：用 CARLA 实时
-感知（六视角图像 / GT 障碍物 / 天气 / 导航 / 自车状态）替代离线 nuScenes，决策轨迹
-实时回控 CARLA，实现**自定义环境下的闭环驾驶**，并支持驾驶视频录制回看。
+感知（六视角图像 / GT 障碍物 / 天气 / 导航 / 自车状态）替代离线 nuScenes。
+默认链路为语义决策 → PDM-Closed 候选规划 → Pure Pursuit + 速度曲线 PID 回控。
+支持通过 `--semantic-influence on|off` 做语义影响对照；安装依赖及使用方式见[第 13 节](#13-语义决策与-pdm-closed)。
 
 > ⚠️ 研究用离线/仿真 Demo，**不可用于实车**。
 
@@ -25,6 +26,9 @@ python -m pip install "pytest>=7.4,<9"
 ```
 
 **先检查环境，不连接仿真器或调用 API：**
+
+PDM 是新增可选依赖，但已作为 CARLA 默认后端。首次更新先按第 13 节安装并预检；
+缺依赖会在加载 CARLA 场景之前报错，不会静默回退到旧模型轨迹。
 
 ```bash
 python -c "import sys, carla, faiss, torch, pydantic; from carla_bridge.closed_loop import ClosedLoop; print('Python:', sys.version); print('CUDA:', torch.cuda.is_available()); print('IMPORT_OK')"
@@ -190,7 +194,8 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
 | **复用记忆管线** | 复用 `OnlineDrivingLoop`（setup/step/close），CARLA 数据经 `KeyframeBuilder` 组装成与 nuScenes 同构的 `kf` dict 喂入 |
 | **3s 全量认知** | 每 3s sim 做一次完整 DINOv2 + 场景VLM + 三层记忆检索 + 决策VLM（与 nuScenes keyframe 一致） |
 | **每周期 5 次 raw 捕获** | 控制阶段每周期 5 次（≈1.67Hz）捕获原始感知（图像+ego+障碍物，不跑 VLM）push 进短期记忆，队列时刻最新 |
-| **10Hz 回控** | Pure Pursuit(横向) + PID(纵向) 跟踪决策轨迹，同步模式 |
+| **5Hz PDM 规划** | 基于最新 world 状态和最近语义，生成、仿真、评分轨迹候选 |
+| **10Hz 回控** | Pure Pursuit(横向) + PID(纵向) 跟踪 PDM 轨迹及时间速度曲线，同步模式 |
 | **同步模式** | VLM 思考期间 CARLA 冻结（不 tick），wall-clock 慢但 sim 时间连续正确 |
 | **驾驶视频录制** | 仅在 CARLA 推进 tick 取帧（跳过 VLM 冻结期），按仿真帧率编码，丢帧时视频可能短于仿真时长 |
 | **CARLA 全优势** | 自定义地图/天气/交通流/车辆/路由，全 Python API |
@@ -208,8 +213,9 @@ carla_bridge.closed_loop  ──每 3s sim──>  keyframe_builder
         │                                    ▼
         │                 src.vla_memory.pipeline.OnlineDrivingLoop.step(kf)
         │                                    │  DINOv2 + 场景VLM + 三层记忆 + 决策VLM
-        │                                    ▼  decision = {behavior, trajectory(ego-centric)}
-        │  ◀──  trajectory  ────────────────
+        │                                    ▼  decision = {lateral_decision, longitudinal_decision, ...}
+        │       CARLA adapter → PDM generator → simulator → scorer + optional semantic preference
+        │  ◀──  validated trajectory + time/speed profile  ────────
         ▼
 trajectory_tracker (Pure Pursuit + PID)  ->  carla.VehicleControl  ->  vehicle.apply_control
         │
@@ -220,8 +226,9 @@ trajectory_tracker (Pure Pursuit + PID)  ->  carla.VehicleControl  ->  vehicle.a
 **单周期时序（每 3s sim）：**
 ```
 [1 捕获]  tick -> 6 相机 mosaic + ego + GT 感知 + nav         (推进 0.1s)
-[2 认知]  loop.step(kf) -> 决策轨迹                           (sim 冻结, wall 5-30s)
-[3 控制]  10Hz × 30 tick：Pure Pursuit+PID 回控 CARLA          (推进 3.0s)
+[2 认知]  loop.step(kf) -> 横纵向语义 -> PDM轨迹              (sim 冻结, wall 5-30s)
+[3 控制]  10Hz × 29 tick：Pure Pursuit+PID 回控 CARLA          (推进 2.9s)
+          每 0.2s PDM 根据最新 world 状态重规划；和下一捕获 tick 合计 3.0s
           其中每周期 5 次 raw 捕获 push 进短期记忆；其余 tick drain 相机防堆积
 [4 记录]  逐 tick 指标采集 + 视频取帧
 ```
@@ -402,7 +409,10 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
 |---|---|---|
 | `carla.host`/`port` | 127.0.0.1/2000 | CARLA 服务器 |
 | `carla.synchronous`/`fixed_delta_seconds` | true/0.1 | 同步模式 + 10Hz |
-| `carla.replan_interval_s` | 3.0 | 3s 全量捕获（= decision.trajectory.horizon_seconds） |
+| `carla.replan_interval_s` | 3.0 | 全量认知与语义更新周期 |
+| `carla.planning.backend` | pdm_closed | PDM 核心；vlm_trajectory 为旧模型轨迹 |
+| `carla.planning.semantic_influence` | true | 语义候选偏好评分开关，与记忆开关独立 |
+| `carla.planning.replan_interval_s` | 0.2 | 两次语义更新之间的 PDM 规划周期 |
 | `carla.max_duration_s` | 300.0 | 全局仿真时间保护上限，与场景 `duration_s` 取较小值；到时未完成为 `timeout` |
 | `carla.capture_timeout_s` | 2.0 | 六路相机共享等待上限（墙钟秒） |
 | `carla.max_capture_failures` | 3 | 连续缺帧达到阈值时结束运行 |
@@ -523,3 +533,239 @@ CARLA 全局：x 前、y 右、z 上。项目 ego-centric：x 前、**y 左**。
 - [x] 长尾事件系统：EventScheduler + scripted 车(NOA+ACC) + 行人(过马路/路边) + 障碍物 + 信号灯控制
 - [x] 本地回归覆盖库读写、隔离、帧同步、行人生命周期、离线模型加载与异常轨迹拦截
 - [ ] P6 服务器验证：完整路线完成率 100%、清理完成且退出码 0；验证原生崩溃修复及 memory_on/off 对比
+
+## 12. 服务器论文实验套件 paper_v1
+
+这是项目自定义实验套件，不是 CARLA Leaderboard 或其他公开基准的复现。
+配置来源为 [paper_suite.yaml](config/paper_suite.yaml)，工具为 [paper_suite.py](paper_suite.py)。
+服务器已确认安装 Town01/02/03/04/05/10HD 及各自的 `_Opt` 版本；本套件统一使用普通版本，
+不混用地图层设置。Town06 未安装，旧 NOA2 不包含在本套件中。
+地图特征参考 [CARLA 官方地图说明](https://carla.readthedocs.io/en/0.9.15/core_map/)。
+
+### 12.1 条件与对照
+
+| 条件 ID | 地图 / 目标路线长度 | 场景内容 | 配对常规对照 |
+|---|---|---|---|
+| R03_urban | Town03 / 800 m | 城市路网、混合交通 | — |
+| R04_extended | Town04 / 1200 m | 较长路线持续驾驶 | — |
+| R05_multilane | Town05 / 900 m | 多车道路网、混合交通 | — |
+| R10_downtown | Town10HD / 700 m | 高细节城区日间驾驶 | — |
+| L05_crossing | Town05 / 同上 | 预置路边行人按距离开始横穿 | R05_multilane |
+| L05_blocked_lane | Town05 / 同上 | 预置同向占道停车，选取有合法同向绕行车道的位置 | R05_multilane |
+| L10_night_rain | Town10HD / 同上 | 夜间降雨 | R10_downtown |
+| L03_fog | Town03 / 同上 | 浓雾视觉条件 | R03_urban |
+| C05_crossing_blocked | Town05 / 同上 | 先后遇到横穿行人与占道停车 | R05_multilane |
+| C10_night_crossing | Town10HD / 同上 | 夜雨和横穿行人组合 | R10_downtown；另与 L10_night_rain 比较 |
+
+默认每轮请求 60 辆背景车和 20 名背景 AI 行人，事件 actor 另计。初始化必须达到请求数量，
+不足就报错并记录实际数量，不静默变成稀疏场景。可在准备前统一修改 catalog 中的交通数量。
+同一 profile 的对照和干预共用冻结路线、起点和预留事件区域，固定同一 seed 对比。
+常规路线不保证经过地图的特定地标，Town04 路线也不宣称全程高速；必须看预检路线及视频。
+行人场景不宣称有视线遮挡；雨雾测试不宣称自动改变轮胎摩擦。
+当前管线仍开启 CARLA GT 障碍物输入（oracle）；雨雾不会自动降低这些真值对象的可见范围。
+因此这套设置评估的是视觉、真值感知和记忆共同参与的决策系统，不应报告为纯视觉感知鲁棒性实验。
+
+### 12.2 在服务器准备真实路线
+
+本地可先查看定义，不连接 CARLA：
+
+```bash
+python -m carla_bridge.paper_suite list
+```
+
+新代码同步到服务器后，保持 CARLA 服务启动，**停止正在运行的闭环任务**，再准备：
+
+```bash
+conda activate mulmem_carla
+python -m carla_bridge.paper_suite prepare --output outputs/paper_v1
+```
+
+`prepare` 会依次加载四个地图，重置当前 world，结束时停留在最后加载的地图。
+它不运行 VLM、不生成交通 actor；检查地图/版本/蓝图、完整路线长度、人行道横穿位置、
+可绕行车道以及事件点是否被路线的其他部分重复经过。不是只把旧场景里的地图名换掉。
+如没有候选路线满足条件，会列出失败原因，不输出一个伪装为可用的套件。
+这时可调整 catalog 的起点候选、路线长度或事件搜索区间，使用一个新的输出目录重试。
+
+全部几何检查通过后生成：
+
+```text
+outputs/paper_v1/
+├── preflight.json                  # 路线坐标、事件坐标、地图哈希、版本、catalog 哈希
+├── train/                         # 10 条件 × seeds 11、22、33
+│   └── R05_multilane_train_s11.yaml
+└── eval/                          # 10 条件 × seeds 101、202、303
+    └── R05_multilane_eval_s101.yaml
+```
+
+工具不会覆盖已有目录。生成的 YAML 是独立可运行场景；不要手改其路线/事件坐标，哈希校验会拒绝。
+改变实验设计应修改 catalog 后重新准备，并保留原版用于追溯。
+预检仅验证地图几何，不等于 actor 一定能生成、事件一定能完成或车辆已通过路线。
+
+### 12.3 首轮驾驶验收与记忆实验
+
+先用训练场景做一轮完整驾驶验收：
+
+```bash
+python -m carla_bridge.run_carla_demo \
+  --scenario outputs/paper_v1/train/R05_multilane_train_s11.yaml \
+  --mode memory_off
+```
+
+然后在训练 seed 下积累库，可以按 case/profile 分库，也可以在多个训练场景使用同一个 general 库：
+
+```bash
+python -m carla_bridge.run_carla_demo \
+  --scenario outputs/paper_v1/train/L05_crossing_train_s11.yaml \
+  --memory-bank outputs/memory_banks/paper_v1/train_general
+```
+
+其他训练条件/seed 更换 `--scenario`，库路径不变则继续积累。普通场景、长尾场景都应纳入训练覆盖，
+不保证每一帧入库；不要用验证条件补充训练库。
+
+评估时冻结训练库，同一个 eval 场景、seed 分别运行以下对照：
+
+```bash
+# 无记忆基线
+python -m carla_bridge.run_carla_demo \
+  --scenario outputs/paper_v1/eval/L05_crossing_eval_s101.yaml --mode memory_off
+
+# 完整记忆，已有库只读；短期上下文开启
+python -m carla_bridge.run_carla_demo \
+  --scenario outputs/paper_v1/eval/L05_crossing_eval_s101.yaml \
+  --memory-bank outputs/memory_banks/paper_v1/train_general --memory-access read_only
+
+# 去掉短期上下文，隔离持久化记忆的作用
+python -m carla_bridge.run_carla_demo \
+  --scenario outputs/paper_v1/eval/L05_crossing_eval_s101.yaml \
+  --memory-bank outputs/memory_banks/paper_v1/train_general --memory-access read_only --no-short-term
+
+# 仅短期上下文：同一个只读库保持加载，但关闭中长期检索
+python -m carla_bridge.run_carla_demo \
+  --scenario outputs/paper_v1/eval/L05_crossing_eval_s101.yaml \
+  --memory-bank outputs/memory_banks/paper_v1/train_general --memory-access read_only --no-memory-retrieval
+```
+
+`eval` 场景禁止可写记忆模式；需要在线持续学习时另用训练场景和独立库开展实验，避免混入冻结库评估。
+分开的 seed 用于不同交通初始化，**不是未见地图/路线泛化划分**；3 个 seed 是初始配置，
+论文所需样本数和统计不确定性需根据试验结果确定。相同 seed 不保证不同 VLM 调用或不同硬件逐位一致。
+交通管理器和行人导航的种子都显式设置，参见 [CARLA TM 确定性说明](https://carla.readthedocs.io/en/0.9.15/adv_traffic_manager/)。
+
+### 12.4 记录与验收
+
+- `experiment_setup.json`：真实地图哈希、路线长度、请求/实际交通数、初始 actor、天气、seed 和完整 case 配置哈希。
+- `events.json`：事件初始化、沿路线触发距离/时刻、运动证据、是否实际接近、完成或失败状态；关键状态变化即写盘。
+- `manifest.json`：记忆模式、代码版本、是否有未提交修改，以及最终 `outcome.experiment_events`。
+- 决策 JSONL、视频和原有运行报告仍在本轮独立目录内。
+
+事件 actor 在驾驶前创建，不在车前突然凭空生成。行人等待达到**沿路线的累计进度**阈值才开始运动，
+占道车辆从起步时就已存在。没有实际生成、没有触发/运动证据、或未实际接近的必需事件，不能当作已测试。
+论文场景即使完成路线，事件覆盖不满足时也以 `scenario_invalid` 非零退出；
+成功需要路线 100%、事件有效、正常清理及报告落盘。碰撞、违规仍独立报告，不能用路线成功掩盖。
+每轮保护上限是 900 **仿真秒**，仅新准备的 paper 场景覆盖原 300 秒全局上限；旧场景不变。
+
+汇总所有尝试（包括初始化失败、超时、事件无效，不只保留成功运行）：
+
+```bash
+python -m carla_bridge.paper_suite summarize --summary-csv outputs/paper_results_v1.csv
+```
+
+每行一轮运行，可用 case、seed、路线哈希、记忆模式和库路径配对。CSV 不覆盖已有文件。
+比较不同记忆模式前，核对场景/路线哈希、初始 actor 布局、实际天气和交通规模；保留失败和缺失项，
+区分基础设施无效、驾驶失败与成功，不将空白指标填成零，也不挑选最好的一轮当总体结果。
+
+当前仍为单个 CARLA 实例的顺序实验。多张 GPU 不会自动合并显存或自动并行运行多个场景。
+后续多实例并行需要独立的 CARLA/TM 端口和输出/库隔离；先验证单实例完整路线和事件效果。
+
+## 13. 语义决策与 PDM-Closed
+
+CARLA 默认使用 `pdm_closed`。模型只输出横向、纵向意图及文字解释；轨迹位置、时间与速度
+由规划器生成。离线 nuScenes 入口仍保留原有数值轨迹输出；CARLA 可通过
+`--planner vlm_trajectory` 显式选择旧路径。
+
+### 13.1 官方核心与 CARLA 适配
+
+复用 [tuPlan Garage 的 PDM-Closed 核心](https://github.com/autonomousvision/tuplan_garage)：
+候选生成、运动仿真、指标评分及紧急制动检测。上游原版运行于 nuPlan，本项目提供 CARLA 的
+地图、障碍物、车辆状态与坐标适配，并增加语义评分与候选策略。因此论文应表述为
+**使用官方 PDM 核心的 CARLA 适配版本**，不能将本项目实验分数称为官方 nuPlan PDM-Closed 基准成绩。
+
+首次使用先按 [规划器依赖与来源说明](planning/README.md) 安装固定版本依赖；不需要下载
+nuPlan 数据集或额外模型权重。依赖检查不连接 CARLA、不调用 VLM：
+
+```bash
+python -m carla_bridge.planning.pdm_planner --check
+python -m pytest -q -p no:cacheprovider
+```
+
+缺依赖立即报错，不自动换成其他规划器。DINOv2 的离线缓存加载方式保持原有入口配置。
+本地单元测试及官方核心合成场景测试不能替代服务器 CARLA 完整路线验收。
+
+### 13.2 语义接口与控制周期
+
+模型必须返回单个 JSON 对象，例如：
+
+```json
+{
+  "lateral_decision": "FOLLOW_ROUTE",
+  "longitudinal_decision": "DECELERATE",
+  "behavior_reason": "前方行人接近车道，提前减速观察。",
+  "risk_level": "medium",
+  "safety_notes": ["保持路线，留出制动距离。"]
+}
+```
+
+| 维度 | 允许值 | 含义 |
+|---|---|---|
+| 横向 | `FOLLOW_ROUTE`、`KEEP_LANE`、`CHANGE_LANE_LEFT`、`CHANGE_LANE_RIGHT` | 路线跟随、保持车道、请求向左/右合法变道 |
+| 纵向 | `MAINTAIN`、`ACCELERATE`、`DECELERATE`、`FOLLOW`、`YIELD`、`STOP` | 保持、加速、减速、跟车、让行、停车偏好 |
+| 风险 | `low`、`medium`、`high` | 用于解释与记忆上下文 |
+
+模型不得给出 `trajectory`、`target_speed` 等数值控制字段；导航路线决定道路转向，
+语义请求不能改写目的地或使禁止变道的路段变成合法变道。不可用的横向请求由候选诊断记录。
+候选先经过统一安全筛选，语义仅改变合格候选的偏好评分。语义不是无条件执行命令。
+
+默认每 **3 秒仿真时间**更新一次模型语义，每 **0.2 秒**使用最新 CARLA 状态重新规划，
+控制器每 **0.1 秒**按轨迹时间插值速度。规划不额外推进 world tick。
+无有效语义、规划异常或轨迹校验失败时制动；失败决策不会写入中期或事件记忆。
+语义格式失败的共同处理规则对 `on`、`off` 都生效。
+
+### 13.3 对照开关与记忆实验
+
+```bash
+# 模型语义参与 PDM 候选选择；默认即为 on
+python -m carla_bridge.run_carla_demo --scenario straight_traffic --planner pdm_closed --semantic-influence on --mode memory_off
+
+# 同样运行模型，但仅使用 PDM 基础评分选择候选
+python -m carla_bridge.run_carla_demo --scenario straight_traffic --planner pdm_closed --semantic-influence off --mode memory_off
+
+# 指定既有训练库只读检索，语义参与选择
+python -m carla_bridge.run_carla_demo --scenario straight_traffic --planner pdm_closed --semantic-influence on --memory-bank outputs/memory_banks/pdm_train --memory-access read_only
+
+# 旧版模型直接输出轨迹，用于历史方法对照
+python -m carla_bridge.run_carla_demo --scenario straight_traffic --planner vlm_trajectory --mode memory_off
+```
+
+`--semantic-influence off` 保留模型调用、语义解析与日志，只关闭候选的语义评分，
+因此不是“完全不调用模型”的计算成本基线。给定同一车辆/地图/交通状态，开关两侧生成
+相同候选并使用相同安全检查；行驶动作不同后，两轮未来状态自然可能分化。
+
+`--mode memory_off` 与语义开关是两个独立实验维度。做对照时固定场景、seed、路线、
+规划参数、模型配置及评估库快照；不要先让一个实验组向同一库写入，再让另一个组读取新增内容。
+持续积累仍使用 `--memory-bank ... --memory-access read_write`；评估使用只读库。
+新旧方法的训练库建议分开保存，旧库不会被自动迁移或覆盖。
+
+### 13.4 输出与验收
+
+每轮 `outputs/carla_runs/<run_id>/` 中：
+
+- `manifest.json` 保存完整规划配置、语义开关、记忆策略及最终路线结果。
+- 决策 JSONL 的 `model_decision_output` 保留模型语义，`decision_output` 保存规划后的指令与轨迹，
+  `planning_output` 保存候选诊断，`decision_validation` 保存执行前数值校验结果。
+- `planner.jsonl` 记录每次 PDM 更新的仿真时间、关联语义帧、候选基础分/语义分/最终选择和校验结果。
+- 记忆中的 `semantic_decision` 是模型建议，`planning_context` 是规划器选择；
+  记录阶段为 `selected_before_execution`，不能据此断言已经成功完成该动作。
+- `paper_suite summarize` 增加 `planner_backend`、`semantic_influence` 和规划配置哈希，方便分组。
+
+验收仍要求**路线完成率 100% 且正常清理退出**，同时审查碰撞、违规和场景事件结果。
+本实现使用 CARLA GT 障碍物与地图，PDM 局部预测和 CARLA 实际控制存在模型差异；
+不能将通过候选检查解释为真实仿真中一定无碰撞。

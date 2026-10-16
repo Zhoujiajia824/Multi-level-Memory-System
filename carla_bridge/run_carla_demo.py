@@ -78,6 +78,10 @@ def main() -> None:
     ap.add_argument("--memory-seed", help="复制已有库到新目标库，原始库保持不变")
     ap.add_argument("--no-memory-retrieval", action="store_true", help="不检索中长期记忆，仍按写入开关积累")
     ap.add_argument("--no-short-term", action="store_true", help="关闭本轮短期记忆")
+    ap.add_argument("--planner", choices=["pdm_closed", "vlm_trajectory"], default=None,
+                    help="轨迹后端，默认 PDM-Closed；vlm_trajectory 为旧模型直接输出轨迹")
+    ap.add_argument("--semantic-influence", choices=["on", "off"], default=None,
+                    help="PDM 候选评分是否接受模型横纵向语义偏好；与记忆开关独立")
     ap.add_argument("--dinov2-model-dir", help="本地 DINOv2 模型目录或缓存 snapshot 目录")
     ap.add_argument("--dinov2-cache-dir", help="Hugging Face 缓存目录（默认项目 .cache/huggingface）")
     ap.add_argument("--allow-model-download", action="store_true", help="显式允许 DINOv2 联网下载；默认仅使用本地文件")
@@ -95,6 +99,15 @@ def main() -> None:
     carla_yaml = PROJECT_ROOT / "carla_bridge" / "config" / "carla.yaml"
     with open(carla_yaml, "r", encoding="utf-8") as f:
         carla_cfg = yaml.safe_load(f)
+    planning = carla_cfg.setdefault("carla", {}).setdefault("planning", {})
+    if args.planner is not None:
+        planning["backend"] = args.planner
+    if args.semantic_influence is not None:
+        if planning.get("backend", "vlm_trajectory") != "pdm_closed":
+            ap.error("--semantic-influence requires --planner pdm_closed")
+        planning["semantic_influence"] = args.semantic_influence == "on"
+    if planning.get("backend") == "vlm_trajectory":
+        planning["semantic_influence"] = False
     feature_cfg = carla_cfg.setdefault("feature_extractor", {})
     feature_cfg.setdefault("local_files_only", True)
     if args.dinov2_model_dir:
@@ -130,6 +143,19 @@ def main() -> None:
         "carla", "default_scenario", default="straight_traffic"
     )
     scenario_path = _resolve_scenario_path(scenario_name, config)
+    with scenario_path.open(encoding="utf-8") as scenario_file:
+        scenario_config = yaml.safe_load(scenario_file)
+    if (scenario_config.get("experiment") or {}).get("suite") == "paper_v1":
+        from carla_bridge.paper_suite import validate_prepared
+        validate_prepared(scenario_config)
+        if (scenario_config["experiment"]["split"] == "eval" and args.mode == "memory_on"
+                and args.memory_access != "read_only"):
+            raise ValueError("paper eval requires --memory-access read_only with a training bank; "
+                             "use a train case for memory accumulation, or --mode memory_off for baseline")
+        # The prepared suite owns its declared time budget; legacy scenes keep
+        # the existing global cap. No general YAML-to-config injection.
+        config.data["carla"]["max_duration_s"] = float(scenario_config["duration_s"])
+        config.data["carla"]["timeout_s"] = 120.0
 
     session = RunSession(config, scenario_path, args.mode, memory_bank=args.memory_bank,
                          memory_access=args.memory_access, memory_seed=args.memory_seed,
@@ -137,6 +163,8 @@ def main() -> None:
     loop = None
     try:
         session.prepare()
+        if (scenario_config.get("experiment") or {}).get("suite") == "paper_v1":
+            config.data["carla"]["experiment_output_dir"] = str(session.run_dir)
         set_log_directory(config.get_path("log_dir"))
         setup_logger(name="carla_demo", level=config.get_nested("logging", "level", default="INFO"),
                      log_dir=config.get_path("log_dir"))

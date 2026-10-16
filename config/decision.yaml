@@ -4,6 +4,53 @@
 # 包含轨迹输出要求、坐标系定义、行为枚举、fallback 配置。
 # =============================================================================
 
+# ---- CARLA 语义决策模式 ----
+# 由 planning_constraints.decision_mode=semantic 启用。
+# 数值轨迹和速度由下游规划器产生；通用离线轨迹模式继续使用原配置。
+# 双大括号用于保留 JSON 示例中的字面大括号。
+semantic:
+  schema_version: 1
+  user_prompt: |
+    你是一个自动驾驶语义决策专家。根据当前观察、导航和历史记忆推理驾驶意图。
+    下游数值规划器负责生成候选轨迹、检查安全约束并选择可执行轨迹。
+    你的输出只包含横向和纵向语义决策及理由，不生成轨迹路点、坐标、时间或目标速度。
+
+    {image_layout_block}
+    {scene_block}
+    {ego_state_block}
+    {nav_block}
+    {history_block}
+    {perception_objects_block}
+    {memory_block}
+
+    ## 语义选择
+    - lateral_decision 只能选：{lateral_enum}
+    - FOLLOW_ROUTE：沿导航路线前进，包括路线要求的转弯；无需主动变道时优先使用。
+    - KEEP_LANE：保持当前车道，不请求主动变道。
+    - CHANGE_LANE_LEFT / CHANGE_LANE_RIGHT：请求向同向相邻车道变道；必须有明确的通行需要。
+    - longitudinal_decision 只能选：{longitudinal_enum}
+    - MAINTAIN：按规划器正常巡航策略前进，没有额外的加速或减速偏好。
+    - ACCELERATE：条件允许时偏好更积极的前进速度，始终遵守道路限速及安全约束。
+    - DECELERATE：偏好减速或较低的巡航速度。
+    - FOLLOW：跟随前车并保持安全间距。
+    - YIELD：为有优先权的交通参与者减速让行，必要时停车。
+    - STOP：请求安全停车；移动车辆仍由规划器生成连续的制动轨迹。
+    - 横纵向意图是对安全候选轨迹的偏好，不能覆盖碰撞、可行驶区域和动力学约束。
+    - 当前观测优先于历史记忆；不能把历史场景中的车辆或信号灯当作当前目标。
+
+    ## 输出要求
+    只输出一个 JSON 对象，严格包含以下五个字段，不增加其他字段：
+    {{
+      "lateral_decision": "FOLLOW_ROUTE",
+      "longitudinal_decision": "MAINTAIN",
+      "behavior_reason": "结合当前观察、导航和适用记忆解释本次横纵向意图",
+      "risk_level": "low",
+      "safety_notes": []
+    }}
+    behavior_reason 必须为非空字符串；risk_level 只能为 low / medium / high；
+    safety_notes 必须为字符串列表，没有补充事项时使用空列表。
+    不输出 behavior、trajectory、target_speed 或 optional_v；这些字段由程序内部处理。
+
 # ---- 轨迹输出要求 ----
 trajectory:
   waypoint_min_num: 20  # 轨迹最少 waypoint 数

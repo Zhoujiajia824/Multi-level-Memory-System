@@ -73,3 +73,11 @@ def get_valid_behaviors() -> List[str]:
     # 延迟导入避免循环依赖
     from src.vla_memory.schemas.decision import VALID_BEHAVIORS
     return list(VALID_BEHAVIORS)
+
+
+def get_semantic_prompt_template() -> str:
+    """Semantic mode has its own output contract, separate from waypoints."""
+    template = (_load_decision_yaml().get("semantic") or {}).get("user_prompt")
+    if not isinstance(template, str) or not template.strip():
+        raise ValueError("config/decision.yaml 缺少 semantic.user_prompt")
+    return template
