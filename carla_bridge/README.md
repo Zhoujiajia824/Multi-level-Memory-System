@@ -542,6 +542,75 @@ CARLA 全局：x 前、y 右、z 上。项目 ego-centric：x 前、**y 左**。
 不混用地图层设置。Town06 未安装，旧 NOA2 不包含在本套件中。
 地图特征参考 [CARLA 官方地图说明](https://carla.readthedocs.io/en/0.9.15/core_map/)。
 
+### 12.0 从服务器开始：生成场景，再运行场景
+
+新场景与旧的 `straight_traffic` 不同：仓库内的 `paper_suite.yaml` 是**生成目录**，
+不能直接作为 `--scenario` 输入。必须先在服务器 CARLA 的真实地图上执行 `prepare`，
+得到冻结路线和事件位置的独立 YAML，再将该 YAML 的路径传给驾驶入口。
+这些生成文件位于被 Git 忽略的 `outputs/`，因此仅 `git pull` 不会得到它们。
+
+以下命令在服务器 Bash 中执行。首次使用 PDM 先完成
+[固定版本依赖安装](planning/README.md#固定源码与安装)，后续只需激活已有环境：
+
+```bash
+cd /data/zjj/code/vlm_memory_system/Multi-level-Memory-System
+conda activate mulmem_pdm
+python -m carla_bridge.planning.pdm_planner --check
+python -m carla_bridge.paper_suite list
+```
+
+保持 CARLA 0.9.15 在 `127.0.0.1:2000` 运行；准备过程中会切换四张地图，
+同一实例不能同时跑驾驶任务。首次生成全部 60 个 YAML（10 类条件 × 6 个 seed）：
+
+```bash
+python -m carla_bridge.paper_suite prepare \
+  --host 127.0.0.1 --port 2000 --output outputs/paper_v1
+```
+
+已有 `outputs/paper_v1/preflight.json` 及完整 `train/`、`eval/` 时，可直接复用；
+不要每次驾驶前重新生成。需要新版本时用 `--output outputs/paper_v2`，后续场景路径也相应替换。
+`prepare` 不调用模型；实际驾驶仍需当前终端中已配置的模型 API Key 和可用 DINOv2 本地缓存。
+缓存不在默认位置时，为下方驾驶命令追加实际 `--dinov2-model-dir` 或 `--dinov2-cache-dir`。
+无需添加 `HF_HUB_OFFLINE=1`、`-X faulthandler`、`-u` 前缀。
+
+**推荐第一轮：Town05 常规场景，PDM + 语义，无记忆。**
+
+```bash
+mkdir -p outputs/server_console
+set -o pipefail
+python -m carla_bridge.run_carla_demo \
+  --scenario outputs/paper_v1/eval/R05_multilane_eval_s101.yaml \
+  --planner pdm_closed --semantic-influence on --mode memory_off \
+  2>&1 | tee "outputs/server_console/R05_on_$(date +%Y%m%d_%H%M%S).log"
+```
+
+前一轮正常结束后，保持同一场景、seed 和配置，仅关闭语义评分：
+
+```bash
+python -m carla_bridge.run_carla_demo \
+  --scenario outputs/paper_v1/eval/R05_multilane_eval_s101.yaml \
+  --planner pdm_closed --semantic-influence off --mode memory_off \
+  2>&1 | tee "outputs/server_console/R05_off_$(date +%Y%m%d_%H%M%S).log"
+```
+
+再运行对应的行人横穿长尾场景：
+
+```bash
+python -m carla_bridge.run_carla_demo \
+  --scenario outputs/paper_v1/eval/L05_crossing_eval_s101.yaml \
+  --planner pdm_closed --semantic-influence on --mode memory_off \
+  2>&1 | tee "outputs/server_console/L05_crossing_on_$(date +%Y%m%d_%H%M%S).log"
+```
+
+此轮的关闭语义对照，只将同一命令的 `--semantic-influence on` 改成 `off`，同时更换日志文件名。
+常规/长尾是在比较场景条件，`on/off` 是在比较语义评分；不要把二者同时改变的两轮当作单因素对照。
+开关两侧仍调用模型；`off` 只去掉语义偏好评分，语义解析失败仍按共同规则制动。
+
+文件名格式为 `<条件ID>_<train或eval>_s<seed>.yaml`。例如更换成占道停车：
+`outputs/paper_v1/eval/L05_blocked_lane_eval_s101.yaml`；更换评估 seed：
+`outputs/paper_v1/eval/L05_blocked_lane_eval_s202.yaml`。
+入口没有 `--seed` 参数，seed 来自 YAML。完整条件列表见下表。
+
 ### 12.1 条件与对照
 
 | 条件 ID | 地图 / 目标路线长度 | 场景内容 | 配对常规对照 |
@@ -576,7 +645,7 @@ python -m carla_bridge.paper_suite list
 新代码同步到服务器后，保持 CARLA 服务启动，**停止正在运行的闭环任务**，再准备：
 
 ```bash
-conda activate mulmem_carla
+conda activate mulmem_pdm
 python -m carla_bridge.paper_suite prepare --output outputs/paper_v1
 ```
 
@@ -622,6 +691,14 @@ python -m carla_bridge.run_carla_demo \
 其他训练条件/seed 更换 `--scenario`，库路径不变则继续积累。普通场景、长尾场景都应纳入训练覆盖，
 不保证每一帧入库；不要用验证条件补充训练库。
 
+以上命令默认使用 PDM 且语义评分开启，也可显式追加
+`--planner pdm_closed --semantic-influence on`。持续积累默认是 `--memory-access read_write`。
+如果只积累横穿行人专用库，将库路径统一替换为
+`outputs/memory_banks/paper_v1/train_crossing`，并使用相应 `train` 场景。
+如果只积累、不检索历史记忆，在训练命令中追加 `--no-memory-retrieval`；
+若也不使用本轮短期上下文，再追加 `--no-short-term`。
+这里的 train 指记忆库积累，**不训练或微调 VLM/PDM 权重**。
+
 评估时冻结训练库，同一个 eval 场景、seed 分别运行以下对照：
 
 ```bash
@@ -646,6 +723,21 @@ python -m carla_bridge.run_carla_demo \
 ```
 
 `eval` 场景禁止可写记忆模式；需要在线持续学习时另用训练场景和独立库开展实验，避免混入冻结库评估。
+
+已有专用库只检索、不增加记忆的完整 PDM 示例：
+
+```bash
+python -m carla_bridge.run_carla_demo \
+  --scenario outputs/paper_v1/eval/L05_crossing_eval_s101.yaml \
+  --planner pdm_closed --semantic-influence on --mode memory_on \
+  --memory-bank outputs/memory_banks/paper_v1/train_crossing \
+  --memory-access read_only
+```
+
+`read_only` 要求该路径已是可用记忆库，不能跳过积累步骤指向不存在的目录。
+对同一冻结库分别使用 `--semantic-influence on` 和 `off`，即可检验记忆建议是否通过语义评分影响选择。
+两轮使用同一只读库，不要中途继续向它写入。
+
 分开的 seed 用于不同交通初始化，**不是未见地图/路线泛化划分**；3 个 seed 是初始配置，
 论文所需样本数和统计不确定性需根据试验结果确定。相同 seed 不保证不同 VLM 调用或不同硬件逐位一致。
 交通管理器和行人导航的种子都显式设置，参见 [CARLA TM 确定性说明](https://carla.readthedocs.io/en/0.9.15/adv_traffic_manager/)。
@@ -675,6 +767,57 @@ python -m carla_bridge.paper_suite summarize --summary-csv outputs/paper_results
 
 当前仍为单个 CARLA 实例的顺序实验。多张 GPU 不会自动合并显存或自动并行运行多个场景。
 后续多实例并行需要独立的 CARLA/TM 端口和输出/库隔离；先验证单实例完整路线和事件效果。
+
+### 12.5 单轮跑通后：顺序批量执行与收集反馈
+
+先确认常规和长尾各一轮能完成，再批量运行。以下 Bash 命令运行 **eval 的全部 30 个 YAML ×
+语义 on/off = 60 轮**，统一关闭记忆。它不训练记忆库，也不与同一 CARLA 实例上的其他任务并行。
+每轮出现非零退出即停止，保留日志，防止服务故障后继续产生大量无效实验：
+
+```bash
+mkdir -p outputs/server_console
+set -o pipefail
+(
+  shopt -s nullglob
+  cases=(outputs/paper_v1/eval/*.yaml)
+  if [ "${#cases[@]}" -eq 0 ]; then
+    echo "未找到场景，请先执行 paper_suite prepare"
+    exit 1
+  fi
+  for scene in "${cases[@]}"; do
+    name=$(basename "$scene" .yaml)
+    for influence in on off; do
+      logfile="outputs/server_console/${name}_${influence}_$(date +%Y%m%d_%H%M%S).log"
+      if python -m carla_bridge.run_carla_demo \
+        --scenario "$scene" --planner pdm_closed \
+        --semantic-influence "$influence" --mode memory_off \
+        2>&1 | tee "$logfile"; then
+        echo "已完成: $name / $influence"
+      else
+        echo "本轮失败，批次已停止，请检查: $logfile"
+        exit 1
+      fi
+    done
+  done
+)
+
+# 使用新文件名，汇总包含失败在内的全部 paper 运行
+python -m carla_bridge.paper_suite summarize \
+  --runs-dir outputs/carla_runs \
+  --summary-csv "outputs/paper_results_$(date +%Y%m%d_%H%M%S).csv"
+```
+
+汇总扫描 `--runs-dir` 下所有 paper 运行，可能包含此前的试跑和重复运行；不会只选取本次批次。
+正式统计应依据 run_id、case_id、seed、配置哈希和代码版本明确纳入哪些运行。
+900 秒是每轮仿真时间保护上限；模型推理期间仿真暂停，因此现实耗时可能更长。
+
+每轮独立目录 `outputs/carla_runs/<run_id>/` 的 `manifest.json` 应满足
+`status=route_completed`、`outcome.success=true`、`outcome.route_completion=1.0`；
+带事件的场景还要核对事件有效性。失败或未触发的事件不能因车走到终点就记为成功。
+反馈时保留对应 `manifest.json`、`experiment_setup.json`、`events.json`（如有）、
+`planner.jsonl`、`decisions_*.jsonl`、`carla_run_*.json` 和本节保存的控制台日志；
+轨迹/变道表现有问题时附上该轮视频。准备阶段失败则提供 `prepare` 完整错误输出，
+此时没有运行结果目录是正常的。
 
 ## 13. 语义决策与 PDM-Closed
 
