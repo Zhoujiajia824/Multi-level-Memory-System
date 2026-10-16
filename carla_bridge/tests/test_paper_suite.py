@@ -268,7 +268,7 @@ def test_geometry_preflight_uses_actual_sidewalks_and_lawful_adjacent_lane(monke
     assert world.spawn_actor.call_count >= 3
     assert all(actor.destroy.call_count == 1 for actor in probes)
     # Loading a synchronous map takes one tick; probes never advance the world.
-    world.tick.assert_called_once()
+    assert world.tick.call_count == 1 + world.spawn_actor.call_count
     # Removing the adjacent lane invalidates the route instead of placing a
     # supposedly bypassable obstacle on a one-lane road.
     original = road.get_waypoint.side_effect

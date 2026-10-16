@@ -52,14 +52,14 @@ def map_fixture():
     return world, road, points, arc, spec, actors
 
 
-def test_spawn_probe_success_destroys_actor_without_ticking():
+def test_spawn_probe_success_initializes_snapshot_before_destroy():
     world, _, _, _, _, actors = map_fixture()
     bp, tf = Mock(id="walker.pedestrian.0001"), carla.Transform(carla.Location(z=1.2))
     result = suite._probe_spawn(world, bp, tf)
     assert result["ok"] is True
     world.spawn_actor.assert_called_once_with(bp, tf)
     actors[0].destroy.assert_called_once()
-    world.tick.assert_not_called()
+    world.tick.assert_called_once()
     world.wait_for_tick.assert_not_called()
 
 
@@ -75,6 +75,66 @@ def test_spawn_none_is_not_success():
     world = Mock()
     world.spawn_actor.return_value = None
     assert suite._probe_spawn(world, Mock(id="walker.pedestrian.0001"), carla.Transform())["ok"] is False
+
+
+def test_new_actor_destroy_does_not_use_stale_pre_spawn_snapshot():
+    world = Mock()
+    actor = world.spawn_actor.return_value
+    actor.id, actor.is_alive = 1422, True
+    world.get_settings.return_value.synchronous_mode = True
+    initialized = []
+    world.tick.side_effect = lambda: initialized.append(True)
+    actor.destroy.side_effect = lambda: bool(initialized)
+    result = suite._probe_spawn(world, Mock(), carla.Transform())
+    assert result["ok"]
+    assert initialized == [True]
+    actor.destroy.assert_called_once()
+
+
+def test_async_probe_waits_for_snapshot_without_forcing_ticks():
+    world = Mock()
+    world.get_settings.return_value.synchronous_mode = False
+    world.spawn_actor.return_value.destroy.return_value = True
+    assert suite._probe_spawn(world, Mock(), carla.Transform())["ok"]
+    world.wait_for_tick.assert_called_once_with(30.0)
+    world.tick.assert_not_called()
+
+
+def test_actor_missing_after_initialization_is_not_a_valid_spawn():
+    world = Mock()
+    world.get_snapshot.return_value.find.return_value = None
+    result = suite._probe_spawn(world, Mock(), carla.Transform())
+    assert result["ok"] is False
+    assert "initialization" in result["error"]
+    world.spawn_actor.return_value.destroy.assert_not_called()
+
+
+def test_destroy_false_accepts_confirmed_removal_in_new_snapshot():
+    world = Mock()
+    before, after = Mock(), Mock()
+    after.find.return_value = None
+    world.get_snapshot.side_effect = [before, after]
+    world.spawn_actor.return_value.destroy.return_value = False
+    assert suite._probe_spawn(world, Mock(), carla.Transform())["ok"]
+    assert world.tick.call_count == 2
+
+
+def test_pending_kill_actor_is_not_a_valid_spawn_even_when_cleanup_succeeds():
+    world = Mock()
+    actor = world.spawn_actor.return_value
+    actor.is_alive = False
+    actor.destroy.return_value = True
+    assert not suite._probe_spawn(world, Mock(), carla.Transform())["ok"]
+    actor.destroy.assert_called_once()
+
+
+def test_snapshot_timeout_aborts_instead_of_trying_different_geometry():
+    world = Mock()
+    world.tick.side_effect = RuntimeError("snapshot timeout")
+    world.spawn_actor.return_value.destroy.return_value = True
+    with pytest.raises(suite.SpawnProbeError, match="snapshot timeout"):
+        suite._probe_spawn(world, Mock(), carla.Transform())
+    world.spawn_actor.return_value.destroy.assert_called_once()
 
 
 def test_spawn_connection_error_is_not_treated_as_bad_geometry():
@@ -149,7 +209,7 @@ def test_resolver_tries_interior_candidates_and_probes_both_frozen_endpoints():
     assert any(pose == event["target"] for _, pose in attempts)
     assert {identity for identity, _ in attempts} == {event["blueprint"]}
     assert all(actor.destroy.call_count == 1 for actor in actors)
-    world.tick.assert_not_called()
+    assert world.tick.call_count == len(actors)
     world.wait_for_tick.assert_not_called()
 
 

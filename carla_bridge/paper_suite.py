@@ -160,14 +160,27 @@ class SpawnProbeCleanupError(SpawnProbeError):
     pass
 
 
+def _probe_snapshot(world):
+    """Spawn/destroy state in CARLA 0.9.15 is read from episode snapshots."""
+    try:
+        if world.get_settings().synchronous_mode:
+            world.tick()
+            return world.get_snapshot()
+        return world.wait_for_tick(30.0)
+    except RuntimeError as exc:
+        raise SpawnProbeError(f"event probe snapshot failed: {exc}") from exc
+
+
 def _probe_spawn(world, bp, tf):
     """Test the exact frozen pose; never read an unticked actor's location.
 
-    This verifies creation only, not settling or the full crossing motion.
+    This verifies creation and one initialized frame, not full settling or
+    crossing motion. Only offline preparation advances simulation here.
     Collision/no-actor results allow trying another deterministic candidate;
     other server errors abort preparation.
     """
     actor = None
+    snapshot = None
     try:
         try:
             actor = world.spawn_actor(bp, tf)
@@ -177,12 +190,23 @@ def _probe_spawn(world, bp, tf):
             raise SpawnProbeError(f"event spawn probe failed: {exc}") from exc
         if actor is None:
             return {"ok": False, "error": "spawn_actor returned no actor"}
+        snapshot = _probe_snapshot(world)
+        if snapshot is None:
+            raise SpawnProbeError("event spawn probe received no initialized snapshot")
+        if snapshot.find(actor.id) is None or not actor.is_alive:
+            return {"ok": False, "error": "probe actor disappeared or died during initialization"}
         return {"ok": True}
     finally:
         if actor is not None:
             try:
-                if actor.destroy() is False:
-                    raise RuntimeError("destroy returned False")
+                if snapshot is not None and snapshot.find(actor.id) is None:
+                    pass  # A fresh initialized snapshot confirms no residual actor.
+                elif actor.destroy() is False:
+                    # May have disappeared between the initialized snapshot
+                    # and destroy RPC. Only a NEW snapshot can confirm cleanup.
+                    after = _probe_snapshot(world)
+                    if after is None or after.find(actor.id) is not None:
+                        raise RuntimeError("destroy returned False and actor removal is unconfirmed")
             except Exception as exc:
                 raise SpawnProbeCleanupError(f"event probe actor {actor.id} cleanup failed: {exc}") from exc
 
@@ -284,6 +308,7 @@ def _resolve_anchor(carla, world, points, arc, spec, event_id):
                          speed_mps=spec["speed_mps"],
                          trigger_distance_m=round(arc[i] - spec["lead_distance_m"], 4),
                          spawn_validation={"method": "actor_spawn_probe_v1", "blueprint": bp.id,
+                                           "initialized_snapshot_checked": True,
                                            "start": selected[0], "target": selected[1],
                                            "walker_height_offset_m": 1.2,
                                            "probes_attempted": probe_count})
@@ -300,6 +325,7 @@ def _resolve_anchor(carla, world, points, arc, spec, event_id):
                 continue
             event.update(spawn=spawn, blueprint=bp.id, trigger_distance_m=0.0,
                          spawn_validation={"method": "actor_spawn_probe_v1", "blueprint": bp.id,
+                                           "initialized_snapshot_checked": True,
                                            "spawn": spawn, "probes_attempted": probe_count})
         return event
     raise ValueError(f"no suitable geometry/spawn for {event_id} in requested route interval; "
