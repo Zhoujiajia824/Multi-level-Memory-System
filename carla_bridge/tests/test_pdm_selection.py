@@ -176,3 +176,39 @@ def test_keep_lane_remains_effective_without_route_deadline():
     selected, audit = choose_candidate(candidates, {"lateral_decision": "KEEP_LANE"}, True)
     assert selected["id"] == "left:MAINTAIN"
     assert not audit["route_recovery_active"]
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_continuity_cannot_preserve_an_old_path_after_it_becomes_unsafe(enabled):
+    old_path = candidate("previous_path", 1.0, "MAINTAIN")
+    old_path.update(continuity_cost=0.0)
+    old_path["safety"]["no_collision"] = 0.0
+    avoidance = candidate("new_path", 0.7, "STOP")
+    avoidance.update(continuity_cost=0.15)
+    selected, audit = choose_candidate([old_path, avoidance], {"longitudinal_decision": "MAINTAIN"}, enabled)
+    assert selected["id"] == "new_path"
+    assert audit["candidates"][0]["final_score"] is None
+
+
+def test_continuity_changes_physical_baseline_equally_in_both_semantic_arms():
+    stable = candidate("stable", 0.90, "YIELD")
+    changed = candidate("changed", 0.95, "MAINTAIN")
+    stable["continuity_cost"], changed["continuity_cost"] = 0.0, 0.10
+    candidates = [stable, changed]
+    original = deepcopy(candidates)
+    off, off_audit = choose_candidate(candidates, {"longitudinal_decision": "MAINTAIN"}, False)
+    on, on_audit = choose_candidate(candidates, {"longitudinal_decision": "MAINTAIN"}, True)
+    assert off["id"] == on_audit["baseline_selected_id"] == "stable"
+    assert on["id"] == "changed"  # Semantics remain effective among safe candidates.
+    assert off_audit["candidate_pool_sha256"] == on_audit["candidate_pool_sha256"]
+    assert [c["planning_score"] for c in off_audit["candidates"]] == [c["planning_score"] for c in on_audit["candidates"]]
+    assert candidates == original
+
+
+def test_continuity_cannot_postpone_required_safe_route_recovery():
+    candidates = recovery_pool()
+    candidates[0]["continuity_cost"] = 0.15
+    candidates[1]["continuity_cost"] = 0.0
+    selected, audit = choose_candidate(candidates, {"lateral_decision": "KEEP_LANE"}, True)
+    assert selected["id"] == "center:MAINTAIN"
+    assert audit["candidates"][1]["safe"] and not audit["candidates"][1]["eligible"]

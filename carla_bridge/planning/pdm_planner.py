@@ -17,6 +17,7 @@ import numpy as np
 
 from .dependencies import load_dependencies, validate_dependencies
 from .selection import choose_candidate
+from .continuity import TrajectoryReference, trajectory_continuity_costs
 
 
 def _lane_key(wp):
@@ -94,6 +95,48 @@ def _lane_corridor(reference, closest, side, progress):
     return lanes[start:end + 1], cut
 
 
+def _junction_lane_match(reference, closest, origin, heading, height):
+    """Resolve overlapping junction road IDs against the ordered route geometry.
+
+    CARLA's nearest waypoint does not use vehicle heading. At a junction it
+    can return a different connection passing through the same position.
+    Require a unique containing, aligned lane on the same deck; this is not
+    permission to snap an off-route vehicle onto a distant route.
+    """
+    import carla
+    matches = {}
+    for side in ("center", "left", "right"):
+        for i in range(max(0, closest - 3), min(len(reference) - 1, closest + 3)):
+            a, b = _adjacent(reference[i], side), _adjacent(reference[i + 1], side)
+            if (a is None or b is None or not (a.is_junction or b.is_junction)
+                    or a.lane_type != carla.LaneType.Driving or b.lane_type != carla.LaneType.Driving
+                    or not _same_direction(reference[i], a) or not _same_direction(reference[i + 1], b)
+                    or not _connected(a, b)):
+                continue
+            delta = _xy(b) - _xy(a)
+            length2 = float(delta @ delta)
+            if length2 < 1e-6:
+                continue
+            u = float((origin - _xy(a)) @ delta / length2)
+            if not 0.0 <= u <= 1.0:
+                continue
+            offset = float(np.linalg.norm(origin - (_xy(a) + u * delta)))
+            route_heading = math.atan2(delta[1], delta[0])
+            height_error = abs(height - ((1 - u) * a.transform.location.z + u * b.transform.location.z))
+            if (offset > min(a.lane_width, b.lane_width) / 2 - 0.05
+                    or math.cos(heading - route_heading) < math.cos(math.radians(30))
+                    or height_error > 1.0):
+                continue
+            evidence = {"offset_m": offset, "height_error_m": height_error,
+                        "reference_index": i, "lane_keys": [_lane_key(a), _lane_key(b)]}
+            if side not in matches or offset < matches[side]["offset_m"]:
+                matches[side] = evidence
+    ranked = sorted(matches, key=lambda side: matches[side]["offset_m"])
+    if not ranked or (len(ranked) > 1 and matches[ranked[1]]["offset_m"] - matches[ranked[0]]["offset_m"] < 0.25):
+        return None, {"method": "junction_geometry_rejected", "matches": matches}
+    return ranked[0], {"method": "junction_geometry", "matches": matches}
+
+
 def _path_states(points, api, first_heading=None):
     points = np.asarray(points, dtype=float)
     keep = np.r_[True, np.linalg.norm(np.diff(points, axis=0), axis=1) > 1e-4]
@@ -168,6 +211,12 @@ class CarlaPDMPlanner:
         self.transition_m = float(self.config.get("lane_change_length_m", 30.0))
         self.lateral_weight = float(self.config.get("lateral_semantic_weight", 0.8))
         self.longitudinal_weight = float(self.config.get("longitudinal_semantic_weight", 0.8))
+        self.continuity_weight = float(self.config.get("continuity_weight", 0.15))
+        if not math.isfinite(self.continuity_weight) or not 0 <= self.continuity_weight <= 0.5:
+            raise ValueError("continuity_weight must be finite and within [0, 0.5]")
+        self._previous_plan = None
+        self._continuity_reference = None
+        self._continuity_timestamp = None
         for name, value in (("horizon_s", self.horizon), ("max_speed_mps", self.max_speed),
                             ("map_radius_m", self.map_radius), ("lane_change_length_m", self.transition_m)):
             if not math.isfinite(value) or value <= 0:
@@ -304,9 +353,14 @@ class CarlaPDMPlanner:
                                  ("right", base_wp.get_right_lane())):
             if candidate is not None and _lane_key(candidate) == _lane_key(ego_wp):
                 current_side = side
+        match = {"method": "lane_id"}
+        if current_side is None:
+            current_side, match = _junction_lane_match(
+                reference, closest, origin, -math.radians(self.ego.get_transform().rotation.yaw),
+                self.ego.get_location().z)
         self._geometry_diagnostics.update(
             ego_lane_key=_lane_key(ego_wp), reference_lane_key=_lane_key(base_wp),
-            current_side=current_side, closest_reference_index=closest,
+            current_side=current_side, lane_match=match, closest_reference_index=closest,
             reference_lane_keys=list(dict.fromkeys(_lane_key(wp) for wp in reference)))
         if current_side is None:
             raise ValueError("Ego has left the reference route and its adjacent driving lanes")
@@ -503,25 +557,44 @@ class CarlaPDMPlanner:
         return lights, stop_polygons
 
     def _policies(self, speed, limit):
+        # Reject corrupted/sub-walking road limits instead of either exceeding
+        # them with a target floor or creating millions of integration steps.
+        if not math.isfinite(limit) or limit < 0.1:
+            raise ValueError("PDM requires a finite speed limit of at least 0.1 m/s")
+        if not math.isfinite(speed) or speed < 0:
+            raise ValueError("PDM policy initial speed must be finite and nonnegative")
         # Every run, including semantic-off, has identical stop and slow-yield
         # policies. STOP avoids IDM's undefined desired-velocity=0 division.
-        labels = ["STOP", "YIELD", "DECELERATE", "FOLLOW", "MAINTAIN", "ACCELERATE"]
-        targets = [0.1, min(2.0, limit), max(0.3, min(limit, speed * 0.5)),
-                   max(0.3, limit * 0.75), max(0.3, limit * 0.85), limit]
+        labels = ["STOP", "YIELD", "DECELERATE", "FOLLOW", "MAINTAIN", "ACCELERATE", "STOP_HARD"]
+        # DECELERATE is not a creep command: once nearly stopped, hold/stop.
+        decel_to_stop = speed < 0.6
+        targets = [0.1, min(2.0, limit), 0.1 if decel_to_stop else min(limit, speed * 0.5),
+                   limit * 0.75, limit * 0.85, limit, 0.1]
         base = self.api.BatchIDMPolicy
 
         class WithStopPolicy(base):
             def propagate(self, previous_idm_states, leading_agent_states, longitudinal_idcs, sampling_time):
-                result = super().propagate(previous_idm_states, leading_agent_states, longitudinal_idcs, sampling_time)
-                mask = np.asarray(longitudinal_idcs) == 0
-                previous_v = np.maximum(0, previous_idm_states[mask, 1])
-                next_v = np.maximum(0, previous_v - 4.0 * sampling_time)
-                result[mask, 0] = previous_idm_states[mask, 0] + (previous_v + next_v) * 0.5 * sampling_time
-                result[mask, 1] = next_v
+                indices = np.asarray(longitudinal_idcs)
+                stop_mask = (indices == 0) | (indices == 6) | ((indices == 2) & decel_to_stop)
+                active_targets = np.asarray(targets)[indices[~stop_mask]]
+                # Exponent-10 IDM is unstable at low targets under a 0.1s Euler
+                # step. Integrate the unchanged upstream derivative in smaller
+                # steps, before proposal simulation/scoring, not after selection.
+                max_step = min(0.01, float(np.min(active_targets)) / 40) if len(active_targets) else 0.01
+                steps = max(1, int(math.ceil(sampling_time / max_step)))
+                dt = sampling_time / steps
+                result = np.array(previous_idm_states, dtype=float, copy=True)
+                for _ in range(steps):
+                    old = result.copy()
+                    result = super().propagate(old, leading_agent_states, longitudinal_idcs, dt)
+                    result[:, 1] = np.maximum(0, result[:, 1])
+                    deceleration = np.where(indices == 6, 4.0, np.where(indices == 2, 1.5, 2.0))
+                    result[stop_mask, 1] = np.maximum(0, old[stop_mask, 1] - deceleration[stop_mask] * dt)
+                    result[:, 0] = old[:, 0] + (np.maximum(0, old[:, 1]) + result[:, 1]) * 0.5 * dt
                 return result
 
         policies = WithStopPolicy(fallback_target_velocity=targets, speed_limit_fraction=[1.0] * len(labels),
-                                  min_gap_to_lead_agent=1.5, headway_time=[1.5, 2.5, 2.0, 2.5, 1.5, 1.5],
+                                  min_gap_to_lead_agent=1.5, headway_time=[1.5, 2.5, 2.0, 2.5, 1.5, 1.5, 1.5],
                                   accel_max=2.0, decel_max=4.0)
         policies.update(None)  # Desired velocities are already capped to the road speed limit.
         return policies, labels, targets
@@ -529,6 +602,11 @@ class CarlaPDMPlanner:
     def plan(self, semantic_decision, semantic_enabled=True):
         from shapely.geometry import Point
         timestamp = int(round(self.world.get_snapshot().timestamp.elapsed_seconds * 1e6))
+        # Freeze the prior reference for repeatable on/off evaluation of the
+        # same snapshot; never use the other arm's just-selected trajectory.
+        if self._continuity_timestamp != timestamp:
+            self._continuity_reference = self._previous_plan
+            self._continuity_timestamp = timestamp
         state, tf = self._ego_state(timestamp)
         self._geometry_diagnostics = {"ego_location": {"x": tf.location.x, "y": tf.location.y,
                                                        "z": tf.location.z}}
@@ -543,24 +621,31 @@ class CarlaPDMPlanner:
         # Reset per snapshot so an initial overlap cannot silently make an actor
         # permanently disappear from all future forecasts.
         observation = self.api.PDMObservation(self.sampling, self.sampling, self.map_radius)
-        observation.update(state, self._observed_actors(timestamp, tf), lights, lanes)
+        actors = self._observed_actors(timestamp, tf)
+        observation.update(state, actors, lights, lanes)
         initial_collisions = [token for token in observation.collided_track_ids
                               if observation.red_light_token not in token]
-        limit = min(self.max_speed, float(self.ego.get_speed_limit()) / 3.6)
-        if not math.isfinite(limit) or limit <= 0:
-            raise ValueError("CARLA returned an invalid speed limit")
+        road_limit = float(self.ego.get_speed_limit()) / 3.6
+        if not math.isfinite(road_limit) or road_limit < 0.1:
+            raise ValueError("CARLA returned a non-finite speed limit or a limit below the supported 0.1 m/s minimum")
+        limit = min(self.max_speed, road_limit)
         policies, longitudinal, targets = self._policies(state.dynamic_car_state.speed, limit)
         manager = self.api.PDMProposalManager(paths, policies)
         proposals = self.generator.generate_proposals(state, observation, manager)
         simulated = self.simulator.simulate_proposals(proposals, state)
         scores = self.scorer.score_proposals(simulated, state, observation, centerline, lanes, area,
                                              _IntersectionMap(self.map, tf.location.z, self.api))
+        costs, continuity = trajectory_continuity_costs(
+            proposals, self.generator._state_idm_array[:, :, 1], timestamp_us=timestamp,
+            sample_interval_s=self.dt, previous=self._continuity_reference, weight=self.continuity_weight)
         candidates = []
         for index in range(len(manager)):
             proposal = manager[index]
             lat = lateral[proposal.lateral_idx]
+            idm_states = self.generator._state_idm_array[index]
+            profile = idm_states[:, 1]
             finite = bool(np.isfinite(proposals[index]).all() and np.isfinite(simulated[index]).all()
-                          and np.isfinite(scores[index]))
+                          and np.isfinite(idm_states).all() and np.isfinite(scores[index]))
             # Upstream scorer intentionally ignores red-light tokens. Add the
             # same hard check in both conditions, including lane-change paths.
             traffic_safe = all(not polygon.intersects(stop) for polygon in self.scorer._ego_polygons[index]
@@ -573,6 +658,8 @@ class CarlaPDMPlanner:
                       "traffic_light": traffic_safe, "finite": finite}
             if initial_collisions:
                 safety["no_collision"] = 0.0
+            collision_time = float(self.scorer.time_to_at_fault_collision(index))
+            ttc_time = float(self.scorer.time_to_ttc_infraction(index))
             candidates.append({"id": "%s:%s" % (lat["id"], longitudinal[proposal.longitudinal_idx]),
                                "index": index, "lateral": lat["label"], "lateral_semantics": lat["semantics"],
                                "route_target": lat["id"] == "center",
@@ -580,7 +667,13 @@ class CarlaPDMPlanner:
                                "forward_progress_m": float(centerline.project(Point(*proposals[index, -1, :2]))
                                                            - centerline.project(Point(*proposals[index, 0, :2]))) if finite else 0.0,
                                "terminal_speed_mps": float(self.generator._state_idm_array[index, -1, 1]) if finite else 0.0,
-                               "longitudinal": longitudinal[proposal.longitudinal_idx],
+                               "longitudinal": "STOP" if longitudinal[proposal.longitudinal_idx] == "STOP_HARD" else longitudinal[proposal.longitudinal_idx],
+                               "continuity_cost": float(costs[index]),
+                               "predicted_collision_time_s": collision_time if math.isfinite(collision_time) else None,
+                               "predicted_ttc_infraction_time_s": ttc_time if math.isfinite(ttc_time) else None,
+                               "speed_at_0_2s_mps": float(profile[2]) if finite else None,
+                               "acceleration_range_mps2": [float(np.min(np.diff(profile) / self.dt)),
+                                                            float(np.max(np.diff(profile) / self.dt))] if finite else None,
                                "desired_speed_mps": targets[proposal.longitudinal_idx],
                                "base_score": float(scores[index]) if finite else 0.0, "safety": safety,
                                "trajectory_sha256": hashlib.sha256(proposals[index].tobytes()).hexdigest()})
@@ -591,6 +684,11 @@ class CarlaPDMPlanner:
                            leading_agent_update_rate=1, lateral_transition="cubic_hermite_pose_tangent",
                            excluded_lateral_paths=excluded, traffic_stop_lines=len(stop_polygons),
                            geometry=self._geometry_diagnostics,
+                           continuity=continuity, idm_integration="substeps_max_0.01s_nonnegative_trapezoid",
+                           actors=[{"id": str(actor.track_token), "x": actor.center.x, "y": actor.center.y,
+                                    "heading": actor.center.heading, "vx": actor.velocity.x, "vy": actor.velocity.y,
+                                    "length": actor.box.length, "width": actor.box.width}
+                                   for actor in actors.tracked_objects.tracked_objects],
                            initial_collision_tokens=initial_collisions,
                            vehicle={"wheelbase_m": self.vehicle_parameters.wheel_base,
                                     "rear_axle_to_center_m": self.vehicle_parameters.rear_axle_to_center})
@@ -599,6 +697,7 @@ class CarlaPDMPlanner:
         emergency_scores = np.asarray([c["final_score"] if c["eligible"] else -1.0 for c in diagnostics["candidates"]])
         emergency = self.emergency.brake_if_emergency(state, emergency_scores, self.scorer)
         if selected is None or emergency is not None:
+            self._previous_plan = None
             diagnostics.update(emergency_brake=True, failure_reason="no_safe_candidate" if selected is None else "upstream_emergency")
             return {"trajectory": [], "target_speed": 0.0, "selected_lateral": "KEEP_LANE",
                     "selected_longitudinal": "STOP", "planner_diagnostics": diagnostics}
@@ -610,6 +709,8 @@ class CarlaPDMPlanner:
         box_offset = np.array([self.ego.bounding_box.location.x, -self.ego.bounding_box.location.y])
         trajectory = []
         idm_velocity = self.generator._state_idm_array[index, :, 1]
+        self._previous_plan = TrajectoryReference(states=proposals[index].copy(), speeds=idm_velocity.copy(),
+                                                  timestamp_us=timestamp, sample_interval_s=self.dt)
         for i, point in enumerate(states):
             center = point.center
             c, s = math.cos(center.heading), math.sin(center.heading)

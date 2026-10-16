@@ -63,9 +63,43 @@ def _render_md(run_info: dict, s: dict) -> str:
         "",
         "## 舒适度指标",
         f"- 最大速度: {s.get('max_speed_mps', 0):.2f} m/s",
-        f"- 最大加速度: {s.get('max_accel_mps2', 0):.2f} m/s²",
-        f"- 最大 jerk: {s.get('max_jerk_mps3', 0):.2f} m/s³",
+        f"- 最大平面加速度模长: {s.get('max_accel_mps2', 0):.2f} m/s²",
+        f"- 最大加速度模长变化率（旧 jerk 字段）: {s.get('max_jerk_mps3', 0):.2f} m/s³",
+    ]
+    if s.get("comfort_schema_version", 1) >= 2:
+        sampling = s.get("comfort_sampling", {})
+        lines += [
+            f"- 平面加速度模长 P95 / RMS: {_number(s.get('p95_accel_mps2'))} / "
+            f"{_number(s.get('rms_accel_mps2'))} m/s²；最大值时刻 {_number(s.get('max_accel_time_s'))} s",
+            f"- 纵向最大加速 / 减速: {_number(s.get('max_longitudinal_acceleration_mps2'))} / "
+            f"{_number(s.get('max_longitudinal_deceleration_mps2'))} m/s²；"
+            f"最大横向加速度 {_number(s.get('max_lateral_acceleration_mps2'))} m/s²",
+            f"- 平面向量 jerk 最大值 / P95 / RMS: {_number(s.get('max_planar_jerk_mps3'))} / "
+            f"{_number(s.get('p95_planar_jerk_mps3'))} / {_number(s.get('rms_planar_jerk_mps3'))} m/s³；"
+            f"最大值时刻 {_number(s.get('max_planar_jerk_time_s'))} s",
+            f"- 纵向 jerk 最大值 / P95 / RMS: {_number(s.get('max_longitudinal_jerk_mps3'))} / "
+            f"{_number(s.get('p95_longitudinal_jerk_mps3'))} / {_number(s.get('rms_longitudinal_jerk_mps3'))} m/s³",
+            f"- 急刹段数（纵向加速度 ≤ {s.get('hard_braking_threshold_mps2', -3):.1f} m/s²）: "
+            f"{s.get('hard_braking_events') if s.get('hard_braking_events') is not None else '未采集'}",
+            f"- 观测静止时长（速度 ≤ {s.get('stop_speed_threshold_mps', .2):.1f} m/s）: "
+            f"{_number(s.get('stopped_time_s'))} s；"
+            f"连续静止 ≥ {s.get('stop_episode_min_duration_s', 1):.1f} s 的段数 {s.get('stop_episodes', 0)}；"
+            f"最长连续静止 {_number(s.get('longest_stop_s'))} s",
+            f"- 采样间隔（仿真时间）: 配置 {_number(sampling.get('configured_dt_s'))} s，"
+            f"观测 {_number(sampling.get('min_observed_dt_s'))}–{_number(sampling.get('max_observed_dt_s'))} s；"
+            f"间隔异常 {sampling.get('gapped_intervals', 0)}，无效时间差 {sampling.get('invalid_intervals', 0)}",
+            "",
+            "> jerk 按相邻运行采样时间差计算（同步循环按固定 tick 累加）；平面向量 jerk 保留加速转制动的方向变化，"
+            "纵向 jerk 为有符号车体纵向加速度变化率，旧字段只计算加速度模长变化率。"
+            "P95/RMS 按观测样本统计，未平滑或剔除启动、碰撞、紧急制动尖峰；"
+            "采样缺口内的 jerk 仅为区间平均变化率。静止统计不区分合理等待与无必要停车。",
+        ]
+    lines += [
         "",
         "> 闭环评测指标（原 ADE/FDE 不适用：未来由自车决策产生）。",
     ]
     return "\n".join(lines) + "\n"
+
+
+def _number(value) -> str:
+    return "未采集" if value is None else f"{value:.2f}"

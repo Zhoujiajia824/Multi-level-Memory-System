@@ -1,9 +1,11 @@
 """Lane endpoints and road seams, using CARLA-shaped map fixtures."""
 from types import SimpleNamespace as NS
+import math
 
 import carla
 import numpy as np
-from carla_bridge.planning.pdm_planner import _lane_corridor
+import pytest
+from carla_bridge.planning.pdm_planner import _lane_corridor, _junction_lane_match
 from carla_bridge.tests.test_pdm_planner import Waypoint, Road, Vehicle
 
 
@@ -78,3 +80,49 @@ def test_connected_road_seam_remains_continuous():
     corridor, cut = _lane_corridor(reference, 0, "left", np.arange(len(reference)) * 2)
     assert len(corridor) == len(reference)
     assert cut is None
+
+
+class OverlappingJunctionRoad(EndingRoad):
+    def __init__(self):
+        super().__init__(end=1000, junction=10)
+        self.seam = 10
+
+    def get_waypoint(self, location, project_to_road=True, lane_type=None):
+        wp = super().get_waypoint(location, project_to_road, lane_type)
+        # Exact route samples map to the intended connection. A small lateral
+        # tracking error picks the crossing connector in CARLA's nearest query.
+        if location.x >= 10 and abs(location.y) > 0.001:
+            wp.road_id, wp.lane_id = 489, -1
+            wp.transform.rotation.yaw = 90
+        return wp
+
+
+@pytest.mark.parametrize("y,heading,height,expected", [
+    (-0.02, 0, 0.2, "center"), (-3.48, 0, 0.2, "left"),
+    (3.48, 0, 0.2, "right"), (-7.0, 0, 0.2, None),
+    (-0.02, math.pi / 2, 0.2, None), (-0.02, math.pi, 0.2, None),
+    (-0.02, 0, 8.0, None),
+])
+def test_junction_match_requires_containment_direction_and_height(y, heading, height, expected):
+    road = OverlappingJunctionRoad()
+    reference = [EndingWaypoint(road, x) for x in range(0, 50, 2)]
+    side, evidence = _junction_lane_match(reference, 6, np.array([12.1, -y]), heading, height)
+    assert side == expected
+    if side:
+        assert evidence["matches"][side]["offset_m"] < 0.03
+
+
+def test_geometry_fallback_is_not_used_on_nonjunction_roads():
+    road = EndingRoad(junction=1000)
+    reference = [EndingWaypoint(road, x) for x in range(0, 50, 2)]
+    side, _ = _junction_lane_match(reference, 6, np.array([12.1, 0.0]), 0, 0.2)
+    assert side is None
+
+
+def test_ambiguous_overlapping_route_lanes_fail_closed(monkeypatch):
+    road = OverlappingJunctionRoad()
+    reference = [EndingWaypoint(road, x) for x in range(0, 50, 2)]
+    monkeypatch.setattr(EndingWaypoint, "get_left_lane", lambda self: self)
+    side, evidence = _junction_lane_match(reference, 6, np.array([12.1, 0.0]), 0, 0.2)
+    assert side is None
+    assert {"left", "center"} <= set(evidence["matches"])

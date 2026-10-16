@@ -78,6 +78,8 @@ class ClosedLoop:
         self._semantic_frame_id = None
         self._next_pdm_replan_at = 0.0
         self._pdm_plan_count = 0
+        self._control_audit_path = None
+        self._last_control_command = None
         self.replan_interval_s = float(ccfg.get("replan_interval_s", 1.0))
         self.fixed_delta = float(ccfg.get("fixed_delta_seconds", 0.05))
         self.max_duration_s = float(ccfg.get("max_duration_s", 300.0))
@@ -225,6 +227,8 @@ class ClosedLoop:
             speed_limit_mps=float(self.ccfg.get("speed_limit_mps", 13.9)),
             dt_s=self.fixed_delta,
         )
+        self._control_audit_path = Path(self.config.get("output_dir") or "outputs") / "control.jsonl"
+        self._control_audit_path.parent.mkdir(parents=True, exist_ok=True)
 
         # 6. 记忆 loop
         out_path = self._make_output_path()
@@ -315,7 +319,22 @@ class ClosedLoop:
 
     def _apply_brake(self) -> None:
         if self.scenario is not None and self.scenario.ego_vehicle is not None:
-            self.scenario.ego_vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
+            self._apply_control(self.scenario.ego_vehicle,
+                                carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0),
+                                source="direct_brake")
+
+    def _apply_control(self, ego, control, *, source="tracker") -> None:
+        # Apply before bookkeeping: diagnostics must never delay an emergency.
+        ego.apply_control(control)
+        tracking = getattr(self.tracker, "last_control_diagnostics", None)
+        self._last_control_command = {
+            "sim_time_s": self._elapsed, "source": source,
+            "planner_sequence": self._pdm_plan_count,
+            "semantic_frame_id": self._semantic_frame_id,
+            "throttle": float(control.throttle), "brake": float(control.brake),
+            "steer": float(control.steer),
+            "tracking": deepcopy(tracking) if source == "tracker" and isinstance(tracking, dict) else None,
+        }
 
     def _validate_decision(self, decision: dict, kf: dict) -> dict:
         decision = decision or {}
@@ -619,8 +638,7 @@ class ClosedLoop:
         # Apply the new decision before advancing physics (including emergency braking).
         v = ego.get_velocity()
         speed = (v.x * v.x + v.y * v.y) ** 0.5
-        ego.apply_control(self.tracker.compute_control(tf.location.x, tf.location.y, ego_yaw,
-                                                       (v.x * v.x + v.y * v.y) ** 0.5))
+        self._apply_control(ego, self.tracker.compute_control(tf.location.x, tf.location.y, ego_yaw, speed))
         for i in range(n_ticks):
             if self._check_run_end():
                 return
@@ -647,7 +665,7 @@ class ClosedLoop:
                 self._apply_brake()
                 return
             ctrl = self.tracker.compute_control(tf2.location.x, tf2.location.y, yaw2, speed)
-            ego.apply_control(ctrl)
+            self._apply_control(ego, ctrl)
 
         # ---- 卡死检测（B5）：低速且无路线进展，先警告后提前终止 ----
         if self._stuck_enabled and not self._planned_stop:
@@ -691,12 +709,35 @@ class ClosedLoop:
         self.carla_client.set_spectator_follow(ego)
         if self.recorder is not None:
             self.recorder.on_tick()
-        if self.metrics is not None:
-            v, a = ego.get_velocity(), ego.get_acceleration()
-            self.metrics.on_tick(ego, self._elapsed, {
+        if self.metrics is not None or self._control_audit_path is not None:
+            v, a, tf = ego.get_velocity(), ego.get_acceleration(), ego.get_transform()
+            yaw = math.radians(tf.rotation.yaw)  # Native CARLA axes for acceleration projections.
+            state = {
                 "speed": math.hypot(v.x, v.y),
                 "acceleration": math.hypot(a.x, a.y),
-            })
+                "acceleration_x": a.x, "acceleration_y": a.y, "yaw_rad": yaw,
+            }
+            if self.metrics is not None:
+                self.metrics.on_tick(ego, self._elapsed, state)
+            if self._control_audit_path is not None:
+                actual = ego.get_control()
+                audit = {
+                    "sim_time_s": self._elapsed,
+                    "measured": {**state, "x": tf.location.x, "y": tf.location.y,
+                                 "acceleration_longitudinal_mps2": a.x * math.cos(yaw) + a.y * math.sin(yaw),
+                                 "acceleration_lateral_mps2": -a.x * math.sin(yaw) + a.y * math.cos(yaw)},
+                    "applied_control": {"throttle": float(actual.throttle), "brake": float(actual.brake),
+                                        "steer": float(actual.steer)},
+                    # This is the command preceding this measured physics tick,
+                    # not the newly replanned command for the next tick.
+                    "command": self._last_control_command,
+                }
+                try:
+                    with self._control_audit_path.open("a", encoding="utf-8") as stream:
+                        stream.write(json.dumps(audit, ensure_ascii=False, allow_nan=False) + "\n")
+                except Exception:
+                    self._apply_brake()
+                    raise
 
     # ------------------------------------------------------------------
     # 路由中心线注入（米制回正锚点）
@@ -807,7 +848,8 @@ class ClosedLoop:
         tf = ego.get_transform()
         self.tracker.set_trajectory([], tf.location.x, tf.location.y,
                                     coords.carla_yaw_deg_to_rad(tf.rotation.yaw), 0.0)
-        ego.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
+        self._apply_control(ego, carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0),
+                            source="capture_failure")
         logger.error("同步采集失败，已制动 (%d): %s", self._capture_failures, exc)
         if self._capture_failures >= int(self.ccfg.get("max_capture_failures", 3)):
             self._early_terminated = True

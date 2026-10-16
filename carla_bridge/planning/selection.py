@@ -25,8 +25,13 @@ def choose_candidate(candidates, semantic, enabled, lateral_weight=0.8, longitud
         lateral_match = lateral in item.get("lateral_semantics", [])
         longitudinal_match = longitudinal == item.get("longitudinal")
         bonus = (lateral_weight * lateral_match + longitudinal_weight * longitudinal_match) if enabled else 0.0
+        continuity_cost = item.get("continuity_cost", 0.0)
+        if type(continuity_cost) not in (float, int) or not math.isfinite(continuity_cost) or not 0 <= continuity_cost <= 0.5:
+            raise ValueError("continuity_cost must be finite and within [0, 0.5]")
+        planning_score = item["base_score"] - continuity_cost
         item.update(safe=safe, semantic_bonus=float(bonus),
-                    final_score=float(item["base_score"] + bonus) if safe else None)
+                    planning_score=float(planning_score),
+                    final_score=float(planning_score + bonus) if safe else None)
         audited.append(item)
     # Route reachability is shared by both ablation arms. Near the last legal
     # return opportunity, do not let KEEP_LANE (or progress on the wrong lane)
@@ -44,7 +49,7 @@ def choose_candidate(candidates, semantic, enabled, lateral_weight=0.8, longitud
             item["final_score"] = None
     feasible = [item for item in audited if item["eligible"]]
     selected = max(feasible, key=lambda item: item["final_score"]) if feasible else None
-    baseline = max(feasible, key=lambda item: item["base_score"]) if feasible else None
+    baseline = max(feasible, key=lambda item: item["planning_score"]) if feasible else None
     # Hash the generated pool/base metrics, excluding the experimental score term.
     identity = hashlib.sha256(json.dumps(candidates, sort_keys=True, allow_nan=False,
                                          separators=(",", ":")).encode("utf-8")).hexdigest()

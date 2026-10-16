@@ -7,7 +7,8 @@
 * 闯红灯：自车近距红灯且仍前进（带冷却，避免单次停车重复计数）。
 * 逆行：自车朝向与所在车道方向反向（连续 3 tick 判一次）。
 * 超速：速度超过限速的 tick 数。
-* 舒适度：纵向最大加速度 / 最大 jerk。
+* 舒适度：保留平面加速度模长及其变化率，并记录有符号纵/横向加速度与平面向量 jerk。
+  jerk 使用相邻观测的仿真时间差，不平滑、不剔除启动或紧急制动尖峰。
 
 原 ADE/FDE 不适用闭环（未来由自车决策产生），故用本指标集。
 """
@@ -46,6 +47,7 @@ class MetricsCollector:
         self._accels: List[float] = []
         self._max_speed = 0.0
         self._max_accel = 0.0
+        self._comfort_samples: List[dict] = []
 
         self._wrong_way_streak = 0
         self._last_rl_time_s = -1e9  # 闯红灯冷却（sim 秒，2s）
@@ -57,14 +59,30 @@ class MetricsCollector:
 
     def on_tick(self, ego_vehicle, elapsed_s: float, ego_state: dict) -> None:
         self.total_ticks += 1
-        speed = float(ego_state.get("speed", 0.0))
-        accel = float(ego_state.get("acceleration", 0.0))
-        self._speeds.append(speed)
-        self._accels.append(accel)
-        self._max_speed = max(self._max_speed, speed)
-        self._max_accel = max(self._max_accel, abs(accel))
+        speed = _finite(ego_state.get("speed"))
+        accel = _finite(ego_state.get("acceleration"))
+        ax, ay = (_finite(ego_state.get(key)) for key in ("acceleration_x", "acceleration_y"))
+        yaw = _finite(ego_state.get("yaw_rad"))
+        longitudinal = lateral = None
+        if ax is not None and ay is not None:
+            accel = math.hypot(ax, ay)
+            if yaw is not None:
+                # All three inputs use native CARLA world axes, without the
+                # ego-frame left/right conversion used by the planner.
+                longitudinal = ax * math.cos(yaw) + ay * math.sin(yaw)
+                lateral = -ax * math.sin(yaw) + ay * math.cos(yaw)
+        self._comfort_samples.append({
+            "t": _finite(elapsed_s), "speed": speed, "accel": accel,
+            "ax": ax, "ay": ay, "longitudinal": longitudinal, "lateral": lateral,
+        })
+        if speed is not None:
+            self._speeds.append(speed)
+            self._max_speed = max(self._max_speed, speed)
+        if accel is not None:
+            self._accels.append(accel)
+            self._max_accel = max(self._max_accel, abs(accel))
 
-        if speed > self.speed_limit:
+        if speed is not None and speed > self.speed_limit:
             self.speeding_ticks += 1
 
         self._check_red_light(ego_vehicle, elapsed_s)
@@ -137,13 +155,104 @@ class MetricsCollector:
     def route_completion(self) -> float:
         return self.route.progress_fraction() if self.route else 0.0
 
-    def _max_jerk(self) -> float:
-        if len(self._accels) < 3:
-            return 0.0
-        return max(
-            abs(self._accels[i] - self._accels[i - 1]) / self.dt
-            for i in range(1, len(self._accels))
-        )
+    def _comfort_summary(self) -> dict:
+        """Sample statistics; unavailable vector measurements remain null.
+
+        Legacy ``max_jerk_mps3`` is d|a_xy|/dt, not vector jerk. New planar
+        jerk is |d(a_x, a_y)/dt| and detects acceleration/braking reversals.
+        Longitudinal jerk differentiates signed body-forward acceleration.
+        Percentiles/RMS are sample-based. No peak is removed. A sampling gap
+        still yields an interval-average jerk but cannot prove a continuous
+        stop; gaps are reported so this limitation remains visible.
+        """
+        samples = self._comfort_samples
+        accels = [abs(s["accel"]) for s in samples if s["accel"] is not None]
+        longs = [s["longitudinal"] for s in samples if s["longitudinal"] is not None]
+        lats = [abs(s["lateral"]) for s in samples if s["lateral"] is not None]
+        magnitude_jerks, planar_jerks, longitudinal_jerks, intervals = [], [], [], []
+        planar_jerk_times = []
+        gaps = invalid_intervals = 0
+        stop_threshold, stop_min_duration, brake_threshold = 0.2, 1.0, -3.0
+        stopped_time = stop_run = longest_stop = 0.0
+        stop_episodes = braking_events = 0
+        was_braking = False
+        for i, current in enumerate(samples):
+            previous = samples[i - 1] if i else None
+            dt = None
+            continuous = False
+            if previous is not None:
+                if previous["t"] is not None and current["t"] is not None:
+                    dt = current["t"] - previous["t"]
+                if dt is None or dt <= 0:
+                    invalid_intervals += 1
+                else:
+                    intervals.append(dt)
+                    continuous = dt <= self.dt * 1.5 + 1e-9
+                    gaps += int(not continuous)
+                    if current["accel"] is not None and previous["accel"] is not None:
+                        magnitude_jerks.append(abs(current["accel"] - previous["accel"]) / dt)
+                    if all(s[k] is not None for s in (previous, current) for k in ("ax", "ay")):
+                        planar_jerks.append(math.hypot(current["ax"] - previous["ax"],
+                                                       current["ay"] - previous["ay"]) / dt)
+                        planar_jerk_times.append(current["t"])
+                    if current["longitudinal"] is not None and previous["longitudinal"] is not None:
+                        longitudinal_jerks.append(abs(current["longitudinal"] - previous["longitudinal"]) / dt)
+            stationary = (continuous and current["speed"] is not None
+                          and previous["speed"] is not None
+                          and abs(current["speed"]) <= stop_threshold
+                          and abs(previous["speed"]) <= stop_threshold)
+            if stationary:
+                old_run = stop_run
+                stop_run += dt
+                stopped_time += dt
+                if old_run < stop_min_duration - 1e-9 <= stop_run:
+                    stop_episodes += 1
+                longest_stop = max(longest_stop, stop_run)
+            else:
+                stop_run = 0.0
+            braking = current["longitudinal"] is not None and current["longitudinal"] <= brake_threshold
+            if braking and (not was_braking or not continuous):
+                braking_events += 1
+            was_braking = braking
+        max_accel_sample = max((s for s in samples if s["accel"] is not None),
+                               key=lambda s: abs(s["accel"]), default=None)
+        stats = {
+            "comfort_schema_version": 2,
+            "max_jerk_mps3": max(magnitude_jerks, default=0.0),
+            "p95_accel_mps2": _percentile95(accels),
+            "rms_accel_mps2": _rms(accels),
+            "max_accel_time_s": max_accel_sample["t"] if max_accel_sample else None,
+            "max_longitudinal_acceleration_mps2": max([0.0] + longs) if longs else None,
+            "max_longitudinal_deceleration_mps2": max([0.0] + [-a for a in longs]) if longs else None,
+            "max_lateral_acceleration_mps2": max(lats, default=None),
+            "max_planar_jerk_mps3": max(planar_jerks, default=None),
+            "p95_planar_jerk_mps3": _percentile95(planar_jerks),
+            "rms_planar_jerk_mps3": _rms(planar_jerks),
+            "max_planar_jerk_time_s": planar_jerk_times[planar_jerks.index(max(planar_jerks))] if planar_jerks else None,
+            "max_longitudinal_jerk_mps3": max(longitudinal_jerks, default=None),
+            "p95_longitudinal_jerk_mps3": _percentile95(longitudinal_jerks),
+            "rms_longitudinal_jerk_mps3": _rms(longitudinal_jerks),
+            "hard_braking_events": braking_events if longs else None,
+            "hard_braking_threshold_mps2": brake_threshold,
+            "stopped_time_s": stopped_time,
+            "stop_episodes": stop_episodes,
+            "longest_stop_s": longest_stop,
+            "stop_speed_threshold_mps": stop_threshold,
+            "stop_episode_min_duration_s": stop_min_duration,
+        }
+        stats = {key: round(value, 3) if isinstance(value, float) else value for key, value in stats.items()}
+        stats["comfort_sampling"] = {
+            "configured_dt_s": self.dt,
+            "min_observed_dt_s": round(min(intervals), 6) if intervals else None,
+            "max_observed_dt_s": round(max(intervals), 6) if intervals else None,
+            "gapped_intervals": gaps,
+            "invalid_intervals": invalid_intervals,
+            "acceleration_samples": len(accels),
+            "longitudinal_acceleration_samples": len(longs),
+            "planar_jerk_samples": len(planar_jerks),
+            "statistics_weighting": "per_sample",
+        }
+        return stats
 
     def summary(self) -> dict:
         return {
@@ -156,5 +265,26 @@ class MetricsCollector:
             "speeding_ticks": self.speeding_ticks,
             "max_speed_mps": round(self._max_speed, 3),
             "max_accel_mps2": round(self._max_accel, 3),
-            "max_jerk_mps3": round(self._max_jerk(), 3),
+            **self._comfort_summary(),
         }
+
+
+def _finite(value) -> Optional[float]:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _percentile95(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = (len(ordered) - 1) * 0.95
+    low, high = math.floor(index), math.ceil(index)
+    return ordered[low] + (ordered[high] - ordered[low]) * (index - low)
+
+
+def _rms(values: List[float]) -> Optional[float]:
+    return math.sqrt(sum(v * v for v in values) / len(values)) if values else None

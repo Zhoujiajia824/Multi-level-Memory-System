@@ -53,6 +53,7 @@ class TrajectoryTracker:
         self._target_speed: float = 0.0
         self._speed_profile: Optional[List[Tuple[float, float]]] = None
         self._profile_elapsed_s: float = 0.0
+        self.last_control_diagnostics: dict = {}
 
     def set_trajectory(
         self,
@@ -69,11 +70,15 @@ class TrajectoryTracker:
         无效曲线抛出 ValueError，并清除上一周期轨迹，避免继续执行过期计划。
         空轨迹始终表示全刹车，不要求速度曲线字段。
         """
+        previous_profile = self._speed_profile is not None and bool(self._global_wps)
         self._global_wps = None
         self._speed_profile = None
         self._profile_elapsed_s = 0.0
         self.pp.reset()
-        self.pid.soft_reset()  # 保留积分（起步助力），只清微分防踢
+        if not ego_centric_trajectory:
+            self.pid.reset()
+        elif not (follow_speed_profile and previous_profile):
+            self.pid.soft_reset()
         if follow_speed_profile and ego_centric_trajectory:
             if not math.isfinite(self.control_dt) or self.control_dt <= 0:
                 raise ValueError("Speed-profile tracking requires a positive finite control dt")
@@ -101,32 +106,74 @@ class TrajectoryTracker:
         self, ego_x: float, ego_y: float, ego_yaw_rad: float, current_speed: float
     ) -> "carla.VehicleControl":
         """根据当前自车位姿/速度算本 tick 控制量。无轨迹则全刹。"""
+        self.last_control_diagnostics = {
+            "profile_acceleration_mps2": None,
+            "endpoint_distance_m": None,
+            "endpoint_forward_m": None,
+        }
         if not self._global_wps:
-            return carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0)
+            return self._full_brake("no_trajectory", current_speed)
+        endpoint = self._global_wps[-1]
+        self.last_control_diagnostics.update(
+            endpoint_distance_m=math.hypot(endpoint["x"] - ego_x, endpoint["y"] - ego_y),
+            endpoint_forward_m=coords.global_to_ego(
+                endpoint["x"], endpoint["y"], ego_x, ego_y, ego_yaw_rad)[0],
+        )
         target_speed = self._target_speed
+        changing_profile_speed = False
         if self._speed_profile is not None:
             # This control will be applied during the next simulation tick. Looking
             # one tick ahead lets a trajectory starting at v(0)=0 accelerate.
+            previous_target = self._profile_speed_at(self._profile_elapsed_s)
             self._profile_elapsed_s += self.control_dt
             if self._profile_elapsed_s > self._speed_profile[-1][0] + 1e-9:
-                return carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0)
+                return self._full_brake("profile_expired", current_speed)
             target_speed = self._profile_speed_at(self._profile_elapsed_s)
-            if target_speed <= 1e-6:
-                # Hold a planned stop even if no forward pursuit point remains or
-                # the PID integral retained from the previous plan is positive.
-                return carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0)
+            profile_acceleration = (target_speed - previous_target) / self.control_dt
+            changing_profile_speed = abs(profile_acceleration) > 1e-6
+            self.last_control_diagnostics["profile_acceleration_mps2"] = profile_acceleration
+        planned_stop = target_speed <= 1e-6
+        if planned_stop and current_speed <= 0.05:
+            # Braking a stationary car holds it. A moving car follows its valid
+            # deceleration profile below; zero speed is not itself an emergency.
+            return self._full_brake("stationary_hold", current_speed, target_speed)
         steer_rad = self.pp.compute_steer(
             ego_x, ego_y, ego_yaw_rad, current_speed, self._global_wps
         )
         if not self.pp.target_valid:
-            return carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0)
+            return self._full_brake("no_forward_target", current_speed, target_speed)
         throttle, brake = self.pid.compute(
-            target_speed - current_speed, dt=self.control_dt
+            target_speed - current_speed, dt=self.control_dt,
+            current_speed=current_speed if self._speed_profile is not None else None,
+            # A fixed cruise target can coast inside the noise deadband. A
+            # planned gentle acceleration/deceleration must not disappear just
+            # because the next-tick speed change is smaller than that deadband.
+            allow_coast=not (planned_stop or changing_profile_speed),
         )
         steer_norm = _clamp(
             (steer_rad / self.max_steer_rad) * self.steer_sign, -1.0, 1.0
         )
-        return carla.VehicleControl(throttle=throttle, steer=steer_norm, brake=brake)
+        return self._control(throttle, steer_norm, brake, current_speed, target_speed,
+                             "planned_stop" if planned_stop else "speed_tracking")
+
+    def _full_brake(self, reason: str, current_speed: float, target_speed=None):
+        # A hold/failsafe bypasses PID. Discard its state so a later release does
+        # not inherit accumulated throttle or a stale acceleration measurement.
+        self.pid.reset()
+        return self._control(0.0, 0.0, 1.0, current_speed, target_speed, reason)
+
+    def _control(self, throttle, steer, brake, current_speed, target_speed, reason):
+        self.last_control_diagnostics = {
+            **self.last_control_diagnostics,
+            "reason": reason,
+            "target_speed_mps": target_speed,
+            "current_speed_mps": current_speed,
+            "speed_error_mps": None if target_speed is None else target_speed - current_speed,
+            "profile_elapsed_s": self._profile_elapsed_s if self._speed_profile is not None else None,
+            "pid_integral": self.pid._i,
+            "throttle": throttle, "brake": brake, "steer": steer,
+        }
+        return carla.VehicleControl(throttle=throttle, steer=steer, brake=brake)
 
     def _profile_speed_at(self, elapsed_s: float) -> float:
         """Linearly interpolate the validated profile at simulation time."""

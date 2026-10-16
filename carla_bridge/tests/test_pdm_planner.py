@@ -381,3 +381,23 @@ def test_cannot_enter_lane_too_short_to_finish_change_before_return_boundary(mon
     plan = planner.plan(semantic(lateral="CHANGE_LANE_LEFT"))
     assert plan["trajectory"]
     assert plan["planner_diagnostics"]["excluded_lateral_paths"]["left"] == "insufficient_lane_change_corridor"
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_overlapping_junction_connector_id_does_not_stop_route_following(enabled, monkeypatch):
+    from carla_bridge.planning.pdm_planner import RoadGeometryError
+    from carla_bridge.tests.test_pdm_route_geometry import OverlappingJunctionRoad, ending_planner
+    planner = ending_planner(OverlappingJunctionRoad(), x=12.1, y=-0.02, speed=2)
+    with monkeypatch.context() as old_lookup:
+        old_lookup.setattr("carla_bridge.planning.pdm_planner._junction_lane_match",
+                           lambda *args: (None, {"method": "disabled_for_regression"}))
+        with pytest.raises(RoadGeometryError, match="Ego has left the reference route"):
+            planner.plan(semantic("YIELD"), semantic_enabled=enabled)
+    plan = planner.plan(semantic("YIELD"), semantic_enabled=enabled)
+    assert plan["trajectory"]
+    geometry = plan["planner_diagnostics"]["geometry"]
+    assert geometry["ego_lane_key"] == "489:0:-1"
+    assert geometry["ego_lane_key"] != geometry["reference_lane_key"]
+    assert geometry["current_side"] == "center"
+    assert geometry["lane_match"]["method"] == "junction_geometry"
+    assert plan["trajectory"][-1]["x"] > 3
