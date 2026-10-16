@@ -1191,6 +1191,10 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --planner vlm_
 - 决策 JSONL 的 `model_decision_output` 保留模型语义，`decision_output` 保存规划后的指令与轨迹，
   `planning_output` 保存候选诊断，`decision_validation` 保存执行前数值校验结果。
 - `planner.jsonl` 记录每次 PDM 更新的仿真时间、关联语义帧、候选基础分/语义分/最终选择和校验结果。
+  临近车道终止或路口时的回归约束见 `route_recovery_active`、逐候选 `route_eligible` / `eligible`；
+  `geometry` 保存车道连接、截断和变道许可诊断。几何失败也会写入 `semantic_error` / `control_error`。
+  `pdm_emergency_brake` 表示主动保护制动，具体原因见 `failure_reason`；不会当作成功执行写入决策记忆。
+  详细规则见 [PDM 规划说明](planning/README.md#相邻车道回归与规划失败诊断)。
 - 记忆中的 `semantic_decision` 是模型建议，`planning_context` 是规划器选择；
   记录阶段为 `selected_before_execution`，不能据此断言已经成功完成该动作。
 - `paper_suite summarize` 增加 `planner_backend`、`semantic_influence` 和规划配置哈希，方便分组。

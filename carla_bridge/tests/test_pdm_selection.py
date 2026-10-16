@@ -130,3 +130,49 @@ def test_hash_and_ties_are_repeatable_for_the_same_ordered_pool():
     second, second_audit = choose_candidate(reordered_keys, {}, False)
     assert first["id"] == second["id"]
     assert first_audit["candidate_pool_sha256"] == second_audit["candidate_pool_sha256"]
+
+
+def recovery_pool():
+    # Scores from the 75.1s server snapshot: KEEP_LANE formerly interrupted
+    # recovery even though both alternatives passed collision/road/TTC checks.
+    center = candidate("center:MAINTAIN", 0.9599316416, "MAINTAIN", "FOLLOW_ROUTE")
+    center.update(route_target=True, forward_progress_m=25.0, terminal_speed_mps=6.4)
+    left = candidate("left:MAINTAIN", 0.9590769486, "MAINTAIN", "KEEP_LANE")
+    left.update(route_target=False, route_recovery_required=True)
+    return [center, left]
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_route_deadline_precedes_semantics_and_baseline_progress(enabled):
+    candidates = recovery_pool()
+    candidates[1]["base_score"] = 1.0  # Also protect the semantics-off arm.
+    selected, audit = choose_candidate(candidates, {"lateral_decision": "KEEP_LANE",
+                                                  "longitudinal_decision": "MAINTAIN"}, enabled)
+    assert selected["id"] == audit["baseline_selected_id"] == "center:MAINTAIN"
+    assert audit["route_recovery_active"]
+    assert audit["candidates"][1]["safe"]  # Safety and route eligibility are separate.
+    assert not audit["candidates"][1]["route_eligible"]
+    _, other = choose_candidate(candidates, {}, not enabled)
+    assert audit["candidate_pool_sha256"] == other["candidate_pool_sha256"]
+
+
+@pytest.mark.parametrize("blocked", ["collision", "red_light", "stopped"])
+def test_route_deadline_never_forces_a_blocked_return(blocked):
+    candidates = recovery_pool()
+    if blocked == "collision":
+        candidates[0]["safety"]["no_collision"] = 0.0
+    elif blocked == "red_light":
+        candidates[0]["safety"]["traffic_light"] = False
+    else:
+        candidates[0].update(forward_progress_m=0.0, terminal_speed_mps=0.0)
+    selected, audit = choose_candidate(candidates, {"lateral_decision": "KEEP_LANE"}, True)
+    assert selected["id"] == "left:MAINTAIN"
+    assert not audit["route_recovery_active"]
+
+
+def test_keep_lane_remains_effective_without_route_deadline():
+    candidates = recovery_pool()
+    candidates[1]["route_recovery_required"] = False
+    selected, audit = choose_candidate(candidates, {"lateral_decision": "KEEP_LANE"}, True)
+    assert selected["id"] == "left:MAINTAIN"
+    assert not audit["route_recovery_active"]

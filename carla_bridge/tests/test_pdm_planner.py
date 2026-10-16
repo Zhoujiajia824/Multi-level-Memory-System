@@ -290,3 +290,94 @@ def test_repeated_point_two_second_replans_preserve_maneuver_and_cruise(lateral)
         assert -4.0 < ego.y < -2.5
     else:
         assert abs(ego.y) < 0.1
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("barrier", ["end", "junction"])
+def test_recover_reference_lane_before_return_opportunity_closes(enabled, barrier):
+    from carla_bridge.tests.test_pdm_route_geometry import EndingRoad, ending_planner
+    road = EndingRoad(end=60 if barrier == "end" else 1000,
+                      junction=60 if barrier == "junction" else 1000)
+    planner = ending_planner(road)
+    plan = planner.plan(semantic(lateral="KEEP_LANE"), semantic_enabled=enabled)
+    diagnostics = plan["planner_diagnostics"]
+    assert plan["trajectory"]
+    assert diagnostics["route_recovery_active"]
+    assert diagnostics["selected_id"].startswith("center:")
+    assert plan["selected_lateral"] == "CHANGE_LANE_RIGHT"
+    assert diagnostics["geometry"]["lateral_paths"]["left"]["return_barrier"]["distance_ahead_m"] == 60
+    other = planner.plan(semantic(lateral="KEEP_LANE"), semantic_enabled=not enabled)
+    assert diagnostics["candidate_pool_sha256"] == other["planner_diagnostics"]["candidate_pool_sha256"]
+
+
+def test_short_current_lane_remains_a_braking_path_when_return_is_forbidden():
+    from carla_bridge.tests.test_pdm_route_geometry import EndingRoad, ending_planner
+    planner = ending_planner(EndingRoad(end=30, junction=24), speed=2)
+    plan = planner.plan(semantic("STOP", "KEEP_LANE"))
+    assert plan["trajectory"]
+    assert plan["target_speed"] == 0
+    diagnostics = plan["planner_diagnostics"]
+    assert diagnostics["selected_id"] == "left:STOP"
+    assert diagnostics["excluded_lateral_paths"]["center"] == "lane_change_not_permitted_or_intersection"
+    assert diagnostics["geometry"]["lateral_paths"]["left"]["cut"]["distance_ahead_m"] == 30
+
+
+def test_repeated_keep_lane_commands_do_not_interrupt_necessary_recovery():
+    from carla_bridge.tests.test_pdm_route_geometry import ending_planner
+    from carla_bridge.state.coords import ego_to_global
+    planner = ending_planner()
+    ego = planner.ego
+    ego.get_velocity = lambda: carla.Vector3D(x=ego.speed * math.cos(math.radians(ego.yaw)),
+                                             y=ego.speed * math.sin(math.radians(ego.yaw)))
+    for step in range(45):
+        plan = planner.plan(semantic(lateral="KEEP_LANE"))
+        assert plan["trajectory"], (step, plan["planner_diagnostics"])
+        point = plan["trajectory"][2]
+        x, y = ego_to_global(point["x"], point["y"], ego.x, ego.y, math.radians(ego.yaw))
+        candidate = next(c for c in plan["planner_diagnostics"]["candidates"]
+                         if c["id"] == plan["planner_diagnostics"]["selected_id"])
+        heading = planner.generator._state_array[candidate["index"], 2, planner.api.StateIndex.HEADING]
+        ego.x, ego.y, ego.yaw, ego.speed = x, y, -math.degrees(heading), point["optional_v"]
+    assert ego.x > 45
+    assert abs(ego.y) < 0.5
+
+
+def test_return_boundary_limits_current_lane_when_recovery_is_forbidden():
+    from carla_bridge.tests.test_pdm_route_geometry import EndingRoad, ending_planner
+    # The neighboring lane geometrically continues through the junction. Its
+    # candidate must stop before the return boundary, not follow that branch.
+    planner = ending_planner(EndingRoad(end=1000, junction=20), speed=3)
+    plan = planner.plan(semantic(lateral="KEEP_LANE"))
+    assert plan["trajectory"]
+    assert max(p["x"] for p in plan["trajectory"]) < 18
+    assert plan["planner_diagnostics"]["geometry"]["lateral_paths"]["left"]["bounded_before_return_barrier"]
+    assert plan["planner_diagnostics"]["excluded_lateral_paths"]["center"] == "lane_change_not_permitted_or_intersection"
+
+
+def test_real_geometry_exception_contains_all_candidate_exclusions():
+    from carla_bridge.planning.pdm_planner import RoadGeometryError
+    from carla_bridge.tests.test_pdm_route_geometry import EndingRoad, ending_planner
+    planner = ending_planner(EndingRoad(end=2, junction=0), x=1.9)
+    with pytest.raises(RoadGeometryError) as error:
+        planner.plan(semantic())
+    details = error.value.diagnostics["geometry"]
+    assert details["current_side"] == "left"
+    assert details["ego_lane_key"]
+    assert details["reference_lane_key"]
+    assert set(details["excluded_lateral_paths"]) == {"center", "left", "right"}
+
+
+def test_cannot_enter_lane_too_short_to_finish_change_before_return_boundary(monkeypatch):
+    from carla_bridge.tests.test_pdm_route_geometry import EndingRoad, EndingWaypoint, ending_planner
+    original = EndingWaypoint.__init__
+
+    def asymmetric_marking(self, road, x, lane=0):
+        original(self, road, x, lane)
+        if lane == 1 and x >= 24:
+            self.lane_change = carla.LaneChange.Left  # Outbound change is allowed; return is not.
+
+    monkeypatch.setattr(EndingWaypoint, "__init__", asymmetric_marking)
+    planner = ending_planner(EndingRoad(end=1000), y=0)
+    plan = planner.plan(semantic(lateral="CHANGE_LANE_LEFT"))
+    assert plan["trajectory"]
+    assert plan["planner_diagnostics"]["excluded_lateral_paths"]["left"] == "insufficient_lane_change_corridor"

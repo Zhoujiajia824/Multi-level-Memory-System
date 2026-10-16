@@ -275,3 +275,36 @@ def test_full_audit_disk_still_brakes_and_terminates_after_three_failures(tmp_pa
     assert closed._audit_pdm_plan.call_count == 6  # Plan audit and error audit both fail.
     assert closed.scenario.ego_vehicle.apply_control.call_count == 3
     closed.carla_client.tick.assert_not_called()
+
+
+@pytest.mark.parametrize("source", ["semantic", "control"])
+def test_geometry_failure_preserves_diagnostics_and_brakes(tmp_path, source):
+    from carla_bridge.planning.pdm_planner import RoadGeometryError
+    closed = planning_loop(tmp_path)
+    diagnostics = {"failure_reason": "road_geometry_error", "geometry": {
+        "current_side": "left", "excluded_lateral_paths": {"center": "lane_change_not_permitted"}}}
+    closed.pdm_planner.plan.side_effect = RoadGeometryError("No legal lateral path", diagnostics)
+    if source == "semantic":
+        decision, _ = parse_semantic_decision_output(json.dumps(SEMANTIC))
+        with pytest.raises(RoadGeometryError):
+            closed._plan_semantic_decision(decision, semantic_keyframe())
+        assert closed._active_semantics is None
+    else:
+        closed._active_semantics = deepcopy(SEMANTIC)
+        closed._elapsed = 0.2
+        closed._refresh_pdm_control(carla.Transform(), 0, 5)
+    audit = json.loads((tmp_path / "closed" / "planner.jsonl").read_text(encoding="utf-8"))
+    assert audit["source"] == source + "_error"
+    assert audit["planner_diagnostics"] == diagnostics
+    assert audit["semantic_decision"] == SEMANTIC
+    assert not audit["validation"]["accepted"]
+    assert closed.scenario.ego_vehicle.apply_control.call_args.args[0].brake == 1.0
+
+
+def test_expected_emergency_is_not_reported_as_malformed_trajectory(tmp_path):
+    closed = planning_loop(tmp_path)
+    plan = {"trajectory": [], "target_speed": 0.0, "planner_diagnostics": {
+        "emergency_brake": True, "failure_reason": "no_safe_candidate"}}
+    validation = closed._validate_decision(plan, semantic_keyframe())
+    assert validation == {"accepted": False, "reasons": ["pdm_emergency_brake"],
+                          "details": {"failure_reason": "no_safe_candidate"}}

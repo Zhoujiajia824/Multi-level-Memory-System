@@ -321,6 +321,10 @@ class ClosedLoop:
         decision = decision or {}
         if decision.get("fallback_used"):
             return {"accepted": False, "reasons": ["rule_fallback_not_executable"], "details": {}}
+        diagnostics = decision.get("planner_diagnostics") or {}
+        if self.planner_backend == "pdm_closed" and diagnostics.get("emergency_brake") is True:
+            return {"accepted": False, "reasons": ["pdm_emergency_brake"],
+                    "details": {"failure_reason": diagnostics.get("failure_reason")}}
         return self.trajectory_validator.validate(
             decision.get("trajectory"), decision.get("target_speed"),
             (kf.get("ego_state") or {}).get("speed", 0.0), self._execution_horizon,
@@ -345,7 +349,15 @@ class ClosedLoop:
         semantic = {key: deepcopy(decision[key]) for key in (
             "lateral_decision", "longitudinal_decision", "behavior_reason", "risk_level", "safety_notes")}
         self._semantic_frame_id = kf.get("sample_token")
-        plan = self.pdm_planner.plan(semantic, semantic_enabled=self.semantic_influence)
+        try:
+            plan = self.pdm_planner.plan(semantic, semantic_enabled=self.semantic_influence)
+        except Exception as exc:
+            # Geometry can fail before a plan dictionary exists. Audit it at
+            # both update rates, while preserving the original exception and
+            # the memory layer's rejected-decision handling.
+            self._apply_brake()
+            self._audit_pdm_error(exc, semantic, "semantic_error")
+            raise
         result = self._merge_plan(decision, semantic, plan)
         validation = self._validate_decision(result, kf)
         self._audit_pdm_plan(result, validation, "semantic_update")
@@ -392,6 +404,16 @@ class ClosedLoop:
         with path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(audit, ensure_ascii=False, allow_nan=False) + "\n")
 
+    def _audit_pdm_error(self, exc, semantic, source):
+        try:
+            self._audit_pdm_plan(
+                {"semantic_decision": deepcopy(semantic),
+                 "planner_diagnostics": getattr(exc, "diagnostics", None)},
+                {"accepted": False, "reasons": ["pdm_planning_error"],
+                 "details": {"error_type": type(exc).__name__, "error": str(exc)}}, source)
+        except Exception:
+            logger.error("PDM error audit could not be written; vehicle already braking", exc_info=True)
+
     def _refresh_pdm_control(self, tf, yaw: float, speed: float) -> None:
         """Replan against current actors between expensive semantic VLM calls."""
         if (self.planner_backend != "pdm_closed" or self._active_semantics is None
@@ -417,11 +439,7 @@ class ClosedLoop:
             self._planned_stop = True
             self._trajectory_rejections += 1
             self._consecutive_trajectory_rejections += 1
-            try:
-                self._audit_pdm_plan({}, {"accepted": False, "reasons": ["pdm_control_update_error"],
-                                         "details": {"error": str(exc)}}, "control_error")
-            except Exception:
-                logger.error("PDM error audit could not be written; vehicle already braking")
+            self._audit_pdm_error(exc, self._active_semantics, "control_error")
             logger.error("PDM control update failed; braking: %s", exc)
             if self._consecutive_trajectory_rejections >= int(self.ccfg.get("max_trajectory_rejections", 3)):
                 self._early_terminated = True

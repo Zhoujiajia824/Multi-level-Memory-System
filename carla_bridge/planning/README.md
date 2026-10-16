@@ -71,6 +71,35 @@ commit 的源码及适用于服务器 Python/Linux 的依赖 wheel，上传后�
    `baseline_selected_id` 和 `selected_id`，可直接检查当次选择是否受到语义影响。
    语义无法复活不安全候选；全部失败或官方 emergency 触发时返回空轨迹，由闭环全刹。
 
+### 相邻车道回归与规划失败诊断
+
+局部车道现在从自车所在位置向前、向后建立连续片段；自车后方缺失邻道不再使
+整条候选失效。跨 road/section/lane 的连接通过 `Waypoint.next()` 验证，避免仅按
+“参考路线左侧/右侧”拼接不相连的道路。前方车道终止时保留有限长度的路径，
+由 IDM 的路径终点约束减速，短于完整变道所需距离的车道不能成为新的变道目标。
+
+邻道终止、不连续、即将进入路口或失去回归变道许可时，计算回归边界。
+边界进入 `lane_change_length_m + 4m + max_speed_mps × horizon_s` 的范围后，
+若存在通过全部安全检查、规划窗口内沿路线前进超过 2m 且末速度超过 0.2m/s 的参考车道候选，
+暂时禁止继续选择会错过该边界的邻道候选。`KEEP_LANE` 加分不能推迟必要回归。
+若回归被阻挡，则保留其它安全候选；前方已知的回归边界也作为邻道路径终点，
+供 IDM 减速停车。已经错过合法回归区间时不会强行跨实线或在路口内变道。
+
+这是 CARLA 适配层新增的路线约束，不是原版 PDM 的功能。语义开/关都使用同样
+规则，且规则只依赖当前地图、状态和候选，不读取历史决策或记忆库。`planner.jsonl`
+新增 `route_recovery_active`、候选的 `route_eligible` / `eligible`、`geometry.lateral_paths`
+中的截断位置和回归边界。`safe` 仍单独表示安全检查结果，`baseline_selected_id`
+也在相同路线约束下计算；绘图时应使用 `eligible` 判断是否可参与最终选择。
+
+几何构建异常现在也写入 `semantic_error` / `control_error`，包含当前/参考车道 ID、
+候选排除原因和位置。无安全候选或上游紧急制动记录为 `pdm_emergency_brake`，
+`details.failure_reason` 区分 `no_safe_candidate` 和 `upstream_emergency`，不再仅报
+“空轨迹格式错误”。连续拒绝退出阈值、禁止写入失败决策记忆的规则保持生效。
+
+本地回归使用固定 PDM 核心验证连续重规划、临近路口回归、有限车道停车、
+连接检查、语义对照一致性及失败审计；仍需服务器重跑 `R05_multilane_eval_s101`
+并达到路线完成率 100%，不能将本地测试通过视为原故障场景已经验收。
+
 适配层维持 0.1s 轨迹采样（上游 TTC 计算使用 10Hz 下标）；PDM 更新频率由闭环
 `carla.planning.replan_interval_s` 控制，默认 0.2s。VLM 语义更新仍为 3s。
 为满足 100% 路线完成，规划中心线在固定验收终点外沿真实道路适度延伸，验收路线

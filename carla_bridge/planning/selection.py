@@ -28,14 +28,29 @@ def choose_candidate(candidates, semantic, enabled, lateral_weight=0.8, longitud
         item.update(safe=safe, semantic_bonus=float(bonus),
                     final_score=float(item["base_score"] + bonus) if safe else None)
         audited.append(item)
-    feasible = [item for item in audited if item["safe"]]
+    # Route reachability is shared by both ablation arms. Near the last legal
+    # return opportunity, do not let KEEP_LANE (or progress on the wrong lane)
+    # postpone recovery if a safe, moving reference-lane proposal exists.
+    # If returning is blocked, retain safe braking/avoidance options instead
+    # of forcing an unsafe lane change. No previous VLM decision is remembered.
+    recovery_active = (any(item.get("route_recovery_required") is True for item in audited)
+                       and any(item["safe"] and item.get("route_target") is True
+                               and item.get("forward_progress_m", 0.0) > 2.0
+                               and item.get("terminal_speed_mps", 0.0) > 0.2 for item in audited))
+    for item in audited:
+        route_eligible = not (recovery_active and item.get("route_recovery_required") is True)
+        item.update(route_eligible=route_eligible, eligible=item["safe"] and route_eligible)
+        if not item["eligible"]:
+            item["final_score"] = None
+    feasible = [item for item in audited if item["eligible"]]
     selected = max(feasible, key=lambda item: item["final_score"]) if feasible else None
     baseline = max(feasible, key=lambda item: item["base_score"]) if feasible else None
     # Hash the generated pool/base metrics, excluding the experimental score term.
     identity = hashlib.sha256(json.dumps(candidates, sort_keys=True, allow_nan=False,
                                          separators=(",", ":")).encode("utf-8")).hexdigest()
-    available = sorted({s for c in audited for s in c.get("lateral_semantics", [])})
+    available = sorted({s for c in audited if c["route_eligible"] for s in c.get("lateral_semantics", [])})
     return selected, {"semantic_enabled": bool(enabled), "semantic_requested": dict(semantic),
+                      "route_recovery_active": recovery_active,
                       "candidate_pool_sha256": identity, "candidates": audited,
                       "selected_id": selected["id"] if selected else None,
                       "baseline_selected_id": baseline["id"] if baseline else None,

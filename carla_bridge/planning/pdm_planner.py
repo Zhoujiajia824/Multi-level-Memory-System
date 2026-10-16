@@ -36,6 +36,64 @@ def _same_direction(first, second):
     return math.cos(_heading(first) - _heading(second)) > 0.8
 
 
+class RoadGeometryError(ValueError):
+    """Preserve the failed snapshot even when no proposal can be generated."""
+
+    def __init__(self, message, diagnostics):
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
+def _adjacent(wp, side):
+    return wp if side == "center" else (wp.get_left_lane() if side == "left" else wp.get_right_lane())
+
+
+def _connected(first, second):
+    """Do not join unrelated lanes merely because they are geometrically close."""
+    distance = float(np.linalg.norm(_xy(second) - _xy(first)))
+    if distance > 6.0 or not _same_direction(first, second):
+        return False
+    if _lane_key(first) == _lane_key(second):
+        return True
+    # next() follows road successors without changing lanes. A small tolerance
+    # accommodates the difference between arc distance and waypoint chord.
+    return any(_lane_key(wp) == _lane_key(second)
+               and float(np.linalg.norm(_xy(wp) - _xy(second))) < 1.0
+               for wp in first.next(max(0.05, distance)))
+
+
+def _lane_corridor(reference, closest, side, progress):
+    """Continuous local lane containing ego's station, with a finite endpoint.
+
+    Missing lane segments behind ego do not invalidate the road ahead. At road
+    seams verify successors rather than stitching equal left/right indices.
+    """
+    import carla
+    lanes = [_adjacent(base, side) for base in reference]
+
+    def usable(i):
+        return (lanes[i] is not None and lanes[i].lane_type == carla.LaneType.Driving
+                and _same_direction(reference[i], lanes[i]))
+
+    if not usable(closest):
+        return [], {"reason": "no_same_direction_lane_at_ego", "distance_ahead_m": 0.0}
+    start, end = closest, closest
+    while start > 0 and usable(start - 1) and _connected(lanes[start - 1], lanes[start]):
+        start -= 1
+    cut = None
+    while end + 1 < len(lanes):
+        i = end + 1
+        reason = ("no_continuous_same_direction_driving_lane" if not usable(i)
+                  else "disconnected_lane_successor" if not _connected(lanes[end], lanes[i]) else None)
+        if reason:
+            cut = {"reason": reason, "reference_index": i,
+                   "distance_ahead_m": float(progress[i] - progress[closest]),
+                   "last_lane_key": _lane_key(lanes[end])}
+            break
+        end = i
+    return lanes[start:end + 1], cut
+
+
 def _path_states(points, api, first_heading=None):
     points = np.asarray(points, dtype=float)
     keep = np.r_[True, np.linalg.norm(np.diff(points, axis=0), axis=1) > 1e-4]
@@ -237,12 +295,19 @@ class CarlaPDMPlanner:
         base_wp = self.map.get_waypoint(carla.Location(x=projected.x, y=-projected.y,
                                                        z=self.ego.get_location().z), project_to_road=True,
                                        lane_type=carla.LaneType.Driving)
+        if base_wp is None:
+            raise ValueError("Reference projection is outside driving lanes")
         closest = min(range(len(reference)), key=lambda i: float(np.linalg.norm(_xy(reference[i]) - origin)))
+        progress = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff([_xy(wp) for wp in reference], axis=0), axis=1))]
         current_side = None
         for side, candidate in (("center", base_wp), ("left", base_wp.get_left_lane()),
                                  ("right", base_wp.get_right_lane())):
             if candidate is not None and _lane_key(candidate) == _lane_key(ego_wp):
                 current_side = side
+        self._geometry_diagnostics.update(
+            ego_lane_key=_lane_key(ego_wp), reference_lane_key=_lane_key(base_wp),
+            current_side=current_side, closest_reference_index=closest,
+            reference_lane_keys=list(dict.fromkeys(_lane_key(wp) for wp in reference)))
         if current_side is None:
             raise ValueError("Ego has left the reference route and its adjacent driving lanes")
 
@@ -263,7 +328,7 @@ class CarlaPDMPlanner:
                     lanes_a[side + str(lane_index)], lanes_b[side + str(lane_index)] = a, b
             for lane_name, a in lanes_a.items():
                 b = lanes_b[lane_name]
-                if float(np.linalg.norm(_xy(a) - _xy(b))) > 6:
+                if not _connected(a, b):
                     continue
                 corners = []
                 for wp, sign in ((a, 1), (b, 1), (b, -1), (a, -1)):
@@ -285,30 +350,66 @@ class CarlaPDMPlanner:
         occupancy = self.api.PDMOccupancyMap(list(polygons), np.array(list(polygons.values()), dtype=object))
 
         paths, metadata, excluded = [], [], {}
+        path_details = {}
+        self._geometry_diagnostics.update(excluded_lateral_paths=excluded, lateral_paths=path_details)
         for side in ("center", "left", "right"):
-            lane_points = []
             reason = None
-            for i, base in enumerate(reference):
-                distance_ahead = sum(float(np.linalg.norm(_xy(reference[j + 1]) - _xy(reference[j])))
-                                     for j in range(closest, max(closest, i)))
-                wp = base if side == "center" else (base.get_left_lane() if side == "left" else base.get_right_lane())
-                if wp is None or wp.lane_type != carla.LaneType.Driving or not _same_direction(base, wp):
-                    if distance_ahead > self.max_speed * self.horizon + 8 and len(lane_points) > 3:
-                        break  # The valid finite lane becomes an IDM stopping constraint.
-                    reason = "no_continuous_same_direction_driving_lane"
-                    break
-                # A change of two lanes is never a candidate.
-                if current_side != "center" and side not in (current_side, "center"):
-                    reason = "would_cross_two_lanes"
-                    break
-                if side != current_side and i >= closest and distance_ahead <= self.transition_m + 4:
-                    source = base if current_side == "center" else (base.get_left_lane() if current_side == "left" else base.get_right_lane())
+            corridor, cut = _lane_corridor(reference, closest, side, progress)
+            details = path_details[side] = {"cut": cut}
+            # A change of two lanes is never a candidate.
+            if current_side != "center" and side not in (current_side, "center"):
+                reason = "would_cross_two_lanes"
+            if not corridor:
+                reason = reason or "no_same_direction_lane_at_ego"
+
+            # Detect the last opportunity to return before a junction, a lane
+            # ending/disconnection, or a marking that forbids returning. This
+            # uses map evidence, never the requested semantic action.
+            barrier = cut if side != "center" else None
+            for i in range(closest, len(reference)):
+                base = reference[i]
+                distance_ahead = float(progress[i] - progress[closest])
+                wp = _adjacent(base, side)
+                if side != "center":
+                    return_permission = carla.LaneChange.Right if side == "left" else carla.LaneChange.Left
+                    if (wp is None or base.is_junction or wp.is_junction
+                            or not (int(wp.lane_change) & int(return_permission))):
+                        limit = {"reason": "return_lane_change_not_permitted_or_intersection",
+                                 "reference_index": i, "distance_ahead_m": distance_ahead}
+                        if barrier is None or distance_ahead < barrier["distance_ahead_m"]:
+                            barrier = limit
+                if reason is None and side != current_side and distance_ahead <= self.transition_m + 4:
+                    source = _adjacent(base, current_side)
                     direction = side if current_side == "center" else ("right" if current_side == "left" else "left")
                     permission = carla.LaneChange.Left if direction == "left" else carla.LaneChange.Right
-                    if source is None or base.is_junction or wp.is_junction or not (int(source.lane_change) & int(permission)):
+                    if (source is None or wp is None or base.is_junction or source.is_junction or wp.is_junction
+                            or not (int(source.lane_change) & int(permission))):
                         reason = "lane_change_not_permitted_or_intersection"
-                        break
-                lane_points.append(_xy(wp))
+                        details["permission_failure_distance_m"] = distance_ahead
+                        details["permission_failure"] = {
+                            "source_lane_key": _lane_key(source) if source else None,
+                            "target_lane_key": _lane_key(wp) if wp else None,
+                            "source_lane_change": int(source.lane_change) if source else None,
+                            "reference_is_junction": bool(base.is_junction)}
+            details["return_barrier"] = barrier
+            recovery_required = (barrier is not None and barrier["distance_ahead_m"]
+                                 <= self.transition_m + 4 + self.max_speed * self.horizon)
+            details["route_recovery_required"] = recovery_required
+            if barrier is not None and barrier["distance_ahead_m"] > 0:
+                # If recovery is temporarily blocked, IDM can slow/stop on the
+                # current lane before its known return boundary. It must not
+                # cruise through an unrelated junction branch just because
+                # geometrically adjacent waypoints continue to exist there.
+                limit_station = progress[barrier["reference_index"]]
+                corridor = [wp for wp in corridor
+                            if reference_line.project(Point(*_xy(wp))) < limit_station - 1e-4]
+                details["bounded_before_return_barrier"] = True
+            # Do not start a lane change that cannot finish inside this finite
+            # corridor. Staying on a short lane is still a valid braking path.
+            endpoint = barrier or cut
+            if (reason is None and side != current_side and endpoint is not None
+                    and endpoint["distance_ahead_m"] <= self.transition_m + 4):
+                reason = "insufficient_lane_change_corridor"
             if reason:
                 excluded[side] = reason
                 continue
@@ -322,8 +423,16 @@ class CarlaPDMPlanner:
             else:
                 label = "CHANGE_LANE_" + side.upper()
                 semantics = [label]
-            paths.append(_smooth_path(lane_points, rear, ego_state.rear_axle.heading, self.api, self.transition_m))
-            metadata.append({"id": side, "label": label, "semantics": sorted(set(semantics))})
+            try:
+                path = _smooth_path([_xy(wp) for wp in corridor], rear,
+                                    ego_state.rear_axle.heading, self.api, self.transition_m)
+            except ValueError as exc:
+                excluded[side] = "insufficient_path_ahead"
+                details["error"] = str(exc)
+                continue
+            paths.append(path)
+            metadata.append({"id": side, "label": label, "semantics": sorted(set(semantics)),
+                             "route_recovery_required": recovery_required})
         if not paths:
             raise ValueError("No legal lateral path from the current lane")
         centerline = self.api.PDMPath(_path_states([_xy(wp) for wp in reference], self.api))
@@ -418,9 +527,18 @@ class CarlaPDMPlanner:
         return policies, labels, targets
 
     def plan(self, semantic_decision, semantic_enabled=True):
+        from shapely.geometry import Point
         timestamp = int(round(self.world.get_snapshot().timestamp.elapsed_seconds * 1e6))
         state, tf = self._ego_state(timestamp)
-        paths, lateral, centerline, area, lanes, excluded = self._road_geometry(state)
+        self._geometry_diagnostics = {"ego_location": {"x": tf.location.x, "y": tf.location.y,
+                                                       "z": tf.location.z}}
+        try:
+            paths, lateral, centerline, area, lanes, excluded = self._road_geometry(state)
+        except Exception as exc:
+            raise RoadGeometryError(str(exc), {
+                "backend": "pdm_closed", "failure_reason": "road_geometry_error",
+                "timestamp_us": timestamp, "geometry": self._geometry_diagnostics,
+            }) from exc
         lights, stop_polygons = self._traffic_lights(lanes, timestamp, state)
         # Reset per snapshot so an initial overlap cannot silently make an actor
         # permanently disappear from all future forecasts.
@@ -457,6 +575,11 @@ class CarlaPDMPlanner:
                 safety["no_collision"] = 0.0
             candidates.append({"id": "%s:%s" % (lat["id"], longitudinal[proposal.longitudinal_idx]),
                                "index": index, "lateral": lat["label"], "lateral_semantics": lat["semantics"],
+                               "route_target": lat["id"] == "center",
+                               "route_recovery_required": lat["route_recovery_required"],
+                               "forward_progress_m": float(centerline.project(Point(*proposals[index, -1, :2]))
+                                                           - centerline.project(Point(*proposals[index, 0, :2]))) if finite else 0.0,
+                               "terminal_speed_mps": float(self.generator._state_idm_array[index, -1, 1]) if finite else 0.0,
                                "longitudinal": longitudinal[proposal.longitudinal_idx],
                                "desired_speed_mps": targets[proposal.longitudinal_idx],
                                "base_score": float(scores[index]) if finite else 0.0, "safety": safety,
@@ -467,12 +590,13 @@ class CarlaPDMPlanner:
                            timestamp_us=timestamp, horizon_s=self.samples * self.dt, sample_interval_s=self.dt,
                            leading_agent_update_rate=1, lateral_transition="cubic_hermite_pose_tangent",
                            excluded_lateral_paths=excluded, traffic_stop_lines=len(stop_polygons),
+                           geometry=self._geometry_diagnostics,
                            initial_collision_tokens=initial_collisions,
                            vehicle={"wheelbase_m": self.vehicle_parameters.wheel_base,
                                     "rear_axle_to_center_m": self.vehicle_parameters.rear_axle_to_center})
         # Run the upstream detector against the selected candidate. Its brake
         # output is an emergency signal; CARLA performs a direct full brake.
-        emergency_scores = np.asarray([c["final_score"] if c["safe"] else -1.0 for c in diagnostics["candidates"]])
+        emergency_scores = np.asarray([c["final_score"] if c["eligible"] else -1.0 for c in diagnostics["candidates"]])
         emergency = self.emergency.brake_if_emergency(state, emergency_scores, self.scorer)
         if selected is None or emergency is not None:
             diagnostics.update(emergency_brake=True, failure_reason="no_safe_candidate" if selected is None else "upstream_emergency")
