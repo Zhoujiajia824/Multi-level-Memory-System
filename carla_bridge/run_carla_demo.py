@@ -12,11 +12,33 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
+
+
+def _configure_runtime_diagnostics() -> None:
+    """Keep native crash traces and timely redirected logs without Python flags."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(line_buffering=True, write_through=True)
+            except (OSError, ValueError):
+                pass  # Notebook/test capture streams may have no usable descriptor.
+    if not faulthandler.is_enabled():
+        for stream in (sys.stderr, sys.__stderr__):
+            try:
+                faulthandler.enable(file=stream, all_threads=True)
+                break
+            except (AttributeError, OSError, ValueError):
+                continue
+
+
+# Must precede CARLA / PyTorch / FAISS native imports, not just loop.setup().
+_configure_runtime_diagnostics()
 
 import yaml
 
@@ -56,6 +78,9 @@ def main() -> None:
     ap.add_argument("--memory-seed", help="复制已有库到新目标库，原始库保持不变")
     ap.add_argument("--no-memory-retrieval", action="store_true", help="不检索中长期记忆，仍按写入开关积累")
     ap.add_argument("--no-short-term", action="store_true", help="关闭本轮短期记忆")
+    ap.add_argument("--dinov2-model-dir", help="本地 DINOv2 模型目录或缓存 snapshot 目录")
+    ap.add_argument("--dinov2-cache-dir", help="Hugging Face 缓存目录（默认项目 .cache/huggingface）")
+    ap.add_argument("--allow-model-download", action="store_true", help="显式允许 DINOv2 联网下载；默认仅使用本地文件")
     args = ap.parse_args()
 
     # 修复 Anaconda/conda 常见坑：SSL_CERT_FILE 指向不存在的 cacert.pem 会让
@@ -70,6 +95,14 @@ def main() -> None:
     carla_yaml = PROJECT_ROOT / "carla_bridge" / "config" / "carla.yaml"
     with open(carla_yaml, "r", encoding="utf-8") as f:
         carla_cfg = yaml.safe_load(f)
+    feature_cfg = carla_cfg.setdefault("feature_extractor", {})
+    feature_cfg.setdefault("local_files_only", True)
+    if args.dinov2_model_dir:
+        feature_cfg["model_dir"] = args.dinov2_model_dir
+    if args.dinov2_cache_dir:
+        feature_cfg["cache_dir"] = args.dinov2_cache_dir
+    if args.allow_model_download:
+        feature_cfg["local_files_only"] = False
     config = load_config(overrides=carla_cfg)
 
     # fail-fast：VLM API Key 缺失立即报错（避免跑完 CARLA+DINOv2 setup 才在第一次 VLM 调用崩）
@@ -86,7 +119,7 @@ def main() -> None:
         _e0 = _missing[0]
         raise EnvironmentError(
             f"VLM API Key 未设置：环境变量 {_missing} 为空。\n"
-            f"  你在用 Git Bash(MINGW64)：必须用 export，不是 set！\n"
+            f"  Linux/macOS Bash 或 Git Bash：使用 export\n"
             f"    export {_e0}=你的key\n"
             f"  Windows CMD:  set {_e0}=你的key\n"
             f"  PowerShell:   $env:{_e0}='你的key'\n"
@@ -122,10 +155,11 @@ def main() -> None:
         try:
             if loop is not None:
                 loop.close()
-                session.set_status(loop.run_status)
+                result = loop.outcome()
+                session.set_status(loop.run_status, outcome=result if isinstance(result, dict) else None)
         finally:
             session.close()
-    if loop is not None and loop.run_status in ("memory_save_failed", "sensor_failure"):
+    if loop is not None and loop.run_status != "route_completed":
         raise RuntimeError(f"运行未成功结束: {loop.run_status}，详见 {session.run_dir}")
 
 

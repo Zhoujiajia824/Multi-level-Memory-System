@@ -42,6 +42,7 @@ class DecisionPromptBuilder:
         long_term_rules_text: str = "",
         perception_objects: Optional[List[Dict]] = None,
         image_layout: str = "",
+        planning_constraints: Optional[Dict] = None,
     ) -> str:
         """构建完整的决策 prompt。
 
@@ -52,6 +53,7 @@ class DecisionPromptBuilder:
             perception_objects: oracle 感知对象列表（nuScenes GT 投影，dict 形式）；
                 非空时渲染为独立段落喂给决策 VLM，并显式标注为 oracle 来源。
             image_layout: 输入图像布局描述串（single_front / surround_mosaic）。
+            planning_constraints: 可选闭环动力学约束；仅仿真调用方提供时生效。
         """
         loader = get_prompt_loader()
 
@@ -76,12 +78,18 @@ class DecisionPromptBuilder:
         # ------------------------------------------------------------
         min_num, max_num = get_waypoint_bounds()
         horizon_seconds, dt = get_horizon_and_dt()
+        if planning_constraints is not None:
+            # Include both capture-time origin and the full execution horizon
+            # without asking for 31 points when the parser accepts at most 30.
+            horizon_seconds = max(horizon_seconds,
+                                  float(planning_constraints["required_horizon_s"]))
+            dt = horizon_seconds / max(1, max_num - 1)
         behavior_enum_str = "/".join(get_valid_behaviors())
 
         # ------------------------------------------------------------
         # 3. 渲染主模板
         # ------------------------------------------------------------
-        return loader.render(
+        prompt = loader.render(
             "decision.user",
             scene_block=scene_block,
             ego_state_block=ego_state_block,
@@ -95,6 +103,32 @@ class DecisionPromptBuilder:
             behavior_enum_str=behavior_enum_str,
             image_layout_block=image_layout_block,
             perception_objects_block=perception_objects_block,
+        )
+        if planning_constraints is not None:
+            prompt += self._render_planning_constraints(
+                planning_constraints, ego_state or {}, horizon_seconds, max_num)
+        return prompt
+
+    @staticmethod
+    def _render_planning_constraints(constraints, ego_state, horizon, point_count):
+        return (
+            "\n## CARLA 闭环轨迹物理约束（执行前会校验）\n"
+            "- 轨迹必须是当前自车坐标系的米制位置：x 前向，y 左向；禁止使用地图全局坐标。\n"
+            f"- 输出恰好 {point_count} 个点，首点 t=0,x=0,y=0，末点 t={horizon:.6g} 秒。"
+            f"第 i 个点的时间为 i*{horizon:.6g}/({point_count}-1)，i 从 0 开始；t 必须严格递增。\n"
+            f"- 当前实测速度是 {float(ego_state.get('speed', 0)):.3f} m/s，"
+            "轨迹应从该速度连续演化，不能直接跳到目标速度。\n"
+            f"- 目标速度不得超过 {constraints['max_speed_mps']:.3g} m/s，"
+            f"纵向加速度不得超过 {constraints['max_acceleration_mps2']:.3g} m/s²，"
+            f"制动减速度不得超过 {constraints['max_deceleration_mps2']:.3g} m/s²，"
+            f"横向加速度不得超过 {constraints['max_lateral_acceleration_mps2']:.3g} m/s²。\n"
+            "- 相邻点距离/时间差必须与速度一致。匀速 6 m/s 行驶 3 秒约走 18 米，"
+            "不能输出 80 米轨迹；起步需计入加速，减速需计入当前速度和制动距离。"
+            "若提供 optional_v，它必须与位置和时间一致。\n"
+            "- route_center 是前方路线的空间参考，不代表必须在本轮时间范围内到达；"
+            "只沿其中物理可达的部分规划，不把远处锚点强塞进 3 秒轨迹。\n"
+            "- 控制器仅支持前进，禁止倒车、轨迹折返和瞬间横移。"
+            "停车目标速度可设 0，但移动车辆仍必须给出连续减速至停止的路径。\n"
         )
 
     # ================================================================

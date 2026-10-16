@@ -106,8 +106,10 @@ class CarlaClient:
         cam_tf = carla.Transform(cam_loc, carla.Rotation(yaw=tf.rotation.yaw, pitch=-15.0))
         self.world.get_spectator().set_transform(cam_tf)
 
-    def restore(self) -> None:
-        """恢复服务器原始（异步）设置，释放同步控制。"""
+    def restore(self) -> bool:
+        """恢复原始设置；失败返回 False，保留原始设置以供重试。"""
+        if self._orig_settings is None:
+            return True
         if self.world is not None and self._orig_settings is not None:
             try:
                 self.world.apply_settings(self._orig_settings)
@@ -115,3 +117,7 @@ class CarlaClient:
                 self._orig_settings = None
             except Exception as e:
                 logger.warning("恢复 CARLA 设置失败: %s", e)
+                return False
+            return True
+        logger.warning("恢复 CARLA 设置失败: world 不可用")
+        return False

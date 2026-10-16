@@ -86,6 +86,7 @@ class OnlineDrivingLoop:
         mode: str,
         output_jsonl_path: Optional[Path | str] = None,
         resume: bool = True,
+        decision_validator=None,
     ):
         if mode not in self.VALID_MODES:
             raise ValueError(f"mode 必须是 {self.VALID_MODES}，实际: {mode!r}")
@@ -102,6 +103,9 @@ class OnlineDrivingLoop:
             else default_output_path(config, mode)
         )
         self.resume = resume
+        # Optional simulator-specific physical validation; offline datasets keep
+        # their existing behavior when no callback is supplied.
+        self.decision_validator = decision_validator
 
         # ---- setup 后填充的组件 ----
         self.feature_extractor: Optional[DINOv2Extractor] = None
@@ -154,11 +158,18 @@ class OnlineDrivingLoop:
 
         # ---- 1. DINOv2 ----
         fe_cfg = cfg.get("feature_extractor", {}) or {}
+        model_dir = fe_cfg.get("model_dir")
+        if model_dir:
+            model_dir = Path(model_dir).expanduser()
+            if not model_dir.is_absolute():
+                model_dir = cfg.root / model_dir
         self.feature_extractor = DINOv2Extractor(
             model_name=fe_cfg.get("model_name", "facebook/dinov2-base"),
             cache_dir=str(fe_cfg.get("cache_dir", ".cache/huggingface")),
             device=fe_cfg.get("device", "auto"),
             normalize=fe_cfg.get("normalize", True),
+            local_files_only=fe_cfg.get("local_files_only", False),
+            model_dir=model_dir,
         )
         self.feature_extractor.load_model()
 
@@ -504,6 +515,7 @@ class OnlineDrivingLoop:
                 long_term_rules_text=rules_text,
                 perception_objects=kf.get("perception_objects"),
                 image_layout=self._image_layout_desc,
+                planning_constraints=kf.get("planning_constraints"),
             )
         except EnvironmentError:
             raise
@@ -516,6 +528,9 @@ class OnlineDrivingLoop:
             ego_state=kf.get("ego_state"),
             nav_instruction=kf.get("nav_instruction", ""),
         )
+
+        decision_validation = self._validate_decision(parsed, kf)
+        decision_accepted = decision_validation is None or decision_validation["accepted"]
 
         # ---- e.1) 中期记忆价值门控（Phase 2：MemoryAdmissionController）----
         # 决策完成后、写入前判断是否入库。先读后写：只读当前帧 + 已检索 memory_result（[0,i-1]）
@@ -545,7 +560,11 @@ class OnlineDrivingLoop:
 
         # 运行门控
         admission_result = None
-        if self.write_memory and self._admission_enabled:
+        if not decision_accepted:
+            # Rejected controller inputs must not become positive experience,
+            # event frames, or evidence for modifying existing memories.
+            mid_term_admit = False
+        elif self.write_memory and self._admission_enabled:
             admission_result = self._admission_controller.decide(
                 admission_ctx, self._prev_frame_ctx
             )
@@ -564,7 +583,7 @@ class OnlineDrivingLoop:
         # 派生 jsonl / mt_record 准入字段（兼容：门控命中 / legacy 全存 / memory_off）
         memory_admission_enabled = self._admission_enabled and self.write_memory
         # Phase 6：冲突更新是否生效（静态标志；具体动作在 i.1 块写入后产生，记于旧记忆 update_history + 日志）
-        memory_update_enabled = self._update_enabled and self.write_memory
+        memory_update_enabled = self._update_enabled and self.write_memory and decision_accepted
         if admission_result is not None:
             memory_admission_score = admission_result.admission_score
             memory_admission_should_store = admission_result.should_store
@@ -584,6 +603,10 @@ class OnlineDrivingLoop:
             memory_scene_tags = []
             memory_risk_tags = []
             _mt_admission_policy = self._mt_legacy_admission_policy
+
+        if not decision_accepted:
+            memory_admission_should_store = False
+            memory_admission_reject_reasons = ["decision_validation_rejected"]
 
         mid_term_memory_added = mid_term_admit
         mid_term_memory_id = record_id if mid_term_admit else ""
@@ -620,6 +643,7 @@ class OnlineDrivingLoop:
             "retrieved_memory_statuses": retrieved_memory_statuses,             # 各结果 status
             "long_term_rule_ids": long_term_rule_ids,
             "decision_output": parsed,
+            "decision_validation": decision_validation,
             "parser_status": parser_status,
             "parser_errors": errors,
             "fallback_used": fallback_used,
@@ -683,7 +707,7 @@ class OnlineDrivingLoop:
             except Exception as e:
                 logger.warning("短期记忆 push 失败 (frame=%s): %s", sample_token, e)
 
-        if self.write_memory:
+        if self.write_memory and decision_accepted:
             # ---- h.1) Phase 5 scene 切换 → flush 当前事件（事件结束条件之一）----
             if self._event_memory_enabled:
                 cur_scene_token = kf.get("scene_token", "") or ""
@@ -821,11 +845,13 @@ class OnlineDrivingLoop:
 
         # ---- j) 更新上一帧上下文（供下一帧 admission 的变化检测；每帧都更新，含拒绝帧）----
         # 只存最近一帧快照，不持久化、不读未来。memory_off 也更新（供 debug_memory_off 用）。
+        # A rejected plan must not bias the next frame's decision-change gating.
+        previous_decision = parsed if decision_accepted else None
         self._prev_frame_ctx = {
-            "behavior": (parsed or {}).get("behavior", ""),
-            "risk_level": (parsed or {}).get("risk_level", "medium"),
-            "target_speed": (parsed or {}).get("target_speed"),
-            "trajectory": (parsed or {}).get("trajectory"),
+            "behavior": (previous_decision or {}).get("behavior", ""),
+            "risk_level": (previous_decision or {}).get("risk_level", "medium"),
+            "target_speed": (previous_decision or {}).get("target_speed"),
+            "trajectory": (previous_decision or {}).get("trajectory"),
             "ego_state": kf.get("ego_state") or {},
             "scene_id": scene_id,
             "traffic_density": (scene_result or {}).get("traffic_density", "unknown"),
@@ -834,6 +860,32 @@ class OnlineDrivingLoop:
         }
 
         return record
+
+    def _validate_decision(self, parsed, kf):
+        """Run an optional actuation validator before any decision memory write.
+
+        Preserve the original decision in the audit record. Invalid validator
+        responses and exceptions fail closed; the CARLA caller brakes on them.
+        """
+        validator = getattr(self, "decision_validator", None)
+        if validator is None:
+            return None
+        try:
+            validation = validator(parsed, kf)
+            if (not isinstance(validation, dict)
+                    or type(validation.get("accepted")) is not bool
+                    or not isinstance(validation.get("reasons"), list)
+                    or not isinstance(validation.get("details"), dict)):
+                raise ValueError("decision_validator returned an invalid result")
+            if not validation["accepted"]:
+                logger.warning("决策验证拒绝 (frame=%s): %s", kf.get("sample_token"),
+                               validation["reasons"])
+            return validation
+        except Exception as exc:
+            logger.exception("决策验证异常，禁止执行/写入决策记忆 (frame=%s)",
+                             kf.get("sample_token"))
+            return {"accepted": False, "reasons": ["decision_validator_error"],
+                    "details": {"error_type": type(exc).__name__, "error": str(exc)}}
 
     # ------------------------------------------------------------------
     # 主循环

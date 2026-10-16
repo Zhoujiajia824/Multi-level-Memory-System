@@ -18,6 +18,15 @@ version: "0.9.15"
 # 未指定 --memory-bank 时使用本轮独立库；指定路径则复用该库。
 memory_db_dir: "outputs/memory_db_carla"
 
+# 服务器缓存由用户上传；默认不对 Hugging Face 发起 HEAD/下载请求。
+feature_extractor:
+  local_files_only: true
+  cache_dir: ".cache/huggingface"
+  model_dir: null              # 可选：含 config.json 的本地模型或 snapshot 目录
+
+fallback:
+  allow_rule_fallback_for_format_error: false  # CARLA 解析失败必须制动，保留真实模型失败
+
 # ---- 感知输入：固定六视角环视（复用 src 现有 surround_mosaic 路径）----
 perception:
   mode: "surround_mosaic"
@@ -49,7 +58,18 @@ carla:
   max_capture_failures: 3      # 连续采集失败时结束本轮，失败期间全刹
   # ---- 闭环节奏 ----
   replan_interval_s: 3.0         # VLM 每 3s 重规划（= decision.trajectory.horizon_seconds）
-  max_duration_s: 60.0           # 单场景最长 sim 时间
+  max_duration_s: 300.0          # 超时保护；到时路线未完成则失败，不作为成功条件
+  route_completion_tolerance_m: 2.0  # 按顺序经过整条路线，且当前距终点 <= 此值
+  route_tracking_tolerance_m: 5.0    # 中途路线走廊，允许一次正常变道/避让
+  max_trajectory_rejections: 3       # 连续不合格轨迹终止；每次拒绝立即全刹
+  trajectory_validation:
+    max_speed_mps: 25.0
+    max_acceleration_mps2: 4.0
+    max_deceleration_mps2: 8.0
+    max_lateral_acceleration_mps2: 6.0
+    speed_tolerance_mps: 1.5
+    position_tolerance_m: 0.25
+    max_initial_heading_deg: 75.0
   # ---- 卡死检测（低速且无路线进展 → 警告 → 提前终止，防卡死后空烧 VLM）----
   stuck_detection:
     enabled: true
@@ -60,7 +80,7 @@ carla:
   # VLM 无法从 480×270 图像定量判断横向偏移（车道线仅 2-3px、无标定参考），
   # 避让后 KEEP_LANE 只会沿偏移位置平行直行、误差永不收敛。A* 路由点即 CARLA
   # 车道中心，转 ego-centric 后以 route_center 伪对象注入 perception_objects
-  # （prompt 按"照参考点写轨迹"可直接抄写米制回正量）。对 memory_on/off 同等生效。
+  # （锚点仅作几何参考，时间采样仍须符合当前速度与动力学）。对 memory_on/off 同等生效。
   route_injection:
     enabled: true
     num_points: 6              # 注入前方中心点数

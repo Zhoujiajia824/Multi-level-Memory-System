@@ -59,6 +59,9 @@ class EventScheduler:
 
     def tick(self) -> None:
         """每 CARLA 推进 tick 调用：检查触发 + 驱动 scripted 车。"""
+        # Existing walkers have received a snapshot since creation. New event
+        # walkers created below begin movement on the next regular scheduler tick.
+        self.walker_ctrl.tick()
         try:
             ego_loc = self.ego.get_location()
         except Exception:
@@ -200,16 +203,22 @@ class EventScheduler:
 
     # ------------------------------------------------------------------
 
-    def destroy(self) -> None:
+    def destroy(self) -> bool:
+        walkers_ok = True
         try:
-            self.walker_ctrl.destroy()
+            walkers_ok = self.walker_ctrl.destroy() is not False
         except Exception as exc:
+            walkers_ok = False
             logger.warning("walker cleanup: %s", exc)
-        for actor in self._scripted_actors + self._static_props:
-            try:
-                actor.destroy()
-            except Exception as exc:
-                logger.warning("event actor cleanup: %s", exc)
+        for registry in (self._scripted_actors, self._static_props):
+            remaining = []
+            for actor in registry:
+                try:
+                    if actor.is_alive and actor.destroy() is False:
+                        remaining.append(actor)
+                except Exception as exc:
+                    logger.warning("event actor cleanup: %s", exc)
+                    remaining.append(actor)
+            registry[:] = remaining
         self.scripted_vehicles.clear()
-        self._scripted_actors.clear()
-        self._static_props.clear()
+        return walkers_ok and not self._scripted_actors and not self._static_props

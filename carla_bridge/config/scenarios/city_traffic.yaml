@@ -3,7 +3,7 @@
 #     交通流（TM autopilot 车辆能动）、人流（AI walker 能动）
 scenario_name: "city_traffic"
 map: "Town01"                  # 城市路网：多路口 + 信号灯（Town05 在 0.9.15 渲染崩，换 Town03）
-duration_s: 60
+duration_s: 300  # 超时保护，路线完成 100% 时提前结束
 seed: 7
 
 weather:

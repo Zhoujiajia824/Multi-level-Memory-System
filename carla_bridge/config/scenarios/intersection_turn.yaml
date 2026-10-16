@@ -1,7 +1,7 @@
 # 路口连续转弯场景（验证 nav 派生 + 转向控制）
 scenario_name: "intersection_turn"
 map: "Town01"
-duration_s: 60
+duration_s: 300  # 超时保护，路线完成 100% 时提前结束
 seed: 7
 
 weather:

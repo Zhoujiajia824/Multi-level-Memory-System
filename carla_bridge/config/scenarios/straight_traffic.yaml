@@ -1,7 +1,7 @@
 # 直行 + 交通流场景
 scenario_name: "straight_traffic"
 map: "Town04"                # CARLA 地图
-duration_s: 60               # 单场景 sim 时长（秒）
+duration_s: 300              # 超时保护；仅路线完成 100% 才算成功
 seed: 42
 
 weather:

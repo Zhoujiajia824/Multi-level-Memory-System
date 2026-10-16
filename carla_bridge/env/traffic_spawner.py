@@ -6,6 +6,7 @@ walker API 略有差异），不影响主流程。
 """
 from __future__ import annotations
 
+import math
 import random
 from typing import List
 
@@ -23,9 +24,12 @@ class TrafficSpawner:
         self.world = world
         self.client = client
         self.ego = ego_vehicle
-        self.tm = client.get_trafficmanager(8000)
+        self.tm_port = 8000
+        self.tm = client.get_trafficmanager(self.tm_port)
+        self._tm_synchronous = False
         try:
             self.tm.set_synchronous_mode(True)
+            self._tm_synchronous = True
         except Exception:
             pass
         self.rng = random.Random(seed)
@@ -56,7 +60,7 @@ class TrafficSpawner:
             except Exception:
                 continue
             self._vehicles.append(veh)
-            veh.set_autopilot(True)
+            veh.set_autopilot(True, self.tm_port)
             try:
                 self.tm.vehicle_percentage_speed_difference(veh, self.rng.uniform(-10, 20))
             except Exception:
@@ -66,7 +70,13 @@ class TrafficSpawner:
         return count
 
     def spawn_walkers(self, num: int, radius: float = 60.0) -> int:
-        """生成行人（best-effort：API 失败则跳过）。"""
+        """场景初始化时生成 AI 行人；开始控制前只推进一次初始化帧。
+
+        只能在闭环开始前调用。运行中的定点行人事件由 WalkerController 驱动，
+        不在事件回调中偷偷推进仿真。出生点和目标都来自 CARLA 的人行导航网格。
+        """
+        if num <= 0:
+            return 0
         bp_lib = self.world.get_blueprint_library()
         walker_bps = list(bp_lib.filter("walker.pedestrian.*"))
         if not walker_bps:
@@ -78,65 +88,127 @@ class TrafficSpawner:
             return 0
 
         ego_loc = self.ego.get_location()
-        count = 0
-        for _ in range(num * 4):
-            if count >= num:
+        pending = []
+        # 导航采样覆盖整张地图；有界拒绝采样，保留 ego 周围的点。
+        for _ in range(max(100, num * 100)):
+            if len(pending) >= num:
                 break
-            loc = carla.Location(
-                x=ego_loc.x + self.rng.uniform(-radius, radius),
-                y=ego_loc.y + self.rng.uniform(-radius, radius),
-                z=ego_loc.z + 1.0,
-            )
-            wp = self.world.get_map().get_waypoint(loc, project_to_road=True)
-            if wp is None:
+            loc = self._navigation_location()
+            if loc is None or loc.distance(ego_loc) > radius:
                 continue
-            spawn = carla.Transform(wp.transform.location)
+            target = self._navigation_location(away_from=loc)
+            if target is None:
+                continue
             bp = self.rng.choice(walker_bps)
+            if bp.has_attribute("is_invincible"):
+                bp.set_attribute("is_invincible", "false")
+            walker = controller = None
             try:
-                walker = self.world.spawn_actor(bp, spawn)
+                walker = self.world.spawn_actor(bp, carla.Transform(loc))
                 self._walkers.append(walker)
-                controller = self.world.spawn_actor(controller_bp, spawn, attach_to=walker)
+                # Attached actors use a relative transform, not the world spawn location.
+                controller = self.world.spawn_actor(controller_bp, carla.Transform(), attach_to=walker)
                 self._walker_controllers.append(controller)
-                controller.start()
-                target = self._random_street_location(wp.transform.location)
-                if target is not None:
-                    controller.go_to_location(target)
-                controller.set_max_speed(self.rng.uniform(1.0, 1.5))
+                pending.append((walker, controller, target))
             except Exception as e:
                 logger.debug("行人生成失败: %s", e)
+                self._discard_walker(walker, controller)
+
+        if pending:
+            # Official 0.9.15 generate_traffic.py waits for a snapshot before start():
+            # without this, AddWalker reads an uninitialized transform (often 0,0,0).
+            if self.world.get_settings().synchronous_mode:
+                self.world.tick()
+            else:
+                self.world.wait_for_tick()
+        count = 0
+        for walker, controller, target in pending:
+            try:
+                controller.start()
+                controller.go_to_location(target)
+                controller.set_max_speed(self.rng.uniform(1.0, 1.5))
+            except Exception as e:
+                logger.warning("行人控制初始化失败: %s", e)
+                self._discard_walker(walker, controller)
                 continue
             count += 1
         logger.info("生成行人 %d/%d", count, num)
+        if count < num:
+            logger.warning("导航区域或出生空间不足，实际行人数 %d，小于请求数 %d", count, num)
         return count
 
-    def _random_street_location(self, near_loc):
-        """best-effort 取一个街道随机点作为行人目标。"""
+    def _navigation_location(self, away_from=None):
+        """只接受官方人行导航采样；不把道路 waypoint 当作导航网格。"""
         for _ in range(5):
             try:
-                loc = self.world.get_random_location_from_street()
-                if loc is not None:
+                loc = self.world.get_random_location_from_navigation()
+                if (loc is not None and all(math.isfinite(v) for v in (loc.x, loc.y, loc.z))
+                        and (away_from is None or loc.distance(away_from) > 1.0)):
                     return loc
-            except Exception:
+            except Exception as exc:
+                logger.warning("行人导航点采样失败: %s", exc)
                 return None
         return None
 
-    def destroy(self) -> None:
+    def _discard_walker(self, walker, controller) -> None:
+        """清理半初始化的行人；销毁失败时保留登记供最终清理重试。"""
+        if controller is not None:
+            try:
+                if controller.is_alive:
+                    controller.stop()
+            except Exception:
+                pass
+        for actor, registry in ((controller, self._walker_controllers), (walker, self._walkers)):
+            if actor is None:
+                continue
+            try:
+                if actor.is_alive and actor.destroy() is False:
+                    continue
+                registry.remove(actor)
+            except Exception as exc:
+                logger.warning("行人初始化回滚失败: %s", exc)
+
+    def destroy(self) -> bool:
+        """尽力释放本轮资源；失败时返回 False 并保留引用供重试。"""
+        # Unregister while actors are alive and TM is still synchronous.
+        # Otherwise its background loop can read destroyed vehicles on resume.
+        unregister_failed = []
+        for vehicle in self._vehicles:
+            try:
+                if vehicle.is_alive:
+                    vehicle.set_autopilot(False, self.tm_port)
+            except Exception as exc:
+                logger.warning("交通车辆自动驾驶注销失败: %s", exc)
+                unregister_failed.append(vehicle)
         for c in self._walker_controllers:
             try:
-                c.stop()
+                if c.is_alive:
+                    c.stop()
             except Exception:
                 pass
         for actors in (self._walker_controllers, self._walkers, self._vehicles):
+            remaining = []
             for a in actors:
+                if any(a is failed for failed in unregister_failed):
+                    # Preserve the live actor until it can be unregistered. Destroying
+                    # it now would leave TM holding the same stale handle as the crash.
+                    remaining.append(a)
+                    continue
                 try:
-                    a.destroy()
-                except Exception:
-                    pass
-        self._vehicles.clear()
-        self._walkers.clear()
-        self._walker_controllers.clear()
+                    if a.is_alive and a.destroy() is False:
+                        remaining.append(a)
+                except Exception as exc:
+                    logger.warning("交通 actor 清理失败: %s", exc)
+                    remaining.append(a)
+            actors[:] = remaining
 
-        try:
-            self.tm.set_synchronous_mode(False)
-        except Exception as exc:
-            logger.warning("Traffic Manager 同步模式恢复失败: %s", exc)
+        actors_remain = bool(self._vehicles or self._walkers or self._walker_controllers)
+        if actors_remain:
+            logger.warning("仍有交通 actor 未完成清理，保留 TM 同步状态以便重试")
+        elif self._tm_synchronous:
+            try:
+                self.tm.set_synchronous_mode(False)
+                self._tm_synchronous = False
+            except Exception as exc:
+                logger.warning("Traffic Manager 同步模式恢复失败: %s", exc)
+        return not actors_remain and not self._tm_synchronous

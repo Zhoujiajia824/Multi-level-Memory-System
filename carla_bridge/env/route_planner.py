@@ -17,6 +17,7 @@ import carla  # 须在 mulmem_carla(3.9) 运行
 
 from src.vla_memory.common.logging_utils import get_logger
 from carla_bridge.state import coords
+from carla_bridge.env.route_progress import RouteProgress
 
 logger = get_logger("carla_route")
 
@@ -27,14 +28,14 @@ NAV_LANE_FOLLOW = "lane_follow"
 
 # A* 搜索上限（防爆栈/超时）
 _MAX_EXPANSIONS = 8000
-_GOAL_THRESH_FACTOR = 3.0  # 到终点 step×3 内即认为到达
 _TURN_THRESH = 0.35  # 弧度，航向变化超过此值判转向
 
 
 class RoutePlanner:
     """全局路由器：自实现 A* 起点->终点；无终点时回退沿路前进。"""
 
-    def __init__(self, world, ego_vehicle, python_api_dir: Optional[str] = None):
+    def __init__(self, world, ego_vehicle, python_api_dir: Optional[str] = None,
+                 completion_tolerance_m: float = 2.0, tracking_tolerance_m: float = 5.0):
         # python_api_dir 保留参数兼容，但自实现 A* 不再使用
         self.world = world
         self.ego = ego_vehicle
@@ -45,6 +46,9 @@ class RoutePlanner:
         self._turns: List[str] = []
         self._junction_indices: List[int] = []
         self._mode = "none"
+        self._progress = None
+        self._completion_tolerance_m = completion_tolerance_m
+        self._tracking_tolerance_m = tracking_tolerance_m
 
     # ------------------------------------------------------------------
     # 规划
@@ -58,9 +62,18 @@ class RoutePlanner:
         length_m: float = 200.0,
         turns: Optional[List[str]] = None,
     ) -> List[carla.Location]:
+        if not math.isfinite(sampling_resolution) or sampling_resolution <= 0:
+            raise ValueError("sampling_resolution must be positive and finite")
         if end_loc is not None:
-            return self._plan_astar(start_loc, end_loc, sampling_resolution)
-        return self._plan_walk_forward(length_m, turns or [], sampling_resolution)
+            route = self._plan_astar(start_loc, end_loc, sampling_resolution)
+        else:
+            if not math.isfinite(length_m) or length_m <= 0:
+                raise ValueError("route length must be positive and finite")
+            route = self._plan_walk_forward(length_m, turns or [], sampling_resolution)
+        # Empty/degenerate plans cannot be accepted as a completed route.
+        self._progress = RouteProgress(route, self._completion_tolerance_m, self._tracking_tolerance_m)
+        self._progress.update(self.ego.get_location())
+        return route
 
     def _plan_astar(self, start_loc, end_loc, step) -> List[carla.Location]:
         if start_loc is None:
@@ -84,7 +97,7 @@ class RoutePlanner:
     def _astar_search(self, start_wp, end_wp, step) -> Tuple[List, List[str]]:
         """A* over waypoint.next() 图。返回 (waypoint 列表, 导航语义列表)。"""
         end_loc = end_wp.transform.location
-        goal_thresh = step * _GOAL_THRESH_FACTOR
+        goal_thresh = step * 1.1
 
         def wp_key(wp) -> tuple:
             return (wp.road_id, wp.lane_id, round(wp.s, 1))
@@ -105,7 +118,8 @@ class RoutePlanner:
             if g > best.get(key, (1e9,))[0]:
                 continue
             expansions += 1
-            if wp.transform.location.distance(end_loc) < goal_thresh:
+            same_lane = (wp.road_id, wp.section_id, wp.lane_id) == (end_wp.road_id, end_wp.section_id, end_wp.lane_id)
+            if same_lane and wp.transform.location.distance(end_loc) < goal_thresh:
                 found_key = key
                 break
             try:
@@ -139,6 +153,11 @@ class RoutePlanner:
             k = pk
         wps.reverse()
         options.reverse()
+        # Include the requested road-projected destination, rather than reporting
+        # 100% at the old coarse search threshold (up to six metres short).
+        if wps[-1].transform.location.distance(end_loc) > 1e-3:
+            wps.append(end_wp)
+            options.append(NAV_LANE_FOLLOW)
         return wps, options
 
     @staticmethod
@@ -173,19 +192,27 @@ class RoutePlanner:
         wp = start
         traveled = 0.0
         turn_idx = 0
+        in_junction = False
+        choice = "straight"
         while traveled < length_m:
             route.append(wp.transform.location)
             nxt = wp.next(step_m)
             if not nxt:
                 break
-            if wp.is_junction:
+            # Consume one requested turn per junction, not per 2-metre sample.
+            junction = wp.is_junction or len(nxt) > 1
+            if junction and not in_junction:
                 junctions.append(len(route) - 1)
                 choice = self._turns[turn_idx] if turn_idx < len(self._turns) else "straight"
                 turn_idx += 1
+            if junction:
                 wp = self._pick_outlet(wp, nxt, choice)
             else:
                 wp = nxt[0]
+            in_junction = junction
             traveled += step_m
+        if not route or route[-1].distance(wp.transform.location) > 1e-3:
+            route.append(wp.transform.location)
         self._route = route
         self._junction_indices = junctions
         self._options = []
@@ -278,10 +305,27 @@ class RoutePlanner:
     def progress_fraction(self) -> float:
         if not self._route:
             return 0.0
-        idx = self._nearest_index(self.ego.get_location())
-        return idx / max(1, len(self._route) - 1)
+        if self._progress is None:
+            self._progress = RouteProgress(self._route, self._completion_tolerance_m, self._tracking_tolerance_m)
+        return self._progress.update(self.ego.get_location())
+
+    def is_complete(self) -> bool:
+        self.progress_fraction()
+        return bool(self._progress and self._progress.completed)
 
     def _nearest_index(self, loc) -> int:
+        progress = getattr(self, "_progress", None)
+        if progress is not None:
+            progress.update(loc)
+            # Deduplicated checkpoint indices may differ from raw route indices;
+            # choose the closest raw sample within the reached arc length window.
+            along = 0.0
+            target = progress.lengths[progress.index]
+            for i in range(1, len(self._route)):
+                along += self._route[i - 1].distance(self._route[i])
+                if along > target + 1e-5:
+                    return i - 1
+            return len(self._route) - 1
         best, best_d = 0, float("inf")
         for i, p in enumerate(self._route):
             d = p.distance(loc)

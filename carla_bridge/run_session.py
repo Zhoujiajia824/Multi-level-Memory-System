@@ -172,8 +172,10 @@ class RunSession:
             self.close()
             raise
 
-    def set_status(self, status, error=None):
+    def set_status(self, status, error=None, outcome=None):
         self.manifest["status"] = status
+        if outcome is not None:
+            self.manifest["outcome"] = outcome
         if error is not None:
             self.manifest["error_type"] = type(error).__name__
         path = self.run_dir / "manifest.json"

@@ -4,7 +4,7 @@
 # turns:[] 在路口选“最直”出口，避免主动转向进匝道/路口，进一步减少路口与红绿灯遭遇。
 scenario_name: "NOA2"
 map: "Town06"
-duration_s: 60
+duration_s: 300  # 超时保护，路线完成 100% 时提前结束
 seed: 7
 
 weather:

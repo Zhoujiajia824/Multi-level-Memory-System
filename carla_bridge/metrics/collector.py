@@ -150,6 +150,7 @@ class MetricsCollector:
             "total_ticks": self.total_ticks,
             "collision_count": self.collision_count,
             "route_completion": round(self.route_completion(), 4),
+            "route_completed": self.route.is_complete() if self.route else False,
             "red_light_violations": self.red_light_violations,
             "wrong_way_violations": self.wrong_way_violations,
             "speeding_ticks": self.speeding_ticks,

@@ -20,6 +20,8 @@ git pull --ff-only origin carla-integration
 git status --short --branch
 git log -1 --oneline
 conda activate mulmem_carla
+# 已有环境补齐测试依赖；无需重建环境
+python -m pip install "pytest>=7.4,<9"
 ```
 
 **先检查环境，不连接仿真器或调用 API：**
@@ -30,7 +32,6 @@ python -m carla_bridge.run_carla_demo --help
 python -m pytest -q -p no:cacheprovider
 ```
 
-本次本地验证为 **69 passed**（Windows / Python 3.9 / `mulmem_carla`）。
 测试使用本地 CARLA Python 绑定和 FAISS，不启动 CARLA、不下载模型、不调用 VLM。
 已有 Pydantic 兼容性警告不等同测试失败。服务器需单独执行以上检查。
 使用已有环境时不必重新运行创建环境脚本；新环境见下文第 5 节。
@@ -43,30 +44,47 @@ python -m pytest -q -p no:cacheprovider
 - 检查 `config/api_models.yaml` 的服务地址、模型名、`api_key_env`，在运行终端设置对应密钥。
   默认 `DASHSCOPE_API_KEY`：Bash 用 `export DASHSCOPE_API_KEY='你的key'`，
   PowerShell 用 `$env:DASHSCOPE_API_KEY='你的key'`。
-- DINOv2 模型需已缓存或能下载；`CUDA: False` 不代表导入失败，但推理性能需另行评估。
+- DINOv2 默认只读本地模型文件；`CUDA: False` 不代表导入失败，但推理性能需另行评估。
 - 当前视频默认开启；显存不足时在 `carla.video` 中关闭视频或降低分辨率。
 
-**先做 10 秒仿真冒烟，再跑完整场景。** 为避免修改版本管理中的场景文件，
-以下 Bash 命令在忽略的 outputs 目录创建测试场景（Windows 可按同样内容手工复制修改）：
+**检查手工上传的 DINOv2 缓存：** 默认路径相对仓库根目录解析，结构为：
 
-```bash
-python - <<'PY'
-from pathlib import Path
-import yaml
-source = Path('carla_bridge/config/scenarios/straight_traffic.yaml')
-cfg = yaml.safe_load(source.read_text(encoding='utf-8'))
-cfg['scenario_name'] = 'smoke_straight'
-cfg['duration_s'] = 10
-out = Path('outputs/scenarios/smoke_straight.yaml')
-out.parent.mkdir(parents=True, exist_ok=True)
-out.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding='utf-8')
-PY
-python -m carla_bridge.run_carla_demo --scenario outputs/scenarios/smoke_straight.yaml --mode memory_off
+```text
+.cache/huggingface/
+└── models--facebook--dinov2-base/
+    ├── blobs/
+    ├── refs/
+    └── snapshots/<revision>/
+        ├── config.json
+        ├── preprocessor_config.json
+        └── model.safetensors 或 pytorch_model.bin
 ```
 
-冒烟通过后依次测试：
+上传时保留完整文件及符号链接目标。`--dinov2-cache-dir` 指向 `huggingface` 缓存根目录，
+`--dinov2-model-dir` 指向包含配置、图像处理器配置和权重的模型目录或具体 snapshot。
+离线预检会实际加载模型并执行一次前向推理：
 
 ```bash
+python scripts/00_prepare_models.py --offline
+# 缓存在其他目录时
+python scripts/00_prepare_models.py --offline --cache-dir /path/to/huggingface
+```
+
+CARLA 配置默认 `feature_extractor.local_files_only: true`，缺文件立即报错，不等待 Hugging Face。
+入口自动启用原生故障堆栈和及时日志输出，**无需 `HF_HUB_OFFLINE=1`、`-X faulthandler`、`-u` 前缀**。
+VLM API 调用仍需网络。覆盖模型位置或显式允许下载的方式为：
+
+```bash
+python carla_bridge/run_carla_demo.py --scenario straight_traffic --dinov2-cache-dir /path/to/huggingface
+python carla_bridge/run_carla_demo.py --scenario straight_traffic --dinov2-model-dir /path/to/dinov2-model
+# 仅在需要联网下载时使用；已指定 model-dir 时始终读取该目录
+python carla_bridge/run_carla_demo.py --scenario straight_traffic --allow-model-download
+```
+
+**验收运行以完整规划路线完成率 100% 为准。** 先运行直行完整路线，再验证转弯和记忆模式：
+
+```bash
+python carla_bridge/run_carla_demo.py --scenario straight_traffic --mode memory_on
 # 直行：指定库积累经验；重复此命令继续积累
 python -m carla_bridge.run_carla_demo --scenario straight_traffic --memory-bank outputs/memory_banks/server_straight
 # 同库只读：验证能检索且不修改库
@@ -79,14 +97,22 @@ python -m carla_bridge.run_carla_demo --scenario intersection_turn --memory-bank
 
 | 检查项 | 文件或观察点 |
 |---|---|
-| 是否正常结束 | `manifest.json` 的 `status`；`completed` 表示运行到时长上限，不代表路线成功或零碰撞 |
+| 路线验收 | `manifest.json` 的 `status=route_completed`、`outcome.success=true`、`outcome.route_completed=true`、`outcome.route_completion=1.0`；报告 `metrics.route_completion=1.0`，清理完成且退出码为 0 |
 | 图像同步 | 决策 JSONL 中的 `carla_frame_id` / `sim_time_s`；报告中的 `capture_failures` |
 | 记忆是否参与 | 决策 JSONL 的 `retrieved_memory_ids`、`memory_retrieval_enabled`、`memory_write_enabled` |
-| 驾驶效果 | 报告的路线完成度、碰撞次数；视频中的左右转、回正和制动行为 |
+| 驾驶效果 | 完成路线之外，单独检查碰撞次数、违规和视频中的左右转、回正及制动行为 |
+| 决策轨迹 | 决策 JSONL 的 `decision_validation`；异常轨迹被拦截后制动，不进入中期或事件记忆 |
 | 异常定位 | 运行目录的 `logs/`，连同服务器 CARLA 日志一起保留 |
 | 多轮隔离 | 两次运行目录不同；明确指定的共享库路径保持一致 |
 
-记忆准入有价值门控，短时或普通直行场景可能没有记录入库；不能仅凭库为空判定写入失败。
+路线必须按顺序通过，且当前车辆距终点不超过默认 2 米；仅驶近某个后续路段不能跳过前面的路线。
+`carla.route_tracking_tolerance_m` 默认 5 米，允许中途正常变道；
+`carla.route_completion_tolerance_m` 默认 2 米，控制终点到达判定。
+场景 `duration_s` 与全局 `carla.max_duration_s` 默认均为 300 秒仿真时间，取较小值作为保护上限，
+长路线可同时调大；达到上限是 `timeout`，不会当作路线完成。10 秒冒烟仅可辅助排查启动问题，不算验收。
+本地回归测试不能验证引擎原生崩溃是否消除，仍需服务器完整路线运行与正常清理验证。
+
+记忆准入有价值门控，普通直行场景可能没有记录入库；不能仅凭库为空判定写入失败。
 报告中的闯红灯等指标采用启发式判定，回归评估时应结合视频。
 如出现问题，保留对应运行目录、场景配置及 CARLA 日志；**无需分享 API Key**。
 
@@ -94,12 +120,19 @@ python -m carla_bridge.run_carla_demo --scenario intersection_turn --memory-bank
 
 | 状态 / 报错 | 处理方式 |
 |---|---|
+| `route_completed` | 已按序完成规划路线；继续核对报告、碰撞指标和退出码 |
+| `timeout` | 到达保护时限仍未完成路线，退出码非 0；先检查实际进度，再决定是否增加场景与全局时限 |
 | `sensor_failure` | 连续采集失败；检查相机日志、渲染负载与是否存在其他 tick 客户端，再评估 `capture_timeout_s`，不要通过额外 tick 绕过同步 |
-| `stuck` | 低速且路线无进展触发提前终止；结合决策、交通灯与轨迹判断，合法长时间等待也可能触发 |
+| `stuck` | 有效决策要求继续行驶却持续低速且无进展；目标为停车的决策不累计卡死计时，仍受总体超时保护 |
+| `invalid_trajectory` | 连续 3 次决策未通过物理校验；检查 JSONL 的 `decision_validation`，单次拒绝即制动且不入库 |
+| `cleanup_failed` / `report_failed` | 资源清理或报告保存失败；即使路线已完成也非零退出，检查 manifest 的 `outcome.cleanup_errors` |
 | `memory_save_failed` | 检查库的写权限、磁盘空间和保存日志；本轮结果不能视为已成功积累 |
 | `failed` / `interrupted` | 运行异常或主动中断；查看 manifest 的 `error_type` 与日志，清理会自动执行 |
 | 库正在被其他运行使用 | 等当前使用者退出；不要删除活动锁文件强行并发 |
 | ID 重复、维度不符、资料缺失 | 保留原库，先使用新库验证；不要覆盖旧库来消除错误 |
+
+只有 `route_completed` 且完成清理和报告保存才以退出码 0 结束，其他结束状态均为非 0。
+CARLA 默认禁用解析失败的规则轨迹兜底，保留原始模型失败供定位。
 
 ## 运行隔离与记忆库选择（当前入口行为）
 
@@ -210,7 +243,7 @@ carla_bridge/
 │   ├── carla.yaml                  # 连接/同步/相机/ego/控制器/视频 配置
 │   └── scenarios/                  # 每个场景一个 YAML
 │       ├── straight_traffic.yaml   #   直行+交通流（Town04）
-│       └── intersection_turn.yaml  #   路口连续转弯（Town05）
+│       └── intersection_turn.yaml  #   路口连续转弯（Town01）
 │
 ├── env/                            # CARLA 环境与场景
 │   ├── carla_client.py             #   连接 + 同步模式 + tick + load_map + spectator 跟随
@@ -234,6 +267,7 @@ carla_bridge/
 │   ├── pure_pursuit.py             #   横向：Pure Pursuit
 │   ├── pid.py                      #   纵向：PID 速度跟踪
 │   ├── trajectory_tracker.py       #   合成 -> carla.VehicleControl（每 tick）
+│   ├── trajectory_validation.py    #   决策轨迹物理合理性检查
 │   └── scripted_vehicle.py         #   NPC 的 NOA 路由 + ACC 跟车
 │
 ├── memory_adapter/                 # 记忆系统适配
@@ -255,14 +289,14 @@ carla_bridge/
 ### 4.1 `env/` 环境与场景
 - **`carla_client.py`**：连接 CARLA（127.0.0.1:2000），设同步模式 + `fixed_delta_seconds=0.1`（10Hz）；`tick()` 推进；`load_map()` 切地图后重应用同步设置；`set_spectator_follow()` 把视角摆到 ego 后上方第三人称。
 - **`scenario_manager.py`**：读场景 YAML，依次设地图/天气/ego/路由/交通流；`from_yaml` 类方法加载；`destroy()` 清理。
-- **`traffic_spawner.py`**：Traffic Manager 生成 N 辆 autopilot 车辆 + M 个 AI 行人（best-effort）。
+- **`traffic_spawner.py`**：Traffic Manager 生成 autopilot 车辆；AI 行人的出生点和目标来自人行导航网格，初始化同步一帧后启动。清理时先注销所有交通车辆，再销毁 actor、恢复 TM 模式。
 - **`weather_controller.py`**：**动态枚举** `carla.WeatherParameters` 预设（0.9.15 的 `MidRainyNoon`/`MidRainSunset` 命名不统一，硬编码会踩坑），支持预设名或自定义参数。
 - **`route_planner.py`**：**自实现 A\* 全局路径规划**（不依赖 agents.GlobalRoutePlanner，起点->终点，模拟地图导航）；由相邻 waypoint 的 yaw 差派生 `nav_instruction`（straight/left_turn/...）；`progress_fraction()` 路线完成度。`end` 为空时回退沿路前进。
-- **`walker_controller.py`**：行人生成 + 行为控制（`spawn_crossing` 过马路 / `spawn_roadside` 路边走），用 `controller.ai.walker`。
-- **`event_scheduler.py`**：**长尾事件调度器**，按 ego 离起点距离触发事件（行人/ACC 车/障碍物/信号灯），每 tick 驱动 scripted 车。
+- **`walker_controller.py`**：`spawn_crossing` / `spawn_roadside` 通过 `WalkerControl` 沿指定线段行走，到达后停止；定点事件不调用 AI 寻路，不自动绕障。
+- **`event_scheduler.py`**：**长尾事件调度器**，按 ego 离起点距离触发事件（行人/ACC 车/障碍物/信号灯），每 tick 驱动车和行人，不额外推进世界。
 
 ### 4.2 `sensors/` 感知
-- **`camera_manager.py`**：6 相机（前左/前/前右/后左/后/后右，2×3 布局）挂 ego；`capture()` 排空旧帧取最新 + 复用 `build_surround_mosaic` 拼 2×3；`drain()` 控制阶段丢弃帧防堆积；`warmup()` 首帧预热。
+- **`camera_manager.py`**：6 相机（前左/前/前右/后左/后/后右，2×3 布局）挂 ego；`capture()` 丢弃旧帧并等待指定帧号的六路图像，再拼接；`drain()` 控制阶段丢弃帧防堆积；`warmup()` 首帧预热。
 - **`perception_provider.py`**：`world.get_actors()` 取 GT（车/行人/交通灯），转 ego-centric，映射成 `PerceptionObject`（`is_oracle=True`，速度/加速度直读）。
 
 ### 4.3 `state/` 状态与坐标
@@ -274,6 +308,7 @@ carla_bridge/
 - **`pure_pursuit.py`**：Pure Pursuit 横向，前瞻距离 `clamp(min+k·speed, min, max)`。
 - **`pid.py`**：PID 纵向速度跟踪，throttle/brake 互斥，积分抗饱和。
 - **`trajectory_tracker.py`**：捕获时刻把 ego-centric 轨迹转全局 waypoint，每 tick Pure Pursuit+PID -> `carla.VehicleControl`。`steer_sign` 修正左右。
+- **`trajectory_validation.py`**：检查轨迹时间、有限数值及位移/速度合理性；拒绝结果触发制动，写入 `decision_validation` 审计，并禁止该决策写入中期或事件记忆。
 - **`scripted_vehicle.py`**：NPC 的 NOA（路由跟随）+ ACC（前方同车道有车则减速），复用 Pure Pursuit+PID。
 
 ### 4.5 `memory_adapter/` 记忆适配
@@ -355,7 +390,8 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
 跑完（或 Ctrl+C）视频在 `outputs/carla_runs/<run_id>/carla_videos/drive_<场景>_<模式>.mp4`，按仿真帧率编码，丢帧时可能短于仿真时长（跳过 VLM 冻结期）。
 
 ### 6.5 首测建议
-60s 仿真约包含 20 个认知周期，每周期包含场景理解与决策两次 VLM 调用，实际墙钟耗时取决于模型和服务。首测使用本文开头的独立 10s 场景，确认闭环通路后再加长。
+直接验证完整路线，以 `route_completed` 和 100% 路线完成率验收。默认 300 秒是仿真时间保护上限，
+实际墙钟耗时还包括每周期两次 VLM 调用；不能用实际运行了多久替代路线完成判定。
 
 ---
 
@@ -367,7 +403,7 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
 | `carla.host`/`port` | 127.0.0.1/2000 | CARLA 服务器 |
 | `carla.synchronous`/`fixed_delta_seconds` | true/0.1 | 同步模式 + 10Hz |
 | `carla.replan_interval_s` | 3.0 | 3s 全量捕获（= decision.trajectory.horizon_seconds） |
-| `carla.max_duration_s` | 60.0 | 单场景最长 sim 时间 |
+| `carla.max_duration_s` | 300.0 | 全局仿真时间保护上限，与场景 `duration_s` 取较小值；到时未完成为 `timeout` |
 | `carla.capture_timeout_s` | 2.0 | 六路相机共享等待上限（墙钟秒） |
 | `carla.max_capture_failures` | 3 | 连续缺帧达到阈值时结束运行 |
 | `carla.cameras` | 6 相机 | 640×360，2×3 布局（P1 可调 transform） |
@@ -375,6 +411,9 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
 | `carla.video` | enabled:true | 视频录制开关与参数 |
 | `--memory-bank` | 本轮 memory_db/ | 指定需要复用的中期记忆库 |
 | `perception.mode` | surround_mosaic | 固定六视角环视 |
+| `feature_extractor.cache_dir` | .cache/huggingface | DINOv2 缓存根目录，相对仓库根目录解析 |
+| `feature_extractor.local_files_only` | true | CARLA 默认离线加载，可用 `--allow-model-download` 显式允许下载 |
+| `feature_extractor.model_dir` | null | 可指定完整本地模型或 snapshot 目录，此时始终离线 |
 
 > carla.yaml 由入口 `load_config(overrides=...)` 深合并进主配置，由 RunSession 进一步设置运行目录和记忆访问策略。
 
@@ -382,7 +421,7 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
 ```yaml
 scenario_name: "straight_traffic"
 map: "Town04"              # CARLA 地图
-duration_s: 60             # 单场景 sim 时长（秒）
+duration_s: 300            # 路线未完成时的仿真时间保护上限（秒）
 seed: 42
 weather: { preset: "ClearNoon" }
 ego: { blueprint: "vehicle.tesla.model3", spawn: {x: null, y: null, yaw: null} }
@@ -419,6 +458,7 @@ events:
 | `traffic_light_force` | 强制前方信号灯状态 | `state`(red/green/yellow), `duration`, `ahead_m` |
 
 - `at_distance`：ego 离起点多少米时触发。
+- 行人事件沿指定线段运动、到达后停止，不自动绕障；随机交通行人仍使用导航网格 AI。
 - `scripted_vehicle`：spawn 在 ego 前方 `ahead_m`、`lane` 车道，沿车道走 `route_len_m`（NOA），速度 `speed`，`acc:true` 开启跟车减速（前方同车道有车则降到前车速度）。
 - 障碍物蓝图可用 `bp_lib.filter("static.prop.*")` 列出全部（名字不对会 warning 跳过，不崩）。
 - 示例：[longtail_city.yaml](config/scenarios/longtail_city.yaml)。
@@ -441,7 +481,7 @@ CARLA 全局：x 前、y 右、z 上。项目 ego-centric：x 前、**y 左**。
 | 指标 | 说明 |
 |---|---|
 | 碰撞次数 | `sensor.other.collision` 触发 |
-| 路线完成度 | `RoutePlanner.progress_fraction` |
+| 路线完成度 | 按顺序追踪规划路线；完整经过路线且当前距终点不超过默认 2 米才为 1.0，同时 `route_completed=true` |
 | 闯红灯 / 逆行 / 超速 | 近红灯仍前进 / 与车道反向 / 超限速 |
 | 最大速度 / 加速度 / jerk | 舒适度 |
 
@@ -453,6 +493,10 @@ CARLA 全局：x 前、y 右、z 上。项目 ego-centric：x 前、**y 左**。
 
 | 现象 | 原因 / 解决 |
 |---|---|
+| `No module named pytest` | 在 `mulmem_carla` 中执行 `python -m pip install "pytest>=7.4,<9"` |
+| DINOv2 本地文件缺失 | 运行 `python scripts/00_prepare_models.py --offline`，检查缓存根目录、snapshot 和链接目标；可显式传入本地模型目录 |
+| 行人导航或退出时原生崩溃 | 保留入口自动输出的故障堆栈和 CARLA 日志；核对客户端/服务端均为 0.9.15，并用完整路线及正常退出验证 |
+| 决策被拒绝后车辆制动 | 检查 JSONL 的 `decision_validation` 和原始决策，排查单位、轨迹时间与目标速度，拒绝帧不会写入中期或事件记忆 |
 | `EnvironmentError: VLM API Key 未设置` | Git Bash 用 `export DASHSCOPE_API_KEY=...`（不是 `set`）；脚本 fail-fast 会在 setup 前报 |
 | `FileNotFoundError: SSL_CERT_FILE` | conda 激活脚本指向不存在的 cacert.pem；`run_carla_demo.py` 已自动清除坏路径改用 certifi，无需手动处理 |
 | `time-out waiting for the simulator` | CARLA 服务器没启动/卡死。`taskkill //F //IM CarlaUE4.exe` 后重启，等加载完 |
@@ -477,5 +521,5 @@ CARLA 全局：x 前、y 右、z 上。项目 ego-centric：x 前、**y 左**。
 - [x] fail-fast API key + SSL_CERT_FILE 自动修复 + 异常 traceback 打印
 - [x] 导入冒烟测试通过（carla_bridge + src 全部导入 OK，坐标数学往返一致）
 - [x] 长尾事件系统：EventScheduler + scripted 车(NOA+ACC) + 行人(过马路/路边) + 障碍物 + 信号灯控制
-- [x] 修复回归：69 项本地测试通过（包含库读写、隔离、帧同步与异常清理）
-- [ ] P6 运行验证：启动 CARLA + 设 key 后跑 memory_on/off 闭环对比，调控制器/坐标手性
+- [x] 本地回归覆盖库读写、隔离、帧同步、行人生命周期、离线模型加载与异常轨迹拦截
+- [ ] P6 服务器验证：完整路线完成率 100%、清理完成且退出码 0；验证原生崩溃修复及 memory_on/off 对比

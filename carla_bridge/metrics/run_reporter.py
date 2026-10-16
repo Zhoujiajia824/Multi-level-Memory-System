@@ -35,6 +35,8 @@ def _render_md(run_info: dict, s: dict) -> str:
         "## 运行信息",
         f"- 运行编号: {run_info.get('run_id', '')}",
         f"- 状态: {run_info.get('status', 'unknown')}",
+        f"- 路线验收通过: {run_info.get('success', False)}（按序完成整条路线并到达终点）",
+        f"- 异常轨迹拒绝次数: {run_info.get('trajectory_rejections', 0)}",
         f"- 采集失败次数: {run_info.get('capture_failures', 0)}",
         f"- 场景: `{run_info.get('scenario')}`",
         f"- 模式: `{run_info.get('mode')}`",

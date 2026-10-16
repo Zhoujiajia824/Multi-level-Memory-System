@@ -1,4 +1,4 @@
-"""封装 OnlineDrivingLoop（不改 src/）
+"""封装 OnlineDrivingLoop
 ====================================
 CARLA 闭环里每 3s 重规划调一次 ``step()``：
 
@@ -7,7 +7,7 @@ CARLA 闭环里每 3s 重规划调一次 ``step()``：
   （含 ``decision_output.trajectory``）；
 * ``close`` 落盘中期记忆（按 ``memory.yaml -> mid_term.persistence``）。
 
-仅做薄封装，记忆系统一行不改。
+通过可选验证回调，在执行和长期保存之前检查 CARLA 决策。
 """
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ class LoopRunner:
         mode: str,
         output_jsonl_path: Optional[str] = None,
         resume: bool = False,
+        decision_validator=None,
     ):
         output_path = (
             Path(output_jsonl_path) if output_jsonl_path
@@ -37,6 +38,7 @@ class LoopRunner:
             mode=mode,
             output_jsonl_path=output_path,
             resume=resume,
+            decision_validator=decision_validator,
         )
         self.output_path = output_path
 

@@ -16,14 +16,19 @@
 经 `KeyframeBuilder` 喂入 `OnlineDrivingLoop`，决策轨迹由 Pure Pursuit + PID 回控。
 默认 10 Hz 控制、约 3 秒仿真时间重规划一次，VLM 推理期间同步仿真暂停。
 
-本次更新包括：
+闭环入口支持：
 
 - 补齐并纳入版本管理的 `carla_bridge/env/`：连接、场景、路由、交通流和长尾事件。
 - 修正横向控制曲率、前瞻点选择及轨迹耗尽制动；六路相机按帧号同步，缺帧制动。
 - 每轮独立输出、唯一帧 ID、异常清理和运行状态记录。
 - 记忆库可持续积累、按路径选择、只读检索或复制为独立实验库；短期记忆单独控制。
-- 本地 **69 项测试通过**，覆盖控制、路由、读写权限、产物隔离和部分初始化失败。
-  **真实 CARLA 闭环效果仍待服务器验证**，单元测试通过不代表驾驶效果已通过验收。
+- DINOv2 默认仅加载本地缓存，入口自动启用原生故障堆栈和及时日志输出。
+- 拦截不合理的决策轨迹并制动；被拒绝的决策不写入中期或事件记忆。
+- 随机 AI 行人从导航网格生成，定点行人事件按脚本运动；退出前先注销交通车辆再销毁。
+
+**验收标准是路线完成率 100%**：按顺序通过规划路线且当前距终点不超过默认 2 米，
+运行状态为 `route_completed`、manifest 的 `outcome.success=true`，报告 `metrics.route_completed=true` 和 `metrics.route_completion=1.0`。
+10 秒冒烟、达到时限或卡住均不算通过；原生崩溃修复和完整路线表现仍需服务器验证。
 
 服务器更新（在仓库根目录执行，已有本地修改时先妥善保留）：
 
@@ -32,12 +37,15 @@ git fetch origin
 git switch carla-integration
 git pull --ff-only origin carla-integration
 conda activate mulmem_carla
+# 已有环境补齐测试依赖，无需重建环境
+python -m pip install "pytest>=7.4,<9"
 python -m pytest -q -p no:cacheprovider
+python scripts/00_prepare_models.py --offline
 ```
 
 已有可用环境可直接复用；新环境见 [环境搭建](carla_bridge/README.md#5-环境搭建)。
 CARLA 使用 Python 3.9 环境，离线 nuScenes 的 Python 3.12 说明不适用于此入口。
-完整的服务器预检、短场景测试、结果位置和排查步骤见
+完整的服务器预检、路线验收、结果位置和排查步骤见
 [服务器拉取与首轮验收](carla_bridge/README.md#服务器拉取与首轮验收)。
 
 先启动现有部署的 CARLA 0.9.15 服务，确认 `carla_bridge/config/carla.yaml` 的 host/port，
@@ -45,11 +53,19 @@ CARLA 使用 Python 3.9 环境，离线 nuScenes 的 Python 3.12 说明不适用
 
 ```bash
 export DASHSCOPE_API_KEY='你的key'
+# 默认从仓库 .cache/huggingface 加载 DINOv2，无需额外运行前缀
+python carla_bridge/run_carla_demo.py --scenario straight_traffic --mode memory_on
 # 连续积累：后续运行使用同一路径即可续用旧库
 python -m carla_bridge.run_carla_demo --scenario straight_traffic --memory-bank outputs/memory_banks/general
 # 只检索：库文件和命中统计保持不变；本轮短期记忆默认启用
 python -m carla_bridge.run_carla_demo --scenario straight_traffic --memory-bank outputs/memory_banks/general --memory-access read_only
 ```
+
+手工上传的缓存应保留 `.cache/huggingface/models--facebook--dinov2-base/` 下的
+`blobs/`、`refs/`、`snapshots/` 及有效的文件链接。可用 `--dinov2-cache-dir` 指定缓存根目录，
+或用 `--dinov2-model-dir` 指定含配置与权重的完整模型目录；只有显式指定
+`--allow-model-download` 才允许此入口联网下载模型。无需再加
+`HF_HUB_OFFLINE=1`、`-X faulthandler` 或 `-u`。VLM API 仍需可访问。
 
 省略 `--memory-bank` 时使用本轮独立空库；不会自动加载旧的 `outputs/memory_db_carla`。
 若要续用旧库，请明确指定该路径。每轮结果位于 `outputs/carla_runs/<run_id>/`，
@@ -662,7 +678,7 @@ vla_memory_demo/
 │   ├── metrics/                        #   碰撞/违规/路线/舒适度 + 报告
 │   └── video/                          #   驾驶视频录制（跳过 VLM 冻结期）
 │
-├── tests/                              # pytest：仅 carla_bridge/tests/（9 个模块）
+├── tests/                              # pytest 默认测试目录为 carla_bridge/tests/
 │   ├── （根级 src 单元测试已随 v1.0 批处理瀑布重构删除）
 │   └── 当前唯一保留：carla_bridge/tests/ 下 coords / pure_pursuit / pid /
 │       history_buffer / trajectory_tracker_sign / route_planner_nav /

@@ -10,7 +10,7 @@ DINOv2 图像特征提取器
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Union
+from typing import List, Optional, Union
 
 import numpy as np
 
@@ -31,6 +31,8 @@ class DINOv2Extractor(ImageFeatureExtractor):
         cache_dir: 模型缓存目录。
         device: 计算设备（cuda / cpu / auto）。
         normalize: 是否对特征向量进行 L2 归一化。
+        local_files_only: 只从本地加载，不连接 Hugging Face。
+        model_dir: 已下载的模型目录；提供时优先于 model_name，且始终禁止下载。
     """
 
     def __init__(
@@ -39,14 +41,40 @@ class DINOv2Extractor(ImageFeatureExtractor):
         cache_dir: str = ".cache/huggingface",
         device: str = "auto",
         normalize: bool = True,
+        local_files_only: bool = False,
+        model_dir: Optional[Union[str, Path]] = None,
     ):
         self.model_name = model_name
-        self.cache_dir = cache_dir
+        self.cache_dir = str(Path(cache_dir).expanduser().resolve())
         self.normalize = normalize
+        self.local_files_only = local_files_only or bool(model_dir)
+        self.model_dir = Path(model_dir).expanduser().resolve() if model_dir else None
         self._model = None
         self._processor = None
         self._device = self._resolve_device(device)
         self._feature_dim = 768  # dinov2-base 默认
+
+    def _pretrained_source(self) -> tuple[str, dict]:
+        """Use an exported model or either supported Hugging Face cache layout."""
+        if self.model_dir is not None:
+            if not self.model_dir.is_dir() or not (self.model_dir / "config.json").is_file():
+                raise FileNotFoundError(
+                    f"DINOv2 本地模型目录无效: {self.model_dir}\n"
+                    "model_dir 必须指向含 config.json、preprocessor_config.json 和权重的目录，"
+                    "也可指向 Hugging Face 缓存的 snapshots/<版本> 目录。"
+                )
+            return str(self.model_dir), {"local_files_only": True}
+
+        cache_dir = Path(self.cache_dir)
+        repo_dir = "models--" + self.model_name.replace("/", "--")
+        # HF_HOME contains hub/, while an explicit transformers cache_dir often
+        # contains models--<owner>--<name> directly. Do not scan unrelated caches.
+        if not (cache_dir / repo_dir).is_dir() and (cache_dir / "hub" / repo_dir).is_dir():
+            cache_dir = cache_dir / "hub"
+        return self.model_name, {
+            "cache_dir": str(cache_dir),
+            "local_files_only": self.local_files_only,
+        }
 
     @staticmethod
     def _resolve_device(device: str) -> str:
@@ -79,30 +107,36 @@ class DINOv2Extractor(ImageFeatureExtractor):
                 f"请安装: pip install torch transformers"
             )
 
-        logger.info(f"正在加载 DINOv2 模型: {self.model_name}")
-        logger.info(f"缓存目录: {self.cache_dir}")
+        source, load_options = self._pretrained_source()
+        logger.info(f"正在加载 DINOv2 模型: {source}")
+        logger.info(f"缓存目录: {load_options.get('cache_dir', '本地模型目录')}")
+        logger.info(f"仅使用本地文件: {self.local_files_only}")
         logger.info(f"设备: {self._device}")
 
         try:
-            self._processor = AutoImageProcessor.from_pretrained(
-                self.model_name,
-                cache_dir=self.cache_dir,
-            )
-            self._model = AutoModel.from_pretrained(
-                self.model_name,
-                cache_dir=self.cache_dir,
-            )
-            self._model.to(self._device)
-            self._model.eval()
-            self._feature_dim = self._model.config.hidden_size
+            processor = AutoImageProcessor.from_pretrained(source, **load_options)
+            model = AutoModel.from_pretrained(source, **load_options)
+            model.to(self._device)
+            model.eval()
+            self._feature_dim = model.config.hidden_size
+            self._processor = processor
+            self._model = model
             logger.info(
                 f"DINOv2 模型加载成功: dim={self._feature_dim}, device={self._device}"
             )
         except Exception as e:
+            guidance = (
+                "当前为离线模式，未尝试联网下载。请检查上传的缓存是否包含 refs、snapshots、blobs，"
+                "以及符号链接目标是否完整；也可将 feature_extractor.model_dir 指向完整的模型目录。\n"
+                "服务器验证命令: python scripts/00_prepare_models.py --offline"
+                f' --cache-dir "{self.cache_dir}"'
+                if self.local_files_only else
+                "请先运行 python scripts/00_prepare_models.py 下载模型权重。"
+            )
             raise RuntimeError(
                 f"DINOv2 模型加载失败: {e}\n"
-                f"请先运行 python scripts/00_prepare_models.py 下载模型权重。"
-            )
+                f"模型来源: {source}\n{guidance}"
+            ) from e
 
     def _ensure_loaded(self) -> None:
         """确保模型已加载，未加载则自动加载。"""

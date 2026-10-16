@@ -12,12 +12,13 @@
       [视频]  每个 CARLA 推进 tick 取一帧写视频（跳过 VLM 冻结期），
               视频时长 = 仿真实际驾驶时间；中断 flush 保存。
 
-复用 ``OnlineDrivingLoop``（不改 src/），CARLA 数据经 ``KeyframeBuilder`` 组装成
+复用 ``OnlineDrivingLoop`` 并注入执行前验证，CARLA 数据经 ``KeyframeBuilder`` 组装成
 kf dict 喂入。指标由 :class:`MetricsCollector` 采集，run 结束写 Markdown + JSON 报告。
 """
 from __future__ import annotations
 
 import queue
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -34,6 +35,7 @@ from carla_bridge.state.ego_state_provider import EgoStateProvider
 from carla_bridge.state.history_buffer import HistoryBuffer
 from carla_bridge.state import coords
 from carla_bridge.control.trajectory_tracker import TrajectoryTracker
+from carla_bridge.control.trajectory_validation import TrajectoryValidator
 from carla_bridge.memory_adapter.keyframe_builder import KeyframeBuilder
 from carla_bridge.memory_adapter.loop_runner import LoopRunner
 from carla_bridge.metrics.collector import MetricsCollector
@@ -55,11 +57,25 @@ class ClosedLoop:
         self._capture_failures = 0
         self._capture_failure_total = 0
         self._termination_reason = ""
+        self._cleanup_errors = []
+        self._final_summary = None
         ccfg = config.get_nested("carla", default={}) or {}
         self.ccfg = ccfg
         self.replan_interval_s = float(ccfg.get("replan_interval_s", 1.0))
         self.fixed_delta = float(ccfg.get("fixed_delta_seconds", 0.05))
-        self.max_duration_s = float(ccfg.get("max_duration_s", 60.0))
+        self.max_duration_s = float(ccfg.get("max_duration_s", 300.0))
+        if not all(math.isfinite(v) and v > 0 for v in
+                   (self.fixed_delta, self.replan_interval_s, self.max_duration_s)):
+            raise ValueError("CARLA tick, replan interval and time limit must be finite and positive")
+        if self.replan_interval_s < self.fixed_delta:
+            raise ValueError("replan_interval_s cannot be shorter than one physics tick")
+        self._cycle_ticks = max(1, round(self.replan_interval_s / self.fixed_delta))
+        self._execution_horizon = self._cycle_ticks * self.fixed_delta
+        self.trajectory_validator = TrajectoryValidator(ccfg.get("trajectory_validation"))
+        self._trajectory_rejections = 0
+        self._consecutive_trajectory_rejections = 0
+        self.route_completion = 0.0
+        self.route_completed = False
         self.cameras_cfg = ccfg.get("cameras", []) or []
         self.out_cfg = ccfg.get("output", {}) or {}
         self.controller_cfg = ccfg.get("controller", {}) or {}
@@ -95,6 +111,7 @@ class ClosedLoop:
         self._stuck_term_s = float(stuck_cfg.get("terminate_after_s", 20.0))
         self._stuck_since: Optional[float] = None
         self._stuck_progress = 0.0
+        self._planned_stop = True
         self._early_terminated = False
 
         self._elapsed = 0.0  # 仿真累计时间（秒）
@@ -175,7 +192,8 @@ class ClosedLoop:
         # 6. 记忆 loop
         out_path = self._make_output_path()
         self.loop = LoopRunner(
-            self.config, mode=self.mode, output_jsonl_path=out_path, resume=False
+            self.config, mode=self.mode, output_jsonl_path=out_path, resume=False,
+            decision_validator=self._validate_decision,
         )
         self.loop.setup()
 
@@ -220,62 +238,110 @@ class ClosedLoop:
     def run(self) -> None:
         assert self.loop and self.carla_client and self.scenario
         self.run_status = "running"
-        dur = min(self.max_duration_s, self.scenario.duration_s())
-        while self._elapsed < dur:
+        duration = min(self.max_duration_s, self.scenario.duration_s())
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError("scenario duration_s must be finite and positive")
+        if not self.scenario.route:
+            raise ValueError("a non-empty planned route is required for route completion")
+        while not self._check_run_end():
             self._replan_cycle()
             if self._early_terminated:
                 break
-        self.run_status = self._termination_reason if self._early_terminated else "completed"
+        self.run_status = self._termination_reason
+        self._apply_brake()
+
+    def _check_run_end(self) -> bool:
+        """Success is measured route completion; elapsed time is only a guard."""
+        if self._early_terminated:
+            return True
+        route = self.scenario.route
+        if route is not None:
+            self.route_completion = route.progress_fraction()
+            self.route_completed = route.is_complete()
+        if self.route_completed:
+            self._termination_reason = "route_completed"
+        elif self._elapsed + self.fixed_delta > min(self.max_duration_s, self.scenario.duration_s()) + 1e-8:
+            self._termination_reason = "timeout"
+        else:
+            return False
+        self._apply_brake()
+        return True
+
+    def _apply_brake(self) -> None:
+        if self.scenario is not None and self.scenario.ego_vehicle is not None:
+            self.scenario.ego_vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
+
+    def _validate_decision(self, decision: dict, kf: dict) -> dict:
+        decision = decision or {}
+        if decision.get("fallback_used"):
+            return {"accepted": False, "reasons": ["rule_fallback_not_executable"], "details": {}}
+        return self.trajectory_validator.validate(
+            decision.get("trajectory"), decision.get("target_speed"),
+            (kf.get("ego_state") or {}).get("speed", 0.0), self._execution_horizon,
+        ).to_dict()
+
+    def outcome(self) -> dict:
+        """Cached result is safe to read after CARLA actors have been destroyed."""
+        return {"success": self.run_status == "route_completed" and self.route_completed,
+                "route_completed": self.route_completed,
+                "route_completion": self.route_completion,
+                "duration_s": round(self._elapsed, 3),
+                "trajectory_rejections": self._trajectory_rejections,
+                "cleanup_errors": list(self._cleanup_errors)}
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+
+        def cleanup(label, operation):
+            try:
+                if operation() is not False:
+                    return True
+            except Exception as exc:
+                logger.error("%s: %s", label, exc)
+            self._cleanup_errors.append(label)
+            return False
+
+        # Snapshot actor-dependent metrics before destroying actors. The final
+        # report is written only after cleanup, so it reflects cleanup failures.
+        if self.metrics is not None:
+            try:
+                self._final_summary = self.metrics.summary()
+            except Exception as exc:
+                logger.error("metrics snapshot: %s", exc)
+                self._cleanup_errors.append("metrics_snapshot")
         if self.recorder is not None:
-            try:
-                self.recorder.flush()
-            except Exception as e:
-                logger.warning("video flush: %s", e)
+            cleanup("video_flush", self.recorder.flush)
         if self.event_scheduler is not None:
-            try:
-                self.event_scheduler.destroy()
-            except Exception as e:
-                logger.warning("event_scheduler destroy: %s", e)
+            cleanup("event_cleanup", self.event_scheduler.destroy)
         if self.loop:
             try:
                 self.loop.close()
             except Exception as e:
                 self.run_status = "memory_save_failed"
                 logger.error("loop close: %s", e)
-        if self.metrics is not None:
+        if self._collision_sensor is not None:
+            cleanup("collision_stop", self._collision_sensor.stop)
+            cleanup("collision_destroy", self._collision_sensor.destroy)
+        if self.cameras:
+            cleanup("camera_cleanup", self.cameras.destroy)
+        scenario_clean = True
+        if self.scenario:
+            scenario_clean = cleanup("scenario_cleanup", self.scenario.destroy)
+        if self.carla_client and scenario_clean:
+            cleanup("world_restore", self.carla_client.restore)
+        elif self.carla_client:
+            self._cleanup_errors.append("world_restore_skipped_for_live_actors")
+        if self._cleanup_errors and self.run_status != "memory_save_failed":
+            self.run_status = "cleanup_failed"
+        if self._final_summary is not None:
             try:
                 self._write_report()
             except Exception as exc:
-                logger.warning("report: %s", exc)
-        if self._collision_sensor is not None:
-            try:
-                self._collision_sensor.stop()
-            except Exception:
-                pass
-            try:
-                self._collision_sensor.destroy()
-            except Exception:
-                pass
-        if self.cameras:
-            try:
-                self.cameras.destroy()
-            except Exception:
-                pass
-        if self.scenario:
-            try:
-                self.scenario.destroy()
-            except Exception:
-                pass
-        if self.carla_client:
-            try:
-                self.carla_client.restore()
-            except Exception:
-                pass
+                self.run_status = "report_failed"
+                self._cleanup_errors.append("report_write")
+                logger.error("report write: %s", exc)
 
     # ------------------------------------------------------------------
     # 单次重规划周期
@@ -289,10 +355,10 @@ class ClosedLoop:
             self.event_scheduler.tick()
         frame_id = self.carla_client.tick()
         self._elapsed += self.fixed_delta
-        self._drain_collisions()
-        self.carla_client.set_spectator_follow(ego)
-        if self.recorder is not None:
-            self.recorder.on_tick()
+        self._record_tick(ego)
+        if self._check_run_end():
+            self.cameras.drain()
+            return
         sample_token = self.kf_builder.next_token()
         try:
             mosaic_path = self.cameras.capture(sample_token, frame_id)
@@ -325,6 +391,12 @@ class ClosedLoop:
         )
         kf["carla_frame_id"] = frame_id
         kf["sim_time_s"] = self._elapsed
+        kf["planning_constraints"] = {
+            "required_horizon_s": self._execution_horizon,
+            **{key: getattr(self.trajectory_validator, key) for key in (
+                "max_speed_mps", "max_acceleration_mps2", "max_deceleration_mps2",
+                "max_lateral_acceleration_mps2")},
+        }
         logger.info(
             "[replan] t=%.1fs token=%s nav=%s objs=%d speed=%.1f",
             self._elapsed, sample_token, nav, len(objs), ego_state.speed,
@@ -338,10 +410,22 @@ class ClosedLoop:
             self._last_scene_result = (record or {}).get("current_scene") or self._last_scene_result
             self._last_nav = nav
             decision = (record or {}).get("decision_output") or {}
-            traj = decision.get("trajectory") or []
-            target_speed = float(decision.get("target_speed", 0.0) or 0.0)
-            if not traj:
-                logger.warning("决策无轨迹，本周期全刹")
+            validation = (record or {}).get("decision_validation") or {}
+            accepted = validation.get("accepted") is True
+            if accepted:
+                self._consecutive_trajectory_rejections = 0
+                traj = decision.get("trajectory") or []
+                target_speed = float(decision.get("target_speed", 0.0) or 0.0)
+                self._planned_stop = target_speed <= self._stuck_speed_thresh
+            else:
+                traj, target_speed = [], 0.0
+                self._planned_stop = True
+                self._trajectory_rejections += 1
+                self._consecutive_trajectory_rejections += 1
+                logger.error("轨迹被拒绝，本周期全刹: %s", validation.get("reasons", ["missing_validation"]))
+                if self._consecutive_trajectory_rejections >= int(self.ccfg.get("max_trajectory_rejections", 3)):
+                    self._early_terminated = True
+                    self._termination_reason = "invalid_trajectory"
             self.tracker.set_trajectory(
                 traj, tf.location.x, tf.location.y, ego_yaw, target_speed
             )
@@ -349,48 +433,48 @@ class ClosedLoop:
             # 认知步骤异常（如 VLM 调用失败）：打印完整 traceback 便于定位，本周期全刹，继续下一周期
             logger.error("认知步骤异常（本周期全刹，继续下一周期）: %s", e, exc_info=True)
             self.tracker.set_trajectory([], tf.location.x, tf.location.y, ego_yaw, 0.0)
+            self._planned_stop = True
+
+        if self._early_terminated:
+            self._apply_brake()
+            return
 
         # ---- [3 控制] 10Hz × N tick，其中每周期 5 次 raw 捕获 push 进短期记忆 ----
-        n_ticks = max(1, int(round(self.replan_interval_s / self.fixed_delta)))
+        # One capture tick belongs to the next cycle. Together these ticks match
+        # the validated trajectory horizon exactly (no extra stale-control tick).
+        n_ticks = self._cycle_ticks - 1
         raw_every = max(1, int(round(n_ticks / 5.0)))  # 每周期 5 次 raw 捕获（≈1.67Hz @3s/10Hz）
-        dur = min(self.max_duration_s, self.scenario.duration_s())
         # Apply the new decision before advancing physics (including emergency braking).
         v = ego.get_velocity()
+        speed = (v.x * v.x + v.y * v.y) ** 0.5
         ego.apply_control(self.tracker.compute_control(tf.location.x, tf.location.y, ego_yaw,
                                                        (v.x * v.x + v.y * v.y) ** 0.5))
         for i in range(n_ticks):
+            if self._check_run_end():
+                return
             if self.event_scheduler is not None:
                 self.event_scheduler.tick()
             frame_id = self.carla_client.tick()
             self._elapsed += self.fixed_delta
+            self._record_tick(ego)
+            if self._check_run_end():
+                self.cameras.drain()
+                return
             self.history.update(ego, self._elapsed)
             if i % raw_every == 0:
                 if not self._raw_capture(ego, frame_id):
                     return  # raw 捕获：mosaic+ego+感知 push 进短期记忆
             else:
                 self.cameras.drain()  # 其余 tick 丢弃相机帧，防堆积
-            self._drain_collisions()
-            self.carla_client.set_spectator_follow(ego)
-            if self.recorder is not None:
-                self.recorder.on_tick()
             tf2 = ego.get_transform()
             yaw2 = coords.carla_yaw_deg_to_rad(tf2.rotation.yaw)
             v = ego.get_velocity()
             speed = (v.x * v.x + v.y * v.y) ** 0.5
             ctrl = self.tracker.compute_control(tf2.location.x, tf2.location.y, yaw2, speed)
             ego.apply_control(ctrl)
-            # 指标采集
-            if self.metrics is not None:
-                a = ego.get_acceleration()
-                self.metrics.on_tick(ego, self._elapsed, {
-                    "speed": speed,
-                    "acceleration": (a.x * a.x + a.y * a.y) ** 0.5,
-                })
-            if self._elapsed >= dur:
-                break
 
         # ---- 卡死检测（B5）：低速且无路线进展，先警告后提前终止 ----
-        if self._stuck_enabled:
+        if self._stuck_enabled and not self._planned_stop:
             prog = (self.scenario.route.progress_fraction()
                     if self.scenario.route else 0.0)
             if speed < self._stuck_speed_thresh and (prog - self._stuck_progress) < 0.005:
@@ -414,6 +498,10 @@ class ClosedLoop:
             else:
                 self._stuck_since = None
             self._stuck_progress = prog
+        else:
+            # A deliberate stop/yield can legitimately outlast the stuck timer.
+            # The overall route timeout still bounds repeated stop decisions.
+            self._stuck_since = None
 
         # ---- [4 记录] ----
         prog = (self.scenario.route.progress_fraction() * 100.0) if self.scenario.route else 0.0
@@ -421,6 +509,18 @@ class ClosedLoop:
             "[cycle end] t=%.1fs 路线完成度=%.1f%% 碰撞=%d",
             self._elapsed, prog, self._collision_count,
         )
+
+    def _record_tick(self, ego) -> None:
+        self._drain_collisions()
+        self.carla_client.set_spectator_follow(ego)
+        if self.recorder is not None:
+            self.recorder.on_tick()
+        if self.metrics is not None:
+            v, a = ego.get_velocity(), ego.get_acceleration()
+            self.metrics.on_tick(ego, self._elapsed, {
+                "speed": math.hypot(v.x, v.y),
+                "acceleration": math.hypot(a.x, a.y),
+            })
 
     # ------------------------------------------------------------------
     # 路由中心线注入（米制回正锚点）
@@ -591,10 +691,12 @@ class ClosedLoop:
     def _write_report(self) -> None:
         if self.metrics is None:
             return
-        summary = self.metrics.summary()
+        summary = self._final_summary if self._final_summary is not None else self.metrics.summary()
         run_info = {
             "run_id": self.run_id,
             "status": self.run_status,
+            **self.outcome(),
+            "success_criterion": "ordered_route_completion_100_percent",
             "capture_failures": self._capture_failure_total,
             "scenario": self.scenario.scenario_name(),
             "mode": self.mode,
@@ -609,11 +711,8 @@ class ClosedLoop:
         }
         out_dir = self.config.get("output_dir") or Path("outputs")
         report_dir = Path(out_dir)
-        try:
-            md_path, _json_path = write_report(summary, run_info, str(report_dir))
-            logger.info("闭环报告已写: %s", md_path)
-        except Exception as e:
-            logger.warning("写报告失败: %s", e)
+        md_path, _json_path = write_report(summary, run_info, str(report_dir))
+        logger.info("闭环报告已写: %s", md_path)
 
     @property
     def collision_count(self) -> int:

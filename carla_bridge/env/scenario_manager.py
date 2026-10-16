@@ -87,6 +87,8 @@ class ScenarioManager:
         self.route = RoutePlanner(
             self.world, self.ego_vehicle,
             python_api_dir=self.carla_cfg.get("python_api_dir"),
+            completion_tolerance_m=float(self.carla_cfg.get("route_completion_tolerance_m", 2.0)),
+            tracking_tolerance_m=float(self.carla_cfg.get("route_tracking_tolerance_m", 5.0)),
         )
         self.route.plan(
             start_loc=start_loc,
@@ -165,21 +167,26 @@ class ScenarioManager:
     # ------------------------------------------------------------------
 
     def duration_s(self) -> float:
-        return float(self.cfg.get("duration_s", 60.0))
+        return float(self.cfg.get("duration_s", 300.0))
 
     def scenario_name(self) -> str:
         return self.cfg.get("scenario_name", "carla_scenario")
 
-    def destroy(self) -> None:
-        if self.traffic:
+    def destroy(self) -> bool:
+        """报告清理是否全部完成；单项失败不阻断其他资源，失败引用保留。"""
+        traffic_ok = True
+        if self.traffic is not None:
             try:
-                self.traffic.destroy()
+                traffic_ok = self.traffic.destroy() is not False
             except Exception as exc:
+                traffic_ok = False
                 logger.warning("traffic cleanup: %s", exc)
         if self.ego_vehicle is not None:
             try:
-                self.ego_vehicle.destroy()
-            except Exception:
-                pass
-
-            self.ego_vehicle = None
+                if not self.ego_vehicle.is_alive or self.ego_vehicle.destroy() is not False:
+                    self.ego_vehicle = None
+                else:
+                    logger.warning("ego cleanup: destroy 返回 False，将保留引用供重试")
+            except Exception as exc:
+                logger.warning("ego cleanup: %s", exc)
+        return traffic_ok and self.ego_vehicle is None
