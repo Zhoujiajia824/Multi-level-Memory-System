@@ -804,12 +804,13 @@ python -m carla_bridge.paper_suite prepare --output outputs/paper_v1
 ```
 
 `prepare` 会依次加载四个地图，重置当前 world，结束时停留在最后加载的地图。
-它不运行 VLM、不生成交通 actor；检查地图/版本/蓝图、完整路线长度、人行道横穿位置、
-可绕行车道以及事件点是否被路线的其他部分重复经过。不是只把旧场景里的地图名换掉。
+它不运行 VLM、不生成背景交通；检查地图/版本/蓝图、完整路线长度、人行道横穿位置、
+可绕行车道以及事件点是否被路线的其他部分重复经过。准备阶段会临时生成事件 actor
+来验证坐标，每次探测后立即销毁；销毁或服务器通信失败会停止准备，不能当作几何不合格跳过。
 如没有候选路线满足条件，会列出失败原因，不输出一个伪装为可用的套件。
 这时可调整 catalog 的起点候选、路线长度或事件搜索区间，使用一个新的输出目录重试。
 
-全部几何检查通过后生成：
+全部几何及事件生成检查通过后生成：
 
 ```text
 outputs/paper_v1/
@@ -822,7 +823,36 @@ outputs/paper_v1/
 
 工具不会覆盖已有目录。生成的 YAML 是独立可运行场景；不要手改其路线/事件坐标，哈希校验会拒绝。
 改变实验设计应修改 catalog 后重新准备，并保留原版用于追溯。
-预检仅验证地图几何，不等于 actor 一定能生成、事件一定能完成或车辆已通过路线。
+预检验证空地图上的事件出生点；运行时背景交通可能改变可用空间，双端能生成也不等于
+行人能穿过中间的护栏或顺利完成横穿。落地、横穿运动和车辆路线仍需要闭环验收。
+
+#### 旧版横穿场景提示出生点碰撞时
+
+`Spawn failed because of collision at spawn position` 表示固定点不能容纳该行人碰撞体，
+不是模型或 PDM 依赖问题。旧生成器采用首个匹配的人行道边缘点并只加 0.3m 高度，
+且未实际试生成。新版在横截面搜索两侧各有 0.5m 余量的候选，采用
+[CARLA ScenarioRunner 0.9.15 横穿场景](https://github.com/carla-simulator/scenario_runner/blob/v0.9.15/srunner/scenarios/object_crash_vehicle.py#L409)
+的地面高度加 1.2m 设置，用实际蓝图验证起点和终点；失败则在准备阶段继续有限搜索。
+静止障碍车也必须通过生成检查。成功的坐标、蓝图和 `spawn_validation` 证据一起冻结到 YAML。
+运行时不会随机挪点、换蓝图或跳过必需事件。这个高度选择仍需实际生成检查，不能保证任何地图点都可用。
+
+**拉取代码不会修改已有 `outputs/paper_v1/*.yaml` 坐标。** 已经生成过旧场景时，
+新代码同步后在空闲 CARLA 上创建新目录，再切换 `--scenario`：
+
+```bash
+conda activate mulmem_carla
+python -m carla_bridge.paper_suite prepare --output outputs/paper_v1_spawncheck
+
+mkdir -p outputs/server_console
+set -o pipefail
+python -m carla_bridge.run_carla_demo \
+  --scenario outputs/paper_v1_spawncheck/eval/L05_crossing_eval_s101.yaml \
+  --planner pdm_closed --semantic-influence on --mode memory_off \
+  2>&1 | tee "outputs/server_console/L05_on_$(date +%Y%m%d_%H%M%S).log"
+```
+
+保留旧目录用于追溯，不手改 YAML 或绕过哈希校验。语义开/关和记忆库各组使用同一套
+新冻结场景；新旧事件坐标、预留位置及背景采样可能不同，结果不能当作同一几何条件直接配对。
 
 ### 12.3 首轮驾驶验收与记忆实验
 

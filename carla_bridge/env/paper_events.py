@@ -14,6 +14,27 @@ from pathlib import Path
 import carla
 
 
+def event_blueprint(library, spec):
+    """Use the exact blueprint probed by prepare; retain legacy YAML support."""
+    if spec["type"] == "pedestrian_crossing":
+        identity = spec.get("blueprint")
+        if identity:
+            if not identity.startswith("walker.pedestrian."):
+                raise ValueError("pedestrian event requires a walker.pedestrian blueprint")
+            bp = library.find(identity)
+        else:
+            available = sorted(library.filter("walker.pedestrian.*"), key=lambda bp: bp.id)
+            if not available:
+                raise ValueError("no pedestrian blueprint available")
+            bp = available[0]
+        if bp.has_attribute("is_invincible"):
+            bp.set_attribute("is_invincible", "false")
+        return bp
+    if spec["type"] == "stationary_vehicle":
+        return library.find(spec["blueprint"])
+    raise ValueError(f"unsupported paper event: {spec['type']}")
+
+
 class PaperEventScheduler:
     def __init__(self, world, ego, route, events, elapsed, audit_path=None):
         self.world, self.ego, self.route, self.elapsed = world, ego, route, elapsed
@@ -30,17 +51,11 @@ class PaperEventScheduler:
             self._write_journal()
             return
         library = self.world.get_blueprint_library()
-        walker_bps = sorted(library.filter("walker.pedestrian.*"), key=lambda bp: bp.id)
         for spec, record in zip(self.events, self.records):
+            bp = event_blueprint(library, spec)
             if spec["type"] == "pedestrian_crossing":
-                if not walker_bps:
-                    raise ValueError("no pedestrian blueprint available")
-                bp = walker_bps[0]
-                if bp.has_attribute("is_invincible"):
-                    bp.set_attribute("is_invincible", "false")
                 tf = carla.Transform(carla.Location(**spec["start"]))
             elif spec["type"] == "stationary_vehicle":
-                bp = library.find(spec["blueprint"])
                 p = spec["spawn"]
                 tf = carla.Transform(carla.Location(x=p["x"], y=p["y"], z=p["z"]),
                                      carla.Rotation(yaw=p["yaw"]))
@@ -56,7 +71,9 @@ class PaperEventScheduler:
                 record.update(state="failed", error="actor_spawn_failed", spawn_error=str(exc))
                 self._write_journal()
                 raise RuntimeError(f"paper event {spec['id']} spawn failed at {record['spawn']} "
-                                   f"using {bp.id}: {exc}; case is invalid") from exc
+                                   f"using {bp.id}: {exc}; case is invalid. "
+                                   "If using old prepared YAML, regenerate with paper_suite prepare "
+                                   "into a new output directory; existing coordinates are not auto-repaired.") from exc
             if actor is None:
                 record.update(state="failed", error="actor_spawn_failed")
                 self._write_journal()

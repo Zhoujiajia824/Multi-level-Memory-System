@@ -2,6 +2,7 @@
 
 list is offline. prepare changes maps and must run on an idle CARLA instance.
 Prepared cases freeze routes and event geometry shared by all paired conditions.
+prepare temporarily spawns and destroys event actors to validate spawn poses.
 """
 from __future__ import annotations
 
@@ -151,25 +152,83 @@ def summarize_runs(runs_dir, output):
     return len(rows)
 
 
-def _sidewalk(carla, road_map, wp, side):
-    """Find an actual sidewalk near the cross-section, without road projection."""
+class SpawnProbeError(RuntimeError):
+    """A server/probe failure must not be mistaken for unsuitable geometry."""
+
+
+class SpawnProbeCleanupError(SpawnProbeError):
+    pass
+
+
+def _probe_spawn(world, bp, tf):
+    """Test the exact frozen pose; never read an unticked actor's location.
+
+    This verifies creation only, not settling or the full crossing motion.
+    Collision/no-actor results allow trying another deterministic candidate;
+    other server errors abort preparation.
+    """
+    actor = None
+    try:
+        try:
+            actor = world.spawn_actor(bp, tf)
+        except RuntimeError as exc:
+            if "collision at spawn position" in str(exc).lower():
+                return {"ok": False, "error": str(exc)}
+            raise SpawnProbeError(f"event spawn probe failed: {exc}") from exc
+        if actor is None:
+            return {"ok": False, "error": "spawn_actor returned no actor"}
+        return {"ok": True}
+    finally:
+        if actor is not None:
+            try:
+                if actor.destroy() is False:
+                    raise RuntimeError("destroy returned False")
+            except Exception as exc:
+                raise SpawnProbeCleanupError(f"event probe actor {actor.id} cleanup failed: {exc}") from exc
+
+
+def _sidewalk_candidates(carla, road_map, wp, side):
+    """Deterministic interior points on this cross-section, with 0.5m margins."""
     tf = wp.transform
     right = tf.get_right_vector()
+    candidates = []
     for half_metres in range(4, 49):
         offset = side * half_metres * .5
         p = carla.Location(x=tf.location.x + right.x * offset,
                            y=tf.location.y + right.y * offset, z=tf.location.z)
         sidewalk = road_map.get_waypoint(p, project_to_road=False, lane_type=carla.LaneType.Sidewalk)
         if sidewalk and abs(sidewalk.transform.location.z - tf.location.z) < 1.5:
-            # Keep the cross-section coordinate (projecting to a waypoint can
-            # slide along the sidewalk into a different junction).
-            p.z = sidewalk.transform.location.z + .3
-            return p
-    return None
+            key = (sidewalk.road_id, sidewalk.section_id, sidewalk.lane_id)
+            edges = [road_map.get_waypoint(carla.Location(x=p.x + right.x * margin,
+                y=p.y + right.y * margin, z=p.z), project_to_road=False,
+                lane_type=carla.LaneType.Sidewalk) for margin in (-.5, .5)]
+            if not all(edge and (edge.road_id, edge.section_id, edge.lane_id) == key for edge in edges):
+                continue
+            # Keep the cross-section coordinate: projecting can slide along
+            # the sidewalk into a different junction. Spawn height is separate.
+            p.z = sidewalk.transform.location.z
+            candidates.append(p)
+    return candidates
 
 
 def _resolve_anchor(carla, world, points, arc, spec, event_id):
+    from carla_bridge.env.paper_events import event_blueprint
     road_map = world.get_map()
+    bp = event_blueprint(world.get_blueprint_library(), spec)
+    probe_failures = []
+    probe_count = 0
+
+    def probe(pose, yaw=0):
+        nonlocal probe_count
+        # Probe the serialized precision and exact blueprint used at runtime.
+        tf = carla.Transform(carla.Location(**{k: pose[k] for k in ("x", "y", "z")}),
+                             carla.Rotation(yaw=yaw))
+        result = _probe_spawn(world, bp, tf)
+        probe_count += 1
+        if not result["ok"]:
+            probe_failures.append({"pose": pose, "error": result.get("error")})
+        return result["ok"]
+
     for i in range(5, len(points) - 6):
         if not spec["search_from_m"] <= arc[i] <= spec["search_to_m"]:
             continue
@@ -188,11 +247,46 @@ def _resolve_anchor(carla, world, points, arc, spec, event_id):
             continue
         event = {"id": event_id, "type": spec["type"], "anchor_distance_m": round(arc[i], 4)}
         if spec["type"] == "pedestrian_crossing":
-            right, left = _sidewalk(carla, road_map, wp, 1), _sidewalk(carla, road_map, wp, -1)
-            if right is None or left is None or not 5 <= right.distance(left) <= 25:
+            right = _sidewalk_candidates(carla, road_map, wp, 1)
+            left = _sidewalk_candidates(carla, road_map, wp, -1)
+            if not right or not left:
                 continue
-            event.update(start=point(right), target=point(left), speed_mps=spec["speed_mps"],
-                         trigger_distance_m=round(arc[i] - spec["lead_distance_m"], 4))
+            tested = {}
+
+            def walker_pose(location):
+                # ScenarioRunner v0.9.15 crossing walkers use +1.2m. A map
+                # waypoint is a road-surface pose, not a safe capsule origin.
+                pose = point(location)
+                pose["z"] = round(pose["z"] + 1.2, 5)
+                key = tuple(pose[k] for k in ("x", "y", "z"))
+                if key not in tested:
+                    tested[key] = probe(pose)
+                return pose if tested[key] else None
+
+            selected = None
+            for start in right:
+                destinations = [target for target in left if 5 <= start.distance(target) <= 25]
+                if not destinations:
+                    continue
+                start_pose = walker_pose(start)
+                if start_pose is None:
+                    continue
+                for target in destinations:
+                    target_pose = walker_pose(target)
+                    if target_pose is not None:
+                        selected = start_pose, target_pose
+                        break
+                if selected:
+                    break
+            if selected is None:
+                continue
+            event.update(start=selected[0], target=selected[1], blueprint=bp.id,
+                         speed_mps=spec["speed_mps"],
+                         trigger_distance_m=round(arc[i] - spec["lead_distance_m"], 4),
+                         spawn_validation={"method": "actor_spawn_probe_v1", "blueprint": bp.id,
+                                           "start": selected[0], "target": selected[1],
+                                           "walker_height_offset_m": 1.2,
+                                           "probes_attempted": probe_count})
         else:
             # A same-direction adjacent driving lane must exist for bypassing.
             adjacent = [(wp.get_left_lane(), carla.LaneChange.Left), (wp.get_right_lane(), carla.LaneChange.Right)]
@@ -200,12 +294,16 @@ def _resolve_anchor(carla, world, points, arc, spec, event_id):
                        and p.road_id == wp.road_id and (wp.lane_change & permission)
                        for p, permission in adjacent):
                 continue
-            world.get_blueprint_library().find(spec["blueprint"])
             spawn = point(wp.transform.location)
             spawn.update(z=spawn["z"] + .3, yaw=float(yaw))
-            event.update(spawn=spawn, blueprint=spec["blueprint"], trigger_distance_m=0.0)
+            if not probe(spawn, yaw):
+                continue
+            event.update(spawn=spawn, blueprint=bp.id, trigger_distance_m=0.0,
+                         spawn_validation={"method": "actor_spawn_probe_v1", "blueprint": bp.id,
+                                           "spawn": spawn, "probes_attempted": probe_count})
         return event
-    raise ValueError(f"no suitable geometry for {event_id} in requested route interval")
+    raise ValueError(f"no suitable geometry/spawn for {event_id} in requested route interval; "
+                     f"probes={probe_count}, last failures={probe_failures[-3:]}")
 
 
 def prepare_profile(carla, client, profile, defaults):
@@ -252,6 +350,8 @@ def prepare_profile(carla, client, profile, defaults):
                     "points": [point(p) for p in points], "length_m": arc[-1], "anchors": anchors,
                     "server_version": client.get_server_version(),
                     "map_sha256": hashlib.sha256(road_map.to_opendrive().encode()).hexdigest()}
+        except SpawnProbeError:
+            raise
         except (ValueError, RuntimeError) as exc:
             errors.append(f"spawn {index}: {exc}")
     raise ValueError(f"{profile['map']}: no route passed preflight; " + "; ".join(errors))
@@ -287,7 +387,8 @@ def main():
         raise ValueError(f"missing maps: {sorted(required - available)}")
     if client.get_client_version() != client.get_server_version():
         raise ValueError("CARLA client/server versions differ")
-    print("Preparing on idle server: maps will be loaded; no VLM or traffic actors are started.", flush=True)
+    print("Preparing on idle server: maps will be loaded; temporary event spawn probes will be destroyed. "
+          "No VLM or background traffic is started.", flush=True)
     prepared = {}
     for key, profile in catalog["profiles"].items():
         print(f"Checking {profile['map']} ...", flush=True)
@@ -295,7 +396,7 @@ def main():
     # Write only after ALL profiles have passed, never a partly validated suite.
     args.output.mkdir(parents=True, exist_ok=False)
     (args.output / "preflight.json").write_text(json.dumps({"catalog_sha256": digest(catalog),
-        "profiles": prepared, "validation": "geometry_only_not_driving_test"}, ensure_ascii=False, indent=2), encoding="utf-8")
+        "profiles": prepared, "validation": "geometry_and_event_spawn_not_driving_test"}, ensure_ascii=False, indent=2), encoding="utf-8")
     for split in ("train", "eval"):
         destination = args.output / split
         destination.mkdir()
@@ -303,7 +404,8 @@ def main():
             validate_prepared(cfg)
             (destination / (name + ".yaml")).write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
     print(f"Prepared {len(catalog['cases'])} cases x 6 seeds: {args.output}", flush=True)
-    print("Geometry preflight only. Spawn counts, event execution and 100% route completion still require driving runs.")
+    print("Geometry and event spawn preflight passed. Crossing motion, background traffic, and "
+          "100% route completion still require driving runs.")
 
 
 if __name__ == "__main__":

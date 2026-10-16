@@ -232,12 +232,22 @@ def test_geometry_preflight_uses_actual_sidewalks_and_lawful_adjacent_lane(monke
     client.get_server_version.return_value = "0.9.15"
     world.get_settings.return_value.synchronous_mode = True
     world.get_map.return_value = road
-    world.get_blueprint_library.return_value.filter.return_value = [Mock()]
+    world.get_blueprint_library.return_value.filter.return_value = [Mock(id="walker.pedestrian.0001")]
+    world.get_blueprint_library.return_value.find.side_effect = lambda name: Mock(id=name)
+    probes = []
+    def spawn_probe(bp, tf):
+        actor = Mock()
+        actor.destroy.return_value = True
+        probes.append(actor)
+        return actor
+    world.spawn_actor.side_effect = spawn_probe
     road.get_spawn_points.return_value = [carla.Transform(carla.Location(z=.3))]
     road.to_opendrive.return_value = "<OpenDRIVE/>"
     def waypoint(p, project_to_road=True, lane_type=carla.LaneType.Driving):
         if lane_type == carla.LaneType.Sidewalk:
-            return NS(transform=carla.Transform(carla.Location(x=p.x, y=p.y, z=.2))) if abs(p.y) >= 4 else None
+            return NS(transform=carla.Transform(carla.Location(x=p.x, y=p.y, z=.2)),
+                      road_id=1, section_id=0, lane_id=3 if p.y > 0 else -3,
+                      lane_type=carla.LaneType.Sidewalk) if 4 <= abs(p.y) <= 8 else None
         return NS(transform=carla.Transform(p), is_junction=False, lane_id=1, road_id=1,
                   lane_change=carla.LaneChange.Both,
                   get_left_lane=lambda: NS(lane_id=2, road_id=1, lane_type=carla.LaneType.Driving),
@@ -247,11 +257,18 @@ def test_geometry_preflight_uses_actual_sidewalks_and_lawful_adjacent_lane(monke
     monkeypatch.setattr(RoutePlanner, "plan", lambda *a, **kw: points)
     result = prepare_profile(carla, client, profile, catalog["defaults"])
     assert result["length_m"] == 900
-    assert result["anchors"]["crossing"]["start"]["y"] == 4
-    assert result["anchors"]["crossing"]["target"]["y"] == -4
+    crossing = result["anchors"]["crossing"]
+    assert crossing["start"]["y"] == 4.5
+    assert crossing["target"]["y"] == -4.5
+    assert crossing["start"]["z"] == pytest.approx(1.4)
+    assert crossing["blueprint"] == "walker.pedestrian.0001"
+    assert crossing["spawn_validation"]["method"] == "actor_spawn_probe_v1"
     assert result["anchors"]["blocked_lane"]["spawn"]["x"] == 500
     world.try_spawn_actor.assert_not_called()
-    world.spawn_actor.assert_not_called()
+    assert world.spawn_actor.call_count >= 3
+    assert all(actor.destroy.call_count == 1 for actor in probes)
+    # Loading a synchronous map takes one tick; probes never advance the world.
+    world.tick.assert_called_once()
     # Removing the adjacent lane invalidates the route instead of placing a
     # supposedly bypassable obstacle on a one-lane road.
     original = road.get_waypoint.side_effect
