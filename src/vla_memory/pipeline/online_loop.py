@@ -258,6 +258,7 @@ class OnlineDrivingLoop:
         )
 
         # ---- 4. 决策 VLM + Client ----
+        from src.vla_memory.decision.config_access import get_decision_system_prompt
         dec_vlm_cfg = cfg.get("decision", {}) or {}
         decision_vlm = OpenAICompatibleVLMClient(
             provider=dec_vlm_cfg.get("provider", "qwen"),
@@ -269,7 +270,7 @@ class OnlineDrivingLoop:
             temperature=dec_vlm_cfg.get("temperature", 0.1),
             retry_times=dec_vlm_cfg.get("retry_times", 3),
             retry_interval_seconds=dec_vlm_cfg.get("retry_interval_seconds", 5),
-            system_prompt=dec_vlm_cfg.get("system_prompt", ""),
+            system_prompt=get_decision_system_prompt(cfg),
         )
         self.decision_client = DecisionClient(vlm_client=decision_vlm)
 

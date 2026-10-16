@@ -440,6 +440,9 @@ python -m pytest carla_bridge/tests -q -p no:cacheprovider
 ```
 
 `--check` 核验 PDM 来源，不连接 CARLA 或模型 API。测试使用模拟场景接口，不能替代服务器真实驾驶。
+PDM 依赖清单同时包含 nuPlan 间接导入所需的 matplotlib/图像处理/pytest，
+以及 tuplan 元数据要求的 scikit-learn 1.2.2、positional-encodings 6.0.1。
+已有 scikit-learn 版本会按该要求调整；不能仅凭两个源码包安装成功就跳过依赖检查。
 若 `pip check` 报已有包与 NumPy/Shapely 等冲突，保留输出定位，不将检查失败当作安装完成。
 这份流程未声称已在你的服务器新建环境完整安装并验收，需要执行上述检查确认。
 
@@ -1140,6 +1143,22 @@ python -m pytest -q -p no:cacheprovider
 语义格式失败的共同处理规则对 `on`、`off` 都生效。
 
 ### 13.3 对照开关与记忆实验
+
+语义提示词版本 2 位于 `config/decision.yaml` 的 `semantic.system_prompt` 和 `semantic.user_prompt`。
+`pdm_closed` 不再使用 `config/api_models.yaml` 中要求输出路点的旧决策系统提示词；
+`vlm_trajectory` 保持原系统契约。场景理解提示词仍在 `config/prompts.yaml`。
+修改后重启驾驶进程使缓存配置生效；`[DECISION_PROMPT]` 日志记录实际系统/用户提示词哈希。
+
+针对重复 STOP，语义提示词区分接近停止位置、停车观察、满足通行条件后恢复行驶。
+`STOP` 是立即制动/保持静止偏好，不能表达“先开到远处停止线”；`MAINTAIN` 可从静止起步。
+历史轨迹显示相对时间，并从现有连续位姿计算有界的近静止时长，不把等待时间当作自动放行条件。
+该运动窗口来自各记忆模式共同的传感器历史，不增加 memory_off 的检索或短期记忆。
+路线锚点与真实 actor 分开显示；静止时长不能证明已在停止线完成停车，视觉估距也不是精确停止位置。
+场景理解只报告观察证据，不从单帧臆测自车正在减速或直接发布停车命令。
+
+验证时使用同一 prepared 场景、seed 和记忆配置，核对模型原始语义、PDM 最终选择、
+停车后是否恢复以及碰撞/违规/完整路线结果。提示词与回归测试不能证明模型一定选择正确，
+仍需服务器闭环验收；此更新没有修改 PDM 安全筛选或用计时器强制车辆起步。
 
 ```bash
 # 模型语义参与 PDM 候选选择；默认即为 on

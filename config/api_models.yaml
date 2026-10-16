@@ -23,6 +23,8 @@ scene_understanding:
     不要输出任何 JSON 以外的内容。不要输出 Markdown 代码块标记。
 
 # ---- 决策 VLM ----
+# 下方 system_prompt 用于旧轨迹后端；CARLA pdm_closed 使用
+# config/decision.yaml 的 semantic.system_prompt，避免系统/用户输出契约冲突。
 decision:
   provider: "qwen"  # VLM 提供商
   api_key_env: "DASHSCOPE_API_KEY"  # API Key 对应的环境变量名"DASHSCOPE_API_KEY"

@@ -9,6 +9,7 @@ config/decision.yaml，语义模式复用上下文而不拼接数值轨迹输出
 from __future__ import annotations
 
 import json
+import math
 from typing import Any, Dict, List, Optional
 
 from src.vla_memory.common.prompt_loader import get_prompt_loader
@@ -66,7 +67,8 @@ class DecisionPromptBuilder:
         scene_block = self._render_scene_block(scene_understanding)
         ego_state_block = self._render_ego_block(ego_state)
         nav_block = self._render_nav_block(nav_instruction)
-        history_block = self._render_history_block(history_trajectory)
+        semantic_mode = (planning_constraints or {}).get("decision_mode") == "semantic"
+        history_block = self._render_history_block(history_trajectory, include_time=semantic_mode)
         memory_block = self._render_memory_block(
             loader=loader,
             short_term_summary=short_term_summary,
@@ -74,7 +76,8 @@ class DecisionPromptBuilder:
             long_term_rules_text=long_term_rules_text,
         )
         image_layout_block = self._render_image_layout_block(image_layout)
-        perception_objects_block = self._render_perception_objects_block(perception_objects)
+        perception_objects_block = self._render_perception_objects_block(
+            perception_objects, source="CARLA" if semantic_mode else "nuScenes")
 
         # Keep the complete scene, image, navigation and memory context, but do
         # not render any of the legacy numerical trajectory output contract.
@@ -87,6 +90,7 @@ class DecisionPromptBuilder:
                 "ego_state_block": ego_state_block,
                 "nav_block": nav_block,
                 "history_block": history_block,
+                "motion_context_block": self._render_motion_context(history_trajectory, ego_state),
                 "memory_block": memory_block,
                 "image_layout_block": image_layout_block,
                 "perception_objects_block": perception_objects_block,
@@ -287,6 +291,7 @@ class DecisionPromptBuilder:
     def _render_history_block(
         self,
         history_trajectory: Optional[List[Dict]],
+        include_time: bool = False,
     ) -> str:
         if not history_trajectory:
             return ""
@@ -295,8 +300,8 @@ class DecisionPromptBuilder:
         ]
         recent = history_trajectory[-10:]
         traj_str = ", ".join(
-            f"({p.get('x', 0):.1f},{p.get('y', 0):.1f})" for p in recent
-        )
+            (f"(t={p.get('t', '未知')},x={p.get('x', 0):.1f},y={p.get('y', 0):.1f})"
+             if include_time else f"({p.get('x', 0):.1f},{p.get('y', 0):.1f})") for p in recent)
         lines.append(f"  {traj_str}")
         lines.append("")
         return "\n".join(lines)
@@ -410,21 +415,58 @@ class DecisionPromptBuilder:
         lines.append("- 上述选择记录不能单独证明动作已完成、驾驶成功或模型建议被采纳。")
         return "\n".join(lines)
 
+    @staticmethod
+    def _render_motion_context(history, ego_state) -> str:
+        """Summarize measured kinematics, not learned/retrieved memory or right of way."""
+        header = "## 实测运动窗口（所有记忆模式共同的传感器状态）\n"
+        unknown = header + "连续静止时长未知：缺少有效、连续且接近当前时刻的测量；不得据此认定停车义务已完成。\n"
+        try:
+            rows = [(float(p['t']), float(p['x']), float(p['y'])) for p in history or []]
+            speed = float((ego_state or {})['speed'])
+            if (len(rows) < 2 or not math.isfinite(speed) or speed < 0
+                    or not all(math.isfinite(v) for row in rows for v in row)
+                    or any(a[0] >= b[0] for a, b in zip(rows, rows[1:]))
+                    or any(t > 0 for t, _, _ in rows) or rows[-1][0] < -0.5
+                    or math.hypot(rows[-1][1], rows[-1][2]) > 0.3):
+                return unknown
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return unknown
+        duration = 0.0
+        distance = sum(math.hypot(b[1]-a[1], b[2]-a[2]) for a, b in zip(rows, rows[1:]))
+        if speed <= 0.2:
+            for a, b in reversed(list(zip(rows, rows[1:]))):
+                dt = b[0] - a[0]
+                if dt > 0.5 or math.hypot(b[1]-a[1], b[2]-a[2]) / dt > 0.2:
+                    break
+                duration += dt
+        return (header + f"- 最近测量覆盖 {rows[-1][0]-rows[0][0]:.2f} 秒，累计移动 {distance:.2f} 米。\n"
+                f"- 连续近静止至少 {duration:.2f} 秒（速度阈值 0.2m/s，仅统计连续测量；窗口外未知）。\n"
+                "- 这不是在停止线完成停车/让行的证明，也不是等待时长达到阈值后的自动通行许可。\n")
+
     def _render_image_layout_block(self, image_layout: str) -> str:
         """渲染输入图像布局说明段（告知决策 VLM 当前图像是单图还是六视角 mosaic）。"""
         if not image_layout:
             return ""
         return f"## 输入图像布局\n{image_layout}\n"
 
-    def _render_perception_objects_block(self, perception_objects) -> str:
+    def _render_perception_objects_block(self, perception_objects, source="nuScenes") -> str:
         """渲染 oracle 感知对象段（nuScenes GT 标注投影，非检测模型预测）。
 
         显式标注 oracle 来源；速度/加速度标注可用性与来源；无对象时返回空串。
         """
         if not perception_objects:
             return ""
+        route_lines = []
+        if source == "CARLA":
+            anchors = [o for o in perception_objects if isinstance(o, dict)
+                       and o.get("semantic_label") == "route_center"]
+            perception_objects = [o for o in perception_objects if isinstance(o, dict)
+                                  and o.get("semantic_label") != "route_center"]
+            if anchors:
+                route_lines = ["## 导航路线空间参考（不是障碍物，不是停止线，也不是通行许可）",
+                               json.dumps([o.get("position_ego") for o in anchors[:6]], ensure_ascii=False), ""]
         lines = [
-            "## Oracle 感知对象（nuScenes GT 标注投影，非检测模型预测）",
+            f"## Oracle 感知对象（{source} GT，非检测模型预测）",
             f"共 {len(perception_objects)} 个目标（按到 ego 距离升序），坐标 ego-centric [x 前向, y 左向]：",
         ]
         for i, o in enumerate(perception_objects[:12], 1):  # 限 12 个避免 prompt 过长
@@ -453,4 +495,4 @@ class DecisionPromptBuilder:
         if len(perception_objects) > 12:
             lines.append(f"  ...（其余 {len(perception_objects) - 12} 个对象略）")
         lines.append("")
-        return "\n".join(lines)
+        return "\n".join(route_lines + lines)

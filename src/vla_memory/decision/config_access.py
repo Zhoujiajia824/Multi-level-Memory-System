@@ -81,3 +81,13 @@ def get_semantic_prompt_template() -> str:
     if not isinstance(template, str) or not template.strip():
         raise ValueError("config/decision.yaml 缺少 semantic.user_prompt")
     return template
+
+
+def get_decision_system_prompt(config) -> str:
+    """Select the system contract consistently with the CARLA planner backend."""
+    if config.get_nested("carla", "planning", "backend", default=None) == "pdm_closed":
+        prompt = (_load_decision_yaml().get("semantic") or {}).get("system_prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("config/decision.yaml 缺少 semantic.system_prompt")
+        return prompt
+    return (config.get("decision", {}) or {}).get("system_prompt", "")

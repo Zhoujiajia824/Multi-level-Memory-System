@@ -40,7 +40,11 @@ python -m pytest carla_bridge/tests/test_pdm_planner.py carla_bridge/tests/test_
 
 tuplan_garage 使用 editable 安装是因为该版本 `setup.py` 只列出了顶层包；
 普通 wheel 安装可能漏掉 planner 子目录。不要直接执行它的历史 `requirements.txt`，
-其中训练相关的旧版依赖不属于这条 CARLA 规划路径。没有下载模型权重的步骤。
+本项目清单已补齐核心的间接导入依赖和上游声明的包约束。nuPlan 的 observation 模块
+会导入点云/绘图模块，因此即使不画图也需要 matplotlib、Pillow、OpenCV 和 pytest。
+tuplan 1.0.0 的元数据要求 `scikit-learn==1.2.2` 和 `positional-encodings==6.0.1`，
+安装它们是为了满足包依赖检查，不表示启用了学习型规划器。已有 scikit-learn 1.5.2
+会被调整为 1.2.2。没有下载模型权重的步骤。
 `--check` 不连接 CARLA、不初始化 VLM、不运行仿真。缺包或源码不符会直接报错，
 不会静默切换到其它规划器。服务器不能访问 GitHub 时，可在联网机器下载对应
 commit 的源码及适用于服务器 Python/Linux 的依赖 wheel，上传后按同样的

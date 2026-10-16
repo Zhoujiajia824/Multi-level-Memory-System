@@ -10,6 +10,7 @@ P5：``decide`` 接收 ``image_paths: List[str]``（oldest→newest，当前帧�
 from __future__ import annotations
 
 import warnings
+import hashlib
 from typing import Any, Dict, List, Optional
 
 from src.vla_memory.perception.vlm_client import VLMClient
@@ -79,6 +80,12 @@ class DecisionClient:
         prompt = self.prompt_builder.build(
             scene_understanding=scene_understanding or {},
             **kwargs,
+        )
+        logger.info(
+            "[DECISION_PROMPT] mode=%s user_sha256=%s system_sha256=%s",
+            (kwargs.get("planning_constraints") or {}).get("decision_mode", "trajectory"),
+            hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            hashlib.sha256((getattr(self.vlm_client, "system_prompt", "") or "").encode("utf-8")).hexdigest(),
         )
 
         # ---- 3. 调用真实 VLM API ----
