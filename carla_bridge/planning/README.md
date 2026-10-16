@@ -16,17 +16,24 @@
   同时读取安装来源 commit/checkout commit，明确不匹配时拒绝运行。
   日志记录实际来源、源码核验摘要、包版本和适配层版本。
 
-在服务器项目根目录，建议先克隆已有环境，避免影响旧版实验环境：
+从零新建环境的完整流程见 [CARLA README 第 5 节](../README.md#5-环境搭建)，
+包括 Python、PyTorch、FAISS、模型缓存、API 和服务器连接。
+下列步骤用于**已有基础依赖的环境**，可直接使用 `mulmem_carla`；不要求新建或克隆环境。
+如果希望隔离旧实验，可自行先执行 `conda create -n mulmem_pdm --clone mulmem_carla`，
+然后激活 `mulmem_pdm` 执行同样的安装步骤。
+
+在服务器项目根目录执行：
 
 ```bash
-conda create -n mulmem_pdm --clone mulmem_carla
-conda activate mulmem_pdm
-python -m pip install -r carla_bridge/planning/requirements-pdm.txt
+conda activate mulmem_carla
+python -m pip install "numpy==1.26.4" "opencv-python==4.10.0.84" "pytest>=7.4,<9" -r carla_bridge/planning/requirements-pdm.txt
 python -m pip install --no-deps 'git+https://github.com/motional/nuplan-devkit.git@e9241677997dd86bfc0bcd44817ab04fe631405b'
 mkdir -p .deps
+# 如果该源码目录已存在，跳过 clone，继续核对固定版本和安装
 git clone https://github.com/autonomousvision/tuplan_garage.git .deps/tuplan_garage
 git -C .deps/tuplan_garage checkout b51d5d04fac1bd4389653b9ab2ff73ea88f435a3
 python -m pip install --no-deps -e .deps/tuplan_garage
+python -m pip check
 python -m carla_bridge.planning.pdm_planner --check
 python -m pytest carla_bridge/tests/test_pdm_planner.py carla_bridge/tests/test_pdm_selection.py -q
 ```

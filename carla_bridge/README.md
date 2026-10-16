@@ -5,6 +5,10 @@
 默认链路为语义决策 → PDM-Closed 候选规划 → Pure Pursuit + 速度曲线 PID 回控。
 支持通过 `--semantic-influence on|off` 做语义影响对照；安装依赖及使用方式见[第 13 节](#13-语义决策与-pdm-closed)。
 
+首次配置按顺序阅读：[第 5 节：新环境或已有环境安装](#5-环境搭建) →
+[第 12.0 节：生成与运行新场景](#120-从服务器开始生成场景再运行场景) →
+[第 12.6 节：记忆库模式完整命令](#126-新场景与记忆库模式完整命令)。
+
 > ⚠️ 研究用离线/仿真 Demo，**不可用于实车**。
 
 
@@ -337,16 +341,163 @@ carla_bridge/
 
 ## 5. 环境搭建
 
-CARLA 0.9.15 绑定需 Python 3.9，与记忆系统的 mulmem(3.12) 不兼容，故新建统一环境：
+本节面向 Linux x86_64 服务器，使用本项目选定的 **Python 3.9 + CARLA 0.9.15** 组合。
+环境名不是程序硬编码要求；下面统一使用 `mulmem_carla`，不要求额外创建 `mulmem_pdm`。
+离线 nuScenes 的 Python 3.12 环境和根目录通用安装步骤不用于此 CARLA/PDM 路径。
+
+### 5.1 取得代码，选择一种环境方式
+
+已经拉取仓库的用户只需进入仓库。全新机器先安装 Git、Conda，并准备 CARLA 0.9.15 服务端
+及 Town03/04/05/10HD 地图；`pip install carla` 只安装 Python 客户端，不安装仿真引擎和地图。
+首次克隆代码：
 
 ```bash
-bash carla_bridge/setup_env.sh
-# 完成后：conda activate mulmem_carla
+git clone --branch carla-integration \
+  https://github.com/Zhoujiajia824/Multi-level-Memory-System.git
+cd Multi-level-Memory-System
 ```
 
-脚本：建 `mulmem_carla`(3.9) -> 装 `requirements.txt` + `faiss-cpu==1.9.0` + `carla==0.9.15` -> 验证 `import carla, faiss, torch, transformers` 与 `OnlineDrivingLoop` 均可用。
+**方式 A：直接复用已有环境（你当前的使用方式）。** 不执行创建环境或重装 PyTorch：
 
-> mulmem(3.12) 保持不动，离线 nuScenes 流程照常在 mulmem 跑。
+```bash
+conda activate mulmem_carla
+python --version
+python -m pip freeze > /tmp/mulmem_carla_before_pdm.txt
+```
+
+接着进入 **5.3** 安装 PDM；已有有效 API Key、DINOv2 缓存和 CARLA 服务配置可继续使用。
+
+**方式 B：从空环境开始。** 只有环境尚不存在时才执行：
+
+```bash
+conda create -n mulmem_carla python=3.9 pip -y
+conda activate mulmem_carla
+python -m pip install --upgrade pip setuptools wheel
+```
+
+若已有同名环境但想独立安装，将创建和激活命令的名称都换成 `mulmem_pdm` 即可。
+后续步骤只依赖当前激活的环境，不依赖名称。
+
+### 5.2 仅新环境需要：安装驾驶与记忆系统基础依赖
+
+先安装配套 PyTorch/torchvision。以下使用 CUDA 12.6 构建，要求服务器驱动支持该运行时；
+先用 `nvidia-smi` 核对驱动环境。版本组合及其他构建见
+[PyTorch 官方历史版本命令](https://pytorch.org/get-started/previous-versions/#v280)。
+已有能运行 DINOv2 的 PyTorch 环境可以跳过这一步。
+
+```bash
+python -m pip install torch==2.8.0 torchvision==0.23.0 \
+  --index-url https://download.pytorch.org/whl/cu126
+
+python -m pip install \
+  "numpy==1.26.4" "opencv-python==4.10.0.84" \
+  "faiss-cpu==1.9.0" "carla==0.9.15" \
+  "pyyaml>=6,<7" "pydantic>=2,<3" "pillow>=10,<12" \
+  "tqdm>=4.66,<5" "transformers==4.57.6" \
+  "openai>=1.6,<3" "requests>=2.31,<3" "pytest>=7.4,<9"
+```
+
+这里按 CARLA 运行链路安装基础依赖，PDM 的数值/地图依赖在下一步补齐。
+不需要 nuScenes 数据集，也不需要安装 `nuscenes-devkit`。
+不要再叠加根目录 `requirements.txt` 或 `pip install -e .`：它们面向另一套离线流程，
+会引入不必要的依赖或不同的 Python 约束；本入口从仓库根目录直接运行。
+固定 NumPy/OpenCV 是为了与 PDM 的 NumPy `<2` 约束保持一致，避免未限定的新版 OpenCV 要求 NumPy 2。
+
+### 5.3 新旧环境都需要：安装固定版本 PDM
+
+以下会安装或调整当前激活环境中的依赖。已有环境保留 PyTorch，显式对齐 NumPy/OpenCV：
+
+```bash
+python -m pip install \
+  "numpy==1.26.4" "opencv-python==4.10.0.84" "pytest>=7.4,<9" \
+  -r carla_bridge/planning/requirements-pdm.txt
+
+python -m pip install --no-deps \
+  'git+https://github.com/motional/nuplan-devkit.git@e9241677997dd86bfc0bcd44817ab04fe631405b'
+
+mkdir -p .deps
+# 已有此目录时跳过 clone，继续核对固定版本和安装
+git clone https://github.com/autonomousvision/tuplan_garage.git .deps/tuplan_garage
+git -C .deps/tuplan_garage checkout b51d5d04fac1bd4389653b9ab2ff73ea88f435a3
+python -m pip install --no-deps -e .deps/tuplan_garage
+```
+
+每一步成功后再继续。tuplan 使用 editable 安装以保留其规划子模块；不要安装上游历史完整
+`requirements.txt`。PDM 不需要训练权重或 nuPlan 数据集。
+服务器不能访问 GitHub/PyPI 时，固定源码和对应 Linux/Python 版本 wheel 的离线转移方法见
+[PDM 依赖说明](planning/README.md#固定源码与安装)。Hugging Face 离线配置只处理 DINOv2，
+不能替代这些软件依赖的首次安装。
+
+### 5.4 环境预检、模型缓存和 API
+
+先检查软件依赖，再进行离线模型加载：
+
+```bash
+python -m pip check
+python -c "import carla, cv2, faiss, torch, transformers; from carla_bridge.closed_loop import ClosedLoop; print('CUDA:', torch.cuda.is_available()); print('IMPORT_OK')"
+python -m carla_bridge.planning.pdm_planner --check
+python -m pytest carla_bridge/tests -q -p no:cacheprovider
+```
+
+`--check` 核验 PDM 来源，不连接 CARLA 或模型 API。测试使用模拟场景接口，不能替代服务器真实驾驶。
+若 `pip check` 报已有包与 NumPy/Shapely 等冲突，保留输出定位，不将检查失败当作安装完成。
+这份流程未声称已在你的服务器新建环境完整安装并验收，需要执行上述检查确认。
+
+DINOv2 两种准备方式二选一：
+
+```bash
+# 服务器可访问 Hugging Face 时，首次下载
+python scripts/00_prepare_models.py --download
+
+# 服务器不可访问 Hugging Face 时，先上传完整缓存，再离线验证
+python scripts/00_prepare_models.py --offline
+```
+
+默认缓存是仓库 `.cache/huggingface`。缓存结构及异地路径参数见本文顶部“检查手工上传的 DINOv2 缓存”。
+独立模型目录可用 `python scripts/00_prepare_models.py --offline --model-dir /实际路径/dinov2`；
+此后驾驶命令也要添加同一个 `--dinov2-model-dir /实际路径/dinov2`。
+
+核对 `config/api_models.yaml` 中场景理解与决策模型的服务地址、模型名和 `api_key_env`。
+默认密钥变量可以在 Bash 当前终端中隐藏输入：
+
+```bash
+read -rsp "请输入 DASHSCOPE_API_KEY: " DASHSCOPE_API_KEY
+echo
+export DASHSCOPE_API_KEY
+```
+
+默认入口不会自动读取 `.env`，新终端需要重新设置或沿用你已有的环境变量管理方式。
+模型缓存离线不意味着 VLM API 也离线；模型调用仍需访问配置的服务。
+
+### 5.5 连接仿真器，再进入新场景实验
+
+在另一终端沿用现有部署启动 CARLA；全新服务器安装好引擎后，可将下面路径替换为实际安装目录：
+
+```bash
+cd /实际安装路径/CARLA_0.9.15
+./CarlaUE4.sh -RenderOffScreen -quality-level=Epic -carla-rpc-port=2000
+```
+
+示例固定为 Epic 画质；各实验组保持相同画质设置。离屏渲染仍提供相机图像，
+不要启用会使相机返回空数据的 `no_rendering_mode`，见
+[CARLA 渲染说明](https://carla.readthedocs.io/en/0.9.15/adv_rendering_options/)。
+
+回到已激活 Python 环境的仓库终端验证：
+
+```bash
+python - <<'PY'
+import carla
+client = carla.Client("127.0.0.1", 2000)
+client.set_timeout(120.0)
+print("客户端:", client.get_client_version())
+print("服务端:", client.get_server_version())
+print("地图:", sorted(client.get_available_maps()))
+PY
+```
+
+版本一致且所需地图齐全后，继续 [12.0 的 prepare 和首轮驾驶命令](#120-从服务器开始生成场景再运行场景)，
+再选择 [12.6 的记忆库方式](#126-新场景与记忆库模式完整命令)。
+历史 `setup_env.sh` 仍是旧基础环境脚本，未包含完整 PDM 安装，不作为本节流程的替代。
 
 ---
 
@@ -550,11 +701,11 @@ CARLA 全局：x 前、y 右、z 上。项目 ego-centric：x 前、**y 左**。
 这些生成文件位于被 Git 忽略的 `outputs/`，因此仅 `git pull` 不会得到它们。
 
 以下命令在服务器 Bash 中执行。首次使用 PDM 先完成
-[固定版本依赖安装](planning/README.md#固定源码与安装)，后续只需激活已有环境：
+[第 5 节安装](#5-环境搭建)，后续只需激活已有环境：
 
 ```bash
 cd /data/zjj/code/vlm_memory_system/Multi-level-Memory-System
-conda activate mulmem_pdm
+conda activate mulmem_carla
 python -m carla_bridge.planning.pdm_planner --check
 python -m carla_bridge.paper_suite list
 ```
@@ -645,7 +796,7 @@ python -m carla_bridge.paper_suite list
 新代码同步到服务器后，保持 CARLA 服务启动，**停止正在运行的闭环任务**，再准备：
 
 ```bash
-conda activate mulmem_pdm
+conda activate mulmem_carla
 python -m carla_bridge.paper_suite prepare --output outputs/paper_v1
 ```
 
@@ -818,6 +969,122 @@ python -m carla_bridge.paper_suite summarize \
 `planner.jsonl`、`decisions_*.jsonl`、`carla_run_*.json` 和本节保存的控制台日志；
 轨迹/变道表现有问题时附上该轮视频。准备阶段失败则提供 `prepare` 完整错误输出，
 此时没有运行结果目录是正常的。
+
+### 12.6 新场景与记忆库模式完整命令
+
+先完成 `prepare`。以下 Bash 变量只是减少重复输入，在执行命令的同一终端定义：
+
+```bash
+SCENE_TRAIN=outputs/paper_v1/train/L05_crossing_train_s11.yaml
+SCENE_EVAL=outputs/paper_v1/eval/L05_crossing_eval_s101.yaml
+BANK_GENERAL=outputs/memory_banks/paper_v1/train_general
+BANK_CROSSING=outputs/memory_banks/paper_v1/train_crossing
+```
+
+| 需求 | 场景划分 | 参数 | 是否修改持久库 | 本轮短期上下文 |
+|---|---|---|---|---|
+| 本轮从空库开始 | train | 不传 `--memory-bank` | 写入本轮独立库 | 开启 |
+| 多轮持续积累通用库 | train | 相同库路径 + `read_write` | 是 | 开启 |
+| 指定场景专用库 | train/eval | 明确传入专用库路径 | 由 access 决定 | 默认开启 |
+| 只检索已有库 | eval | 已有库 + `read_only` | 否 | 开启 |
+| 只积累、不检索历史 | train | `read_write --no-memory-retrieval` | 是 | 默认开启，可关闭 |
+| 只用持久记忆、去掉短期 | eval | `read_only --no-short-term` | 否 | 关闭 |
+| 去掉持久记忆检索、保留短期 | eval | `read_only --no-memory-retrieval` | 否 | 开启 |
+| 从已有库复制后独立积累 | train | `--memory-seed` + 不存在的目标库 | 只修改新库 | 开启 |
+| 无记忆对照 | train/eval | `--mode memory_off` | 不读不写 | 关闭 |
+
+这里的检索开关针对中长期记忆检索；固定长期规则仍受原有 `long_term` 配置控制。
+场景名不会自动决定使用哪个库，指定库不会自动筛选该库内部的某一种场景记录。
+想得到专用库，应从空目录开始，只在对应训练场景向该库积累。
+
+**本轮独立库：** 默认从空库开始，产物及记忆保存在本轮运行目录。重复执行会创建新库，不会续写上一轮。
+
+```bash
+python -m carla_bridge.run_carla_demo \
+  --scenario "$SCENE_TRAIN" --planner pdm_closed --semantic-influence on \
+  --mode memory_on
+```
+
+**持续积累通用库：** 相同路径会加载历史并继续积累。换成其他 `train` YAML 或 seed 22/33，仍使用同一路径。
+
+```bash
+python -m carla_bridge.run_carla_demo \
+  --scenario "$SCENE_TRAIN" --planner pdm_closed --semantic-influence on \
+  --mode memory_on --memory-bank "$BANK_GENERAL" --memory-access read_write
+```
+
+**单独积累横穿行人专用库：** 该库与通用库独立；重复此命令或更换对应训练 seed 可以续写。
+
+```bash
+python -m carla_bridge.run_carla_demo \
+  --scenario "$SCENE_TRAIN" --planner pdm_closed --semantic-influence on \
+  --mode memory_on --memory-bank "$BANK_CROSSING" --memory-access read_write
+```
+
+**只检索已有专用库，不增加记忆：** 必须先完成上面的积累。只读模式不写回条目、淘汰结果或检索统计，
+但仍维护本轮短期上下文，并正常写运行日志、图像和报告。
+
+```bash
+python -m carla_bridge.run_carla_demo \
+  --scenario "$SCENE_EVAL" --planner pdm_closed --semantic-influence on \
+  --mode memory_on --memory-bank "$BANK_CROSSING" --memory-access read_only
+```
+
+**只积累、不使用历史检索或本轮短期上下文：** 如需保留短期上下文，删除 `--no-short-term`。
+为续写保留旧条目，程序仍会加载已有库；“不检索”不等于“删除旧库”。
+
+```bash
+python -m carla_bridge.run_carla_demo \
+  --scenario "$SCENE_TRAIN" --planner pdm_closed --semantic-influence on \
+  --mode memory_on --memory-bank "$BANK_GENERAL" --memory-access read_write \
+  --no-memory-retrieval --no-short-term
+```
+
+**持久记忆与短期上下文的分别对照：** 两轮都读取同一冻结库，不新增记忆。
+
+```bash
+# 保留持久记忆检索，关闭短期上下文
+python -m carla_bridge.run_carla_demo \
+  --scenario "$SCENE_EVAL" --planner pdm_closed --semantic-influence on \
+  --mode memory_on --memory-bank "$BANK_CROSSING" --memory-access read_only \
+  --no-short-term
+
+# 保留短期上下文，关闭持久记忆检索
+python -m carla_bridge.run_carla_demo \
+  --scenario "$SCENE_EVAL" --planner pdm_closed --semantic-influence on \
+  --mode memory_on --memory-bank "$BANK_CROSSING" --memory-access read_only \
+  --no-memory-retrieval
+```
+
+**复制历史库做独立积累实验：** 源库保持不变；目标目录必须不存在，也不能与源目录相互包含。
+下例首次复制后继续积累；后续续写目标库时去掉 `--memory-seed`。
+
+```bash
+python -m carla_bridge.run_carla_demo \
+  --scenario "$SCENE_TRAIN" --planner pdm_closed --semantic-influence on \
+  --mode memory_on --memory-seed "$BANK_CROSSING" \
+  --memory-bank outputs/memory_banks/paper_v1/crossing_experiment_a \
+  --memory-access read_write
+```
+
+**无记忆基线：** 不能再同时指定 `--memory-bank` 或 `--memory-seed`。
+
+```bash
+python -m carla_bridge.run_carla_demo \
+  --scenario "$SCENE_EVAL" --planner pdm_closed --semantic-influence on \
+  --mode memory_off
+```
+
+语义开关与上述记忆模式独立。将同一条评估命令的 `--semantic-influence on` 改为 `off`，
+即可组成“有/无记忆 × 有/无语义评分”四组；`off` 保留模型调用及共同的解析失败制动规则。
+四组应使用相同场景 YAML、seed、规划参数和冻结库快照，并保留重复试验及失败记录。
+不要使用 eval 场景写库，也不要在只读对照之间继续更新训练库。
+
+记忆准入存在价值门控，不保证每帧都入库；被规划/校验拒绝的决策不进入中期或事件记忆。
+检查决策 JSONL 的 `memory_retrieval_enabled`、`memory_write_enabled`、`retrieved_memory_ids`，
+以及 manifest 的 `memory_bank`、`memory_access` 和 `config.memory_access` 确认实际模式。
+同一库由进程锁串行访问；备份或迁移时保留整个库目录和 `assets/`，
+旧库若引用外部图像/特征还需保留这些文件，或用 `--memory-seed` 将可用资料复制入新库。
 
 ## 13. 语义决策与 PDM-Closed
 

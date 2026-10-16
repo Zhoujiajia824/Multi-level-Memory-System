@@ -17,9 +17,14 @@
 由官方 PDM-Closed 核心的 CARLA 适配层生成、仿真和评分候选轨迹，再用 Pure Pursuit + PID 回控。
 默认 10 Hz 控制、0.2 秒 PDM 规划、3 秒语义推理；VLM 推理期间同步仿真暂停。
 首次使用需安装额外 PDM 依赖，见 [PDM 接入与消融](carla_bridge/README.md#13-语义决策与-pdm-closed)。
+**从零安装 CARLA/PDM 环境**或直接为现有 `mulmem_carla` 补装依赖，请按
+[CARLA 环境搭建第 5 节](carla_bridge/README.md#5-环境搭建) 执行，包含基础依赖、PDM 固定版本、
+DINOv2 离线缓存、API、仿真器连接及预检。下文离线 nuScenes 的 Python 3.12 安装不用于此入口。
 新建的大地图常规/长尾场景需先在服务器生成，再传入场景 YAML 路径运行，完整命令见
 [新场景服务器操作步骤](carla_bridge/README.md#120-从服务器开始生成场景再运行场景)，
 包括语义 on/off、记忆库积累/只读以及顺序批量实验。
+持续积累、场景专用库、只检索不写入、只积累不检索、短期消融和复制历史库的完整命令见
+[新场景与记忆库模式](carla_bridge/README.md#126-新场景与记忆库模式完整命令)。
 `--semantic-influence on|off` 控制语义是否影响候选选择；`--planner vlm_trajectory` 可运行旧轨迹输出路径。
 
 闭环入口支持：
