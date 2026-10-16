@@ -123,6 +123,8 @@ class TrafficSpawner:
             loc = self._navigation_location()
             if loc is None or loc.distance(ego_loc) > radius:
                 continue
+            if self.strict and any(loc.distance(site) <= 8 for site in self.reserved_locations):
+                continue
             target = self._navigation_location(away_from=loc)
             if target is None:
                 continue

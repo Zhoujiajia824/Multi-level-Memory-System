@@ -56,6 +56,18 @@ def test_ai_walkers_use_navigation_and_start_after_snapshot():
     world.get_random_location_from_street.assert_not_called()
 
 
+def test_paper_background_walkers_do_not_spawn_at_reserved_event_sites():
+    spawner, world, events = traffic_fixture()
+    spawner.strict = True
+    spawner.reserved_locations = [carla.Location(x=10)]
+    walker, controller = actor("walker", events), actor("controller", events)
+    world.get_random_location_from_navigation.side_effect = [
+        carla.Location(x=10), carla.Location(x=17), carla.Location(x=25), carla.Location(x=35)]
+    world.spawn_actor.side_effect = [walker, controller]
+    assert spawner.spawn_walkers(1) == 1
+    assert world.spawn_actor.call_args_list[0].args[1].location.x == 25
+
+
 def test_partial_controller_spawn_rolls_back_registered_walker():
     spawner, world, events = traffic_fixture()
     walker = actor("walker", events)

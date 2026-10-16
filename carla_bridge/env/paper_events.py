@@ -46,11 +46,22 @@ class PaperEventScheduler:
                                      carla.Rotation(yaw=p["yaw"]))
             else:
                 raise ValueError(f"unsupported paper event: {spec['type']}")
-            actor = self.world.try_spawn_actor(bp, tf)
+            record.update(blueprint=bp.id,
+                          spawn={"x": tf.location.x, "y": tf.location.y, "z": tf.location.z})
+            try:
+                # Unlike try_spawn_actor, this preserves CARLA's failure reason
+                # (e.g. collision at the fixed pose) for reproducible debugging.
+                actor = self.world.spawn_actor(bp, tf)
+            except RuntimeError as exc:
+                record.update(state="failed", error="actor_spawn_failed", spawn_error=str(exc))
+                self._write_journal()
+                raise RuntimeError(f"paper event {spec['id']} spawn failed at {record['spawn']} "
+                                   f"using {bp.id}: {exc}; case is invalid") from exc
             if actor is None:
                 record.update(state="failed", error="actor_spawn_failed")
                 self._write_journal()
-                raise RuntimeError(f"paper event {spec['id']} spawn failed; case is invalid")
+                raise RuntimeError(f"paper event {spec['id']} spawn failed at {record['spawn']} "
+                                   f"using {bp.id}; case is invalid")
             self.actors[spec["id"]] = actor
             record.update(state="waiting", spawned=True, actor_id=actor.id,
                           blueprint=bp.id, spawn={"x": tf.location.x, "y": tf.location.y, "z": tf.location.z})

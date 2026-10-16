@@ -111,7 +111,7 @@ def scheduler_fixture(case_id="L05_crossing_train_s11"):
         actor.destroy.return_value = True
         spawned.append(actor)
         return actor
-    world.try_spawn_actor.side_effect = spawn
+    world.spawn_actor.side_effect = spawn
     scheduler = PaperEventScheduler(world, ego, route, cfg["events"], elapsed=lambda: 12.0)
     return scheduler, world, route, spawned
 
@@ -155,13 +155,29 @@ def test_missing_event_actor_is_failure_not_successful_trigger():
 
 def test_partial_setup_failure_retains_prior_actor_for_cleanup():
     scheduler, world, _, actors = scheduler_fixture("C05_crossing_blocked_train_s11")
-    spawn = world.try_spawn_actor.side_effect
-    world.try_spawn_actor.side_effect = lambda bp, tf: spawn(bp, tf) if not actors else None
+    spawn = world.spawn_actor.side_effect
+    world.spawn_actor.side_effect = lambda bp, tf: spawn(bp, tf) if not actors else None
     with pytest.raises(RuntimeError, match="invalid"):
         scheduler.setup()
     assert scheduler.destroy()
     actors[0].destroy.assert_called_once()
     assert scheduler.has_failed()
+
+
+def test_event_spawn_failure_preserves_native_reason_and_frozen_pose(tmp_path):
+    scheduler, world, _, _ = scheduler_fixture()
+    scheduler.audit_path = tmp_path / "events.json"
+    world.spawn_actor.side_effect = RuntimeError("Spawn failed because of collision at spawn position")
+    with pytest.raises(RuntimeError, match="collision at spawn position"):
+        scheduler.setup()
+    record = scheduler.summary()["events"][0]
+    assert record["state"] == "failed"
+    assert not record["spawned"]
+    assert record["spawn"] == pytest.approx(scheduler.events[0]["start"])
+    assert record["blueprint"] == "walker.pedestrian.0001"
+    assert "collision" in record["spawn_error"]
+    assert scheduler.audit_path.exists()
+    world.spawn_actor.assert_called_once()  # Never silently relocate a frozen event.
 
 
 def test_route_completion_with_unexecuted_event_is_invalid_experiment():
