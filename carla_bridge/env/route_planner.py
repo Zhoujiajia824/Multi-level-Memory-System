@@ -41,6 +41,8 @@ class RoutePlanner:
         self.ego = ego_vehicle
         self.map = world.get_map()
         self._route: List[carla.Location] = []
+        self._route_waypoints = None
+        self._waypoint_resolution = None
         self._options: List[str] = []  # 导航语义列表（A* 模式）
         # walk-forward 回退用
         self._turns: List[str] = []
@@ -83,9 +85,13 @@ class RoutePlanner:
         if start_wp is None or end_wp is None:
             logger.warning("A* 起终点投影到路面失败，路由为空")
             self._route, self._options = [], []
+            self._route_waypoints = None
+            self._waypoint_resolution = None
             return []
         wps, options = self._astar_search(start_wp, end_wp, step)
         self._route = [wp.transform.location for wp in wps]
+        self._route_waypoints = wps
+        self._waypoint_resolution = {"method": "native_astar", "point_count": len(wps)}
         self._options = options
         self._mode = "astar"
         logger.info(
@@ -184,10 +190,13 @@ class RoutePlanner:
 
     def _plan_walk_forward(self, length_m, turns, step_m) -> List[carla.Location]:
         self._turns = list(turns)
+        self._route_waypoints = None
+        self._waypoint_resolution = None
         start = self.map.get_waypoint(self.ego.get_location(), project_to_road=True)
         if start is None:
             return []
         route: List[carla.Location] = []
+        route_waypoints = []
         junctions: List[int] = []
         wp = start
         traveled = 0.0
@@ -196,6 +205,7 @@ class RoutePlanner:
         choice = "straight"
         while traveled < length_m:
             route.append(wp.transform.location)
+            route_waypoints.append(wp)
             nxt = wp.next(step_m)
             if not nxt:
                 break
@@ -213,7 +223,10 @@ class RoutePlanner:
             traveled += step_m
         if not route or route[-1].distance(wp.transform.location) > 1e-3:
             route.append(wp.transform.location)
+            route_waypoints.append(wp)
         self._route = route
+        self._route_waypoints = route_waypoints
+        self._waypoint_resolution = {"method": "native_walk", "point_count": len(route_waypoints)}
         self._junction_indices = junctions
         self._options = []
         self._mode = "walk"
@@ -315,16 +328,18 @@ class RoutePlanner:
 
     def load_fixed_points(self, points) -> None:
         """Use a server-prepared route unchanged across experimental conditions."""
+        from carla_bridge.planning.route_waypoints import resolve_route_waypoints
         self._route = [carla.Location(x=p["x"], y=p["y"], z=p["z"]) for p in points]
         self._progress = RouteProgress(self._route, self._completion_tolerance_m, self._tracking_tolerance_m)
         self._progress.update(self.ego.get_location())
         self._mode = "astar"
         self._options = []
-        for i, p in enumerate(self._route):
-            current = self.map.get_waypoint(p, project_to_road=True)
-            ahead = self.map.get_waypoint(self._route[min(i + 5, len(self._route) - 1)], project_to_road=True)
-            if current is None or ahead is None:
-                raise ValueError("prepared route does not match the loaded map")
+        # Retain topology through overlapping junction connections. Independent
+        # nearest-point projection can silently switch to a different branch.
+        self._route_waypoints, self._waypoint_resolution = resolve_route_waypoints(self.map, self._route)
+        for i in range(len(self._route)):
+            current = self._route_waypoints[i]
+            ahead = self._route_waypoints[min(i + 5, len(self._route) - 1)]
             self._options.append(self._infer_nav(coords.carla_yaw_deg_to_rad(current.transform.rotation.yaw), ahead)
                                  if current.is_junction or ahead.is_junction else NAV_LANE_FOLLOW)
 

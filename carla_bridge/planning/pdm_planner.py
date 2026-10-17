@@ -118,8 +118,19 @@ def _junction_lane_match(reference, closest, origin, heading, height):
             if length2 < 1e-6:
                 continue
             u = float((origin - _xy(a)) @ delta / length2)
-            if not 0.0 <= u <= 1.0:
-                continue
+            if u < 0.0:
+                previous = _adjacent(reference[i - 1], side) if i > 0 else None
+                if previous is None or not _connected(previous, a):
+                    continue
+            elif u > 1.0:
+                following = _adjacent(reference[i + 2], side) if i + 2 < len(reference) else None
+                if following is None or not _connected(b, following):
+                    continue
+            # At the outer side of a polyline bend, both perpendicular feet
+            # can fall beyond their respective segments. The shared internal
+            # vertex still belongs to the connected lane; real endpoints do
+            # not receive this allowance. Containment/direction limits remain.
+            u = float(np.clip(u, 0.0, 1.0))
             offset = float(np.linalg.norm(origin - (_xy(a) + u * delta)))
             route_heading = math.atan2(delta[1], delta[0])
             height_error = abs(height - ((1 - u) * a.transform.location.z + u * b.transform.location.z))
@@ -150,6 +161,31 @@ def _path_states(points, api, first_heading=None):
     if first_heading is not None:
         yaw[0] = first_heading
     return [api.StateSE2(float(p[0]), float(p[1]), float(h)) for p, h in zip(points, yaw)]
+
+
+def _lane_path_points(waypoints):
+    """Continuous map tangents for planning, without moving route checkpoints.
+
+    A two-metre polyline changes tangent abruptly at each bend vertex. Feeding
+    that chord tangent into pose recovery amplifies sampling error and makes
+    repeated replans depend on which side of a vertex ego happens to project.
+    Interpolate only between connected map samples, using their actual heading.
+    Road safety is still checked against independently constructed lane surfaces.
+    """
+    from scipy.interpolate import CubicHermiteSpline
+    points = np.array([_xy(wp) for wp in waypoints])
+    if len(points) < 2:
+        raise ValueError("Reference path has fewer than two waypoints")
+    keep = np.r_[True, np.linalg.norm(np.diff(points, axis=0), axis=1) > 1e-4]
+    headings = np.array([_heading(wp) for wp in waypoints])[keep]
+    points = points[keep]
+    if len(points) < 2:
+        raise ValueError("Reference path has fewer than two distinct waypoints")
+    stations = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))]
+    tangents = np.column_stack((np.cos(headings), np.sin(headings)))
+    curve = CubicHermiteSpline(stations, points, tangents, axis=0)
+    samples = np.unique(np.r_[stations, np.arange(0.0, stations[-1], 0.25)])
+    return curve(samples)
 
 
 def _smooth_path(points, rear, heading, api, transition_m):
@@ -217,6 +253,10 @@ class CarlaPDMPlanner:
         self._previous_plan = None
         self._continuity_reference = None
         self._continuity_timestamp = None
+        self._reference_route_source = None
+        self._resolved_route_waypoints = None
+        self._route_resolution = None
+        self._junction_area_cache = {}
         for name, value in (("horizon_s", self.horizon), ("max_speed_mps", self.max_speed),
                             ("map_radius_m", self.map_radius), ("lane_change_length_m", self.transition_m)):
             if not math.isfinite(value) or value <= 0:
@@ -234,6 +274,14 @@ class CarlaPDMPlanner:
         self.scorer = self.api.PDMScorer(self.sampling)
         self.emergency = self.api.PDMEmergencyBrake(self.sampling)
         self.vehicle_parameters = self._vehicle_parameters()
+        # Upstream resets only the bicycle's vehicle per rollout. Its LQR
+        # otherwise retains the default Pacifica wheelbase and its bicycle
+        # keeps a 60-degree steering limit. Bind both official components to
+        # this CARLA vehicle so the controller and simulated plant agree.
+        self.simulator._tracker = self.api.BatchLQRTracker(
+            vehicle=self.vehicle_parameters, discretization_time=self.dt)
+        self.simulator._motion_model = self.api.BatchKinematicBicycleModel(
+            vehicle=self.vehicle_parameters, max_steering_angle=self.max_steer)
         self.provenance = dict(self.api.provenance)
 
     def _vehicle_parameters(self):
@@ -285,17 +333,24 @@ class CarlaPDMPlanner:
         return state, tf
 
     def _reference_waypoints(self):
-        import carla
+        from .route_waypoints import resolve_route_waypoints
         location = self.ego.get_location()
         raw = self.route._route
+        if (self._reference_route_source is not raw or self._resolved_route_waypoints is None
+                or len(self._resolved_route_waypoints) != len(raw)):
+            retained = getattr(self.route, "_route_waypoints", None)
+            if retained is not None and len(retained) == len(raw):
+                self._resolved_route_waypoints = list(retained)
+                self._route_resolution = getattr(self.route, "_waypoint_resolution", None)
+            else:
+                self._resolved_route_waypoints, self._route_resolution = resolve_route_waypoints(self.map, raw)
+            self._reference_route_source = raw
+        self._geometry_diagnostics["reference_resolution"] = self._route_resolution
         index = self.route._nearest_index(location)
         start = max(0, index - 6)
         points, travelled = [], 0.0
         span = max(55.0, self.max_speed * self.horizon + self.transition_m + 10)
-        for p in raw[start:]:
-            wp = self.map.get_waypoint(p, project_to_road=True, lane_type=carla.LaneType.Driving)
-            if wp is None:
-                raise ValueError("Route is not on a CARLA driving lane")
+        for wp in self._resolved_route_waypoints[start:]:
             if points:
                 travelled += float(np.linalg.norm(_xy(wp) - _xy(points[-1])))
             points.append(wp)
@@ -401,6 +456,15 @@ class CarlaPDMPlanner:
         if not polygons:
             raise ValueError("No usable CARLA road polygons")
         lane_dict = {key: SimpleNamespace(polygon=poly) for key, poly in polygons.items() if key in on_route_keys}
+        # The route is only one corridor through the intersection. A vehicle's
+        # corners can legally pass over other real junction connections while
+        # turning. Include their actual surfaces without making them route
+        # targets or granting lane-change permission.
+        from .junction_area import junction_driving_polygons
+        junction_polygons, junction_info = junction_driving_polygons(reference, cache=self._junction_area_cache)
+        self._geometry_diagnostics["junction_drivable_area"] = junction_info
+        for key, polygon in junction_polygons.items():
+            polygons[key] = polygons[key].union(polygon) if key in polygons else polygon
         occupancy = self.api.PDMOccupancyMap(list(polygons), np.array(list(polygons.values()), dtype=object))
 
         paths, metadata, excluded = [], [], {}
@@ -410,6 +474,12 @@ class CarlaPDMPlanner:
             reason = None
             corridor, cut = _lane_corridor(reference, closest, side, progress)
             details = path_details[side] = {"cut": cut}
+            if side == "center" and cut is not None:
+                # A prepared reference must be a connected route. Treat losing
+                # its topology as a map/route error, not an invisible stop line
+                # that IDM can accept indefinitely as a planned stop.
+                raise ValueError("Reference route is disconnected at index %s: %s" %
+                                 (cut.get("reference_index"), cut.get("reason")))
             # A change of two lanes is never a candidate.
             if current_side != "center" and side not in (current_side, "center"):
                 reason = "would_cross_two_lanes"
@@ -477,14 +547,26 @@ class CarlaPDMPlanner:
             else:
                 label = "CHANGE_LANE_" + side.upper()
                 semantics = [label]
+            # Following a lane needs local pose recovery. Carrying a small
+            # tracking error through a 30-m lane-change blend can push the
+            # outgoing footprint over a curb in a short-radius turn. Use two
+            # wheelbases / two seconds of current travel for same-lane recovery;
+            # actual lane changes keep the configured full transition distance.
+            transition = self.transition_m
+            if side == current_side:
+                transition = min(transition, max(2 * self.vehicle_parameters.wheel_base,
+                                                  2 * ego_state.dynamic_car_state.speed))
+            details["path_kind"] = "lane_follow" if side == current_side else "lane_change"
+            details["transition_length_m"] = float(transition)
             try:
-                path = _smooth_path([_xy(wp) for wp in corridor], rear,
-                                    ego_state.rear_axle.heading, self.api, self.transition_m)
+                path = _smooth_path(_lane_path_points(corridor), rear,
+                                    ego_state.rear_axle.heading, self.api, transition)
             except ValueError as exc:
                 excluded[side] = "insufficient_path_ahead"
                 details["error"] = str(exc)
                 continue
             paths.append(path)
+            details["path_length_m"] = float(path.length)
             metadata.append({"id": side, "label": label, "semantics": sorted(set(semantics)),
                              "route_recovery_required": recovery_required})
         if not paths:
@@ -658,6 +740,12 @@ class CarlaPDMPlanner:
                       "traffic_light": traffic_safe, "finite": finite}
             if initial_collisions:
                 safety["no_collision"] = 0.0
+            offroad_steps = np.flatnonzero(self.scorer._ego_areas[index, :, self.api.EgoAreaIndex.NON_DRIVABLE_AREA])
+            first_offroad = int(offroad_steps[0]) if len(offroad_steps) else None
+            area_failure = None
+            if first_offroad is not None and finite:
+                area_failure = {"time_s": first_offroad * self.dt,
+                                "footprint_corners_xy": self.scorer._ego_coords[index, first_offroad, :4].tolist()}
             collision_time = float(self.scorer.time_to_at_fault_collision(index))
             ttc_time = float(self.scorer.time_to_ttc_infraction(index))
             candidates.append({"id": "%s:%s" % (lat["id"], longitudinal[proposal.longitudinal_idx]),
@@ -671,6 +759,7 @@ class CarlaPDMPlanner:
                                "continuity_cost": float(costs[index]),
                                "predicted_collision_time_s": collision_time if math.isfinite(collision_time) else None,
                                "predicted_ttc_infraction_time_s": ttc_time if math.isfinite(ttc_time) else None,
+                               "drivable_area_failure": area_failure,
                                "speed_at_0_2s_mps": float(profile[2]) if finite else None,
                                "acceleration_range_mps2": [float(np.min(np.diff(profile) / self.dt)),
                                                             float(np.max(np.diff(profile) / self.dt))] if finite else None,
@@ -691,6 +780,12 @@ class CarlaPDMPlanner:
                                    for actor in actors.tracked_objects.tracked_objects],
                            initial_collision_tokens=initial_collisions,
                            vehicle={"wheelbase_m": self.vehicle_parameters.wheel_base,
+                                    "max_steer_rad": self.max_steer,
+                                    "width_m": self.vehicle_parameters.width,
+                                    "length_m": self.vehicle_parameters.length,
+                                    "bounding_box_offset_xyz": [
+                                        self.ego.bounding_box.location.x, self.ego.bounding_box.location.y,
+                                        self.ego.bounding_box.location.z],
                                     "rear_axle_to_center_m": self.vehicle_parameters.rear_axle_to_center})
         # Run the upstream detector against the selected candidate. Its brake
         # output is an emergency signal; CARLA performs a direct full brake.

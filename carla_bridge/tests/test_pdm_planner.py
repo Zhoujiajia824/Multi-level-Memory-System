@@ -117,6 +117,16 @@ def test_real_core_sources_and_coordinates():
     assert result.accepted, result.to_dict()
 
 
+def test_rollout_tracker_and_bicycle_share_actual_carla_vehicle_geometry():
+    planner = make_planner()
+    assert planner.simulator._tracker._wheel_base == pytest.approx(planner.vehicle_parameters.wheel_base)
+    assert planner.simulator._motion_model._vehicle is planner.vehicle_parameters
+    assert planner.simulator._motion_model._max_steering_angle == pytest.approx(planner.max_steer)
+    planner.plan(semantic())
+    assert planner.simulator._tracker._wheel_base == pytest.approx(2.8)
+    assert planner.simulator._motion_model._max_steering_angle == pytest.approx(math.radians(40))
+
+
 def test_real_core_stop_ablation_changes_choice_only():
     planner = make_planner()
     on = planner.plan(semantic("STOP"), semantic_enabled=True)

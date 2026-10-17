@@ -79,6 +79,8 @@ def load_dependencies():
             "PDMGenerator": "proposal.pdm_generator",
             "PDMProposalManager": "proposal.pdm_proposal",
             "PDMSimulator": "simulation.pdm_simulator",
+            "BatchLQRTracker": "simulation.batch_lqr",
+            "BatchKinematicBicycleModel": "simulation.batch_kinematic_bicycle",
             "PDMScorer": "scoring.pdm_scorer",
             "PDMObservation": "observation.pdm_observation",
             "PDMOccupancyMap": "observation.pdm_occupancy_map",
@@ -87,6 +89,7 @@ def load_dependencies():
             "MultiMetricIndex": "utils.pdm_enums",
             "WeightedMetricIndex": "utils.pdm_enums",
             "StateIndex": "utils.pdm_enums",
+            "EgoAreaIndex": "utils.pdm_enums",
         }.items():
             modules[name] = PDM_ROOT + "." + suffix
         values = {name: getattr(import_module(module), name) for name, module in modules.items()}
@@ -97,7 +100,7 @@ def load_dependencies():
             "nuplan_repository": "https://github.com/motional/nuplan-devkit",
             "nuplan_expected_commit": NUPLAN_COMMIT,
             "shapely_version": shapely.__version__,
-            "adapter_version": 2,
+            "adapter_version": 3,
         }
         values["provenance"].update(_verify_sources())
         for distribution, package in (("tuplan-garage", "tuplan_garage"), ("nuplan-devkit", "nuplan")):

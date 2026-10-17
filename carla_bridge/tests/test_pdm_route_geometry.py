@@ -126,3 +126,77 @@ def test_ambiguous_overlapping_route_lanes_fail_closed(monkeypatch):
     side, evidence = _junction_lane_match(reference, 6, np.array([12.1, 0.0]), 0, 0.2)
     assert side is None
     assert {"left", "center"} <= set(evidence["matches"])
+
+
+def test_disconnected_prepared_reference_reports_error_instead_of_virtual_stop():
+    from carla_bridge.planning.pdm_planner import RoadGeometryError
+    from carla_bridge.tests.test_pdm_planner import make_planner, semantic
+    planner = make_planner()
+    retained = [planner.map.get_waypoint(point) for point in planner.route._route]
+    retained[3].road_id = 999  # Geometrically close, but not a real successor.
+    planner.route._route_waypoints = retained
+    with pytest.raises(RoadGeometryError, match="Reference route is disconnected") as failure:
+        planner.plan(semantic("YIELD"))
+    details = failure.value.diagnostics
+    assert details["failure_reason"] == "road_geometry_error"
+    assert details["geometry"]["lateral_paths"]["center"]["cut"]["reason"] == "disconnected_lane_successor"
+
+
+def test_actual_offroad_footprint_reports_first_failed_corners():
+    from carla_bridge.tests.test_pdm_planner import make_planner, semantic
+    planner = make_planner()
+    planner.ego.y = 5.0  # Center still in the outer lane, body crosses its edge.
+    plan = planner.plan(semantic("YIELD"))
+    assert not plan["trajectory"]
+    for candidate in plan["planner_diagnostics"]["candidates"]:
+        assert candidate["safety"]["drivable_area"] == 0
+        failure = candidate["drivable_area_failure"]
+        assert failure["time_s"] == 0
+        assert len(failure["footprint_corners_xy"]) == 4
+        assert any(y < -5.25 for x, y in failure["footprint_corners_xy"])
+
+
+@pytest.mark.parametrize("point,expected", [((.05, -.5), "center"),
+    ((.05, -2.0), None), ((-2.1, 0), None), ((2.1, .765), None)])
+def test_junction_internal_vertex_has_no_projection_gap_but_endpoints_stay_bounded(point, expected):
+    road = OverlappingJunctionRoad()
+    reference = []
+    for x, y, yaw in [(-2, 0, 0), (0, 0, 10), (2, .728, 20)]:
+        wp = EndingWaypoint(road, x)
+        wp.is_junction = True
+        wp.transform = carla.Transform(carla.Location(x=x, y=-y), carla.Rotation(yaw=-yaw))
+        wp.get_left_lane = wp.get_right_lane = lambda: None
+        reference.append(wp)
+    side, evidence = _junction_lane_match(reference, 1, np.array(point), math.radians(10), 0)
+    assert side == expected
+    if side:
+        assert evidence["matches"][side]["offset_m"] == pytest.approx(math.hypot(*point))
+
+
+def test_curved_map_reference_preserves_checkpoints_and_continuous_tangent():
+    from carla_bridge.planning.pdm_planner import _lane_path_points
+    angles = np.radians([0, 15, 30, 45, 60, 75, 90])
+    reference = [NS(transform=carla.Transform(
+        carla.Location(x=8 * math.sin(a), y=8 * (1 - math.cos(a))),
+        carla.Rotation(yaw=math.degrees(a)))) for a in angles]
+    before = [(wp.transform.location.x, wp.transform.location.y) for wp in reference]
+    points = _lane_path_points(reference)
+    # Follow the curved map, rather than a chain of two-metre straight chords.
+    radial_error = np.abs(np.linalg.norm(points - [0, -8], axis=1) - 8)
+    assert radial_error.max() < .02
+    yaw = np.unwrap(np.arctan2(np.diff(points[:, 1]), np.diff(points[:, 0])))
+    assert np.max(np.abs(np.diff(yaw))) < math.radians(4)
+    for x, y in before:
+        assert np.linalg.norm(points - [x, -y], axis=1).min() < 1e-5
+    assert [(wp.transform.location.x, wp.transform.location.y) for wp in reference] == before
+
+
+def test_same_lane_recovery_does_not_shorten_actual_lane_change():
+    from carla_bridge.tests.test_pdm_planner import make_planner, semantic
+    planner = make_planner(speed=4)
+    details = planner.plan(semantic())["planner_diagnostics"]["geometry"]["lateral_paths"]
+    assert details["center"]["path_kind"] == "lane_follow"
+    assert details["center"]["transition_length_m"] == pytest.approx(8)
+    for side in ("left", "right"):
+        assert details[side]["path_kind"] == "lane_change"
+        assert details[side]["transition_length_m"] == 30

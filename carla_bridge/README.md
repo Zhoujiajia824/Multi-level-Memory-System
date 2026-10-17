@@ -1245,6 +1245,9 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --planner vlm_
   `geometry` 保存车道连接、截断和变道许可诊断。几何失败也会写入 `semantic_error` / `control_error`。
   `pdm_emergency_brake` 表示主动保护制动，具体原因见 `failure_reason`；不会当作成功执行写入决策记忆。
   详细规则见 [PDM 规划说明](planning/README.md#相邻车道回归与规划失败诊断)。
+- `control.jsonl` 将每个物理 tick 的速度/加速度与前一条控制命令对齐，并保存服务器
+  帧号/时间、带方向的前向速度及挡位/倒车/手刹状态。`control_context.json` 保存本轮
+  实际物理子步配置和车辆制动参数，便于区分规划停车、控制响应和仿真推进异常。
 - 记忆中的 `semantic_decision` 是模型建议，`planning_context` 是规划器选择；
   记录阶段为 `selected_before_execution`，不能据此断言已经成功完成该动作。
 - `paper_suite summarize` 增加 `planner_backend`、`semantic_influence` 和规划配置哈希，方便分组。

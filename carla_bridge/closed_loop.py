@@ -229,6 +229,7 @@ class ClosedLoop:
         )
         self._control_audit_path = Path(self.config.get("output_dir") or "outputs") / "control.jsonl"
         self._control_audit_path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_control_context(world, ego)
 
         # 6. 记忆 loop
         out_path = self._make_output_path()
@@ -331,10 +332,83 @@ class ClosedLoop:
             "sim_time_s": self._elapsed, "source": source,
             "planner_sequence": self._pdm_plan_count,
             "semantic_frame_id": self._semantic_frame_id,
-            "throttle": float(control.throttle), "brake": float(control.brake),
-            "steer": float(control.steer),
+            **self._control_audit_values(control),
             "tracking": deepcopy(tracking) if source == "tracker" and isinstance(tracking, dict) else None,
         }
+
+    @staticmethod
+    def _control_audit_values(control) -> dict:
+        return {
+            "throttle": float(control.throttle), "brake": float(control.brake),
+            "steer": float(control.steer), "gear": int(control.gear),
+            "reverse": bool(control.reverse), "hand_brake": bool(control.hand_brake),
+        }
+
+    @staticmethod
+    def _audit_fields(source, fields, errors, prefix) -> dict:
+        """Record unavailable telemetry explicitly; never stringify a client/mock object."""
+        values = {}
+        for name, kind in fields.items():
+            try:
+                value = getattr(source, name)
+                if kind is float:
+                    if type(value) not in (int, float) or not math.isfinite(value):
+                        raise ValueError("expected a finite number")
+                    value = float(value)
+                elif type(value) is not kind:
+                    raise ValueError("expected " + kind.__name__)
+                values[name] = value
+            except Exception as exc:
+                values[name] = None
+                errors[prefix + name] = type(exc).__name__ + ": " + str(exc)
+        return values
+
+    def _world_clock_audit(self) -> dict:
+        errors = {}
+        values = {"frame": None, "elapsed_seconds": None, "delta_seconds": None}
+        try:
+            snapshot = self.carla_client.get_world().get_snapshot()
+            values.update(self._audit_fields(snapshot, {"frame": int}, errors, "snapshot."))
+            values.update(self._audit_fields(snapshot.timestamp, {
+                "elapsed_seconds": float, "delta_seconds": float,
+            }, errors, "snapshot.timestamp."))
+        except Exception as exc:
+            errors["snapshot"] = type(exc).__name__ + ": " + str(exc)
+        if errors:
+            values["errors"] = errors
+        return values
+
+    def _write_control_context(self, world, ego) -> None:
+        """Snapshot physics metadata once; these observations never change physics settings."""
+        errors = {}
+        context = {"schema_version": 1, "world_settings": None, "vehicle_physics": None}
+        try:
+            context["world_settings"] = self._audit_fields(world.get_settings(), {
+                "synchronous_mode": bool, "fixed_delta_seconds": float,
+                "substepping": bool, "max_substeps": int, "max_substep_delta_time": float,
+            }, errors, "world_settings.")
+        except Exception as exc:
+            errors["world_settings"] = type(exc).__name__ + ": " + str(exc)
+        try:
+            physics = ego.get_physics_control()
+            values = self._audit_fields(physics, {"mass": float}, errors, "vehicle_physics.")
+            values["mass_kg"] = values.pop("mass")
+            values["wheels"] = []
+            context["vehicle_physics"] = values
+            for index, wheel in enumerate(physics.wheels):
+                entry = self._audit_fields(wheel, {"max_brake_torque": float, "radius": float},
+                                           errors, "vehicle_physics.wheels[%d]." % index)
+                values["wheels"].append({"index": index, "max_brake_torque_nm": entry["max_brake_torque"],
+                                        "radius_cm": entry["radius"]})
+        except Exception as exc:
+            errors["vehicle_physics"] = type(exc).__name__ + ": " + str(exc)
+        context["errors"] = errors
+        try:
+            self._control_audit_path.with_name("control_context.json").write_text(
+                json.dumps(context, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        except Exception:
+            self._apply_brake()
+            raise
 
     def _validate_decision(self, decision: dict, kf: dict) -> dict:
         decision = decision or {}
@@ -705,6 +779,9 @@ class ClosedLoop:
         )
 
     def _record_tick(self, ego) -> None:
+        # Read the server clock before observers/metrics, in the same callback as
+        # the measured response. Keep the local scheduler's sim_time_s unchanged.
+        world_clock = self._world_clock_audit() if self._control_audit_path is not None else None
         self._drain_collisions()
         self.carla_client.set_spectator_follow(ego)
         if self.recorder is not None:
@@ -714,6 +791,8 @@ class ClosedLoop:
             yaw = math.radians(tf.rotation.yaw)  # Native CARLA axes for acceleration projections.
             state = {
                 "speed": math.hypot(v.x, v.y),
+                "velocity_x": v.x, "velocity_y": v.y,
+                "speed_longitudinal_mps": v.x * math.cos(yaw) + v.y * math.sin(yaw),
                 "acceleration": math.hypot(a.x, a.y),
                 "acceleration_x": a.x, "acceleration_y": a.y, "yaw_rad": yaw,
             }
@@ -723,11 +802,11 @@ class ClosedLoop:
                 actual = ego.get_control()
                 audit = {
                     "sim_time_s": self._elapsed,
+                    "world_snapshot": world_clock,
                     "measured": {**state, "x": tf.location.x, "y": tf.location.y,
                                  "acceleration_longitudinal_mps2": a.x * math.cos(yaw) + a.y * math.sin(yaw),
                                  "acceleration_lateral_mps2": -a.x * math.sin(yaw) + a.y * math.cos(yaw)},
-                    "applied_control": {"throttle": float(actual.throttle), "brake": float(actual.brake),
-                                        "steer": float(actual.steer)},
+                    "applied_control": self._control_audit_values(actual),
                     # This is the command preceding this measured physics tick,
                     # not the newly replanned command for the next tick.
                     "command": self._last_control_command,
