@@ -79,7 +79,7 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --memory-bank 
 `HF_HUB_OFFLINE=1`、`-X faulthandler` 或 `-u`。VLM API 仍需可访问。
 
 省略 `--memory-bank` 时使用本轮独立空库；不会自动加载旧的 `outputs/memory_db_carla`。
-若要续用旧库，请明确指定该路径。每轮结果位于 `outputs/carla_runs/<run_id>/`，
+若要续用旧库，请明确指定该路径。每轮结果位于 `outputs/carla_runs/<运行目录>/`，
 包含 `manifest.json`、决策、报告、视频和日志。可写库引用的图像与特征保存在库内 `assets/`。
 
 > 完整参数与使用方式见 **[carla_bridge/README.md](carla_bridge/README.md)**。

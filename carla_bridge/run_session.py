@@ -4,10 +4,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 
@@ -63,7 +65,6 @@ class RunSession:
         self.config = config
         self.mode = mode
         self.run_id = uuid.uuid4().hex[:16]
-        self.run_dir = Path(config.get("output_dir")) / "carla_runs" / self.run_id
         self.lock = None
         self.manifest = {}
         self.scenario_path = Path(scenario_path).resolve()
@@ -72,6 +73,22 @@ class RunSession:
         self.access = "off" if mode == "memory_off" else memory_access
         self.short_term = short_term and mode != "memory_off"
         self.retrieve = retrieve and mode != "memory_off"
+        self.started_at = datetime.now().astimezone()
+        # Use the case filename (including split/seed) and portable path characters.
+        scenario_label = re.sub(r"[^\w-]+", "_", self.scenario_path.stem).strip("_")[:64] or "scenario"
+        planning = config.data.get("carla", {}).get("planning", {})
+        backend = planning.get("backend", "vlm_trajectory")
+        planner_label = "pdm_closed" if backend == "pdm_closed" else "vlm_trajectory"
+        semantic = ("sem_on" if planning.get("semantic_influence", True) else "sem_off") if backend == "pdm_closed" else "sem_na"
+        memory_label = "memory_off" if self.access == "off" else "memory_" + self.access
+        if mode != "memory_off":
+            if not self.retrieve:
+                memory_label += "_no_retrieval"
+            if not self.short_term:
+                memory_label += "_no_short_term"
+        dirname = "__".join((self.started_at.strftime("%Y%m%d_%H%M%S"), scenario_label,
+                             memory_label, planner_label, semantic, self.run_id[:8]))
+        self.run_dir = Path(config.get("output_dir")) / "carla_runs" / dirname
 
     def _path(self, value):
         p = Path(value)
@@ -160,6 +177,8 @@ class RunSession:
             except (OSError, subprocess.CalledProcessError):
                 revision, dirty = "unknown", None
             self.manifest = {"run_id": self.run_id, "status": "prepared", "mode": self.mode,
+                             "run_directory": self.run_dir.name,
+                             "started_at": self.started_at.isoformat(),
                              "memory_access": self.access, "memory_bank": str(bank),
                              "memory_seed": str(seed) if seed else None,
                              "commit": revision, "dirty": dirty,

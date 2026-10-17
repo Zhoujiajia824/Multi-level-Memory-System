@@ -145,9 +145,24 @@ CARLA 默认禁用解析失败的规则轨迹兜底，保留原始模型失败�
 ## 运行隔离与记忆库选择（当前入口行为）
 
 在仓库根目录、`mulmem_carla` 环境运行。每次生成独立的
-`outputs/carla_runs/<run_id>/`，包含 manifest、决策、报告、视频和日志。
+`outputs/carla_runs/<运行目录>/`，包含 manifest、决策、报告、视频和日志。
 manifest 记录实际配置、场景、代码提交号、工作区修改状态、记忆库来源和结束状态。
-`run_id` 是短 UUID，帧编号包含它，重复运行同一场景不会覆盖产物。
+新运行目录自动使用 `时间__场景文件名__记忆模式__规划器__语义开关__短编号`，例如：
+
+```text
+20261017_143025__L05_crossing_eval_s101__memory_off__pdm_closed__sem_on__7efbaf53
+```
+
+时间取运行机器的本地时间，场景文件名保留评估/训练划分与种子。
+记忆模式为 `memory_off`、`memory_read_only` 或 `memory_read_write`；
+关闭检索或短期记忆时，分别追加 `_no_retrieval`、`_no_short_term`。
+PDM 的语义开关为 `sem_on` / `sem_off`，旧轨迹后端使用 `sem_na`。
+场景名中的特殊字符会替换为下划线，最多保留 64 个字符。
+启动时终端打印完整输出路径，无须修改运行命令。
+
+内部 `run_id` 仍为 16 位短 UUID，帧编号继续使用它；目录末尾取其前 8 位以区分重复运行。
+manifest 额外保存 `run_directory` 和带时区的 `started_at`。
+旧目录不会重命名，汇总脚本兼容新旧目录；已有记忆库仍按原路径指定。
 
 ```powershell
 # 独立实验：本轮从空库开始，也在本轮持续学习
@@ -328,7 +343,7 @@ carla_bridge/
 
 ### 4.6 `metrics/` 评测
 - **`collector.py`**：碰撞（collision sensor）、闯红灯、逆行、超速、路线完成度、舒适度（jerk/加速度）逐 tick 采集。
-- **`run_reporter.py`**：写 Markdown + JSON 报告到 `outputs/carla_runs/<run_id>/`。
+- **`run_reporter.py`**：写 Markdown + JSON 报告到 `outputs/carla_runs/<运行目录>/`。
 
 ### 4.7 `video/` 驾驶视频录制
 - **`recorder.py`**：挂一个 chase/front 相机到 ego，每个 CARLA 推进 tick 取一帧写视频（10fps）；VLM 冻结期不 tick 不取帧 -> **按仿真帧率编码，丢帧时视频可能短于仿真时长**；`flush()` 中断时保存。
@@ -536,7 +551,7 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
 python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_on
 python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_off
 ```
-报告在 `outputs/carla_runs/<run_id>/`，对比碰撞率/路线完成度等量化记忆增益。
+报告在 `outputs/carla_runs/<运行目录>/`，对比碰撞率/路线完成度等量化记忆增益。
 
 ### 6.4 驾驶视频录制
 在 [config/carla.yaml](config/carla.yaml) 的 `carla.video` 块设 `enabled: true`：
@@ -548,7 +563,7 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
     height: 720
     view: "chase"      # chase（后上方第三人称）| front（前视角）
 ```
-跑完（或 Ctrl+C）视频在 `outputs/carla_runs/<run_id>/carla_videos/drive_<场景>_<模式>.mp4`，按仿真帧率编码，丢帧时可能短于仿真时长（跳过 VLM 冻结期）。
+跑完（或 Ctrl+C）视频在 `outputs/carla_runs/<运行目录>/carla_videos/drive_<场景>_<模式>.mp4`，按仿真帧率编码，丢帧时可能短于仿真时长（跳过 VLM 冻结期）。
 
 ### 6.5 首测建议
 直接验证完整路线，以 `route_completed` 和 100% 路线完成率验收。默认 300 秒是仿真时间保护上限，
@@ -649,7 +664,7 @@ CARLA 全局：x 前、y 右、z 上。项目 ego-centric：x 前、**y 左**。
 | 闯红灯 / 逆行 / 超速 | 近红灯仍前进 / 与车道反向 / 超限速 |
 | 最大速度 / 加速度 / jerk | 舒适度 |
 
-报告：`outputs/carla_runs/<run_id>/carla_run_<场景>_<模式>.md` / `.json`。
+报告：`outputs/carla_runs/<运行目录>/carla_run_<场景>_<模式>.md` / `.json`。
 
 ---
 
@@ -1000,7 +1015,7 @@ python -m carla_bridge.paper_suite summarize \
 正式统计应依据 run_id、case_id、seed、配置哈希和代码版本明确纳入哪些运行。
 900 秒是每轮仿真时间保护上限；模型推理期间仿真暂停，因此现实耗时可能更长。
 
-每轮独立目录 `outputs/carla_runs/<run_id>/` 的 `manifest.json` 应满足
+每轮独立目录 `outputs/carla_runs/<运行目录>/` 的 `manifest.json` 应满足
 `status=route_completed`、`outcome.success=true`、`outcome.route_completion=1.0`；
 带事件的场景还要核对事件有效性。失败或未触发的事件不能因车走到终点就记为成功。
 反馈时保留对应 `manifest.json`、`experiment_setup.json`、`events.json`（如有）、
@@ -1220,7 +1235,7 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --planner vlm_
 
 ### 13.4 输出与验收
 
-每轮 `outputs/carla_runs/<run_id>/` 中：
+每轮 `outputs/carla_runs/<运行目录>/` 中：
 
 - `manifest.json` 保存完整规划配置、语义开关、记忆策略及最终路线结果。
 - 决策 JSONL 的 `model_decision_output` 保留模型语义，`decision_output` 保存规划后的指令与轨迹，

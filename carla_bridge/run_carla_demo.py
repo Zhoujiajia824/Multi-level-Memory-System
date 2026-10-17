@@ -163,6 +163,7 @@ def main() -> None:
     loop = None
     try:
         session.prepare()
+        print(f"[carla_bridge] 本轮输出目录: {session.run_dir}", flush=True)
         if (scenario_config.get("experiment") or {}).get("suite") == "paper_v1":
             config.data["carla"]["experiment_output_dir"] = str(session.run_dir)
         set_log_directory(config.get_path("log_dir"))
