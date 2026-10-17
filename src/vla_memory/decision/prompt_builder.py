@@ -411,7 +411,7 @@ class DecisionPromptBuilder:
             if context.get("semantic_influence") is False:
                 lines.append("- 此历史帧关闭语义影响；模型建议未参与该帧候选评分。")
             elif context.get("semantic_influence") is True:
-                lines.append("- 此历史帧开启语义影响；请求意图仍受规划器安全约束限制。")
+                lines.append("- 此历史帧开启语义影响；模型建议参与该帧候选评分。")
         lines.append("- 上述选择记录不能单独证明动作已完成、驾驶成功或模型建议被采纳。")
         return "\n".join(lines)
 
@@ -419,7 +419,7 @@ class DecisionPromptBuilder:
     def _render_motion_context(history, ego_state) -> str:
         """Summarize measured kinematics, not learned/retrieved memory or right of way."""
         header = "## 实测运动窗口（所有记忆模式共同的传感器状态）\n"
-        unknown = header + "连续静止时长未知：缺少有效、连续且接近当前时刻的测量；不得据此认定停车义务已完成。\n"
+        unknown = header + "连续静止时长未知：有效连续测量不足。\n"
         try:
             rows = [(float(p['t']), float(p['x']), float(p['y'])) for p in history or []]
             speed = float((ego_state or {})['speed'])
@@ -441,7 +441,7 @@ class DecisionPromptBuilder:
                 duration += dt
         return (header + f"- 最近测量覆盖 {rows[-1][0]-rows[0][0]:.2f} 秒，累计移动 {distance:.2f} 米。\n"
                 f"- 连续近静止至少 {duration:.2f} 秒（速度阈值 0.2m/s，仅统计连续测量；窗口外未知）。\n"
-                "- 这不是在停止线完成停车/让行的证明，也不是等待时长达到阈值后的自动通行许可。\n")
+                "- 以上仅描述实测运动状态，通行权由当前交通情况判断。\n")
 
     def _render_image_layout_block(self, image_layout: str) -> str:
         """渲染输入图像布局说明段（告知决策 VLM 当前图像是单图还是六视角 mosaic）。"""
@@ -463,7 +463,7 @@ class DecisionPromptBuilder:
             perception_objects = [o for o in perception_objects if isinstance(o, dict)
                                   and o.get("semantic_label") != "route_center"]
             if anchors:
-                route_lines = ["## 导航路线空间参考（不是障碍物，不是停止线，也不是通行许可）",
+                route_lines = ["## 导航路线空间参考（仅表示路线位置）",
                                json.dumps([o.get("position_ego") for o in anchors[:6]], ensure_ascii=False), ""]
         lines = [
             f"## Oracle 感知对象（{source} GT，非检测模型预测）",

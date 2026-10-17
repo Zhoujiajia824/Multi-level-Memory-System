@@ -21,7 +21,7 @@ def test_stationary_window_is_measured_even_without_memory():
     assert "连续近静止至少 4.90 秒" in prompt
     assert "t=-0.9" in prompt
     assert "## 短期记忆" not in prompt
-    assert "不是在停止线完成停车/让行的证明" in prompt
+    assert "以上仅描述实测运动状态，通行权由当前交通情况判断" in prompt
 
 
 @pytest.mark.parametrize("history", [
@@ -57,7 +57,7 @@ def test_route_reference_points_do_not_hide_real_actors():
                                           planning_constraints={"decision_mode": "semantic"})
     assert "CARLA GT" in prompt
     assert "nuScenes GT" not in prompt
-    assert "不是障碍物，不是停止线" in prompt
+    assert "导航路线空间参考（仅表示路线位置）" in prompt
     assert "ACTOR_11" in prompt
     assert "共 12 个目标" in prompt
 

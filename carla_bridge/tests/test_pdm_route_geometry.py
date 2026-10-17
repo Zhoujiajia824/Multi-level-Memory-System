@@ -143,17 +143,21 @@ def test_disconnected_prepared_reference_reports_error_instead_of_virtual_stop()
 
 
 def test_actual_offroad_footprint_reports_first_failed_corners():
-    from carla_bridge.tests.test_pdm_planner import make_planner, semantic
+    from carla_bridge.tests.test_pdm_planner import make_planner, semantic, assert_score_only_selection
     planner = make_planner()
     planner.ego.y = 5.0  # Center still in the outer lane, body crosses its edge.
     plan = planner.plan(semantic("YIELD"))
-    assert not plan["trajectory"]
+    assert plan["trajectory"]
+    assert_score_only_selection(plan["planner_diagnostics"])
     for candidate in plan["planner_diagnostics"]["candidates"]:
         assert candidate["safety"]["drivable_area"] == 0
+        assert candidate["base_score"] == 0
+        assert candidate["eligible"]  # The original PDM zero score is retained, not a veto.
         failure = candidate["drivable_area_failure"]
         assert failure["time_s"] == 0
         assert len(failure["footprint_corners_xy"]) == 4
         assert any(y < -5.25 for x, y in failure["footprint_corners_xy"])
+    assert plan["planner_diagnostics"]["selected_zero_base_score"]
 
 
 @pytest.mark.parametrize("point,expected", [((.05, -.5), "center"),

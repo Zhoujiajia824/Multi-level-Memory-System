@@ -125,21 +125,23 @@ def test_real_town05_fixed_route_uses_706_at_both_overlapping_seams():
     pytest.param(4.6, 1.8, 2.8, id="narrow_fixture"),
     pytest.param(4.8, 2.2, 3.004646956723217, id="wide_assumption_archive_wheelbase",
         marks=pytest.mark.xfail(strict=True, raises=AssertionError,
-            reason="Known wide-vehicle continuous-turn stall; real vehicle geometry and "
-                   "trajectory generation/prediction consistency remain unresolved")),
+            reason="Known assumed wide footprint still stalls under native PDM base scoring "
+                   "without adapter safety or recovery vetoes; full turn is not resolved")),
 ])
-def test_real_town05_continuous_low_speed_turn_with_pinned_pdm(length, width, wheelbase):
+def test_real_town05_continuous_low_speed_turn_with_pinned_pdm(length, width, wheelbase, record_property):
     """Ideal reference execution isolates planning from CARLA actuator physics.
 
     The regression must pass the whole bend, not just emit one moving plan.
     Actual server route completion and actuator comfort remain separate checks.
     The wide envelope is an explicit assumption, not measured Tesla dimensions:
-    only its wheelbase is available from the supplied archive. Keep that known
-    failing case visible until real geometry and planning consistency are fixed.
+    only its wheelbase is available from the supplied archive.
+    The score-only experiment does not assert collision-free or road-compliant
+    execution: it measures predicted road failures and actual origin deviation
+    separately from completion, so removal of a veto is not called a safety fix.
     """
     pytest.importorskip("tuplan_garage")
     pytest.importorskip("nuplan")
-    from carla_bridge.tests.test_pdm_planner import Vehicle, semantic
+    from carla_bridge.tests.test_pdm_planner import Vehicle, semantic, assert_score_only_selection
     from carla_bridge.planning.pdm_planner import CarlaPDMPlanner
     from carla_bridge.state.coords import ego_to_global
 
@@ -174,7 +176,8 @@ def test_real_town05_continuous_low_speed_turn_with_pinned_pdm(length, width, wh
     assert [c["safety"] for c in initial["candidates"]] == [c["safety"] for c in baseline["candidates"]]
     ego.get_acceleration = lambda: carla.Vector3D()
     planner = CarlaPDMPlanner(world, ego, route)
-    speeds, choices, rejected_moving = [], [], False
+    speeds, choices, scored_offroad = [], [], False
+    selected_offroad_steps, offsets = 0, []
     for step in range(90):
         world.get_snapshot = lambda: SimpleNamespace(timestamp=SimpleNamespace(elapsed_seconds=2 + step * .2))
         plan = planner.plan(semantic("YIELD"))
@@ -182,8 +185,10 @@ def test_real_town05_continuous_low_speed_turn_with_pinned_pdm(length, width, wh
         assert plan["trajectory"], (step, diagnostics)
         assert diagnostics["geometry"]["lateral_paths"]["center"]["cut"] is None
         choice = next(c for c in diagnostics["candidates"] if c["id"] == diagnostics["selected_id"])
-        assert choice["safe"]
-        rejected_moving |= any(not c["safety"]["drivable_area"] and c["desired_speed_mps"] > 2
+        assert choice["eligible"]
+        assert_score_only_selection(diagnostics)
+        selected_offroad_steps += choice["safety"]["drivable_area"] == 0
+        scored_offroad |= any(not c["safety"]["drivable_area"] and c["desired_speed_mps"] > 2
                                for c in diagnostics["candidates"])
         point = plan["trajectory"][2]
         x, y = ego_to_global(point["x"], point["y"], ego.x, ego.y, math.radians(ego.yaw))
@@ -194,9 +199,23 @@ def test_real_town05_continuous_low_speed_turn_with_pinned_pdm(length, width, wh
         ego.steer = max(-1, min(1, math.atan(planner.vehicle_parameters.wheel_base * curvature) / planner.max_steer))
         ego.x, ego.y, ego.yaw, ego.speed = x, y, yaw, point["optional_v"]
         ego.z = road.get_waypoint(ego.get_location()).transform.location.z + .0017
+        nearest = road.get_waypoint(ego.get_location()).transform.location
+        offsets.append(math.hypot(ego.x - nearest.x, ego.y - nearest.y))
         speeds.append(ego.speed)
         choices.append(diagnostics["selected_id"])
+    measurements = {"final_x_m": ego.x, "final_y_m": ego.y, "final_yaw_deg": ego.yaw,
+                    "max_origin_lane_center_offset_m": max(offsets),
+                    "selected_predicted_offroad_steps": selected_offroad_steps,
+                    "min_speed_after_start_mps": min(speeds[5:]),
+                    "stop_selection_count": sum("STOP" in name for name in choices),
+                    "final_selected_id": choice["id"],
+                    "final_candidate_score_audit": [{"id": c["id"], "base_score": c["base_score"],
+                        "semantic_bonus": c["semantic_bonus"], "final_score": c["final_score"],
+                        "drivable_area": c["safety"]["drivable_area"], "eligible": c["eligible"]}
+                        for c in diagnostics["candidates"]]}
+    for name, value in measurements.items():
+        record_property(name, value)
     assert ego.y > 110 and 80 < ego.yaw < 100, (ego.x, ego.y, ego.yaw)
     assert min(speeds[5:]) > .5
     assert not any("STOP" in choice for choice in choices)
-    assert rejected_moving  # actual fast off-road proposals still fail safety
+    assert scored_offroad  # Road failures still affect native scores, not eligibility.

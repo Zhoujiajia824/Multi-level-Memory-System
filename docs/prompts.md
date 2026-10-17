@@ -1,6 +1,41 @@
 # 在哪里改提示词（Prompts Editing Guide）
 
-> 所有 VLM 提示词集中在 **`config/prompts.yaml`** 单一文件，无需改 Python 代码。
+> CARLA 的 PDM 语义决策提示词位于 **`config/decision.yaml` 的 `semantic` 块**；场景理解、通用数值轨迹决策与记忆段落模板位于 **`config/prompts.yaml`**。
+
+## CARLA / PDM 语义决策
+
+使用 `--planner pdm_closed` 时，实际调用链为：
+
+1. `get_decision_system_prompt` 读取 `semantic.system_prompt`，替换旧数值轨迹模式的系统提示词。
+2. `DecisionPromptBuilder.build` 根据 `decision_mode=semantic` 渲染 `semantic.user_prompt`，保留图像、场景、自车状态、导航、实测运动窗口、GT 对象与启用的记忆。
+3. 模型只输出横纵向意图；PDM 生成数值候选轨迹。`--semantic-influence off` 时模型建议不参与候选评分。
+
+当前 `prompt_version: 4` 将驾驶指导压缩为按当前通行条件决策、畅通时持续前进、遵守适用信号与通行权。STOP 和 YIELD 仅作为合法动作的中性定义，没有针对停车、低速探查的长篇示例，也不要求因信息未知而停车。
+
+输出保持现有五字段解析契约，避免破坏记忆与日志兼容性：
+
+```json
+{
+  "lateral_decision": "FOLLOW_ROUTE",
+  "longitudinal_decision": "MAINTAIN",
+  "behavior_reason": "当前路线畅通，沿路线正常行驶。",
+  "risk_level": "low",
+  "safety_notes": []
+}
+```
+
+- 横向枚举：`FOLLOW_ROUTE / KEEP_LANE / CHANGE_LANE_LEFT / CHANGE_LANE_RIGHT`。
+- 纵向枚举：`MAINTAIN / ACCELERATE / DECELERATE / FOLLOW / YIELD / STOP`。
+- `behavior_reason` 只要求一句当前依据，建议不超过40字；`safety_notes` 通常为空，有补充事项时只写一条短句。解析器仍兼容旧版合法文本，不按字数拒绝已有记录。
+- 不输出轨迹、目标速度或控制数值。场景与历史是输入，解释无需逐项复述输入。
+
+`semantic.user_prompt` 复用下表的场景、导航与记忆占位符，并额外使用 `{motion_context_block}`、`{lateral_enum}` 和 `{longitudinal_enum}`，不使用数值路点占位符。实测运动窗口只描述运动状态，不把静止时长推断为通行许可。
+
+修改后可验证真实拼接和输出兼容性：
+
+```bash
+python -m pytest carla_bridge/tests/test_semantic_decision.py carla_bridge/tests/test_semantic_progress_context.py -q
+```
 
 ## 结构总览
 
@@ -49,10 +84,10 @@ memory_integration:
 
 ## 占位符说明
 
-模板使用 Python `str.format_map` 语法（`{var}`），由
-[`src/vla_memory/common/prompt_loader.py`](../src/vla_memory/common/prompt_loader.py) 渲染。
-未定义的占位符默认**保留原文 `{var}`** 并发 warning（`strict=False` 模式），
-便于调试，不会中断流程。
+模板使用 Python `str.format_map` 语法（`{var}`）。通用模板由
+[`src/vla_memory/common/prompt_loader.py`](../src/vla_memory/common/prompt_loader.py) 渲染，
+未定义的占位符默认保留原文并发 warning（`strict=False`）；语义模板由
+`DecisionPromptBuilder` 直接渲染，未定义的占位符会抛出 `KeyError`。
 
 ### 决策 prompt（`decision.user`）的占位符全集
 
@@ -84,7 +119,7 @@ memory_integration:
 
 ## 安全编辑指南
 
-1. **直接编辑 `config/prompts.yaml`**，无需改 Python 代码。
+1. 按运行后端编辑正确模板：CARLA / PDM 改 `config/decision.yaml` 的 `semantic`；其余模板改 `config/prompts.yaml`。调整语义行为时同步增加 `semantic.prompt_version`，通常无需改 Python 代码。
 2. 占位符用 Python `str.format_map` 语法（`{var}`）。注意 YAML 字符串中要写两个花括号 `{{` `}}` 才能输出字面的 `{` `}`（例如 JSON 示例段）。
 3. **不要重命名占位符**，除非同时 grep 以下文件确认 ctx dict key 一致：
    - [`src/vla_memory/decision/prompt_builder.py`](../src/vla_memory/decision/prompt_builder.py)
@@ -147,7 +182,7 @@ perception:
 
 ## 为什么 YAML 而非独立 `.txt`
 
-- **单文件单一来源**：所有 prompts 集中一处，便于审查和版本化。
+- **明确模板来源**：语义决策模板随决策配置维护，通用模板集中在 prompts.yaml，便于审查和版本化。
 - **diff 可读**：每段提示词都有 YAML key 标记，PR 中改动一目了然。
 - **支持注释**：可在 yaml 中写中文注释解释设计意图。
 - **配合代码同步演进**：prompts.yaml 与代码一起版本化，避免 prompt 改了代码忘改、或反之的不一致。

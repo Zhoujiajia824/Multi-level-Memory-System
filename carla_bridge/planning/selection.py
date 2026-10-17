@@ -1,4 +1,8 @@
-"""Ablation changes this score term only; candidates and safety are immutable."""
+"""Rank finite proposals by the PDM score plus the optional semantic bonus.
+
+Safety metrics remain observable diagnostics. They do not independently exclude
+candidates in this experimental selection rule.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -6,8 +10,37 @@ import json
 import math
 
 
+SELECTION_RULE = "pdm_base_plus_semantic"
+
+
+def _pool_identity(value):
+    """Keep the pool hash deterministic even when an invalid input contains NaN."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return {"__non_finite_float__": "nan" if math.isnan(value) else
+                ("positive_infinity" if value > 0 else "negative_infinity")}
+    if isinstance(value, dict):
+        return {key: _pool_identity(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_pool_identity(item) for item in value]
+    return value
+
+
+def _audit_value(value, invalid_paths, path=""):
+    """Represent non-finite diagnostic numbers as JSON null without gating."""
+    if isinstance(value, float) and not math.isfinite(value):
+        invalid_paths.append(path)
+        return None
+    if isinstance(value, dict):
+        return {key: _audit_value(item, invalid_paths, path + "." + key if path else key)
+                for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_audit_value(item, invalid_paths, "%s[%d]" % (path, index))
+                for index, item in enumerate(value)]
+    return value
+
+
 def choose_candidate(candidates, semantic, enabled, lateral_weight=0.8, longitudinal_weight=0.8):
-    """Return an audited selection; all hard constraints precede semantic scoring."""
+    """Select by score only; reject numerically invalid trajectories or scores."""
     for value in (lateral_weight, longitudinal_weight):
         if not math.isfinite(value) or value < 0 or value > 2:
             raise ValueError("semantic weights must be finite and within [0, 2]")
@@ -16,46 +49,49 @@ def choose_candidate(candidates, semantic, enabled, lateral_weight=0.8, longitud
     longitudinal = semantic.get("longitudinal_decision")
     audited = []
     for candidate in candidates:
-        item = dict(candidate)
-        safety = item.get("safety", {})
+        diagnostic_invalid = []
+        item = _audit_value(candidate, diagnostic_invalid)
+        safety = candidate.get("safety", {})
         metrics = [safety.get(k) for k in ("no_collision", "drivable_area", "driving_direction", "ttc")]
+        score_valid = (type(candidate.get("base_score")) in (int, float)
+                       and math.isfinite(candidate["base_score"]))
+        numerically_valid = safety.get("finite") is True and score_valid
+        # Retain the former safety assessment for comparison with older logs.
+        # It is deliberately independent from eligibility in this version.
         safe = (all(type(v) in (int, float) and math.isfinite(v) and 1.0 - 1e-8 <= v <= 1 for v in metrics)
-                and safety.get("finite") is True and safety.get("traffic_light") is True
-                and type(item.get("base_score")) in (int, float) and math.isfinite(item["base_score"]))
+                and safety.get("finite") is True and safety.get("traffic_light", True) is True
+                and score_valid)
         lateral_match = lateral in item.get("lateral_semantics", [])
         longitudinal_match = longitudinal == item.get("longitudinal")
         bonus = (lateral_weight * lateral_match + longitudinal_weight * longitudinal_match) if enabled else 0.0
-        continuity_cost = item.get("continuity_cost", 0.0)
-        if type(continuity_cost) not in (float, int) or not math.isfinite(continuity_cost) or not 0 <= continuity_cost <= 0.5:
-            raise ValueError("continuity_cost must be finite and within [0, 0.5]")
-        planning_score = item["base_score"] - continuity_cost
+        planning_score = float(item["base_score"]) if score_valid else None
+        invalid_reasons = []
+        if safety.get("finite") is not True:
+            invalid_reasons.append("non_finite_trajectory")
+        if not score_valid:
+            invalid_reasons.append("invalid_base_score")
+            item["base_score"] = None
         item.update(safe=safe, semantic_bonus=float(bonus),
-                    planning_score=float(planning_score),
-                    final_score=float(planning_score + bonus) if safe else None)
+                    numerically_valid=numerically_valid,
+                    invalid_numeric_reasons=invalid_reasons,
+                    diagnostic_numeric_invalid=diagnostic_invalid,
+                    planning_score=planning_score,
+                    final_score=float(planning_score + bonus) if numerically_valid else None,
+                    # Compatibility fields: no route or safety gate is applied.
+                    route_eligible=True, eligible=numerically_valid)
         audited.append(item)
-    # Route reachability is shared by both ablation arms. Near the last legal
-    # return opportunity, do not let KEEP_LANE (or progress on the wrong lane)
-    # postpone recovery if a safe, moving reference-lane proposal exists.
-    # If returning is blocked, retain safe braking/avoidance options instead
-    # of forcing an unsafe lane change. No previous VLM decision is remembered.
-    recovery_active = (any(item.get("route_recovery_required") is True for item in audited)
-                       and any(item["safe"] and item.get("route_target") is True
-                               and item.get("forward_progress_m", 0.0) > 2.0
-                               and item.get("terminal_speed_mps", 0.0) > 0.2 for item in audited))
-    for item in audited:
-        route_eligible = not (recovery_active and item.get("route_recovery_required") is True)
-        item.update(route_eligible=route_eligible, eligible=item["safe"] and route_eligible)
-        if not item["eligible"]:
-            item["final_score"] = None
-    feasible = [item for item in audited if item["eligible"]]
-    selected = max(feasible, key=lambda item: item["final_score"]) if feasible else None
-    baseline = max(feasible, key=lambda item: item["planning_score"]) if feasible else None
+    eligible = [item for item in audited if item["eligible"]]
+    selected = max(eligible, key=lambda item: item["final_score"]) if eligible else None
+    baseline = max(eligible, key=lambda item: item["planning_score"]) if eligible else None
     # Hash the generated pool/base metrics, excluding the experimental score term.
-    identity = hashlib.sha256(json.dumps(candidates, sort_keys=True, allow_nan=False,
+    identity = hashlib.sha256(json.dumps(_pool_identity(candidates), sort_keys=True, allow_nan=False,
                                          separators=(",", ":")).encode("utf-8")).hexdigest()
-    available = sorted({s for c in audited if c["route_eligible"] for s in c.get("lateral_semantics", [])})
+    available = sorted({s for c in eligible for s in c.get("lateral_semantics", [])})
     return selected, {"semantic_enabled": bool(enabled), "semantic_requested": dict(semantic),
-                      "route_recovery_active": recovery_active,
+                      "selection_rule": SELECTION_RULE,
+                      "safety_gate_applied": False, "safety_is_diagnostic_only": True,
+                      "continuity_penalty_applied": False,
+                      "route_recovery_gate_applied": False, "route_recovery_active": False,
                       "candidate_pool_sha256": identity, "candidates": audited,
                       "selected_id": selected["id"] if selected else None,
                       "baseline_selected_id": baseline["id"] if baseline else None,

@@ -105,6 +105,25 @@ def semantic(longitudinal="MAINTAIN", lateral="FOLLOW_ROUTE"):
     return {"lateral_decision": lateral, "longitudinal_decision": longitudinal}
 
 
+def assert_score_only_selection(diagnostics):
+    """Check the actual rank formula, including zero-base and unsafe candidates."""
+    assert diagnostics["selection_rule"] == "pdm_base_plus_semantic"
+    assert not diagnostics["safety_gate_applied"]
+    assert not diagnostics["route_recovery_gate_applied"]
+    assert not diagnostics["continuity_penalty_applied"]
+    eligible = [candidate for candidate in diagnostics["candidates"] if candidate["eligible"]]
+    for candidate in eligible:
+        assert candidate["planning_score"] == candidate["base_score"]
+        assert candidate["final_score"] == pytest.approx(candidate["base_score"] + candidate["semantic_bonus"])
+        assert candidate["safety"]["finite"]
+    if eligible:
+        selected = max(eligible, key=lambda candidate: candidate["final_score"])
+        assert diagnostics["selected_id"] == selected["id"]
+        assert diagnostics["selected_zero_base_score"] == (selected["base_score"] == 0)
+    else:
+        assert diagnostics["selected_id"] is None
+
+
 def test_real_core_sources_and_coordinates():
     assert validate_dependencies()["upstream_source_files_verified"] >= 30
     plan = make_planner().plan(semantic(), semantic_enabled=False)
@@ -164,11 +183,14 @@ def test_front_rear_road_seam_does_not_reject():
     assert plan["trajectory"]
 
 
-def test_initial_collision_cannot_be_ignored_by_upstream():
+def test_initial_collision_is_diagnostic_without_a_selection_veto():
     plan = make_planner(others=[Vehicle(actor_id=9, x=2)]).plan(semantic("ACCELERATE"))
-    assert plan["trajectory"] == []
-    assert plan["planner_diagnostics"]["initial_collision_tokens"] == ["9"]
-    assert not any(c["safe"] for c in plan["planner_diagnostics"]["candidates"])
+    diagnostics = plan["planner_diagnostics"]
+    assert plan["trajectory"]
+    assert diagnostics["initial_collision_tokens"] == ["9"]
+    assert all(c["eligible"] and c["safety"]["no_collision"] == 0 for c in diagnostics["candidates"])
+    assert not diagnostics["emergency_brake"]
+    assert_score_only_selection(diagnostics)
 
 
 def test_separate_bridge_level_does_not_create_false_collision():
@@ -177,7 +199,7 @@ def test_separate_bridge_level_does_not_create_false_collision():
     assert not plan["planner_diagnostics"]["initial_collision_tokens"]
 
 
-def test_red_light_constraint_applies_with_semantics_on_and_off():
+def test_native_red_light_idm_stops_candidates_without_an_extra_polygon_gate():
     planner = make_planner(speed=4)
     light = RedLight(planner.map, 16)
     planner.world.get_actors = lambda: [planner.ego, light]
@@ -185,9 +207,11 @@ def test_red_light_constraint_applies_with_semantics_on_and_off():
         plan = planner.plan(semantic("ACCELERATE", "CHANGE_LANE_LEFT"), semantic_enabled=enabled)
         assert plan["trajectory"]
         assert max(point["x"] for point in plan["trajectory"]) < 16 - 2.3
-        chosen = next(c for c in plan["planner_diagnostics"]["candidates"]
-                      if c["id"] == plan["planner_diagnostics"]["selected_id"])
-        assert chosen["safety"]["traffic_light"] is True
+        diagnostics = plan["planner_diagnostics"]
+        assert diagnostics["native_red_light_idm"]
+        assert diagnostics["traffic_stop_lines"] == 3
+        assert all("traffic_light" not in c["safety"] for c in diagnostics["candidates"])
+        assert_score_only_selection(diagnostics)
 
 
 class CurvedWaypoint(Waypoint):
@@ -304,7 +328,7 @@ def test_repeated_point_two_second_replans_preserve_maneuver_and_cruise(lateral)
 
 @pytest.mark.parametrize("enabled", [True, False])
 @pytest.mark.parametrize("barrier", ["end", "junction"])
-def test_recover_reference_lane_before_return_opportunity_closes(enabled, barrier):
+def test_return_opportunity_does_not_override_score_ranking(enabled, barrier):
     from carla_bridge.tests.test_pdm_route_geometry import EndingRoad, ending_planner
     road = EndingRoad(end=60 if barrier == "end" else 1000,
                       junction=60 if barrier == "junction" else 1000)
@@ -312,10 +336,17 @@ def test_recover_reference_lane_before_return_opportunity_closes(enabled, barrie
     plan = planner.plan(semantic(lateral="KEEP_LANE"), semantic_enabled=enabled)
     diagnostics = plan["planner_diagnostics"]
     assert plan["trajectory"]
-    assert diagnostics["route_recovery_active"]
-    assert diagnostics["selected_id"].startswith("center:")
-    assert plan["selected_lateral"] == "CHANGE_LANE_RIGHT"
-    assert diagnostics["geometry"]["lateral_paths"]["left"]["return_barrier"]["distance_ahead_m"] == 60
+    assert_score_only_selection(diagnostics)
+    assert not diagnostics["route_recovery_active"]
+    details = diagnostics["geometry"]["lateral_paths"]["left"]
+    assert "return_barrier" not in details and "bounded_before_return_barrier" not in details
+    if barrier == "end":
+        assert details["cut"]["distance_ahead_m"] == 60
+    else:
+        assert details["cut"] is None
+        assert details["path_length_m"] > 60
+    if enabled:
+        assert plan["selected_lateral"] == "KEEP_LANE"
     other = planner.plan(semantic(lateral="KEEP_LANE"), semantic_enabled=not enabled)
     assert diagnostics["candidate_pool_sha256"] == other["planner_diagnostics"]["candidate_pool_sha256"]
 
@@ -332,7 +363,7 @@ def test_short_current_lane_remains_a_braking_path_when_return_is_forbidden():
     assert diagnostics["geometry"]["lateral_paths"]["left"]["cut"]["distance_ahead_m"] == 30
 
 
-def test_repeated_keep_lane_commands_do_not_interrupt_necessary_recovery():
+def test_repeated_keep_lane_commands_are_not_replaced_by_forced_recovery():
     from carla_bridge.tests.test_pdm_route_geometry import ending_planner
     from carla_bridge.state.coords import ego_to_global
     planner = ending_planner()
@@ -342,6 +373,8 @@ def test_repeated_keep_lane_commands_do_not_interrupt_necessary_recovery():
     for step in range(45):
         plan = planner.plan(semantic(lateral="KEEP_LANE"))
         assert plan["trajectory"], (step, plan["planner_diagnostics"])
+        assert_score_only_selection(plan["planner_diagnostics"])
+        assert plan["selected_lateral"] == "KEEP_LANE"
         point = plan["trajectory"][2]
         x, y = ego_to_global(point["x"], point["y"], ego.x, ego.y, math.radians(ego.yaw))
         candidate = next(c for c in plan["planner_diagnostics"]["candidates"]
@@ -349,19 +382,23 @@ def test_repeated_keep_lane_commands_do_not_interrupt_necessary_recovery():
         heading = planner.generator._state_array[candidate["index"], 2, planner.api.StateIndex.HEADING]
         ego.x, ego.y, ego.yaw, ego.speed = x, y, -math.degrees(heading), point["optional_v"]
     assert ego.x > 45
-    assert abs(ego.y) < 0.5
+    assert ego.y == pytest.approx(-3.5, abs=.1)
 
 
-def test_return_boundary_limits_current_lane_when_recovery_is_forbidden():
+def test_junction_return_boundary_does_not_artificially_shorten_current_lane():
     from carla_bridge.tests.test_pdm_route_geometry import EndingRoad, ending_planner
     # The neighboring lane geometrically continues through the junction. Its
-    # candidate must stop before the return boundary, not follow that branch.
+    # Score-only selection must not insert a virtual stop at the junction.
     planner = ending_planner(EndingRoad(end=1000, junction=20), speed=3)
     plan = planner.plan(semantic(lateral="KEEP_LANE"))
     assert plan["trajectory"]
-    assert max(p["x"] for p in plan["trajectory"]) < 18
-    assert plan["planner_diagnostics"]["geometry"]["lateral_paths"]["left"]["bounded_before_return_barrier"]
-    assert plan["planner_diagnostics"]["excluded_lateral_paths"]["center"] == "lane_change_not_permitted_or_intersection"
+    diagnostics = plan["planner_diagnostics"]
+    details = diagnostics["geometry"]["lateral_paths"]["left"]
+    assert details["cut"] is None and details["path_length_m"] > 60
+    assert "bounded_before_return_barrier" not in details
+    assert diagnostics["excluded_lateral_paths"]["center"] == "lane_change_not_permitted_or_intersection"
+    assert_score_only_selection(diagnostics)
+    assert max(p["x"] for p in plan["trajectory"]) > 18
 
 
 def test_real_geometry_exception_contains_all_candidate_exclusions():
@@ -377,7 +414,7 @@ def test_real_geometry_exception_contains_all_candidate_exclusions():
     assert set(details["excluded_lateral_paths"]) == {"center", "left", "right"}
 
 
-def test_cannot_enter_lane_too_short_to_finish_change_before_return_boundary(monkeypatch):
+def test_future_return_marking_does_not_remove_an_allowed_outbound_change(monkeypatch):
     from carla_bridge.tests.test_pdm_route_geometry import EndingRoad, EndingWaypoint, ending_planner
     original = EndingWaypoint.__init__
 
@@ -390,7 +427,22 @@ def test_cannot_enter_lane_too_short_to_finish_change_before_return_boundary(mon
     planner = ending_planner(EndingRoad(end=1000), y=0)
     plan = planner.plan(semantic(lateral="CHANGE_LANE_LEFT"))
     assert plan["trajectory"]
-    assert plan["planner_diagnostics"]["excluded_lateral_paths"]["left"] == "insufficient_lane_change_corridor"
+    diagnostics = plan["planner_diagnostics"]
+    assert "left" not in diagnostics["excluded_lateral_paths"]
+    assert plan["selected_lateral"] == "CHANGE_LANE_LEFT"
+    assert_score_only_selection(diagnostics)
+
+
+def test_actual_lane_end_still_prevents_an_unfinishable_outbound_change():
+    from carla_bridge.tests.test_pdm_route_geometry import EndingRoad, ending_planner
+    planner = ending_planner(EndingRoad(end=24), y=0)
+    plan = planner.plan(semantic(lateral="CHANGE_LANE_LEFT"))
+    diagnostics = plan["planner_diagnostics"]
+    assert plan["trajectory"]
+    assert diagnostics["excluded_lateral_paths"]["left"] == "lane_change_not_permitted_or_intersection"
+    assert diagnostics["geometry"]["lateral_paths"]["left"]["permission_failure"]["target_lane_key"] is None
+    assert diagnostics["geometry"]["lateral_paths"]["left"]["cut"]["distance_ahead_m"] == 24
+    assert_score_only_selection(diagnostics)
 
 
 @pytest.mark.parametrize("enabled", [True, False])

@@ -1,4 +1,4 @@
-"""Regression of low-speed numerics and continuity through the pinned PDM core."""
+"""Regression of low-speed numerics and history-independent score-only ranking."""
 from importlib.util import find_spec
 from types import SimpleNamespace as NS
 import json
@@ -6,7 +6,7 @@ import json
 import numpy as np
 import pytest
 
-from carla_bridge.tests.test_pdm_planner import make_planner, semantic, Vehicle
+from carla_bridge.tests.test_pdm_planner import make_planner, semantic, Vehicle, assert_score_only_selection
 
 
 pytestmark = pytest.mark.skipif(find_spec("tuplan_garage") is None or find_spec("nuplan") is None,
@@ -85,51 +85,74 @@ def test_normal_stop_uses_comfort_deceleration_when_the_road_is_clear():
 
 
 @pytest.mark.parametrize("enabled", [True, False])
-def test_hard_stop_survives_when_comfort_stop_fails_predicted_ttc(enabled):
+def test_ttc_failure_changes_base_score_without_removing_a_candidate(enabled):
     planner = make_planner(speed=4, allow_change=False, others=[Vehicle(actor_id=9, x=10)])
     plan = planner.plan(semantic("STOP"), semantic_enabled=enabled)
     diagnostics = plan["planner_diagnostics"]
     soft = next(c for c in diagnostics["candidates"] if c["id"] == "center:STOP")
     hard = next(c for c in diagnostics["candidates"] if c["id"] == "center:STOP_HARD")
     assert not soft["safe"] and soft["predicted_ttc_infraction_time_s"] is not None
-    assert hard["safe"]
-    assert diagnostics["selected_id"] == "center:STOP_HARD"
-    assert plan["selected_longitudinal"] == "STOP"
+    assert soft["eligible"] and hard["eligible"]
+    assert soft["safety"]["ttc"] == 0 and hard["safety"]["ttc"] == 1
+    assert_score_only_selection(diagnostics)
+    assert plan["trajectory"] and not diagnostics["emergency_brake"]
 
 
-def test_semantic_arms_share_prior_plan_costs_and_pool_for_repeated_snapshot():
+def test_prior_selection_does_not_add_history_costs_to_either_semantic_arm():
     planner = make_planner(speed=2, allow_change=False)
     first = planner.plan(semantic("YIELD"))
-    first_reference = planner._previous_plan
     planner.ego.x = first["trajectory"][2]["x"]
     planner.ego.speed = first["trajectory"][2]["optional_v"]
     planner.world.get_snapshot = lambda: NS(timestamp=NS(elapsed_seconds=2.2))
     on = planner.plan(semantic("STOP"), semantic_enabled=True)["planner_diagnostics"]
     off = planner.plan(semantic("STOP"), semantic_enabled=False)["planner_diagnostics"]
     repeated = planner.plan(semantic("STOP"), semantic_enabled=True)["planner_diagnostics"]
-    assert on["continuity"]["applied"]
-    assert on["continuity"]["reference_age_s"] == pytest.approx(0.2)
-    assert on["continuity"] == off["continuity"] == repeated["continuity"]
     assert on["candidate_pool_sha256"] == off["candidate_pool_sha256"] == repeated["candidate_pool_sha256"]
     assert on["selected_id"] == repeated["selected_id"] != off["selected_id"]
     assert on["baseline_selected_id"] == off["selected_id"]
-    assert planner._continuity_reference is first_reference
-    assert any(c["continuity_cost"] > 0 for c in off["candidates"])
+    assert "continuity" not in on and "continuity" not in off
+    for diagnostics in (on, off, repeated):
+        assert_score_only_selection(diagnostics)
+        assert all("continuity_cost" not in c for c in diagnostics["candidates"])
+    assert all(c["semantic_bonus"] == 0 for c in off["candidates"])
 
 
-def test_emergency_invalidates_previous_plan_reference_before_recovery():
+def test_collision_diagnostic_does_not_override_winner_or_create_history_penalty():
     planner = make_planner(speed=0, allow_change=False)
     planner.plan(semantic("YIELD"))
     planner.world.get_snapshot = lambda: NS(timestamp=NS(elapsed_seconds=2.2))
     planner.world.get_actors = lambda: [planner.ego, Vehicle(actor_id=9, x=2)]
-    emergency = planner.plan(semantic("YIELD"))
-    assert not emergency["trajectory"]
-    assert emergency["planner_diagnostics"]["failure_reason"] == "no_safe_candidate"
+    overlap = planner.plan(semantic("YIELD"))
+    assert overlap["trajectory"]
+    assert overlap["planner_diagnostics"]["initial_collision_tokens"] == ["9"]
+    assert not overlap["planner_diagnostics"]["emergency_brake"]
+    assert_score_only_selection(overlap["planner_diagnostics"])
     planner.world.get_snapshot = lambda: NS(timestamp=NS(elapsed_seconds=2.4))
     planner.world.get_actors = lambda: [planner.ego]
     recovered = planner.plan(semantic("YIELD"))
     assert recovered["trajectory"]
-    assert recovered["planner_diagnostics"]["continuity"]["reason"] == "no_previous"
+    assert "continuity" not in recovered["planner_diagnostics"]
+    assert_score_only_selection(recovered["planner_diagnostics"])
+
+
+def test_no_finite_candidate_brakes_instead_of_executing_nan(monkeypatch):
+    planner = make_planner(speed=0, allow_change=False)
+    generate = planner.generator.generate_proposals
+
+    def corrupt_all_profiles(*args, **kwargs):
+        proposals = generate(*args, **kwargs)
+        planner.generator._state_idm_array[:, 5, 1] = np.nan
+        return proposals
+
+    monkeypatch.setattr(planner.generator, "generate_proposals", corrupt_all_profiles)
+    plan = planner.plan(semantic("YIELD"))
+    diagnostics = plan["planner_diagnostics"]
+    assert not plan["trajectory"]
+    assert diagnostics["emergency_brake"]
+    assert diagnostics["failure_reason"] == "no_finite_candidate"
+    assert not any(candidate["eligible"] for candidate in diagnostics["candidates"])
+    assert_score_only_selection(diagnostics)
+    json.dumps(diagnostics, allow_nan=False)
 
 
 @pytest.mark.parametrize("road_limit_mps", [1e-9, 0.0, -1.0, 0.09, float("nan"), float("inf")])

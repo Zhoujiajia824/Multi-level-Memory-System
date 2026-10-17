@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.vla_memory.decision.prompt_builder import DecisionPromptBuilder
+from src.vla_memory.decision.config_access import get_semantic_prompt_template
 from src.vla_memory.decision.semantic_output_parser import (
     LATERAL_DECISIONS,
     LONGITUDINAL_DECISIONS,
@@ -131,6 +132,39 @@ def test_semantic_prompt_keeps_all_context_without_legacy_output_contract():
     assert "{scene_block}" not in prompt
 
 
+def test_concise_prompt_example_preserves_the_complete_parser_contract():
+    prompt = DecisionPromptBuilder().build(
+        {}, planning_constraints={"decision_mode": "semantic"},
+    )
+    # The rendered example is an executable output contract, including empty
+    # optional notes, rather than a second numerical planner output schema.
+    output_section = prompt.split("## 输出要求", 1)[1]
+    example, _ = json.JSONDecoder().raw_decode(output_section[output_section.index("{"):])
+    parsed, errors = parse_semantic_decision_output(json.dumps(example))
+    assert not errors
+    assert parsed["behavior_reason"]
+    assert len(parsed["behavior_reason"]) <= 40
+    assert parsed["safety_notes"] == []
+    for intent in LATERAL_DECISIONS + LONGITUDINAL_DECISIONS:
+        assert intent in prompt
+
+
+def test_semantic_guidance_is_brief_and_uses_current_passage_conditions():
+    template = get_semantic_prompt_template()
+    assert len(template) < 1700
+    assert "道路畅通时持续前进" in template
+    assert "遵守适用信号和通行权" in template
+    assert "不因路口、附近目标或信息未知本身一律停车或让行" in template
+    assert "当前观测优先于历史记忆" in template
+    assert "behavior_reason 只写一句当前依据" in template
+    for obsolete in (
+        "已静止时应选择 YIELD", "不确定能否安全接近时可继续停车观察",
+        "## 连续驾驶、停车与恢复行驶", "下游数值规划器负责生成候选轨迹、检查安全约束",
+        "选择 STOP 时指出具体阻塞和解除条件",
+    ):
+        assert obsolete not in template
+
+
 def test_semantic_memory_off_has_no_empty_memory_sections():
     prompt = DecisionPromptBuilder().build(
         {}, planning_constraints={"decision_mode": "semantic"},
@@ -176,7 +210,7 @@ def test_memory_distinguishes_model_request_from_selected_plan(object_record, in
     assert '"executed_behavior": "KEEP_LANE"' in prompt
     assert "上述选择记录不能单独证明" in prompt
     if influence:
-        assert "请求意图仍受规划器安全约束限制" in prompt
+        assert "模型建议参与该帧候选评分" in prompt
     else:
         assert "模型建议未参与该帧候选评分" in prompt
 

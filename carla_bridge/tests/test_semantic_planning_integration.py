@@ -304,7 +304,7 @@ def test_geometry_failure_preserves_diagnostics_and_brakes(tmp_path, source):
 def test_expected_emergency_is_not_reported_as_malformed_trajectory(tmp_path):
     closed = planning_loop(tmp_path)
     plan = {"trajectory": [], "target_speed": 0.0, "planner_diagnostics": {
-        "emergency_brake": True, "failure_reason": "no_safe_candidate"}}
+        "emergency_brake": True, "failure_reason": "no_finite_candidate"}}
     validation = closed._validate_decision(plan, semantic_keyframe())
     assert validation == {"accepted": False, "reasons": ["pdm_emergency_brake"],
-                          "details": {"failure_reason": "no_safe_candidate"}}
+                          "details": {"failure_reason": "no_finite_candidate"}}

@@ -1,9 +1,11 @@
-"""Safety and ablation contracts for semantic candidate selection."""
+"""Score-only selection and semantic ablation contracts."""
 from copy import deepcopy
+import json
+import math
 
 import pytest
 
-from carla_bridge.planning.selection import choose_candidate
+from carla_bridge.planning.selection import SELECTION_RULE, choose_candidate
 
 
 def candidate(identity, score, longitudinal="CRUISE", lateral="FOLLOW_ROUTE"):
@@ -40,7 +42,7 @@ def test_off_removes_all_semantic_score_terms(lateral, longitudinal, weights):
     assert all(item["final_score"] == item["base_score"] for item in audit["candidates"])
 
 
-def test_stop_bonus_can_change_selection_without_changing_pool_or_base_scores():
+def test_semantics_change_only_additive_score_not_candidate_pool_or_diagnostics():
     candidates = pool()
     original = deepcopy(candidates)
     semantic = {"lateral_decision": "FOLLOW_ROUTE", "longitudinal_decision": "STOP"}
@@ -48,7 +50,9 @@ def test_stop_bonus_can_change_selection_without_changing_pool_or_base_scores():
     selected, on = choose_candidate(candidates, semantic, True)
     assert baseline["id"] == "cruise"
     assert selected["id"] == "stop"
-    assert selected["semantic_bonus"] > 0
+    assert selected["semantic_bonus"] == pytest.approx(1.6)
+    assert selected["final_score"] == pytest.approx(selected["base_score"] + 1.6)
+    assert on["selection_rule"] == off["selection_rule"] == SELECTION_RULE
     assert on["candidate_pool_sha256"] == off["candidate_pool_sha256"]
     assert [c["base_score"] for c in on["candidates"]] == [c["base_score"] for c in original]
     assert [c["safety"] for c in on["candidates"]] == [c["safety"] for c in original]
@@ -57,158 +61,154 @@ def test_stop_bonus_can_change_selection_without_changing_pool_or_base_scores():
 
 
 @pytest.mark.parametrize("failed_metric", [
-    "no_collision", "drivable_area", "driving_direction", "ttc", "finite", "traffic_light",
+    "no_collision", "drivable_area", "driving_direction", "ttc", "traffic_light",
 ])
-def test_unsafe_candidate_never_wins_even_with_maximum_semantic_bonus(failed_metric):
+@pytest.mark.parametrize("enabled", [True, False])
+def test_failed_safety_diagnostics_do_not_exclude_the_highest_scored_candidate(failed_metric, enabled):
     safe = candidate("safe", 0.1)
-    unsafe = candidate("unsafe", 1.0, "STOP", "CHANGE_LANE_LEFT")
-    unsafe["safety"][failed_metric] = False if failed_metric in ("finite", "traffic_light") else 0.0
+    unsafe = candidate("diagnostic_failure", 1.0, "MAINTAIN", "CHANGE_LANE_LEFT")
+    unsafe["safety"][failed_metric] = False if failed_metric == "traffic_light" else 0.0
     selected, audit = choose_candidate([safe, unsafe], {
-        "lateral_decision": "CHANGE_LANE_LEFT", "longitudinal_decision": "STOP",
-    }, True, 2.0, 2.0)
-    assert selected["id"] == "safe"
-    rejected = audit["candidates"][1]
-    assert rejected["safe"] is False
-    assert rejected["final_score"] is None
+        "lateral_decision": "CHANGE_LANE_LEFT", "longitudinal_decision": "MAINTAIN",
+    }, enabled)
+    assert selected["id"] == audit["baseline_selected_id"] == "diagnostic_failure"
+    assert selected["safe"] is False and selected["eligible"] is True
+    assert selected["final_score"] == pytest.approx(1.0 + (1.6 if enabled else 0))
+    assert audit["safety_gate_applied"] is False
+    assert audit["safety_is_diagnostic_only"] is True
 
 
-@pytest.mark.parametrize("flag", ["finite", "traffic_light"])
-@pytest.mark.parametrize("value", ["false", "true", 1, 0, None])
-def test_safety_flags_require_actual_true_booleans(flag, value):
+def test_zero_base_score_can_win_from_semantics_without_a_hidden_safety_gate():
+    failed = candidate("zero_base", 0.0, "ACCELERATE", "FOLLOW_ROUTE")
+    failed["safety"].update(no_collision=0.0, drivable_area=0.0,
+                            driving_direction=0.0, ttc=0.0, traffic_light=False)
+    alternatives = [candidate("higher_base", 0.9, "STOP", "KEEP_LANE"), failed]
+    selected, audit = choose_candidate(alternatives, {
+        "lateral_decision": "FOLLOW_ROUTE", "longitudinal_decision": "ACCELERATE",
+    }, True)
+    assert selected["id"] == "zero_base"
+    assert selected["final_score"] == pytest.approx(1.6)
+    assert audit["baseline_selected_id"] == "higher_base"
+
+
+@pytest.mark.parametrize("value", [False, "false", "true", 1, 0, None])
+def test_numerical_finite_flag_requires_the_actual_true_boolean(value):
     invalid = candidate("invalid", 1.0)
-    invalid["safety"][flag] = value
+    invalid["safety"]["finite"] = value
     selected, audit = choose_candidate([invalid], {}, False)
     assert selected is None
-    assert audit["candidates"][0]["safe"] is False
+    assert audit["candidates"][0]["eligible"] is False
+    assert audit["candidates"][0]["final_score"] is None
+    assert audit["candidates"][0]["invalid_numeric_reasons"] == ["non_finite_trajectory"]
 
 
 @pytest.mark.parametrize("metric", [
-    "no_collision", "drivable_area", "driving_direction", "ttc", "finite", "traffic_light",
+    "no_collision", "drivable_area", "driving_direction", "ttc", "traffic_light",
 ])
-def test_missing_safety_evidence_fails_closed(metric):
-    invalid = candidate("invalid", 1.0)
-    del invalid["safety"][metric]
-    selected, audit = choose_candidate([invalid], {}, True)
+def test_missing_optional_safety_diagnostics_do_not_affect_eligibility(metric):
+    item = candidate("finite", 1.0)
+    del item["safety"][metric]
+    selected, _ = choose_candidate([item], {}, False)
+    assert selected["id"] == "finite" and selected["eligible"]
+    if metric == "traffic_light":
+        # The planner no longer constructs this additional footprint check.
+        assert selected["safe"]
+
+
+def test_missing_finite_evidence_is_a_numerical_rejection():
+    item = candidate("invalid", 1.0)
+    del item["safety"]["finite"]
+    selected, audit = choose_candidate([item], {}, False)
     assert selected is None
     assert audit["selected_id"] is None
+    assert audit["available_lateral_semantics"] == []
 
 
-@pytest.mark.parametrize("field", ["base_score", "no_collision", "drivable_area",
-                                  "driving_direction", "ttc"])
-@pytest.mark.parametrize("value", [float("nan"), float("inf")])
-def test_nonfinite_metrics_never_return_an_executable_selection(field, value):
-    invalid = candidate("invalid", 1.0)
-    if field == "base_score":
-        invalid[field] = value
-    else:
-        invalid["safety"][field] = value
-    # Strict JSON audit encoding may reject the whole pool; accepting it as an
-    # explicitly unsafe candidate is also fail-closed. Neither may select it.
-    try:
-        selected, audit = choose_candidate([invalid], {}, False)
-    except ValueError:
-        return
-    assert selected is None
-    assert audit["candidates"][0]["safe"] is False
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf"), None, True, "1"])
+def test_invalid_base_score_is_rejected_without_breaking_pool_hash(value):
+    invalid = candidate("invalid", value)
+    valid = candidate("valid", 0.0)
+    semantic = {"lateral_decision": "FOLLOW_ROUTE", "longitudinal_decision": "CRUISE"}
+    selected, off = choose_candidate([invalid, valid], semantic, False)
+    _, on = choose_candidate([invalid, valid], semantic, True)
+    assert selected["id"] == "valid"
+    assert off["candidate_pool_sha256"] == on["candidate_pool_sha256"]
+    assert off["candidates"][0]["final_score"] is None
+    assert off["candidates"][0]["planning_score"] is None
+    assert off["candidates"][0]["base_score"] is None
+    assert off["candidates"][0]["invalid_numeric_reasons"] == ["invalid_base_score"]
+    json.dumps(off, allow_nan=False)
 
 
-def test_all_unsafe_and_empty_pools_have_no_selected_trajectory():
-    unsafe = pool()
-    for item in unsafe:
+@pytest.mark.parametrize("metric", ["no_collision", "drivable_area", "driving_direction", "ttc"])
+def test_nonfinite_unused_diagnostics_do_not_become_a_new_gate(metric):
+    item = candidate("finite_trajectory_and_score", 1.0)
+    item["safety"][metric] = math.nan
+    selected, first = choose_candidate([item], {}, False)
+    _, second = choose_candidate([item], {}, True)
+    assert selected["id"] == "finite_trajectory_and_score"
+    assert selected["safe"] is False and selected["eligible"] is True
+    assert selected["safety"][metric] is None
+    assert selected["diagnostic_numeric_invalid"] == ["safety." + metric]
+    assert math.isnan(item["safety"][metric])
+    assert first["candidate_pool_sha256"] == second["candidate_pool_sha256"]
+    json.dumps(first, allow_nan=False)
+
+
+def test_all_diagnostic_failures_are_ranked_and_only_empty_pool_has_no_selection():
+    candidates = pool()
+    for item in candidates:
         item["safety"]["ttc"] = 0.0
-    for candidates in (unsafe, []):
-        selected, audit = choose_candidate(candidates, {"longitudinal_decision": "STOP"}, True)
-        assert selected is None
-        assert audit["selected_id"] is None
+    selected, _ = choose_candidate(candidates, {"longitudinal_decision": "STOP"}, True)
+    assert selected["id"] == "stop"
+    assert not selected["safe"] and selected["eligible"]
+    selected, audit = choose_candidate([], {}, False)
+    assert selected is None and audit["selected_id"] is None
 
 
 def test_hash_and_ties_are_repeatable_for_the_same_ordered_pool():
     candidates = [candidate("first", 0.8), candidate("second", 0.8)]
     first, first_audit = choose_candidate(candidates, {}, False)
-    # Dictionary key insertion order does not change the identity of a pool.
     reordered_keys = [dict(reversed(list(item.items()))) for item in candidates]
     second, second_audit = choose_candidate(reordered_keys, {}, False)
-    assert first["id"] == second["id"]
+    assert first["id"] == second["id"] == "first"
     assert first_audit["candidate_pool_sha256"] == second_audit["candidate_pool_sha256"]
 
 
-def recovery_pool():
-    # Scores from the 75.1s server snapshot: KEEP_LANE formerly interrupted
-    # recovery even though both alternatives passed collision/road/TTC checks.
-    center = candidate("center:MAINTAIN", 0.9599316416, "MAINTAIN", "FOLLOW_ROUTE")
+@pytest.mark.parametrize("enabled", [True, False])
+def test_route_recovery_metadata_never_excludes_the_best_scored_candidate(enabled):
+    center = candidate("center", 0.8, "MAINTAIN", "FOLLOW_ROUTE")
     center.update(route_target=True, forward_progress_m=25.0, terminal_speed_mps=6.4)
-    left = candidate("left:MAINTAIN", 0.9590769486, "MAINTAIN", "KEEP_LANE")
+    left = candidate("left", 1.0, "MAINTAIN", "KEEP_LANE")
     left.update(route_target=False, route_recovery_required=True)
-    return [center, left]
+    selected, audit = choose_candidate([center, left], {"lateral_decision": "KEEP_LANE"}, enabled)
+    assert selected["id"] == audit["baseline_selected_id"] == "left"
+    assert selected["route_eligible"] and selected["eligible"]
+    assert audit["route_recovery_active"] is False
+    assert audit["route_recovery_gate_applied"] is False
 
 
-@pytest.mark.parametrize("enabled", [True, False])
-def test_route_deadline_precedes_semantics_and_baseline_progress(enabled):
-    candidates = recovery_pool()
-    candidates[1]["base_score"] = 1.0  # Also protect the semantics-off arm.
-    selected, audit = choose_candidate(candidates, {"lateral_decision": "KEEP_LANE",
-                                                  "longitudinal_decision": "MAINTAIN"}, enabled)
-    assert selected["id"] == audit["baseline_selected_id"] == "center:MAINTAIN"
-    assert audit["route_recovery_active"]
-    assert audit["candidates"][1]["safe"]  # Safety and route eligibility are separate.
-    assert not audit["candidates"][1]["route_eligible"]
-    _, other = choose_candidate(candidates, {}, not enabled)
-    assert audit["candidate_pool_sha256"] == other["candidate_pool_sha256"]
-
-
-@pytest.mark.parametrize("blocked", ["collision", "red_light", "stopped"])
-def test_route_deadline_never_forces_a_blocked_return(blocked):
-    candidates = recovery_pool()
-    if blocked == "collision":
-        candidates[0]["safety"]["no_collision"] = 0.0
-    elif blocked == "red_light":
-        candidates[0]["safety"]["traffic_light"] = False
-    else:
-        candidates[0].update(forward_progress_m=0.0, terminal_speed_mps=0.0)
-    selected, audit = choose_candidate(candidates, {"lateral_decision": "KEEP_LANE"}, True)
-    assert selected["id"] == "left:MAINTAIN"
-    assert not audit["route_recovery_active"]
-
-
-def test_keep_lane_remains_effective_without_route_deadline():
-    candidates = recovery_pool()
-    candidates[1]["route_recovery_required"] = False
-    selected, audit = choose_candidate(candidates, {"lateral_decision": "KEEP_LANE"}, True)
-    assert selected["id"] == "left:MAINTAIN"
-    assert not audit["route_recovery_active"]
-
-
-@pytest.mark.parametrize("enabled", [True, False])
-def test_continuity_cannot_preserve_an_old_path_after_it_becomes_unsafe(enabled):
-    old_path = candidate("previous_path", 1.0, "MAINTAIN")
-    old_path.update(continuity_cost=0.0)
-    old_path["safety"]["no_collision"] = 0.0
-    avoidance = candidate("new_path", 0.7, "STOP")
-    avoidance.update(continuity_cost=0.15)
-    selected, audit = choose_candidate([old_path, avoidance], {"longitudinal_decision": "MAINTAIN"}, enabled)
-    assert selected["id"] == "new_path"
-    assert audit["candidates"][0]["final_score"] is None
-
-
-def test_continuity_changes_physical_baseline_equally_in_both_semantic_arms():
+@pytest.mark.parametrize("continuity_cost", [0.15, 0.5, 100, -1, math.nan, "obsolete"])
+def test_continuity_metadata_never_changes_the_base_score(continuity_cost):
     stable = candidate("stable", 0.90, "YIELD")
     changed = candidate("changed", 0.95, "MAINTAIN")
-    stable["continuity_cost"], changed["continuity_cost"] = 0.0, 0.10
+    stable["continuity_cost"], changed["continuity_cost"] = 0.0, continuity_cost
     candidates = [stable, changed]
-    original = deepcopy(candidates)
-    off, off_audit = choose_candidate(candidates, {"longitudinal_decision": "MAINTAIN"}, False)
-    on, on_audit = choose_candidate(candidates, {"longitudinal_decision": "MAINTAIN"}, True)
-    assert off["id"] == on_audit["baseline_selected_id"] == "stable"
-    assert on["id"] == "changed"  # Semantics remain effective among safe candidates.
+    off, off_audit = choose_candidate(candidates, {"longitudinal_decision": "YIELD"}, False)
+    on, on_audit = choose_candidate(candidates, {"longitudinal_decision": "YIELD"}, True)
+    assert off["id"] == on_audit["baseline_selected_id"] == "changed"
+    assert on["id"] == "stable"
     assert off_audit["candidate_pool_sha256"] == on_audit["candidate_pool_sha256"]
-    assert [c["planning_score"] for c in off_audit["candidates"]] == [c["planning_score"] for c in on_audit["candidates"]]
-    assert candidates == original
+    assert all(item["planning_score"] == item["base_score"] for item in off_audit["candidates"])
+    assert on_audit["continuity_penalty_applied"] is False
+    json.dumps(off_audit, allow_nan=False)
+    if isinstance(continuity_cost, float) and math.isnan(continuity_cost):
+        assert math.isnan(changed["continuity_cost"])
+        assert off["continuity_cost"] is None
+        assert off["diagnostic_numeric_invalid"] == ["continuity_cost"]
 
 
-def test_continuity_cannot_postpone_required_safe_route_recovery():
-    candidates = recovery_pool()
-    candidates[0]["continuity_cost"] = 0.15
-    candidates[1]["continuity_cost"] = 0.0
-    selected, audit = choose_candidate(candidates, {"lateral_decision": "KEEP_LANE"}, True)
-    assert selected["id"] == "center:MAINTAIN"
-    assert audit["candidates"][1]["safe"] and not audit["candidates"][1]["eligible"]
+@pytest.mark.parametrize("weight", [-1, 2.1, math.nan, math.inf])
+def test_invalid_semantic_weights_are_still_rejected(weight):
+    with pytest.raises(ValueError, match="semantic weights"):
+        choose_candidate(pool(), {}, True, weight, 0.8)

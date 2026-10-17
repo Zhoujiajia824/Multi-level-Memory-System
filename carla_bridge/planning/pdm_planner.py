@@ -1,7 +1,7 @@
 """PDM-Closed core executed on CARLA observations and road geometry.
 
 This is a simulator adapter, not the original nuPlan benchmark planner. The
-official generator, LQR/bicycle simulator, scorer and emergency detector are
+official generator, LQR/bicycle simulator and scorer are
 imported unchanged from pinned upstream sources. See README.md for deviations.
 """
 from __future__ import annotations
@@ -17,7 +17,6 @@ import numpy as np
 
 from .dependencies import load_dependencies, validate_dependencies
 from .selection import choose_candidate
-from .continuity import TrajectoryReference, trajectory_continuity_costs
 
 
 def _lane_key(wp):
@@ -170,7 +169,7 @@ def _lane_path_points(waypoints):
     that chord tangent into pose recovery amplifies sampling error and makes
     repeated replans depend on which side of a vertex ego happens to project.
     Interpolate only between connected map samples, using their actual heading.
-    Road safety is still checked against independently constructed lane surfaces.
+    Road compliance is still scored against independently built lane surfaces.
     """
     from scipy.interpolate import CubicHermiteSpline
     points = np.array([_xy(wp) for wp in waypoints])
@@ -247,12 +246,6 @@ class CarlaPDMPlanner:
         self.transition_m = float(self.config.get("lane_change_length_m", 30.0))
         self.lateral_weight = float(self.config.get("lateral_semantic_weight", 0.8))
         self.longitudinal_weight = float(self.config.get("longitudinal_semantic_weight", 0.8))
-        self.continuity_weight = float(self.config.get("continuity_weight", 0.15))
-        if not math.isfinite(self.continuity_weight) or not 0 <= self.continuity_weight <= 0.5:
-            raise ValueError("continuity_weight must be finite and within [0, 0.5]")
-        self._previous_plan = None
-        self._continuity_reference = None
-        self._continuity_timestamp = None
         self._reference_route_source = None
         self._resolved_route_waypoints = None
         self._route_resolution = None
@@ -272,7 +265,6 @@ class CarlaPDMPlanner:
         self.generator = self.api.PDMGenerator(self.sampling, self.sampling, leading_agent_update_rate=1)
         self.simulator = self.api.PDMSimulator(self.sampling)
         self.scorer = self.api.PDMScorer(self.sampling)
-        self.emergency = self.api.PDMEmergencyBrake(self.sampling)
         self.vehicle_parameters = self._vehicle_parameters()
         # Upstream resets only the bicycle's vehicle per rollout. Its LQR
         # otherwise retains the default Pacifica wheelbase and its bicycle
@@ -486,22 +478,10 @@ class CarlaPDMPlanner:
             if not corridor:
                 reason = reason or "no_same_direction_lane_at_ego"
 
-            # Detect the last opportunity to return before a junction, a lane
-            # ending/disconnection, or a marking that forbids returning. This
-            # uses map evidence, never the requested semantic action.
-            barrier = cut if side != "center" else None
             for i in range(closest, len(reference)):
                 base = reference[i]
                 distance_ahead = float(progress[i] - progress[closest])
                 wp = _adjacent(base, side)
-                if side != "center":
-                    return_permission = carla.LaneChange.Right if side == "left" else carla.LaneChange.Left
-                    if (wp is None or base.is_junction or wp.is_junction
-                            or not (int(wp.lane_change) & int(return_permission))):
-                        limit = {"reason": "return_lane_change_not_permitted_or_intersection",
-                                 "reference_index": i, "distance_ahead_m": distance_ahead}
-                        if barrier is None or distance_ahead < barrier["distance_ahead_m"]:
-                            barrier = limit
                 if reason is None and side != current_side and distance_ahead <= self.transition_m + 4:
                     source = _adjacent(base, current_side)
                     direction = side if current_side == "center" else ("right" if current_side == "left" else "left")
@@ -515,22 +495,9 @@ class CarlaPDMPlanner:
                             "target_lane_key": _lane_key(wp) if wp else None,
                             "source_lane_change": int(source.lane_change) if source else None,
                             "reference_is_junction": bool(base.is_junction)}
-            details["return_barrier"] = barrier
-            recovery_required = (barrier is not None and barrier["distance_ahead_m"]
-                                 <= self.transition_m + 4 + self.max_speed * self.horizon)
-            details["route_recovery_required"] = recovery_required
-            if barrier is not None and barrier["distance_ahead_m"] > 0:
-                # If recovery is temporarily blocked, IDM can slow/stop on the
-                # current lane before its known return boundary. It must not
-                # cruise through an unrelated junction branch just because
-                # geometrically adjacent waypoints continue to exist there.
-                limit_station = progress[barrier["reference_index"]]
-                corridor = [wp for wp in corridor
-                            if reference_line.project(Point(*_xy(wp))) < limit_station - 1e-4]
-                details["bounded_before_return_barrier"] = True
             # Do not start a lane change that cannot finish inside this finite
             # corridor. Staying on a short lane is still a valid braking path.
-            endpoint = barrier or cut
+            endpoint = cut
             if (reason is None and side != current_side and endpoint is not None
                     and endpoint["distance_ahead_m"] <= self.transition_m + 4):
                 reason = "insufficient_lane_change_corridor"
@@ -567,8 +534,7 @@ class CarlaPDMPlanner:
                 continue
             paths.append(path)
             details["path_length_m"] = float(path.length)
-            metadata.append({"id": side, "label": label, "semantics": sorted(set(semantics)),
-                             "route_recovery_required": recovery_required})
+            metadata.append({"id": side, "label": label, "semantics": sorted(set(semantics))})
         if not paths:
             raise ValueError("No legal lateral path from the current lane")
         centerline = self.api.PDMPath(_path_states([_xy(wp) for wp in reference], self.api))
@@ -684,11 +650,6 @@ class CarlaPDMPlanner:
     def plan(self, semantic_decision, semantic_enabled=True):
         from shapely.geometry import Point
         timestamp = int(round(self.world.get_snapshot().timestamp.elapsed_seconds * 1e6))
-        # Freeze the prior reference for repeatable on/off evaluation of the
-        # same snapshot; never use the other arm's just-selected trajectory.
-        if self._continuity_timestamp != timestamp:
-            self._continuity_reference = self._previous_plan
-            self._continuity_timestamp = timestamp
         state, tf = self._ego_state(timestamp)
         self._geometry_diagnostics = {"ego_location": {"x": tf.location.x, "y": tf.location.y,
                                                        "z": tf.location.z}}
@@ -717,9 +678,6 @@ class CarlaPDMPlanner:
         simulated = self.simulator.simulate_proposals(proposals, state)
         scores = self.scorer.score_proposals(simulated, state, observation, centerline, lanes, area,
                                              _IntersectionMap(self.map, tf.location.z, self.api))
-        costs, continuity = trajectory_continuity_costs(
-            proposals, self.generator._state_idm_array[:, :, 1], timestamp_us=timestamp,
-            sample_interval_s=self.dt, previous=self._continuity_reference, weight=self.continuity_weight)
         candidates = []
         for index in range(len(manager)):
             proposal = manager[index]
@@ -728,16 +686,11 @@ class CarlaPDMPlanner:
             profile = idm_states[:, 1]
             finite = bool(np.isfinite(proposals[index]).all() and np.isfinite(simulated[index]).all()
                           and np.isfinite(idm_states).all() and np.isfinite(scores[index]))
-            # Upstream scorer intentionally ignores red-light tokens. Add the
-            # same hard check in both conditions, including lane-change paths.
-            traffic_safe = all(not polygon.intersects(stop) for polygon in self.scorer._ego_polygons[index]
-                               for stop in stop_polygons)
             multi, weighted = self.scorer._multi_metrics, self.scorer._weighted_metrics
             safety = {"no_collision": float(multi[self.api.MultiMetricIndex.NO_COLLISION, index]),
                       "drivable_area": float(multi[self.api.MultiMetricIndex.DRIVABLE_AREA, index]),
                       "driving_direction": float(multi[self.api.MultiMetricIndex.DRIVING_DIRECTION, index]),
-                      "ttc": float(weighted[self.api.WeightedMetricIndex.TTC, index]),
-                      "traffic_light": traffic_safe, "finite": finite}
+                      "ttc": float(weighted[self.api.WeightedMetricIndex.TTC, index]), "finite": finite}
             if initial_collisions:
                 safety["no_collision"] = 0.0
             offroad_steps = np.flatnonzero(self.scorer._ego_areas[index, :, self.api.EgoAreaIndex.NON_DRIVABLE_AREA])
@@ -751,12 +704,10 @@ class CarlaPDMPlanner:
             candidates.append({"id": "%s:%s" % (lat["id"], longitudinal[proposal.longitudinal_idx]),
                                "index": index, "lateral": lat["label"], "lateral_semantics": lat["semantics"],
                                "route_target": lat["id"] == "center",
-                               "route_recovery_required": lat["route_recovery_required"],
                                "forward_progress_m": float(centerline.project(Point(*proposals[index, -1, :2]))
                                                            - centerline.project(Point(*proposals[index, 0, :2]))) if finite else 0.0,
                                "terminal_speed_mps": float(self.generator._state_idm_array[index, -1, 1]) if finite else 0.0,
                                "longitudinal": "STOP" if longitudinal[proposal.longitudinal_idx] == "STOP_HARD" else longitudinal[proposal.longitudinal_idx],
-                               "continuity_cost": float(costs[index]),
                                "predicted_collision_time_s": collision_time if math.isfinite(collision_time) else None,
                                "predicted_ttc_infraction_time_s": ttc_time if math.isfinite(ttc_time) else None,
                                "drivable_area_failure": area_failure,
@@ -773,7 +724,8 @@ class CarlaPDMPlanner:
                            leading_agent_update_rate=1, lateral_transition="cubic_hermite_pose_tangent",
                            excluded_lateral_paths=excluded, traffic_stop_lines=len(stop_polygons),
                            geometry=self._geometry_diagnostics,
-                           continuity=continuity, idm_integration="substeps_max_0.01s_nonnegative_trapezoid",
+                           native_red_light_idm=True,
+                           idm_integration="substeps_max_0.01s_nonnegative_trapezoid",
                            actors=[{"id": str(actor.track_token), "x": actor.center.x, "y": actor.center.y,
                                     "heading": actor.center.heading, "vx": actor.velocity.x, "vy": actor.velocity.y,
                                     "length": actor.box.length, "width": actor.box.width}
@@ -787,13 +739,11 @@ class CarlaPDMPlanner:
                                         self.ego.bounding_box.location.x, self.ego.bounding_box.location.y,
                                         self.ego.bounding_box.location.z],
                                     "rear_axle_to_center_m": self.vehicle_parameters.rear_axle_to_center})
-        # Run the upstream detector against the selected candidate. Its brake
-        # output is an emergency signal; CARLA performs a direct full brake.
-        emergency_scores = np.asarray([c["final_score"] if c["eligible"] else -1.0 for c in diagnostics["candidates"]])
-        emergency = self.emergency.brake_if_emergency(state, emergency_scores, self.scorer)
-        if selected is None or emergency is not None:
-            self._previous_plan = None
-            diagnostics.update(emergency_brake=True, failure_reason="no_safe_candidate" if selected is None else "upstream_emergency")
+        diagnostics["selected_zero_base_score"] = selected is not None and selected["base_score"] == 0.0
+        # Selection is score-only. No separate collision/TTC detector replaces
+        # the winner; only numerically invalid candidates cannot be executed.
+        if selected is None:
+            diagnostics.update(emergency_brake=True, failure_reason="no_finite_candidate")
             return {"trajectory": [], "target_speed": 0.0, "selected_lateral": "KEEP_LANE",
                     "selected_longitudinal": "STOP", "planner_diagnostics": diagnostics}
         index = selected["index"]
@@ -804,8 +754,6 @@ class CarlaPDMPlanner:
         box_offset = np.array([self.ego.bounding_box.location.x, -self.ego.bounding_box.location.y])
         trajectory = []
         idm_velocity = self.generator._state_idm_array[index, :, 1]
-        self._previous_plan = TrajectoryReference(states=proposals[index].copy(), speeds=idm_velocity.copy(),
-                                                  timestamp_us=timestamp, sample_interval_s=self.dt)
         for i, point in enumerate(states):
             center = point.center
             c, s = math.cos(center.heading), math.sin(center.heading)

@@ -1185,7 +1185,9 @@ python -m pytest -q -p no:cacheprovider
 
 模型不得给出 `trajectory`、`target_speed` 等数值控制字段；导航路线决定道路转向，
 语义请求不能改写目的地或使禁止变道的路段变成合法变道。不可用的横向请求由候选诊断记录。
-候选先经过统一安全筛选，语义仅改变合格候选的偏好评分。语义不是无条件执行命令。
+候选按 `PDM基础分 + 语义加分` 直接选择，不再增加碰撞/道路/方向/TTC/红灯的独立
+硬筛选、必要回归或连续性扣分。PDM 原生基础分仍包含风险指标；0 基础分候选也可被
+语义加分选中。执行前数值与动力学一致性校验继续生效。
 
 默认每 **3 秒仿真时间**更新一次模型语义，每 **0.2 秒**使用最新 CARLA 状态重新规划，
 控制器每 **0.1 秒**按轨迹时间插值速度。规划不额外推进 world tick。
@@ -1194,13 +1196,14 @@ python -m pytest -q -p no:cacheprovider
 
 ### 13.3 对照开关与记忆实验
 
-语义提示词版本 2 位于 `config/decision.yaml` 的 `semantic.system_prompt` 和 `semantic.user_prompt`。
+语义提示词版本 4 位于 `config/decision.yaml` 的 `semantic.system_prompt` 和 `semantic.user_prompt`。
 `pdm_closed` 不再使用 `config/api_models.yaml` 中要求输出路点的旧决策系统提示词；
 `vlm_trajectory` 保持原系统契约。场景理解提示词仍在 `config/prompts.yaml`。
 修改后重启驾驶进程使缓存配置生效；`[DECISION_PROMPT]` 日志记录实际系统/用户提示词哈希。
 
-针对重复 STOP，语义提示词区分接近停止位置、停车观察、满足通行条件后恢复行驶。
-`STOP` 是立即制动/保持静止偏好，不能表达“先开到远处停止线”；`MAINTAIN` 可从静止起步。
+提示词以当前证据与通行条件选择动作，畅通时持续前进；六个纵向动作中性定义，
+不使用长篇 STOP/YIELD 或低速探查示例引导。`behavior_reason` 只需一句短理由，
+建议不超过 40 字，`safety_notes` 通常为 `[]`，保留原五字段 JSON 协议。
 历史轨迹显示相对时间，并从现有连续位姿计算有界的近静止时长，不把等待时间当作自动放行条件。
 该运动窗口来自各记忆模式共同的传感器历史，不增加 memory_off 的检索或短期记忆。
 路线锚点与真实 actor 分开显示；静止时长不能证明已在停止线完成停车，视觉估距也不是精确停止位置。
@@ -1208,7 +1211,7 @@ python -m pytest -q -p no:cacheprovider
 
 验证时使用同一 prepared 场景、seed 和记忆配置，核对模型原始语义、PDM 最终选择、
 停车后是否恢复以及碰撞/违规/完整路线结果。提示词与回归测试不能证明模型一定选择正确，
-仍需服务器闭环验收；此更新没有修改 PDM 安全筛选或用计时器强制车辆起步。
+仍需服务器闭环验收；不要用计时器强制车辆起步。
 
 ```bash
 # 模型语义参与 PDM 候选选择；默认即为 on
@@ -1226,7 +1229,7 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --planner vlm_
 
 `--semantic-influence off` 保留模型调用、语义解析与日志，只关闭候选的语义评分，
 因此不是“完全不调用模型”的计算成本基线。给定同一车辆/地图/交通状态，开关两侧生成
-相同候选并使用相同安全检查；行驶动作不同后，两轮未来状态自然可能分化。
+相同候选与基础分，只有语义加分不同；行驶动作不同后，两轮未来状态自然可能分化。
 
 `--mode memory_off` 与语义开关是两个独立实验维度。做对照时固定场景、seed、路线、
 规划参数、模型配置及评估库快照；不要先让一个实验组向同一库写入，再让另一个组读取新增内容。
@@ -1241,10 +1244,12 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --planner vlm_
 - 决策 JSONL 的 `model_decision_output` 保留模型语义，`decision_output` 保存规划后的指令与轨迹，
   `planning_output` 保存候选诊断，`decision_validation` 保存执行前数值校验结果。
 - `planner.jsonl` 记录每次 PDM 更新的仿真时间、关联语义帧、候选基础分/语义分/最终选择和校验结果。
-  临近车道终止或路口时的回归约束见 `route_recovery_active`、逐候选 `route_eligible` / `eligible`；
-  `geometry` 保存车道连接、截断和变道许可诊断。几何失败也会写入 `semantic_error` / `control_error`。
-  `pdm_emergency_brake` 表示主动保护制动，具体原因见 `failure_reason`；不会当作成功执行写入决策记忆。
-  详细规则见 [PDM 规划说明](planning/README.md#相邻车道回归与规划失败诊断)。
+  `selection_rule=pdm_base_plus_semantic`，`eligible` 只表示数值有效，`safe` / `safety` 仅作
+  风险诊断；`selected_zero_base_score` 标记是否选择了 0 基础分候选。必要回归已移除，
+  `route_recovery_active=false`。`geometry` 保存实际车道连接、截断和变道许可诊断。
+  几何失败也会写入 `semantic_error` / `control_error`；无数值有效候选时
+  `failure_reason=no_finite_candidate`，兼容的校验原因仍为 `pdm_emergency_brake`。
+  详细规则见 [PDM 规划说明](planning/README.md#路线几何与规划失败诊断)。
 - `control.jsonl` 将每个物理 tick 的速度/加速度与前一条控制命令对齐，并保存服务器
   帧号/时间、带方向的前向速度及挡位/倒车/手刹状态。`control_context.json` 保存本轮
   实际物理子步配置和车辆制动参数，便于区分规划停车、控制响应和仿真推进异常。

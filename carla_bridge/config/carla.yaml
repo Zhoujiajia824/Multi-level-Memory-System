@@ -60,7 +60,7 @@ carla:
   replan_interval_s: 3.0         # VLM 每 3s 更新语义意图，PDM 独立高频规划
   planning:
     backend: "pdm_closed"       # pdm_closed | vlm_trajectory（旧版轨迹模式）
-    semantic_influence: true    # 消融只切换语义评分，不改变候选生成和安全检查
+    semantic_influence: true    # 消融只切换语义加分；最终选择=PDM基础分+语义分
     replan_interval_s: 0.2      # PDM 更新周期；VLM 意图在两次认知之间保持
     horizon_s: 4.0              # 不短于 VLM 周期；轨迹由官方 PDM 核心产生
     sample_interval_s: 0.1      # 固定版本官方 TTC 实现使用 10Hz 索引
@@ -69,7 +69,6 @@ carla:
     lane_change_length_m: 30.0
     lateral_semantic_weight: 0.8
     longitudinal_semantic_weight: 0.8
-    continuity_weight: 0.15     # 同安全候选间的短时轨迹连续性扣分上限；语义开/关共用，0可关闭
   max_duration_s: 300.0          # 超时保护；到时路线未完成则失败，不作为成功条件
   route_completion_tolerance_m: 2.0  # 按顺序经过整条路线，且当前距终点 <= 此值
   route_tracking_tolerance_m: 5.0    # 中途路线走廊，允许一次正常变道/避让
