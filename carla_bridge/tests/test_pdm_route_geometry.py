@@ -204,3 +204,84 @@ def test_same_lane_recovery_does_not_shorten_actual_lane_change():
     for side in ("left", "right"):
         assert details[side]["path_kind"] == "lane_change"
         assert details[side]["transition_length_m"] == 30
+
+
+def test_within_lane_offsets_share_physical_lane_and_pool_in_both_semantic_modes():
+    from carla_bridge.tests.test_pdm_planner import make_planner, semantic, assert_score_only_selection
+    planner = make_planner(speed=4)
+    on = planner.plan(semantic("MAINTAIN"))["planner_diagnostics"]
+    off = planner.plan(semantic("MAINTAIN"), semantic_enabled=False)["planner_diagnostics"]
+    assert on["candidate_pool_sha256"] == off["candidate_pool_sha256"]
+    assert_score_only_selection(on)
+    assert_score_only_selection(off)
+    center = [c for c in on["candidates"] if c["physical_lane_side"] == "center"]
+    assert {c["lane_offset_m"] for c in center} == {0.0, -.5, -.25, .25, .5}
+    assert all(c["route_target"] and "FOLLOW_ROUTE" in c["lateral_semantics"] for c in center)
+    assert len({c["id"] for c in on["candidates"]}) == len(on["candidates"])
+
+
+def test_offset_limit_just_above_quarter_metre_is_quantized_before_id_deduplication():
+    from carla_bridge.tests.test_pdm_planner import make_planner, semantic
+    planner = make_planner()
+    planner.vehicle_parameters.width = 2.798  # lane 3.5: cap .251 m before quantization.
+    diagnostics = planner.plan(semantic("MAINTAIN"))["planner_diagnostics"]
+    offsets = {c["lane_offset_m"] for c in diagnostics["candidates"]
+               if c["physical_lane_side"] == "center"}
+    assert offsets == {0.0, -.25, .25}
+    assert len({c["id"] for c in diagnostics["candidates"]}) == len(diagnostics["candidates"])
+
+
+def test_invalid_extra_offset_records_its_error_and_keeps_the_zero_offset_path(monkeypatch):
+    import carla_bridge.planning.pdm_planner as module
+    from carla_bridge.tests.test_pdm_planner import make_planner, semantic
+    original = module._lane_offset_points
+    def rejected(points, offset, api):
+        if offset > 0:
+            raise ValueError("synthetic singular extra offset")
+        return original(points, offset, api)
+    monkeypatch.setattr(module, "_lane_offset_points", rejected)
+    diagnostics = make_planner().plan(semantic("MAINTAIN"))["planner_diagnostics"]
+    assert any(c["id"] == "center:MAINTAIN" for c in diagnostics["candidates"])
+    assert set(diagnostics["geometry"]["lateral_paths"]["center"]["excluded_offset_paths"]) == {"+0.25", "+0.50"}
+
+
+def test_route_return_offsets_respect_a_narrower_future_reference_lane(monkeypatch):
+    import carla_bridge.planning.pdm_planner as module
+    from carla_bridge.tests.test_pdm_planner import semantic
+    planner = ending_planner(EndingRoad(end=1000), speed=4)
+    lookup = planner.map.get_waypoint
+    def narrow_exit(location, project_to_road=True, lane_type=None):
+        wp = lookup(location, project_to_road, lane_type)
+        if wp.lane == 0 and wp.x >= 40:
+            wp.lane_width = 2.8
+        return wp
+    planner.map.get_waypoint = narrow_exit
+    planner.route._route_waypoints = [narrow_exit(location) for location in planner.route._route]
+    # Isolate the width contract of a complete return proposal. Its current
+    # adjacent lane remains 3.5 m; only its future route target narrows to 2.8 m.
+    monkeypatch.setattr(module, "_route_compatible_lane_points", lambda reference, *args:
+        (module._lane_path_points(reference), {"method": "synthetic_complete_route_return"}))
+    diagnostics = planner.plan(semantic("MAINTAIN"))["planner_diagnostics"]
+    left = diagnostics["geometry"]["lateral_paths"]["left"]
+    assert left["within_lane_offset_limit_m"] == .4
+    assert max(abs(value) for value in left["within_lane_offsets_m"]) == .4
+
+
+def test_nonzero_lane_section_start_is_rounded_into_its_real_interval():
+    from shapely.geometry import Point
+    from carla_bridge.planning.road_area import road_driving_polygons
+    def waypoint(road, lane, station):
+        station = float(np.float32(station))  # CARLA's conversion contract.
+        if station >= 2:
+            return None
+        return NS(road_id=road, section_id=0 if station < .7 else 1, lane_id=lane,
+            s=station, lane_width=3.5, lane_type=carla.LaneType.Driving, is_junction=False,
+            transform=carla.Transform(carla.Location(x=station)))
+    lane = '<left><lane id="1" type="driving" /></left>'
+    xml = ('<OpenDRIVE><road id="5" length="2"><lanes><laneSection s="0">' + lane
+           + '</laneSection><laneSection s=".7">' + lane + '</laneSection></lanes></road></OpenDRIVE>')
+    road = NS(to_opendrive=lambda: xml, get_waypoint_xodr=waypoint)
+    polygons, _ = road_driving_polygons(road, [waypoint(5, 1, 1)])
+    assert float(np.float32(.7)) < .7  # A rejected first sample formerly left a .5-m gap.
+    assert polygons["5:1:1"].contains(Point(.7001, 0))
+    assert not polygons["5:1:1"].contains(Point(.6999, 0))

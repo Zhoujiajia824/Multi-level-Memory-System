@@ -218,6 +218,7 @@ class ClosedLoop:
             planner_cfg = dict(self.planning_cfg)
             planner_cfg["horizon_s"] = max(float(planner_cfg.get("horizon_s", 4.0)), self._execution_horizon)
             self.pdm_planner = CarlaPDMPlanner(world, ego, self.scenario.route, planner_cfg)
+            self._bind_pdm_controller(ego)
         self.kf_builder = KeyframeBuilder(scenario_name=self.scenario.scenario_name(), run_id=self.run_id)
 
         # 5. 碰撞传感器 + 指标采集
@@ -378,6 +379,18 @@ class ClosedLoop:
             values["errors"] = errors
         return values
 
+    def _bind_pdm_controller(self, ego) -> None:
+        """Use one vehicle geometry for PDM rollouts and CARLA trajectory tracking."""
+        self.tracker.bind_vehicle_model(
+            self.pdm_planner.vehicle_parameters.wheel_base,
+            steering_model=self.pdm_planner.steering_model,
+            rear_axle_actor_xyz_m=self.pdm_planner.rear_axle_actor_xyz_m,
+        )
+        self.ego_provider.max_steer_rad = self.pdm_planner.max_steer
+        self.ego_provider.steering_model = self.tracker.steering_model
+        logger.info("PDM控制参数已绑定：轴距 %.4fm，前轮距 %.4fm，等效中心转角上限 %.4frad，后轴参考点跟踪",
+                    self.tracker.pp.L, self.tracker.steering_model.front_track_m, self.tracker.max_steer_rad)
+
     def _write_control_context(self, world, ego) -> None:
         """Snapshot physics metadata once; these observations never change physics settings."""
         errors = {}
@@ -403,6 +416,20 @@ class ClosedLoop:
         except Exception as exc:
             errors["vehicle_physics"] = type(exc).__name__ + ": " + str(exc)
         context["errors"] = errors
+        tracker = getattr(self, "tracker", None)
+        if isinstance(tracker, TrajectoryTracker):
+            context["tracking_vehicle_model"] = {
+                "source": tracker.vehicle_model_source,
+                "wheelbase_m": tracker.pp.L,
+                "max_steer_rad": tracker.max_steer_rad,
+                "physical_inner_max_steer_rad": tracker.steering_model.physical_max_steer_rad,
+                "front_track_m": tracker.steering_model.front_track_m,
+                "steering_curve_kmh_scale": tracker.steering_model.curve,
+                "mapping": tracker.steering_model.mapping,
+                "tracking_reference": "pdm_rear_axle" if tracker.rear_axle_actor_xyz_m is not None else "carla_actor_origin",
+                "rear_axle_actor_xyz_m": tracker.rear_axle_actor_xyz_m,
+                "input_latency_modeled": False,
+            }
         try:
             self._control_audit_path.with_name("control_context.json").write_text(
                 json.dumps(context, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
@@ -660,6 +687,10 @@ class ClosedLoop:
                 "max_speed_mps", "max_acceleration_mps2", "max_deceleration_mps2",
                 "max_lateral_acceleration_mps2")},
         }
+        if self.planner_backend == "pdm_closed":
+            from carla_bridge.planning.navigation_context import build_navigation_context
+            kf["planning_constraints"]["navigation_context"] = build_navigation_context(
+                self.scenario.route, ego, self._elapsed)
         logger.info(
             "[replan] t=%.1fs token=%s nav=%s objs=%d speed=%.1f",
             self._elapsed, sample_token, nav, len(objs), ego_state.speed,

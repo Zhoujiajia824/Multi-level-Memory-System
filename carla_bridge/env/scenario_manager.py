@@ -20,7 +20,7 @@ import yaml
 
 from src.vla_memory.common.logging_utils import get_logger
 from carla_bridge.env.weather_controller import WeatherController
-from carla_bridge.env.traffic_spawner import TrafficSpawner
+from carla_bridge.env.traffic_spawner import TrafficSpawner, resolve_traffic_manager_port
 from carla_bridge.env.route_planner import RoutePlanner
 
 logger = get_logger("carla_scenario")
@@ -46,6 +46,7 @@ class ScenarioManager:
         self.route: Optional[RoutePlanner] = None
         self.paper = (scenario_cfg.get("experiment") or {}).get("suite") == "paper_v1"
         self.experiment_snapshot = None
+        self.traffic_manager_port = None
 
     @classmethod
     def from_yaml(cls, carla_client, carla_cfg: dict, yaml_path: str) -> "ScenarioManager":
@@ -55,6 +56,10 @@ class ScenarioManager:
 
     def setup(self) -> "ScenarioManager":
         cfg = self.cfg
+        # Use the connected wrapper's RPC port: CLI overrides may differ from
+        # the port stored in the original config. Validate before mutating world.
+        self.traffic_manager_port = resolve_traffic_manager_port(
+            self.carla_client.port, self.carla_cfg.get("traffic_manager_port"))
         if self.paper:
             from carla_bridge.paper_suite import validate_prepared
             validate_prepared(cfg)
@@ -121,7 +126,8 @@ class ScenarioManager:
             )
         # 交通流
         self.traffic = TrafficSpawner(
-            self.world, self.client, self.ego_vehicle, seed=int(cfg.get("seed", 42))
+            self.world, self.client, self.ego_vehicle, seed=int(cfg.get("seed", 42)),
+            tm_port=self.traffic_manager_port,
         )
         tcfg = cfg.get("traffic", {}) or {}
         if self.paper:
@@ -137,6 +143,7 @@ class ScenarioManager:
             self.experiment_snapshot = {
                 "experiment": cfg["experiment"], "case_config_sha256": digest(cfg), "seed": cfg["seed"],
                 "map": self.world.get_map().name,
+                "traffic_manager_port": self.traffic.tm_port,
                 "route_length_m": self.route._progress.lengths[-1],
                 "spawned_vehicles": spawned_vehicles, "spawned_walkers": spawned_walkers,
                 "requested_vehicles": tcfg["num_vehicles"], "requested_walkers": tcfg["num_walkers"],

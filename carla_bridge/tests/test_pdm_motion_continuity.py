@@ -84,6 +84,32 @@ def test_normal_stop_uses_comfort_deceleration_when_the_road_is_clear():
     assert hard["acceleration_range_mps2"][0] == pytest.approx(-4.0)
 
 
+def test_gentle_start_extends_the_shared_pool_without_slowing_ordinary_acceleration():
+    planner = make_planner(speed=0, allow_change=False)
+    off = planner.plan(semantic("YIELD"), semantic_enabled=False)["planner_diagnostics"]
+    profiles = planner.generator._state_idm_array.copy()
+    on = planner.plan(semantic("YIELD"), semantic_enabled=True)["planner_diagnostics"]
+    assert off["candidate_pool_sha256"] == on["candidate_pool_sha256"]
+    assert len({c["id"] for c in off["candidates"]}) == len(off["candidates"])
+    for audit in (off, on):
+        assert_score_only_selection(audit)
+        gentle = next(c for c in audit["candidates"] if c["id"] == "center:YIELD_GENTLE")
+        ordinary = next(c for c in audit["candidates"] if c["id"] == "center:ACCELERATE")
+        assert gentle["longitudinal"] == "YIELD" and gentle["longitudinal_policy_index"] == 7
+        assert gentle["idm_accel_max_mps2"] == .2 and ordinary["idm_accel_max_mps2"] == 2.
+        # IDM also reacts to the finite path endpoint, so its realised
+        # acceleration approaches, rather than exactly equals, the maximum.
+        assert .19 < gentle["acceleration_range_mps2"][1] <= .2
+        assert 1.9 < ordinary["acceleration_range_mps2"][1] <= 2.
+        assert gentle["idm_decel_max_mps2"] == ordinary["idm_decel_max_mps2"] == 4.
+        assert ordinary["forward_progress_m"] > gentle["forward_progress_m"] * 5
+        # A stationary gentle rollout progresses monotonically, without the
+        # old Euler oscillation or a substitute parking trajectory.
+        profile = profiles[gentle["index"]]
+        assert np.diff(profile[:, 0]).min() >= 0
+        assert np.diff(profile[:, 1]).min() >= 0 and profile[-1, 1] > .5
+
+
 @pytest.mark.parametrize("enabled", [True, False])
 def test_ttc_failure_changes_base_score_without_removing_a_candidate(enabled):
     planner = make_planner(speed=4, allow_change=False, others=[Vehicle(actor_id=9, x=10)])

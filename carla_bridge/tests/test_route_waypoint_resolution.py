@@ -120,13 +120,277 @@ def test_real_town05_fixed_route_uses_706_at_both_overlapping_seams():
     assert all(_connected(a, b) for a, b in zip(wps, wps[1:]))
 
 
+@pytest.mark.skipif(not TOWN05.is_file(), reason="set CARLA_TOWN05_XODR for real-map topology regression")
+def test_real_town05_left_lane_cannot_take_the_reference_right_exit():
+    road = carla.Map("Town05", TOWN05.read_text())
+    lane = road.get_waypoint(carla.Location(x=-208.76, y=91.334))
+    branches = [[lane]]
+    for _ in range(25):
+        branches = [path + [following] for path in branches for following in path[-1].next(2)]
+    chains = [list(dict.fromkeys((wp.road_id, wp.lane_id) for wp in path)) for path in branches]
+    assert chains == [[(24, 1), (607, 1), (23, 1)], [(24, 1), (646, 1), (43, -1)]]
+    assert not any(706 in [road_id for road_id, lane_id in chain] for chain in chains)
+
+
+@pytest.mark.skipif(not TOWN05.is_file(), reason="set CARLA_TOWN05_XODR for real-map late-exit regression")
+def test_real_town05_vehicle_already_at_the_wrong_exit_gets_a_finite_stop_diagnostic():
+    pytest.importorskip("tuplan_garage")
+    pytest.importorskip("nuplan")
+    from carla_bridge.tests.test_pdm_planner import Vehicle, semantic
+    from carla_bridge.planning.pdm_planner import CarlaPDMPlanner
+    road = carla.Map("Town05", TOWN05.read_text())
+    waypoints, _ = resolve_route_waypoints(road, [carla.Location(x=x, y=y, z=z) for x, y, z in TURN_XYZ])
+    points = [wp.transform.location for wp in waypoints]
+    ego = Vehicle(x=-207.6, y=91.334, speed=0)
+    world = SimpleNamespace(get_map=lambda: road, get_actors=lambda: [ego],
+        get_snapshot=lambda: SimpleNamespace(timestamp=SimpleNamespace(elapsed_seconds=2)))
+    route = SimpleNamespace(_route=points, _route_waypoints=waypoints,
+        _nearest_index=lambda location: min(range(len(points)), key=lambda i: points[i].distance(location)))
+    diagnostics = CarlaPDMPlanner(world, ego, route).plan(semantic("MAINTAIN"))["planner_diagnostics"]
+    left = diagnostics["geometry"]["lateral_paths"]["left"]
+    assert left["route_connection"]["reason"] == "route_exit_return_is_too_late"
+    assert left["route_connection"]["finite_stopping_corridor_retained"]
+    assert left["cut"]["last_lane_key"] == "24:0:1"
+    assert left["path_length_m"] < 12
+    assert diagnostics["route_recovery_gate_applied"] is False
+
+
+@pytest.mark.skipif(not TOWN05.is_file(), reason="set CARLA_TOWN05_XODR for real-map road-surface regression")
+def test_real_town05_exit_surface_includes_lane_before_its_first_sparse_reference_sample():
+    from shapely.geometry import Point
+    from carla_bridge.planning.road_area import road_driving_polygons
+    road = carla.Map("Town05", TOWN05.read_text())
+    first_outer = road.get_waypoint(carla.Location(x=-195.04199, y=105.59914))
+    assert (first_outer.road_id, first_outer.lane_id) == (42, 2)
+    inner = first_outer.get_left_lane()
+    assert (inner.road_id, inner.lane_id) == (42, 1)
+    polygons, audit = road_driving_polygons(road, [first_outer, inner])
+    # This actual LQR footprint corner was rejected by sparse neighbour strips:
+    # 706 has no corresponding neighbour, so 42:1 previously began at y=105.6.
+    corner = carla.Location(x=-193.1166961, y=104.1564308)
+    assert road.get_waypoint(corner, project_to_road=False, lane_type=carla.LaneType.Driving) is not None
+    assert polygons["42:0:1"].contains(Point(corner.x, -corner.y))
+    assert not polygons["42:0:1"].contains(Point(-188, -104.1564308))
+    assert audit["polygon_expansion_m"] == 0
+
+
+@pytest.mark.skipif(not TOWN05.is_file(), reason="set CARLA_TOWN05_XODR for physical-stall surface regression")
+def test_real_town05_road_end_includes_the_recorded_73_percent_stall_corner():
+    from shapely.geometry import Point
+    from carla_bridge.planning.road_area import road_driving_polygons
+    road = carla.Map("Town05", TOWN05.read_text())
+    seeds = [road.get_waypoint_xodr(0, lane, 52) for lane in (1, 2)]
+    cache = {}
+    polygons, audit = road_driving_polygons(road, seeds, cache=cache)
+    # The actual low-speed candidate in the local CARLA physics run was
+    # rejected at s=53.54449, beyond the old final 53.5 grid cross-section.
+    # Both corners are on real ordinary-road lanes near their junction seam.
+    for lane, x, y in ((1, -36.3563600514671, 4.147040209108387),
+                       (2, -35.284437351304824, 6.026268146036446)):
+        actual = road.get_waypoint(carla.Location(x=x, y=y), project_to_road=False,
+                                  lane_type=carla.LaneType.Driving)
+        assert (actual.road_id, actual.lane_id) == (0, lane)
+        assert polygons[f"0:0:{lane}"].contains(Point(x, -y))
+    assert audit["exact_opendrive_endpoints"]
+    assert audit["polygon_expansion_m"] == 0
+    cached, _ = road_driving_polygons(road, seeds, cache=cache)
+    assert all(cached[key] is polygon for key, polygon in polygons.items())
+
+
+@pytest.mark.skipif(not TOWN05.is_file(), reason="set CARLA_TOWN05_XODR for recorded physics rollout regression")
+@pytest.mark.parametrize("preview_s", [1., 2.])
+@pytest.mark.parametrize("points,pose,velocity,acceleration,steer,sign", [
+    pytest.param([
+        (-43.534,17.39394,.05545),(-43.56283,15.37315,.05545),(-43.59929,13.35888,.05545),
+        (-43.50749,11.69512,.05545),(-43.05963,10.16536,.05544),(-42.2748,8.778,.04002),
+        (-41.20385,7.62043,.0096),(-39.89649,6.76994,0),(-38.4197,6.26832,0),
+        (-36.77868,6.13886,0),(-34.77869,6.13399,0),(-32.77869,6.12912,0),
+        (-30.77871,6.12425,0),(-28.77871,6.11939,0),(-26.77872,6.11452,0),
+        (-24.77872,6.10965,0),(-22.77873,6.10478,0),(-20.77874,6.09991,0),
+        (-18.77874,6.09505,0),(-16.77875,6.09018,0),(-14.77875,6.08531,0),
+        (-12.77876,6.08044,0),(-10.77876,6.07557,0),(-8.77877,6.0707,0),
+        (-6.77878,6.06584,0),(-4.77878,6.06097,0),(-2.77879,6.0561,0),(-.77879,6.05123,0)],
+        (-38.015556335,6.654981613,.008506292,-.406312762),
+        (.108365335,-.019177094),(.17014198,-.033901185),.377732784,1, id="recorded_73_percent_exit"),
+    pytest.param([
+        (24.5471,162.59673,.00002),(24.5463,164.59673,.00002),(24.5455,166.59673,.00002),
+        (24.5447,168.59673,.00002),(24.54391,170.59673,.00002),(24.54311,172.59673,.00002),
+        (24.54231,174.59673,.00002),(24.54151,176.59673,.00002),(24.54071,178.59671,.00002),
+        (24.51324,180.44435,.00002),(24.19544,182.01494,.00002),(23.53488,183.47488,.00001),
+        (22.56493,184.7504,.00001),(21.30518,185.80922,.00001),(19.82754,186.66284,0),
+        (18.22882,187.25961,0),(16.55326,187.58301,0)],
+        (24.543762207,178.95880127,.001745507,1.569208816),(0,0),(0,0),0,-1,
+        id="recorded_98_percent_exit"),
+])
+def test_real_town05_native_offsets_provide_a_road_compliant_moving_rollout(points, pose, velocity, acceleration, steer, sign, preview_s):
+    """Frozen real physical states; improve proposals without changing scores."""
+    pytest.importorskip("tuplan_garage")
+    pytest.importorskip("nuplan")
+    from carla_bridge.tests.test_pdm_planner import Vehicle, semantic, assert_score_only_selection
+    from carla_bridge.planning.pdm_planner import CarlaPDMPlanner
+    road = carla.Map("Town05", TOWN05.read_text())
+    locations = [carla.Location(x=x,y=y,z=z) for x,y,z in points]
+    waypoints, _ = resolve_route_waypoints(road, locations)
+    x,y,z,yaw = pose
+    ego = Vehicle(x=x,y=y,z=z,yaw=math.degrees(yaw),speed=math.hypot(*velocity))
+    ego.bounding_box = carla.BoundingBox(carla.Location(x=.0292187948,z=.735860527),
+        carla.Vector3D(x=4.791779518127441/2,y=2.163450002670288/2,z=.75))
+    ego.wheelbase_m,ego.max_steer_deg,ego.rear_axle_local_x_m = 3.004646956723217,70,-1.386424422
+    ego.get_velocity = lambda: carla.Vector3D(x=velocity[0],y=velocity[1])
+    ego.get_acceleration = lambda: carla.Vector3D(x=acceleration[0],y=acceleration[1])
+    ego.get_control = lambda: carla.VehicleControl(steer=steer)
+    world = SimpleNamespace(get_map=lambda:road,get_actors=lambda:[ego],
+        get_snapshot=lambda:SimpleNamespace(timestamp=SimpleNamespace(elapsed_seconds=2)))
+    route = SimpleNamespace(_route=locations,_route_waypoints=waypoints,
+        _nearest_index=lambda loc:min(range(len(locations)),key=lambda i:locations[i].distance(loc)))
+    planner = CarlaPDMPlanner(world,ego,route,{"lqr_lateral_horizon_s":preview_s})
+    diagnostics = [planner.plan(semantic("MAINTAIN","FOLLOW_ROUTE"),semantic_enabled=enabled)["planner_diagnostics"]
+                   for enabled in (False,True)]
+    assert diagnostics[0]["candidate_pool_sha256"] == diagnostics[1]["candidate_pool_sha256"]
+    for audit in diagnostics:
+        assert_score_only_selection(audit)
+        original = next(c for c in audit["candidates"] if c["id"] == "center:MAINTAIN")
+        if preview_s == 1.:
+            assert original["safety"]["drivable_area"] == 0  # The original failure is not suppressed.
+        chosen = next(c for c in audit["candidates"] if c["id"] == audit["selected_id"])
+        if preview_s == 1.:
+            assert chosen["lane_offset_m"] * sign > 0
+        assert chosen["physical_lane_side"] == "center" and chosen["route_target"]
+        assert chosen["safety"]["drivable_area"] == 1 and chosen["base_score"] > .5
+        assert chosen["forward_progress_m"] > 5 and chosen["terminal_speed_mps"] > 1
+
+
+@pytest.mark.skipif(not TOWN05.is_file(), reason="set CARLA_TOWN05_XODR for frozen restart regression")
+def test_real_town05_zero_wheel_angle_restart_has_a_native_road_compliant_choice_with_two_second_preview():
+    """Recorded 98.8456% absorbing state: real dimensions, actual wheels zero.
+
+    One-second native LQR preview reproduces the all-moving-road-zero failure.
+    A separate two-second lateral preview and gentle native IDM proposal admit
+    a moving choice, while longitudinal control retains its one-second horizon.
+    This frozen-state check does not claim a whole physical route has passed.
+    """
+    pytest.importorskip("tuplan_garage")
+    pytest.importorskip("nuplan")
+    from carla_bridge.tests.test_pdm_planner import Vehicle, semantic, assert_score_only_selection
+    from carla_bridge.planning.pdm_planner import CarlaPDMPlanner
+    road=carla.Map("Town05",TOWN05.read_text())
+    locations=[carla.Location(x=x,y=y,z=z)for x,y,z in [
+        (24.5471,162.59673,.00002),(24.5463,164.59673,.00002),(24.5455,166.59673,.00002),
+        (24.5447,168.59673,.00002),(24.54391,170.59673,.00002),(24.54311,172.59673,.00002),
+        (24.54231,174.59673,.00002),(24.54151,176.59673,.00002),(24.54071,178.59671,.00002),
+        (24.51324,180.44435,.00002),(24.19544,182.01494,.00002),(23.53488,183.47488,.00001),
+        (22.56493,184.7504,.00001),(21.30518,185.80922,.00001),(19.82754,186.66284,0),
+        (18.22882,187.25961,0),(16.55326,187.58301,0)]]
+    ego=Vehicle(x=24.1381587982,y=181.3146209717,z=.001758209,yaw=math.degrees(1.64027367226))
+    ego.bounding_box=carla.BoundingBox(carla.Location(x=.029218795,y=.000000925,z=.735860527),
+        carla.Vector3D(x=2.395889759,y=1.081725001,z=.743830025))
+    ego.wheelbase_m,ego.max_steer_deg,ego.rear_axle_local_x_m=3.004646956723217,70,-1.386424422
+    def physics():
+        wheels=[]
+        for i in range(4):
+            point=ego.get_transform().transform(carla.Location(
+                x=ego.rear_axle_local_x_m+(ego.wheelbase_m if i<2 else 0),
+                y=(-1 if i%2==0 else 1)*1.666828/2,z=.3708472))
+            wheels.append(SimpleNamespace(position=carla.Vector3D(x=100*point.x,y=100*point.y,z=100*point.z),
+                                          max_steer_angle=70 if i<2 else 0))
+        return SimpleNamespace(wheels=wheels)
+    ego.get_physics_control=physics
+    ego.get_wheel_steer_angle=lambda which:0.
+    world=SimpleNamespace(get_map=lambda:road,get_actors=lambda:[ego],
+        get_snapshot=lambda:SimpleNamespace(timestamp=SimpleNamespace(elapsed_seconds=2)))
+    route=SimpleNamespace(_route=locations,
+        _nearest_index=lambda loc:min(range(len(locations)),key=lambda i:locations[i].distance(loc)))
+    outcomes=[]
+    for preview in (1.,2.):
+        planner=CarlaPDMPlanner(world,ego,route,{"lqr_lateral_horizon_s":preview})
+        audits=[planner.plan(semantic("MAINTAIN"),semantic_enabled=enabled)["planner_diagnostics"]for enabled in (False,True)]
+        assert audits[0]["candidate_pool_sha256"]==audits[1]["candidate_pool_sha256"]
+        for audit in audits:
+            assert_score_only_selection(audit)
+            assert audit["steering_state"]["source"]=="carla_measured_front_wheels"
+            assert audit["steering_state"]["bicycle_angle_rad"]==0.
+            moving=[c for c in audit["candidates"]if c["longitudinal"]not in ("STOP","DECELERATE")]
+            if preview==1.:
+                assert all(c["safety"]["drivable_area"]==0 for c in moving)
+            else:
+                chosen=next(c for c in audit["candidates"]if c["id"]==audit["selected_id"])
+                assert chosen in moving
+                assert chosen["safety"]["drivable_area"]==1 and chosen["base_score"]>0
+                assert chosen["terminal_speed_mps"]>.5
+                assert chosen["longitudinal_policy_id"]=="YIELD_GENTLE"
+                assert audit["lqr_longitudinal_horizon_s"]==1.
+        outcomes.append(audits[0])
+    assert outcomes[0]["selected_id"].endswith(":STOP")
+    assert not outcomes[1]["selected_id"].endswith(":STOP")
+
+
+@pytest.mark.skipif(not TOWN05.is_file(), reason="set CARLA_TOWN05_XODR for real-map route-exit regression")
+@pytest.mark.parametrize("enabled", [True, False])
+def test_real_town05_adjacent_proposal_returns_before_required_right_exit(enabled):
+    """Measured Tesla footprint, rolling replans and native PDM scores.
+
+    This proves legal lane selection before the exit. It does not claim the
+    following tight right bend or CARLA actuator physics have passed.
+    """
+    pytest.importorskip("tuplan_garage")
+    pytest.importorskip("nuplan")
+    from carla_bridge.tests.test_pdm_planner import Vehicle, semantic, assert_score_only_selection
+    from carla_bridge.planning.pdm_planner import CarlaPDMPlanner
+    from carla_bridge.state.coords import ego_to_global
+    road = carla.Map("Town05", TOWN05.read_text())
+    waypoints, _ = resolve_route_waypoints(road, [carla.Location(x=x, y=y, z=z) for x, y, z in TURN_XYZ])
+    for _ in range(40):
+        waypoints.insert(0, waypoints[0].previous(2)[0])
+    points = [wp.transform.location for wp in waypoints]
+    ego = Vehicle(x=-242, y=91.33, z=.002, yaw=.06557, speed=4)
+    ego.bounding_box = carla.BoundingBox(carla.Location(x=.0292187948, z=.735860527),
+        carla.Vector3D(x=4.791779518127441 / 2, y=2.163450002670288 / 2, z=.75))
+    wheelbase = 3.004646956723217
+    ego.wheelbase_m, ego.max_steer_deg, ego.rear_axle_local_x_m = wheelbase, 70, -1.3864
+    ego.steer = 0.0
+    ego.get_control = lambda: carla.VehicleControl(steer=ego.steer)
+    ego.get_velocity = lambda: carla.Vector3D(x=ego.speed * math.cos(math.radians(ego.yaw)),
+                                             y=ego.speed * math.sin(math.radians(ego.yaw)))
+    world = SimpleNamespace(get_map=lambda: road, get_actors=lambda: [ego],
+                            get_snapshot=lambda: SimpleNamespace(timestamp=SimpleNamespace(elapsed_seconds=2)))
+    route = SimpleNamespace(_route=points, _route_waypoints=waypoints,
+        _nearest_index=lambda location: min(range(len(points)), key=lambda i: points[i].distance(location)))
+    planner = CarlaPDMPlanner(world, ego, route)
+    saw_return_proposal = False
+    for step in range(35):
+        world.get_snapshot = lambda: SimpleNamespace(timestamp=SimpleNamespace(elapsed_seconds=2 + .2 * step))
+        plan = planner.plan(semantic("MAINTAIN", "KEEP_LANE"), semantic_enabled=enabled)
+        diagnostics = plan["planner_diagnostics"]
+        assert_score_only_selection(diagnostics)
+        # STOP is a braking profile, not an instantaneous standstill. Native
+        # ranking may select it briefly before a return; detect actual stalled
+        # execution while retaining the same 35-step legal-return deadline.
+        assert ego.speed > .5
+        left = diagnostics["geometry"]["lateral_paths"]["left"]
+        saw_return_proposal |= left.get("route_connection", {}).get("method") == "legal_return_in_spatial_proposal"
+        choice = next(c for c in diagnostics["candidates"] if c["id"] == diagnostics["selected_id"])
+        assert choice["safety"]["drivable_area"] == 1
+        point = plan["trajectory"][2]
+        x, y = ego_to_global(point["x"], point["y"], ego.x, ego.y, math.radians(ego.yaw))
+        yaw = -math.degrees(planner.generator._state_array[choice["index"], 2, planner.api.StateIndex.HEADING])
+        curvature = math.radians(yaw - ego.yaw) / max(1e-5, math.hypot(x - ego.x, y - ego.y))
+        ego.steer = planner.steering_model.bicycle_to_normalized(math.atan(wheelbase * curvature), point["optional_v"])
+        ego.x, ego.y, ego.yaw, ego.speed = x, y, yaw, point["optional_v"]
+        assert ego.speed > .5
+        ego.z = road.get_waypoint(ego.get_location()).transform.location.z + .0017
+        if ego.x > -210 and ego.y > 94 and road.get_waypoint(ego.get_location()).lane_id == 2:
+            # Acceptance here is the complete legal return before the turn;
+            # full bend execution is covered separately below and in CARLA.
+            break
+    assert saw_return_proposal
+    assert ego.x > -210 and ego.y > 94, (ego.x, ego.y)
+    assert road.get_waypoint(ego.get_location()).lane_id == 2
+
+
 @pytest.mark.skipif(not TOWN05.is_file(), reason="set CARLA_TOWN05_XODR for optional real-map regression")
 @pytest.mark.parametrize("length,width,wheelbase", [
     pytest.param(4.6, 1.8, 2.8, id="narrow_fixture"),
-    pytest.param(4.8, 2.2, 3.004646956723217, id="wide_assumption_archive_wheelbase",
-        marks=pytest.mark.xfail(strict=True, raises=AssertionError,
-            reason="Known assumed wide footprint still stalls under native PDM base scoring "
-                   "without adapter safety or recovery vetoes; full turn is not resolved")),
+    pytest.param(4.8, 2.2, 3.004646956723217, id="wide_assumption_archive_wheelbase"),
 ])
 def test_real_town05_continuous_low_speed_turn_with_pinned_pdm(length, width, wheelbase, record_property):
     """Ideal reference execution isolates planning from CARLA actuator physics.
@@ -151,10 +415,7 @@ def test_real_town05_continuous_low_speed_turn_with_pinned_pdm(length, width, wh
                   yaw=math.degrees(.01468131), speed=0)
     ego.bounding_box = carla.BoundingBox(carla.Location(x=.2, z=.8),
         carla.Vector3D(x=length / 2, y=width / 2, z=.8))
-    ego.get_physics_control = lambda: SimpleNamespace(wheels=[
-        SimpleNamespace(position=carla.Vector3D(x=x, y=y), max_steer_angle=40 if x > 0 else 0)
-        for x, y in ((wheelbase * 50, -80), (wheelbase * 50, 80),
-                     (-wheelbase * 50, -80), (-wheelbase * 50, 80))])
+    ego.wheelbase_m, ego.max_steer_deg = wheelbase, 40
     ego.steer = 0.0
     ego.get_control = lambda: carla.VehicleControl(steer=ego.steer)
     ego.get_velocity = lambda: carla.Vector3D(x=ego.speed * math.cos(math.radians(ego.yaw)),
@@ -171,7 +432,9 @@ def test_real_town05_continuous_low_speed_turn_with_pinned_pdm(length, width, wh
     initial = planner.plan(semantic("YIELD"))["planner_diagnostics"]
     baseline = planner.plan(semantic("YIELD"), semantic_enabled=False)["planner_diagnostics"]
     assert not initial["emergency_brake"]
-    assert initial["selected_id"] == "center:YIELD"
+    initial_choice = next(c for c in initial["candidates"] if c["id"] == initial["selected_id"])
+    assert initial_choice["physical_lane_side"] == "center"
+    assert initial_choice["longitudinal"] == "YIELD"
     assert initial["candidate_pool_sha256"] == baseline["candidate_pool_sha256"]
     assert [c["safety"] for c in initial["candidates"]] == [c["safety"] for c in baseline["candidates"]]
     ego.get_acceleration = lambda: carla.Vector3D()
@@ -196,7 +459,8 @@ def test_real_town05_continuous_low_speed_turn_with_pinned_pdm(length, width, wh
         yaw = -math.degrees(heading)
         distance = max(1e-5, math.hypot(x - ego.x, y - ego.y))
         curvature = math.radians(yaw - ego.yaw) / distance
-        ego.steer = max(-1, min(1, math.atan(planner.vehicle_parameters.wheel_base * curvature) / planner.max_steer))
+        ego.steer = planner.steering_model.bicycle_to_normalized(
+            math.atan(planner.vehicle_parameters.wheel_base * curvature), point["optional_v"])
         ego.x, ego.y, ego.yaw, ego.speed = x, y, yaw, point["optional_v"]
         ego.z = road.get_waypoint(ego.get_location()).transform.location.z + .0017
         nearest = road.get_waypoint(ego.get_location()).transform.location

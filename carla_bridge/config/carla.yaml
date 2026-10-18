@@ -49,6 +49,7 @@ carla:
   # ---- 连接 ----
   host: "127.0.0.1"
   port: 2000
+  traffic_manager_port: null    # null = 实际CARLA RPC端口+6000；多实例必须独立，2000默认8000
   timeout_s: 30.0
   python_api_dir: "D:/software/carla/WindowsNoEditor/PythonAPI/carla"  # 兼容保留；自实现 A*（route_planner.py）后不再使用 agents.GlobalRoutePlanner，可删除
   # ---- 同步模式 ----
@@ -64,6 +65,7 @@ carla:
     replan_interval_s: 0.2      # PDM 更新周期；VLM 意图在两次认知之间保持
     horizon_s: 4.0              # 不短于 VLM 周期；轨迹由官方 PDM 核心产生
     sample_interval_s: 0.1      # 固定版本官方 TTC 实现使用 10Hz 索引
+    lqr_lateral_horizon_s: 2.0  # 横向预瞄；纵向保留原生1s制动预测；整数采样、>=2个采样且<=规划时域
     max_speed_mps: 8.0          # 适配首轮保守上限，同时服从当前道路限速
     map_radius_m: 100.0
     lane_change_length_m: 30.0

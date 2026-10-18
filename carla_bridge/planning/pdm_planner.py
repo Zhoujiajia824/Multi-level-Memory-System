@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import math
 from collections import defaultdict
 from types import SimpleNamespace
@@ -17,6 +18,8 @@ import numpy as np
 
 from .dependencies import load_dependencies, validate_dependencies
 from .selection import choose_candidate
+
+logger = logging.getLogger("carla_pdm_planner")
 
 
 def _lane_key(wp):
@@ -187,6 +190,92 @@ def _lane_path_points(waypoints):
     return curve(samples)
 
 
+def _lane_offset_points(points, offset, api):
+    """Use upstream PDM's parallel-path construction inside the same lane."""
+    from tuplan_garage.planning.simulation.planner.pdm_planner.utils.pdm_geometry_utils import parallel_discrete_path
+    return np.array([[state.x, state.y] for state in
+                     parallel_discrete_path(_path_states(points, api), offset)])
+
+
+def _route_compatible_lane_points(reference, closest, side, progress, cut, transition_m,
+                                  current_side):
+    """Build an adjacent-lane excursion with its legal return to the route.
+
+    Relative left/right lanes are not a route through a junction: in Town05,
+    lane 24:1 continues straight/left while the reference 24:2 turns right.
+    Truncating 24:1 at that junction invents a stationary IDM leader. Instead,
+    include the return lane change in the spatial proposal before that seam.
+    This changes proposal geometry, never candidate scoring or eligibility.
+    """
+    import carla
+    from scipy.interpolate import CubicHermiteSpline
+
+    if side == "center" or cut is None:
+        return None, None
+    end = int(cut["reference_index"])
+    last = _adjacent(reference[end - 1], side)
+    # Preserve actual lane endings as finite stopping corridors. The special
+    # case here is a continuing lane whose successors do not take our exit.
+    if not reference[end].is_junction or last is None or not last.next(2.0):
+        return None, None
+    start = closest
+    while start > 0:
+        previous, current = _adjacent(reference[start - 1], side), _adjacent(reference[start], side)
+        if (previous is None or previous.lane_type != carla.LaneType.Driving
+                or not _same_direction(reference[start - 1], previous) or not _connected(previous, current)):
+            break
+        start -= 1
+    # Complete the whole vehicle's transition before the connection diverges.
+    merge_end = float(progress[end - 1] - 4.0)
+    merge_start = merge_end - transition_m
+    ahead = float(progress[closest])
+    if merge_start < progress[start] and side != current_side:
+        return None, {"reason": "route_exit_return_cannot_fit", "distance_to_exit_m": float(progress[end] - ahead)}
+    if side != current_side and merge_start - ahead < transition_m + 4.0:
+        return None, {"reason": "insufficient_route_compatible_lane_change_corridor",
+                      "distance_to_exit_m": float(progress[end] - ahead)}
+    # A replan within an already developing return must retain its fixed map
+    # endpoint, rather than demanding another fresh 30 metres every 0.2 s.
+    if side == current_side and merge_end - ahead < 4.0:
+        return None, {"reason": "route_exit_return_is_too_late", "distance_to_exit_m": float(progress[end] - ahead)}
+    if end - start < 2:
+        return None, {"reason": "route_exit_has_insufficient_connected_samples",
+                      "distance_to_exit_m": float(progress[end] - ahead)}
+    direction = carla.LaneChange.Right if side == "left" else carla.LaneChange.Left
+    stations = [i for i, station in enumerate(progress) if merge_start - 2 <= station <= merge_end + 2]
+    for i in stations:
+        source = _adjacent(reference[i], side)
+        target = reference[i]
+        if (source is None or source.is_junction or target.is_junction
+                or not int(source.lane_change) & int(direction)
+                or source.lane_type != carla.LaneType.Driving or not _same_direction(source, target)):
+            return None, {"reason": "route_exit_has_no_legal_return", "reference_index": i,
+                          "source_lane_key": _lane_key(source) if source else None}
+    # The shared reference station parameter keeps inner/outer curve samples
+    # aligned; their own arc lengths differ and must not be mixed.
+    centers = np.array([_xy(wp) for wp in reference[start:]])
+    tangents = np.array([[math.cos(_heading(wp)), math.sin(_heading(wp))] for wp in reference[start:]])
+    center_keep = np.r_[True, np.diff(progress[start:]) > 1e-4]
+    side_keep = np.r_[True, np.diff(progress[start:end]) > 1e-4]
+    if center_keep.sum() < 2 or side_keep.sum() < 2:
+        return None, {"reason": "route_exit_has_insufficient_distinct_samples"}
+    center_curve = CubicHermiteSpline(progress[start:][center_keep], centers[center_keep], tangents[center_keep], axis=0)
+    left_points = np.array([_xy(_adjacent(wp, side)) for wp in reference[start:end]])
+    left_tangents = np.array([[math.cos(_heading(_adjacent(wp, side))),
+                               math.sin(_heading(_adjacent(wp, side)))] for wp in reference[start:end]])
+    side_curve = CubicHermiteSpline(progress[start:end][side_keep], left_points[side_keep], left_tangents[side_keep], axis=0)
+    samples = np.unique(np.r_[progress[start:], np.arange(progress[start], progress[-1], .25),
+                              max(merge_start, progress[start]), merge_end])
+    u = np.clip((samples - merge_start) / transition_m, 0.0, 1.0)
+    blend = 1 - 10 * u ** 3 + 15 * u ** 4 - 6 * u ** 5
+    # Avoid extrapolating an absent lane after it has already been left.
+    side_samples = side_curve(np.minimum(samples, merge_end))
+    points = center_curve(samples) + blend[:, None] * (side_samples - center_curve(samples))
+    return points, {"method": "legal_return_in_spatial_proposal", "merge_start_ahead_m": merge_start - ahead,
+                    "merge_end_ahead_m": merge_end - ahead, "return_length_m": transition_m,
+                    "exit_reference_index": end, "selection_gate_applied": False}
+
+
 def _smooth_path(points, rear, heading, api, transition_m):
     """Start every candidate at the measured rear axle, with a gradual merge."""
     from shapely.geometry import LineString, Point
@@ -250,6 +339,7 @@ class CarlaPDMPlanner:
         self._resolved_route_waypoints = None
         self._route_resolution = None
         self._junction_area_cache = {}
+        self._road_area_cache = {}
         for name, value in (("horizon_s", self.horizon), ("max_speed_mps", self.max_speed),
                             ("map_radius_m", self.map_radius), ("lane_change_length_m", self.transition_m)):
             if not math.isfinite(value) or value <= 0:
@@ -257,6 +347,15 @@ class CarlaPDMPlanner:
         if self.horizon < 3 or self.max_speed > 20 or self.transition_m < 15:
             raise ValueError("PDM requires horizon >=3s, max speed <=20m/s, and lane-change length >=15m")
         self.samples = int(math.ceil(self.horizon / self.dt))
+        self.lqr_lateral_horizon_s = float(self.config.get("lqr_lateral_horizon_s", 2.0))
+        if not math.isfinite(self.lqr_lateral_horizon_s):
+            raise ValueError("lqr_lateral_horizon_s must be finite")
+        tracking_steps = self.lqr_lateral_horizon_s / self.dt
+        self.lqr_lateral_horizon_samples = round(tracking_steps)
+        if (not math.isclose(tracking_steps, self.lqr_lateral_horizon_samples, abs_tol=1e-8)
+                or not 2 <= self.lqr_lateral_horizon_samples <= self.samples):
+            raise ValueError("lqr_lateral_horizon_s must be an exact sample_interval_s multiple, "
+                             "at least two samples and no longer than the planning horizon")
         self.sampling = self.api.TrajectorySampling(num_poses=self.samples, interval_length=self.dt)
         # Upstream's update_rate=2 leaves the freshly reset t=1 leader state at
         # zero, creating a phantom stopped leader on every short replan. Updating
@@ -270,8 +369,14 @@ class CarlaPDMPlanner:
         # otherwise retains the default Pacifica wheelbase and its bicycle
         # keeps a 60-degree steering limit. Bind both official components to
         # this CARLA vehicle so the controller and simulated plant agree.
-        self.simulator._tracker = self.api.BatchLQRTracker(
-            vehicle=self.vehicle_parameters, discretization_time=self.dt)
+        # Lateral preview and longitudinal braking must not share a horizon:
+        # extending both weakens the predicted hard-stop response. Preserve
+        # native one-second longitudinal control, with a separate lateral preview.
+        from .lqr_tracker import build_lqr_tracker
+        self.simulator._tracker = build_lqr_tracker(
+            self.api, self.vehicle_parameters, self.dt,
+            longitudinal_tracking_horizon_samples=10,
+            lateral_tracking_horizon_samples=self.lqr_lateral_horizon_samples)
         self.simulator._motion_model = self.api.BatchKinematicBicycleModel(
             vehicle=self.vehicle_parameters, max_steering_angle=self.max_steer)
         self.provenance = dict(self.api.provenance)
@@ -279,28 +384,87 @@ class CarlaPDMPlanner:
     def _vehicle_parameters(self):
         box = self.ego.bounding_box
         half_length, width = float(box.extent.x), 2 * float(box.extent.y)
-        wheels = self.ego.get_physics_control().wheels
+        physics = self.ego.get_physics_control()
+        wheels = physics.wheels
         if len(wheels) < 4:
             raise ValueError("PDM bicycle model requires a four-wheel ego vehicle")
-        # CARLA WheelPhysicsControl.position uses centimetres.
+        # CARLA 0.9.15 reports wheel positions in WORLD centimetres. Transform
+        # the physical axle into the actor frame; half the wheelbase assumes
+        # the actor/bounding-box centre lies midway between the axles, which
+        # is false even for the default Tesla Model 3.
         front = np.mean([[w.position.x, w.position.y, w.position.z] for w in wheels[:2]], axis=0)
         rear = np.mean([[w.position.x, w.position.y, w.position.z] for w in wheels[-2:]], axis=0)
         wheelbase = float(np.linalg.norm(front - rear) * 0.01)
         if not 1.0 < wheelbase < 6.0:
             raise ValueError("CARLA returned invalid wheelbase geometry")
-        # Geometric center / rear-axle distance is explicitly configurable; the
-        # default half-wheelbase approximation is recorded in every plan.
-        center_offset = float(self.config.get("rear_axle_to_center_m", wheelbase / 2))
+        inverse = np.asarray(self.ego.get_transform().get_inverse_matrix())
+        rear_local = inverse @ np.r_[rear * .01, 1.0]
+        front_local = [inverse @ np.array([w.position.x * .01, w.position.y * .01,
+                                           w.position.z * .01, 1.0]) for w in wheels[:2]]
+        self.front_track_m = float(abs(front_local[1][1] - front_local[0][1]))
+        measured_offset = float(box.location.x - rear_local[0])
+        center_offset = float(self.config.get("rear_axle_to_center_m", measured_offset))
+        self._vehicle_geometry_source = {
+            "rear_axle_to_center_source": "config_override" if "rear_axle_to_center_m" in self.config
+                                         else "carla_world_wheel_positions",
+            "measured_rear_axle_to_center_m": measured_offset,
+            "rear_axle_actor_xyz_m": rear_local[:3].tolist(),
+        }
         if not 0 < center_offset < half_length:
             raise ValueError("rear_axle_to_center_m must lie within the ego footprint")
-        self.max_steer = math.radians(max(float(w.max_steer_angle) for w in wheels[:2]))
-        if not 0 < self.max_steer < math.pi / 2:
+        # The effective PDM rear axle follows its centre offset, including an
+        # explicit config override. Do not confuse that offset with actor->axle.
+        self.rear_axle_actor_xyz_m = (float(box.location.x - center_offset),
+                                      float(box.location.y), float(rear_local[2]))
+        self._vehicle_geometry_source["planning_rear_axle_actor_xyz_m"] = list(self.rear_axle_actor_xyz_m)
+        self.physical_max_steer = math.radians(max(float(w.max_steer_angle) for w in wheels[:2]))
+        if not 0 < self.physical_max_steer < math.pi / 2:
             raise ValueError("CARLA returned invalid front-wheel steering limits")
+        from carla_bridge.control.steering_model import SteeringModel
+        self.steering_model = SteeringModel(self.physical_max_steer,
+            [(point.x, point.y) for point in getattr(physics, "steering_curve", ())],
+            wheelbase_m=wheelbase, front_track_m=self.front_track_m)
+        self.max_steer = self.steering_model.max_steer_rad
         return self.api.VehicleParameters(width=width, front_length=half_length + center_offset,
                                          rear_length=half_length - center_offset,
                                          cog_position_from_rear_axle=center_offset, wheel_base=wheelbase,
                                          vehicle_name=self.ego.type_id, vehicle_type="carla",
                                          height=2 * float(box.extent.z))
+
+    def _observed_bicycle_steering(self, speed_mps):
+        """Read both physical front wheels while the owning loop freezes ticks.
+
+        A command is not actual wheel feedback: smoothing/sleeping can leave the
+        wheels at a different angle, especially during a low-speed stall.
+        """
+        import carla
+        command = float(self.ego.get_control().steer)
+        estimate = self.steering_model.normalized_to_bicycle(command, speed_mps)
+        getter = getattr(self.ego, "get_wheel_steer_angle", None)
+        locations = getattr(carla, "VehicleWheelLocation", None)
+        if callable(getter) and hasattr(locations, "FL_Wheel") and hasattr(locations, "FR_Wheel"):
+            # CARLA returns degrees and positive-right; the PDM frame is left-positive.
+            left_deg, right_deg = float(getter(locations.FL_Wheel)), float(getter(locations.FR_Wheel))
+            angle = self.steering_model.front_wheels_to_bicycle(
+                math.radians(left_deg), math.radians(right_deg))
+            self._steering_state_diagnostics = {
+                "source": "carla_measured_front_wheels", "front_left_deg": left_deg,
+                "front_right_deg": right_deg, "command_estimate_bicycle_rad": -estimate,
+                "bicycle_angle_rad": -angle, "normalized_command": command,
+                "input_latency_modeled": False,
+            }
+        else:
+            reason = "wheel_angle_api_unavailable"
+            angle = estimate
+            self._steering_state_diagnostics = {
+                "source": "command_ackermann_estimate", "fallback_reason": reason,
+                "bicycle_angle_rad": -angle, "normalized_command": command,
+                "input_latency_modeled": False,
+            }
+            if not getattr(self, "_steering_fallback_warned", False):
+                logger.warning("CARLA前轮角API不可用，PDM显式回退至指令转角估计（未建模输入迟滞）")
+                self._steering_fallback_warned = True
+        return -angle
 
     def _ego_state(self, timestamp_us):
         import carla
@@ -318,7 +482,7 @@ class CarlaPDMPlanner:
             center=self.api.StateSE2(center.x, -center.y, -yaw),
             center_velocity_2d=self.api.StateVector2D(max(0.0, v[0]), v[1]),
             center_acceleration_2d=self.api.StateVector2D(*a),
-            tire_steering_angle=-float(self.ego.get_control().steer) * self.max_steer,
+            tire_steering_angle=self._observed_bicycle_steering(math.hypot(*v)),
             time_point=self.api.TimePoint(timestamp_us), vehicle_parameters=self.vehicle_parameters,
             angular_vel=-math.radians(self.ego.get_angular_velocity().z),
         )
@@ -413,6 +577,7 @@ class CarlaPDMPlanner:
             raise ValueError("Ego has left the reference route and its adjacent driving lanes")
 
         strips = defaultdict(list)
+        surface_seeds = []
         on_route_keys = set()
         # Include all driving lane ribbons next to the route for the drivable
         # area; only lanes oriented along the route count as on-route direction.
@@ -429,6 +594,7 @@ class CarlaPDMPlanner:
                     lanes_a[side + str(lane_index)], lanes_b[side + str(lane_index)] = a, b
             for lane_name, a in lanes_a.items():
                 b = lanes_b[lane_name]
+                surface_seeds.extend((a, b))
                 if not _connected(a, b):
                     continue
                 corners = []
@@ -447,6 +613,11 @@ class CarlaPDMPlanner:
         polygons = {key: unary_union(value).buffer(0.025) for key, value in strips.items()}
         if not polygons:
             raise ValueError("No usable CARLA road polygons")
+        from .road_area import road_driving_polygons
+        dense_polygons, road_info = road_driving_polygons(self.map, surface_seeds, cache=self._road_area_cache)
+        self._geometry_diagnostics["road_drivable_area"] = road_info
+        for key, polygon in dense_polygons.items():
+            polygons[key] = polygons[key].union(polygon) if key in polygons else polygon
         lane_dict = {key: SimpleNamespace(polygon=poly) for key, poly in polygons.items() if key in on_route_keys}
         # The route is only one corridor through the intersection. A vehicle's
         # corners can legally pass over other real junction connections while
@@ -504,6 +675,18 @@ class CarlaPDMPlanner:
             if reason:
                 excluded[side] = reason
                 continue
+            route_points, route_connection = _route_compatible_lane_points(
+                reference, closest, side, progress, cut, self.transition_m, current_side)
+            if route_connection is not None:
+                details["route_connection"] = route_connection
+                if route_points is None:
+                    if side != current_side:
+                        excluded[side] = route_connection["reason"]
+                        continue
+                    # A vehicle already trapped in the wrong lane still needs
+                    # a real finite braking path. Report the failed connection
+                    # instead of fabricating an illegal route or dropping it.
+                    details["route_connection"]["finite_stopping_corridor_retained"] = True
             if side == current_side:
                 label, semantics = "KEEP_LANE", ["KEEP_LANE"]
                 if side == "center":
@@ -525,8 +708,9 @@ class CarlaPDMPlanner:
                                                   2 * ego_state.dynamic_car_state.speed))
             details["path_kind"] = "lane_follow" if side == current_side else "lane_change"
             details["transition_length_m"] = float(transition)
+            target_points = route_points if route_points is not None else _lane_path_points(corridor)
             try:
-                path = _smooth_path(_lane_path_points(corridor), rear,
+                path = _smooth_path(target_points, rear,
                                     ego_state.rear_axle.heading, self.api, transition)
             except ValueError as exc:
                 excluded[side] = "insufficient_path_ahead"
@@ -534,7 +718,36 @@ class CarlaPDMPlanner:
                 continue
             paths.append(path)
             details["path_length_m"] = float(path.length)
-            metadata.append({"id": side, "label": label, "semantics": sorted(set(semantics))})
+            base_metadata = {"id": side, "label": label, "semantics": sorted(set(semantics)),
+                             "physical_lane_side": side, "route_target": side == "center", "lane_offset_m": 0.0}
+            metadata.append(base_metadata)
+            # Upstream PDM includes parallel lateral proposals, whereas the old
+            # CARLA adapter had one centreline per lane. A single LQR rollout
+            # can overshoot a short-radius exit by centimetres and zero every
+            # moving proposal. Add actual within-lane alternatives; their real
+            # footprints still receive the unchanged native road/collision score.
+            if side == current_side:
+                widths = [float(wp.lane_width) for wp in corridor]
+                if route_points is not None:
+                    widths.extend(float(wp.lane_width) for wp in reference[closest:])
+                limit = max(0.0, min(.5, (min(widths)
+                                         - self.vehicle_parameters.width) / 2 - .1))
+                # IDs represent centimetres; quantize downward before dedup so
+                # e.g. .250 and .251 never create two different @+0.25 paths.
+                limit = math.floor(limit * 100 + 1e-9) / 100
+                offsets = sorted({sign * min(amount, limit) for sign in (-1, 1)
+                                  for amount in (.25, .5)}) if limit >= .05 else []
+                details["within_lane_offset_limit_m"] = limit
+                details["within_lane_offsets_m"] = [0.0] + offsets
+                for offset in offsets:
+                    try:
+                        shifted = _smooth_path(_lane_offset_points(target_points, offset, self.api), rear,
+                                               ego_state.rear_axle.heading, self.api, transition)
+                    except ValueError as exc:
+                        details.setdefault("excluded_offset_paths", {})["%+.2f" % offset] = str(exc)
+                        continue
+                    paths.append(shifted)
+                    metadata.append(dict(base_metadata, id=side + "@%+.2f" % offset, lane_offset_m=offset))
         if not paths:
             raise ValueError("No legal lateral path from the current lane")
         centerline = self.api.PDMPath(_path_states([_xy(wp) for wp in reference], self.api))
@@ -613,11 +826,17 @@ class CarlaPDMPlanner:
             raise ValueError("PDM policy initial speed must be finite and nonnegative")
         # Every run, including semantic-off, has identical stop and slow-yield
         # policies. STOP avoids IDM's undefined desired-velocity=0 division.
-        labels = ["STOP", "YIELD", "DECELERATE", "FOLLOW", "MAINTAIN", "ACCELERATE", "STOP_HARD"]
+        labels = ["STOP", "YIELD", "DECELERATE", "FOLLOW", "MAINTAIN", "ACCELERATE", "STOP_HARD",
+                  "YIELD_GENTLE"]
         # DECELERATE is not a creep command: once nearly stopped, hold/stop.
         decel_to_stop = speed < 0.6
         targets = [0.1, min(2.0, limit), 0.1 if decel_to_stop else min(limit, speed * 0.5),
-                   limit * 0.75, limit * 0.85, limit, 0.1]
+                   limit * 0.75, limit * 0.85, limit, 0.1, min(2.0, limit)]
+        # Retain every ordinary 2m/s² proposal. An additional native IDM policy
+        # can establish steering gently when starting on a tight bend; it is
+        # generated in both semantic arms and competes under the same scoring.
+        accelerations = [2.0] * 7 + [0.2]
+        headways = [1.5, 2.5, 2.0, 2.5, 1.5, 1.5, 1.5, 2.5]
         base = self.api.BatchIDMPolicy
 
         class WithStopPolicy(base):
@@ -642,8 +861,8 @@ class CarlaPDMPlanner:
                 return result
 
         policies = WithStopPolicy(fallback_target_velocity=targets, speed_limit_fraction=[1.0] * len(labels),
-                                  min_gap_to_lead_agent=1.5, headway_time=[1.5, 2.5, 2.0, 2.5, 1.5, 1.5, 1.5],
-                                  accel_max=2.0, decel_max=4.0)
+                                  min_gap_to_lead_agent=1.5, headway_time=headways,
+                                  accel_max=accelerations, decel_max=4.0)
         policies.update(None)  # Desired velocities are already capped to the road speed limit.
         return policies, labels, targets
 
@@ -703,11 +922,19 @@ class CarlaPDMPlanner:
             ttc_time = float(self.scorer.time_to_ttc_infraction(index))
             candidates.append({"id": "%s:%s" % (lat["id"], longitudinal[proposal.longitudinal_idx]),
                                "index": index, "lateral": lat["label"], "lateral_semantics": lat["semantics"],
-                               "route_target": lat["id"] == "center",
+                               "route_target": lat["route_target"],
+                               "physical_lane_side": lat["physical_lane_side"],
+                               "lane_offset_m": lat["lane_offset_m"],
                                "forward_progress_m": float(centerline.project(Point(*proposals[index, -1, :2]))
                                                            - centerline.project(Point(*proposals[index, 0, :2]))) if finite else 0.0,
                                "terminal_speed_mps": float(self.generator._state_idm_array[index, -1, 1]) if finite else 0.0,
-                               "longitudinal": "STOP" if longitudinal[proposal.longitudinal_idx] == "STOP_HARD" else longitudinal[proposal.longitudinal_idx],
+                               "longitudinal": {"STOP_HARD": "STOP", "YIELD_GENTLE": "YIELD"}.get(
+                                   longitudinal[proposal.longitudinal_idx], longitudinal[proposal.longitudinal_idx]),
+                               "longitudinal_policy_id": longitudinal[proposal.longitudinal_idx],
+                               "longitudinal_policy_index": int(proposal.longitudinal_idx),
+                               "idm_accel_max_mps2": float(policies._accel_max[proposal.longitudinal_idx]),
+                               "idm_decel_max_mps2": float(policies._decel_max[proposal.longitudinal_idx]),
+                               "idm_headway_s": float(policies._headway_time[proposal.longitudinal_idx]),
                                "predicted_collision_time_s": collision_time if math.isfinite(collision_time) else None,
                                "predicted_ttc_infraction_time_s": ttc_time if math.isfinite(ttc_time) else None,
                                "drivable_area_failure": area_failure,
@@ -721,9 +948,15 @@ class CarlaPDMPlanner:
                                                   self.lateral_weight, self.longitudinal_weight)
         diagnostics.update(backend="pdm_closed", provenance=self.provenance,
                            timestamp_us=timestamp, horizon_s=self.samples * self.dt, sample_interval_s=self.dt,
+                           lqr_longitudinal_horizon_s=1.0,
+                           lqr_longitudinal_horizon_samples=10,
+                           lqr_lateral_horizon_s=self.lqr_lateral_horizon_samples * self.dt,
+                           lqr_lateral_horizon_samples=self.lqr_lateral_horizon_samples,
+                           lqr_lateral_velocity_forecast="finite_forward_constant_acceleration_stop_at_zero",
                            leading_agent_update_rate=1, lateral_transition="cubic_hermite_pose_tangent",
                            excluded_lateral_paths=excluded, traffic_stop_lines=len(stop_polygons),
                            geometry=self._geometry_diagnostics,
+                           steering_state=self._steering_state_diagnostics,
                            native_red_light_idm=True,
                            idm_integration="substeps_max_0.01s_nonnegative_trapezoid",
                            actors=[{"id": str(actor.track_token), "x": actor.center.x, "y": actor.center.y,
@@ -733,12 +966,16 @@ class CarlaPDMPlanner:
                            initial_collision_tokens=initial_collisions,
                            vehicle={"wheelbase_m": self.vehicle_parameters.wheel_base,
                                     "max_steer_rad": self.max_steer,
+                                    "physical_inner_max_steer_rad": self.physical_max_steer,
+                                    "front_track_m": self.front_track_m,
+                                    "steering_mapping": self.steering_model.mapping,
                                     "width_m": self.vehicle_parameters.width,
                                     "length_m": self.vehicle_parameters.length,
                                     "bounding_box_offset_xyz": [
                                         self.ego.bounding_box.location.x, self.ego.bounding_box.location.y,
                                         self.ego.bounding_box.location.z],
                                     "rear_axle_to_center_m": self.vehicle_parameters.rear_axle_to_center})
+        diagnostics["vehicle"].update(self._vehicle_geometry_source)
         diagnostics["selected_zero_base_score"] = selected is not None and selected["base_score"] == 0.0
         # Selection is score-only. No separate collision/TTC detector replaces
         # the winner; only numerically invalid candidates cannot be executed.
@@ -763,6 +1000,8 @@ class CarlaPDMPlanner:
                                                                              s * box_offset[0] + c * box_offset[1]])
             x, y = global_to_ego(origin[0], -origin[1], tf.location.x, tf.location.y, yaw)
             trajectory.append({"t": round(i * self.dt, 8), "x": float(x), "y": float(y),
+                               "optional_heading_rad": math.atan2(math.sin(center.heading + yaw),
+                                                                  math.cos(center.heading + yaw)),
                                "optional_v": float(max(0, idm_velocity[i]))})
         diagnostics.update(emergency_brake=False, selected_lateral=selected["lateral"],
                            selected_longitudinal=selected["longitudinal"])

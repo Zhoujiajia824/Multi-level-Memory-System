@@ -12,6 +12,7 @@ from typing import Optional
 import carla  # 须在 mulmem_carla(3.9) 运行
 
 from src.vla_memory.schemas.ego_state import EgoState
+from carla_bridge.control.steering_model import SteeringModel
 from carla_bridge.state import coords
 
 
@@ -19,12 +20,16 @@ class EgoStateProvider:
     """CARLA vehicle -> EgoState。
 
     Args:
-        max_steer_rad: 方向盘最大转角（弧度），用于把 CARLA 归一化 steer 近似换算
-            成弧度写入 ``steering_angle``（项目 schema 约定为弧度）。
+        max_steer_rad: 未提供 steering_model 时，用于换算轮角的静态最大角（弧度）。
+        steering_model: 可选的共享转向模型，按当前速度换算归一化 steer。
+            ``steering_angle`` 是左正转角估计；绑定 PDM 时为等效自行车转角。
+            它不是实测前轮角或方向盘角，也不包含执行器输入迟滞。
     """
 
-    def __init__(self, max_steer_rad: float = 0.6):
+    def __init__(self, max_steer_rad: float = 0.6, *,
+                 steering_model: Optional[SteeringModel] = None):
         self.max_steer_rad = max_steer_rad
+        self.steering_model = steering_model
 
     def build(
         self,
@@ -52,8 +57,13 @@ class EgoStateProvider:
         eax, eay = coords.rotate_vector_to_ego(a.x, a.y, yaw_rad)
         accel = math.hypot(eax, eay)
 
-        # ctrl.steer ∈ [-1,1]（归一化，CARLA 右正）-> 项目左正弧度：取反
-        steer_rad = -float(ctrl.steer) * self.max_steer_rad if ctrl else None
+        # Convert the command using the same speed-dependent approximation as
+        # execution. PDM separately reads actual front-wheel feedback; the
+        # semantic state remains a clearly documented command estimate.
+        steer_rad = None
+        if ctrl:
+            steer_rad = (-self.steering_model.normalized_to_bicycle(ctrl.steer, speed)
+                         if self.steering_model is not None else -float(ctrl.steer) * self.max_steer_rad)
 
         ts_us = int(elapsed_sim_s * 1e6)
         return EgoState(

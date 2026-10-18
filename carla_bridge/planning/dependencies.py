@@ -99,7 +99,7 @@ def load_dependencies():
             "nuplan_repository": "https://github.com/motional/nuplan-devkit",
             "nuplan_expected_commit": NUPLAN_COMMIT,
             "shapely_version": shapely.__version__,
-            "adapter_version": 4,
+            "adapter_version": 5,
         }
         values["provenance"].update(_verify_sources())
         for distribution, package in (("tuplan-garage", "tuplan_garage"), ("nuplan-devkit", "nuplan")):

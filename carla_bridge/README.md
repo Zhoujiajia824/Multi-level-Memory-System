@@ -1148,7 +1148,7 @@ CARLA 默认使用 `pdm_closed`。模型只输出横向、纵向意图及文字�
 ### 13.1 官方核心与 CARLA 适配
 
 复用 [tuPlan Garage 的 PDM-Closed 核心](https://github.com/autonomousvision/tuplan_garage)：
-候选生成、运动仿真、指标评分及紧急制动检测。上游原版运行于 nuPlan，本项目提供 CARLA 的
+候选生成、运动仿真和指标评分。上游原版运行于 nuPlan，本项目提供 CARLA 的
 地图、障碍物、车辆状态与坐标适配，并增加语义评分与候选策略。因此论文应表述为
 **使用官方 PDM 核心的 CARLA 适配版本**，不能将本项目实验分数称为官方 nuPlan PDM-Closed 基准成绩。
 
@@ -1189,6 +1189,18 @@ python -m pytest -q -p no:cacheprovider
 硬筛选、必要回归或连续性扣分。PDM 原生基础分仍包含风险指标；0 基础分候选也可被
 语义加分选中。执行前数值与动力学一致性校验继续生效。
 
+适配版本 5 修正道路交界漏面和邻道导航连接。邻道通向直行/左转而本路线要求右转时，
+候选需要包含合法返回目标车道的空间路径；无法完成驶入并返回的新变道不生成。
+这改变候选几何，不改变上面的评分公式，语义开关两侧使用相同构造。
+`KEEP_LANE` 候选在出口前也可能包含导航所需的返回段。详见
+[路线几何与诊断说明](planning/README.md#路线几何与规划失败诊断)。
+
+规划与执行共用实测轴距、前轮距和后轴参考点；归一化转向、内轮转角及 bicycle
+等效中心角分别换算。PDM 初始轮角优先使用同步帧实测值。
+LQR 纵向保留原生 1s 制动预测，横向独立预瞄默认 2s（`planning.lqr_lateral_horizon_s`）。
+原七种纵向策略之外新增一个缓起步 IDM 候选，保留常规加速和急刹策略参数；
+是否选中仍由上述评分决定。分轴预测与新增候选的依据和局部复现见规划说明。
+
 默认每 **3 秒仿真时间**更新一次模型语义，每 **0.2 秒**使用最新 CARLA 状态重新规划，
 控制器每 **0.1 秒**按轨迹时间插值速度。规划不额外推进 world tick。
 无有效语义、规划异常或轨迹校验失败时制动；失败决策不会写入中期或事件记忆。
@@ -1196,7 +1208,7 @@ python -m pytest -q -p no:cacheprovider
 
 ### 13.3 对照开关与记忆实验
 
-语义提示词版本 4 位于 `config/decision.yaml` 的 `semantic.system_prompt` 和 `semantic.user_prompt`。
+语义提示词版本 5 位于 `config/decision.yaml` 的 `semantic.system_prompt` 和 `semantic.user_prompt`。
 `pdm_closed` 不再使用 `config/api_models.yaml` 中要求输出路点的旧决策系统提示词；
 `vlm_trajectory` 保持原系统契约。场景理解提示词仍在 `config/prompts.yaml`。
 修改后重启驾驶进程使缓存配置生效；`[DECISION_PROMPT]` 日志记录实际系统/用户提示词哈希。
@@ -1208,6 +1220,8 @@ python -m pytest -q -p no:cacheprovider
 该运动窗口来自各记忆模式共同的传感器历史，不增加 memory_off 的检索或短期记忆。
 路线锚点与真实 actor 分开显示；静止时长不能证明已在停止线完成停车，视觉估距也不是精确停止位置。
 场景理解只报告观察证据，不从单帧臆测自车正在减速或直接发布停车命令。
+版本 5 补充当前 CARLA 实测状态优先于单帧运动猜测；路面 STOP 文字不等于持续停车命令。
+可选导航上下文来自当前地图和有序路线，注明快照时间，不把车道身份当作通行权。
 
 验证时使用同一 prepared 场景、seed 和记忆配置，核对模型原始语义、PDM 最终选择、
 停车后是否恢复以及碰撞/违规/完整路线结果。提示词与回归测试不能证明模型一定选择正确，
@@ -1245,7 +1259,7 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --planner vlm_
   `planning_output` 保存候选诊断，`decision_validation` 保存执行前数值校验结果。
 - `planner.jsonl` 记录每次 PDM 更新的仿真时间、关联语义帧、候选基础分/语义分/最终选择和校验结果。
   `selection_rule=pdm_base_plus_semantic`，`eligible` 只表示数值有效，`safe` / `safety` 仅作
-  风险诊断；`selected_zero_base_score` 标记是否选择了 0 基础分候选。必要回归已移除，
+  风险诊断；`selected_zero_base_score` 标记是否选择了 0 基础分候选。选择阶段的必要回归门控已移除，
   `route_recovery_active=false`。`geometry` 保存实际车道连接、截断和变道许可诊断。
   几何失败也会写入 `semantic_error` / `control_error`；无数值有效候选时
   `failure_reason=no_finite_candidate`，兼容的校验原因仍为 `pdm_emergency_brake`。
@@ -1266,3 +1280,49 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --planner vlm_
 8m；这会影响背景采样序列，新旧版本结果不能视为完全相同的交通快照，应在同一版本重跑
 语义开/关对照。预留位置不保证没有地图静态障碍物；旧场景 YAML 若仍无法生成事件，
 需要在服务器检查固定起点与碰撞几何，不应运行时随机挪动事件位置。
+
+### 13.5 不调用模型的路线故障定位
+
+`check_pdm_route` 使用真实 CARLA 车辆物理、相同 PDM 核心和执行控制器，固定输入
+`FOLLOW_ROUTE + MAINTAIN`，不调用 VLM、不加载 DINO、不访问记忆库。
+这是工程诊断，输出明确标记 `paper_vlm_experiment=false`，不能代替模型或记忆实验结果。
+请使用空闲 CARLA 实例，关闭其它会推进该实例 `world.tick()` 的进程。
+多实例时 Traffic Manager 默认使用各自实际 RPC 端口加 6000（例如 2000→8000、
+2200→8200），可用 `carla.traffic_manager_port` 显式覆盖；不同实例不能共用一个端口。
+绑定或同步初始化失败会明确报错，工具不自动抢占其它进程的端口。
+
+先用原 prepared YAML 排除背景交通因素，再保留原交通数量复查：
+
+```bash
+# 空背景交通，基础 PDM 评分。保留原路线、终点、seed 和交通灯。
+python -m carla_bridge.tools.check_pdm_route \
+  --scenario outputs/paper_v1_spawncheck/eval/R05_multilane_eval_s101.yaml \
+  --semantic-influence off --empty-traffic \
+  --output-dir outputs/pdm_diagnostics/R05_empty_off
+
+# 原 YAML 背景交通；固定正常行驶语义参与评分。
+python -m carla_bridge.tools.check_pdm_route \
+  --scenario outputs/paper_v1_spawncheck/eval/R05_multilane_eval_s101.yaml \
+  --semantic-influence on \
+  --output-dir outputs/pdm_diagnostics/R05_traffic_on
+```
+
+`--host` / `--port` 默认 `127.0.0.1:2000`；默认关闭渲染，`--rendering` 可启用。
+不传 `--max-duration-s` 时使用 YAML 时限。每轮必须使用新的输出目录，工具拒绝覆盖旧结果。
+包含脚本事件的 YAML 会明确报不支持，应使用完整驾驶入口验证，不能遗漏事件后计作成功。
+按同样方式组合 empty/原交通 × on/off；这些对照用于定位地图、规划、控制和交通因素。
+上面两条命令同时改变了交通和语义开关，不能直接相减来评价语义收益；比较开关时须保持
+同一源码、场景、交通配置和参数，并分别运行 on/off。固定意图的实验也不能验证真实模型
+是否仍误读 STOP 路面文字，后者要使用完整驾驶入口另行检验。
+
+`report.json` 保存完整原始/有效场景、路线及源码哈希、实际交通出生清单、车辆参数、版本、
+实际 Traffic Manager 端口、清理结果；`planner.jsonl` / `control.jsonl` 保存候选与逐 tick 执行。
+只有按序完成路线 100%、到达终点、无碰撞、无异常轨迹、无运行错误且正常清理才通过。
+运行中修改源码也不会计作通过。不要将“运行若干秒未报错”或绕过导航出口当成修复成功。
+这个通过条件只验收路线可达性和上述运行检查，不验收压线、逆行、闯灯、舒适性或驾驶效率。
+还应检查实际车辆的速度、加速度、车道侵入及交通违规；候选预测评分与实际执行指标也应分别报告。
+
+2026-10-18 的本地真实物理验证保留原 R05 路线和 60 车 / 20 行人配置，固定语义的
+on/off 两组分别在 316.2s / 313.6s 完成 100%，记录碰撞和轨迹拒绝均为 0。
+这不包含真实 VLM 和记忆验证，原始制动仍有明显尖峰；完整条件、结果及限制见
+[PDM 修复与物理验证说明](planning/README.md#本地完整路线物理验证2026-10-18)。

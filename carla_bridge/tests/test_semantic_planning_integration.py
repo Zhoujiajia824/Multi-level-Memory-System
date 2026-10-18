@@ -43,6 +43,9 @@ def planning_loop(tmp_path, enabled=True):
     closed.config.data["output_dir"] = tmp_path / "closed"
     closed.planner_backend = "pdm_closed"
     closed.semantic_influence = enabled
+    # This scheduling fixture has no map geometry. Do not let Mock fabricate
+    # a truthy waypoint collection for the optional current navigation facts.
+    closed.scenario.route._route_waypoints = []
     closed.pdm_planner = Mock()
     closed.pdm_planner.plan.side_effect = lambda *args, **kwargs: deepcopy(planned_trajectory())
     return closed

@@ -75,8 +75,15 @@ class Vehicle:
         return carla.VehicleControl()
 
     def get_physics_control(self):
-        return NS(wheels=[NS(position=carla.Vector3D(x=x, y=y), max_steer_angle=40 if x > 0 else 0)
-                          for x, y in ((140, -80), (140, 80), (-140, -80), (-140, 80))])
+        wheelbase = getattr(self, "wheelbase_m", 2.8)
+        rear_x = getattr(self, "rear_axle_local_x_m", self.bounding_box.location.x - wheelbase / 2)
+        locations = [(rear_x + wheelbase, -.8), (rear_x + wheelbase, .8), (rear_x, -.8), (rear_x, .8)]
+        wheels = []
+        for index, (x, y) in enumerate(locations):
+            world = self.get_transform().transform(carla.Location(x=x, y=y))
+            wheels.append(NS(position=carla.Vector3D(x=world.x * 100, y=world.y * 100, z=world.z * 100),
+                             max_steer_angle=getattr(self, "max_steer_deg", 40) if index < 2 else 0))
+        return NS(wheels=wheels)
 
     def get_speed_limit(self):
         return 30.0
@@ -143,7 +150,102 @@ def test_rollout_tracker_and_bicycle_share_actual_carla_vehicle_geometry():
     assert planner.simulator._motion_model._max_steering_angle == pytest.approx(planner.max_steer)
     planner.plan(semantic())
     assert planner.simulator._tracker._wheel_base == pytest.approx(2.8)
-    assert planner.simulator._motion_model._max_steering_angle == pytest.approx(math.radians(40))
+    assert planner.simulator._motion_model._max_steering_angle == pytest.approx(
+        planner.steering_model.inner_to_bicycle(math.radians(40)))
+    assert planner.physical_max_steer == pytest.approx(math.radians(40))
+
+
+@pytest.mark.parametrize("preview_s", [None, .2, 1., 2., 4.])
+def test_native_lqr_preview_is_bound_to_configuration_and_saved_in_diagnostics(preview_s):
+    fixture = make_planner()
+    config = {} if preview_s is None else {"lqr_lateral_horizon_s": preview_s}
+    planner = CarlaPDMPlanner(fixture.world, fixture.ego, fixture.route, config)
+    expected_s = 2. if preview_s is None else preview_s
+    assert planner.simulator._tracker._tracking_horizon == round(expected_s / planner.dt)
+    assert planner.simulator._tracker._discretization_time == planner.dt
+    diagnostics = planner.plan(semantic(), semantic_enabled=False)["planner_diagnostics"]
+    assert diagnostics["lqr_lateral_horizon_s"] == pytest.approx(expected_s)
+    assert diagnostics["lqr_lateral_horizon_samples"] == round(expected_s / planner.dt)
+    assert diagnostics["lqr_longitudinal_horizon_s"] == 1.
+    assert diagnostics["lqr_longitudinal_horizon_samples"] == 10
+    assert planner.simulator._tracker._longitudinal_tracker._tracking_horizon == 10
+    assert_score_only_selection(diagnostics)
+
+
+@pytest.mark.parametrize("preview_s", [float("nan"), float("inf"), -.1, 0., .1, .25, 4.1])
+def test_invalid_lqr_preview_is_rejected_before_rollout(preview_s):
+    fixture = make_planner()
+    with pytest.raises(ValueError, match="lqr_lateral_horizon_s"):
+        CarlaPDMPlanner(fixture.world, fixture.ego, fixture.route, {"lqr_lateral_horizon_s": preview_s})
+
+
+def test_world_wheel_positions_measure_the_rear_axle_instead_of_half_wheelbase():
+    """CARLA 0.9.15 Tesla probe, translated and rotated away from the origin."""
+    planner = make_planner()
+    ego = planner.ego
+    ego.x, ego.y, ego.z, ego.yaw = -164.73216247558594, -95.14187622070312, .0014131736243, -179.9136962890625
+    ego.bounding_box = carla.BoundingBox(carla.Location(x=.02921879478, y=.00000481854, z=.735860527),
+                                        carla.Vector3D(x=2.395889759, y=1.081725001, z=.743830025))
+    measured_world_cm = [(-16635.1640625, -9431.08984375, 36.962612152),
+                         (-16634.9140625, -9597.7724609375, 36.962608337),
+                         (-16334.7001953125, -9430.6376953125, 36.962615967),
+                         (-16334.44921875, -9597.3203125, 36.962615967)]
+    ego.get_physics_control = lambda: NS(wheels=[
+        NS(position=carla.Vector3D(x=x, y=y, z=z), max_steer_angle=70 if i < 2 else 0)
+        for i, (x, y, z) in enumerate(measured_world_cm)])
+    parameters = planner._vehicle_parameters()
+    assert parameters.wheel_base == pytest.approx(3.0046469567)
+    assert parameters.rear_axle_to_center == pytest.approx(1.4156, abs=.001)
+    assert abs(parameters.rear_axle_to_center - parameters.wheel_base / 2) > .08
+    assert planner.front_track_m == pytest.approx(1.666828, abs=1e-5)
+    assert planner.rear_axle_actor_xyz_m[0] == pytest.approx(-1.3864, abs=.001)
+    assert planner._vehicle_geometry_source["rear_axle_to_center_source"] == "carla_world_wheel_positions"
+    planner.config["rear_axle_to_center_m"] = 1.45
+    assert planner._vehicle_parameters().rear_axle_to_center == pytest.approx(1.45)
+    assert planner.rear_axle_actor_xyz_m[0] == pytest.approx(ego.bounding_box.location.x - 1.45)
+    assert planner._vehicle_geometry_source["rear_axle_to_center_source"] == "config_override"
+
+
+def test_planning_steering_estimate_uses_the_same_speed_curve_as_execution():
+    planner = make_planner(speed=10)
+    physics = planner.ego.get_physics_control()
+    physics.steering_curve = [carla.Vector2D(x=0, y=1), carla.Vector2D(x=20, y=.9),
+                              carla.Vector2D(x=60, y=.8)]
+    planner.ego.get_physics_control = lambda: physics
+    planner.ego.get_control = lambda: carla.VehicleControl(steer=.5)
+    planner._vehicle_parameters()
+    state, _ = planner._ego_state(2_000_000)
+    assert state.tire_steering_angle == pytest.approx(
+        -planner.steering_model.inner_to_bicycle(.5 * math.radians(40) * .86))
+    assert planner._steering_state_diagnostics["source"] == "command_ackermann_estimate"
+    assert planner._steering_state_diagnostics["fallback_reason"] == "wheel_angle_api_unavailable"
+
+
+def test_planning_state_prefers_actual_wheel_angles_over_unexecuted_command():
+    planner = make_planner(speed=.056)
+    planner.ego.get_control = lambda: carla.VehicleControl(steer=-.6)
+    planner.ego.get_wheel_steer_angle = lambda wheel: {
+        carla.VehicleWheelLocation.FL_Wheel: -13.2981967926,
+        carla.VehicleWheelLocation.FR_Wheel: -11.8026046753}[wheel]
+    state, _ = planner._ego_state(2_000_000)
+    assert math.degrees(state.tire_steering_angle) == pytest.approx(12.5065544102)
+    diagnostic = planner._steering_state_diagnostics
+    assert diagnostic["source"] == "carla_measured_front_wheels"
+    assert diagnostic["front_left_deg"] == pytest.approx(-13.2981967926)
+    assert not diagnostic["input_latency_modeled"]
+    assert abs(diagnostic["command_estimate_bicycle_rad"] - state.tire_steering_angle) > .1
+
+
+@pytest.mark.parametrize("failure", [float('nan'), RuntimeError("wheel feedback failed")])
+def test_available_but_broken_wheel_api_is_not_silently_replaced_by_command(failure):
+    planner = make_planner()
+    def read_angle(wheel):
+        if isinstance(failure, Exception):
+            raise failure
+        return failure
+    planner.ego.get_wheel_steer_angle = read_angle
+    with pytest.raises((RuntimeError, ValueError)):
+        planner._ego_state(2_000_000)
 
 
 def test_real_core_stop_ablation_changes_choice_only():
@@ -379,10 +481,20 @@ def test_repeated_keep_lane_commands_are_not_replaced_by_forced_recovery():
         x, y = ego_to_global(point["x"], point["y"], ego.x, ego.y, math.radians(ego.yaw))
         candidate = next(c for c in plan["planner_diagnostics"]["candidates"]
                          if c["id"] == plan["planner_diagnostics"]["selected_id"])
+        assert candidate["physical_lane_side"] == "left"
         heading = planner.generator._state_array[candidate["index"], 2, planner.api.StateIndex.HEADING]
         ego.x, ego.y, ego.yaw, ego.speed = x, y, -math.degrees(heading), point["optional_v"]
     assert ego.x > 45
-    assert ego.y == pytest.approx(-3.5, abs=.1)
+    # KEEP_LANE permits the native within-lane offsets; it need not end on the
+    # exact centreline. Check the actual footprint stays in that physical lane.
+    half_width = ego.bounding_box.extent.y
+    half_length = ego.bounding_box.extent.x
+    box = ego.bounding_box.location
+    transform = ego.get_transform()
+    for dx in (-half_length, half_length):
+        for dy in (-half_width, half_width):
+            corner = transform.transform(carla.Location(x=box.x+dx, y=box.y+dy, z=box.z))
+            assert -5.25 <= corner.y <= -1.75
 
 
 def test_junction_return_boundary_does_not_artificially_shorten_current_lane():

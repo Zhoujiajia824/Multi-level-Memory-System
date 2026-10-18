@@ -7,6 +7,7 @@ walker API 略有差异），不影响主流程。
 from __future__ import annotations
 
 import math
+from numbers import Integral
 import random
 from typing import List
 
@@ -17,21 +18,47 @@ from src.vla_memory.common.logging_utils import get_logger
 logger = get_logger("carla_traffic")
 
 
+def _validated_port(value, name: str) -> int:
+    """Reject lossy coercions (including booleans) before touching CARLA."""
+    if isinstance(value, str) and value.isdecimal():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, Integral) or not 1 <= value <= 65535:
+        raise ValueError(f"{name} must be an integer in 1..65535; got {value!r}")
+    return int(value)
+
+
+def resolve_traffic_manager_port(rpc_port: int, traffic_manager_port=None) -> int:
+    """One deterministic TM endpoint per RPC instance; preserve 2000 -> 8000.
+
+    Overrides are explicit: never search for, kill, or silently reuse another
+    port after a bind failure. Instances on the same host need distinct TM ports.
+    """
+    rpc_port = _validated_port(rpc_port, "CARLA RPC port")
+    candidate = rpc_port + 6000 if traffic_manager_port is None else traffic_manager_port
+    return _validated_port(candidate, "carla.traffic_manager_port")
+
+
 class TrafficSpawner:
     """交通车辆 + 行人生成器。"""
 
-    def __init__(self, world, client, ego_vehicle, seed: int = 42):
+    def __init__(self, world, client, ego_vehicle, seed: int = 42, tm_port: int = 8000):
         self.world = world
         self.client = client
         self.ego = ego_vehicle
-        self.tm_port = 8000
-        self.tm = client.get_trafficmanager(self.tm_port)
+        self.tm_port = _validated_port(tm_port, "carla.traffic_manager_port")
         self._tm_synchronous = False
         try:
+            self.tm = client.get_trafficmanager(self.tm_port)
             self.tm.set_synchronous_mode(True)
             self._tm_synchronous = True
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError(
+                f"Traffic Manager initialization failed on port {self.tm_port}: {exc}. "
+                "Check carla.traffic_manager_port and port ownership; each CARLA RPC "
+                "instance on the same host requires a distinct TM port. No port "
+                "fallback or process takeover was attempted."
+            ) from exc
+        logger.info("Traffic Manager 已连接端口 %d (同步=True)", self.tm_port)
         self.rng = random.Random(seed)
         self._vehicles: List = []
         self._walkers: List = []

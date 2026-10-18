@@ -89,6 +89,8 @@ class DecisionPromptBuilder:
                 "scene_block": scene_block,
                 "ego_state_block": ego_state_block,
                 "nav_block": nav_block,
+                "navigation_context_block": self._render_navigation_context(
+                    (planning_constraints or {}).get("navigation_context")),
                 "history_block": history_block,
                 "motion_context_block": self._render_motion_context(history_trajectory, ego_state),
                 "memory_block": memory_block,
@@ -270,10 +272,13 @@ class DecisionPromptBuilder:
             f"- 速度: {ego_state.get('speed', 0):.2f} m/s",
             f"- 加速度: {ego_state.get('acceleration', 0):.2f} m/s²",
         ]
-        # P3 起，若 CAN bus 提供了额外字段则一并展示
+        # CARLA supplies a command-derived road-wheel estimate, whereas the
+        # nuScenes CAN bus field describes steering-wheel rotation.
+        steering_label = ("前轮转角近似（控制命令换算，左正）" if ego_state.get("source") == "carla"
+                          else "方向盘转角")
         for key, label, fmt in (
             ("yaw_rate", "偏航角速率", "{:.3f} rad/s"),
-            ("steering_angle", "方向盘转角", "{:.3f} rad"),
+            ("steering_angle", steering_label, "{:.3f} rad"),
             ("throttle", "油门", "{:.2f}"),
             ("brake", "刹车", "{:.2f}"),
         ):
@@ -416,6 +421,40 @@ class DecisionPromptBuilder:
         return "\n".join(lines)
 
     @staticmethod
+    def _render_navigation_context(context) -> str:
+        """Expose map lane facts separately from an earlier planner snapshot.
+
+        Availability describes the generated candidate pool, not legal passage
+        or physical impossibility. Missing context must not imply a blockage.
+        """
+        if not isinstance(context, dict) or not context:
+            return ""
+        data = {}
+        # Producers supply source/timestamp fields so a historical candidate
+        # pool cannot silently be presented as current map/traffic truth.
+        for key in ("source", "snapshot_time_s", "ego_lane_key", "reference_lane_key",
+                    "current_side", "available_lateral_semantics", "unavailable_lateral_request",
+                    "route_distance_to_junction_m", "lane_change_completion_distance_m",
+                    "planner_source", "planner_snapshot_time_s"):
+            value = context.get(key)
+            if value is not None:
+                if isinstance(value, float) and not math.isfinite(value):
+                    continue
+                data[key] = value
+        if not data:
+            return ""
+        data.setdefault("source", "unspecified")
+        data.setdefault("snapshot_time_s", None)
+        if any(key in data for key in ("available_lateral_semantics", "unavailable_lateral_request")):
+            data.setdefault("planner_source", "unspecified")
+            data.setdefault("planner_snapshot_time_s", None)
+        return ("## 导航车道上下文（来源与快照时间见字段）\n"
+                + json.dumps(data, ensure_ascii=False) + "\n"
+                "- 未标记来源或时间即未知；车道身份描述路线关系，候选可用性仅属于所标记的规划快照。\n"
+                "- 候选可用性不代表当前通行权，缺失不表示道路阻塞。\n"
+                "- 以当前实测交通和导航为准；KEEP_LANE 不表示放弃导航目标，FOLLOW_ROUTE 包含进入导航所需车道。\n")
+
+    @staticmethod
     def _render_motion_context(history, ego_state) -> str:
         """Summarize measured kinematics, not learned/retrieved memory or right of way."""
         header = "## 实测运动窗口（所有记忆模式共同的传感器状态）\n"
@@ -441,7 +480,7 @@ class DecisionPromptBuilder:
                 duration += dt
         return (header + f"- 最近测量覆盖 {rows[-1][0]-rows[0][0]:.2f} 秒，累计移动 {distance:.2f} 米。\n"
                 f"- 连续近静止至少 {duration:.2f} 秒（速度阈值 0.2m/s，仅统计连续测量；窗口外未知）。\n"
-                "- 以上仅描述实测运动状态，通行权由当前交通情况判断。\n")
+                "- 以上仅描述实测运动状态，通行权由当前交通情况判断；近静止不是永久保持 STOP 的理由。\n")
 
     def _render_image_layout_block(self, image_layout: str) -> str:
         """渲染输入图像布局说明段（告知决策 VLM 当前图像是单图还是六视角 mosaic）。"""
