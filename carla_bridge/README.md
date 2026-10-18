@@ -581,6 +581,7 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
 | `carla.replan_interval_s` | 3.0 | 全量认知与语义更新周期 |
 | `carla.planning.backend` | pdm_closed | PDM 核心；vlm_trajectory 为旧模型轨迹 |
 | `carla.planning.semantic_influence` | true | 语义候选偏好评分开关，与记忆开关独立 |
+| `carla.planning.model_inference` | true | 模型调用开关；false 跳过双 VLM、DINOv2、记忆和六路认知相机，要求 PDM、语义影响关闭及 memory_off |
 | `carla.planning.replan_interval_s` | 0.2 | 两次语义更新之间的 PDM 规划周期 |
 | `carla.max_duration_s` | 300.0 | 全局仿真时间保护上限，与场景 `duration_s` 取较小值；到时未完成为 `timeout` |
 | `carla.capture_timeout_s` | 2.0 | 六路相机共享等待上限（墙钟秒） |
@@ -1234,6 +1235,9 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --planner pdm_
 # 同样运行模型，但仅使用 PDM 基础评分选择候选
 python -m carla_bridge.run_carla_demo --scenario straight_traffic --planner pdm_closed --semantic-influence off --mode memory_off
 
+# 纯 PDM 快速运行：不初始化或调用模型，不需要 API Key 或 DINOv2 缓存
+python -m carla_bridge.run_carla_demo --scenario straight_traffic --planner pdm_closed --semantic-influence off --model-inference off --mode memory_off
+
 # 指定既有训练库只读检索，语义参与选择
 python -m carla_bridge.run_carla_demo --scenario straight_traffic --planner pdm_closed --semantic-influence on --memory-bank outputs/memory_banks/pdm_train --memory-access read_only
 
@@ -1245,6 +1249,39 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --planner vlm_
 因此不是“完全不调用模型”的计算成本基线。给定同一车辆/地图/交通状态，开关两侧生成
 相同候选与基础分，只有语义加分不同；行驶动作不同后，两轮未来状态自然可能分化。
 
+`--model-inference on|off` 是独立的模型调用开关，默认 `on`，对应
+`carla.planning.model_inference`。组合如下：
+
+| 语义影响 | 模型调用 | 运行方式 |
+| --- | --- | --- |
+| on | on | 模型理解场景、输出语义，参与 PDM 候选评分 |
+| off | on | 保留模型理解、决策与日志，PDM 只按基础分选择；兼容原有对照 |
+| off | off | 跳过模型与记忆管线，直接按 PDM 基础分规划，适合快速跑场景 |
+| on | off | 不支持，启动前报错：没有模型输出可用于语义加分 |
+
+纯 PDM 模式必须显式使用 `--planner pdm_closed --semantic-influence off
+--model-inference off --mode memory_off`；旧 `vlm_trajectory` 后端或记忆开启时会在连接
+CARLA 前报错。没有真实认知输出，因此不生成模型决策记录，也不检索或积累记忆。
+该模式不安装六路认知相机、不加载 DINOv2、不创建双 VLM 客户端，不检查模型 API Key。
+仍使用 CARLA GT 地图与 actor、相同 PDM 候选生成/基础评分/执行前校验、0.2s 规划及
+0.1s 物理控制，保留场景事件、碰撞与路线指标、卡死检测、正常清理和可选驾驶视频。
+它不保证整轮立即结束：PDM 计算、CARLA 物理、交通等待和视频录制仍消耗时间。
+
+在现有 `mulmem_carla` 环境快速运行原 R05 场景：
+
+```bash
+python -m carla_bridge.run_carla_demo \
+  --scenario outputs/paper_v1_spawncheck/eval/R05_multilane_eval_s101.yaml \
+  --planner pdm_closed \
+  --semantic-influence off \
+  --model-inference off \
+  --mode memory_off
+```
+
+恢复模型调用时将 `--model-inference off` 改为 `on` 或省略；模型调用开关关闭时，不可用
+该轮结果评价提示词、记忆或真实模型语义的作用。比较运行耗时时应分别报告模型调用状态；
+移除认知相机会改变计算负载，不属于仅改变语义加分的同计算条件对照。
+
 `--mode memory_off` 与语义开关是两个独立实验维度。做对照时固定场景、seed、路线、
 规划参数、模型配置及评估库快照；不要先让一个实验组向同一库写入，再让另一个组读取新增内容。
 持续积累仍使用 `--memory-bank ... --memory-access read_write`；评估使用只读库。
@@ -1254,7 +1291,9 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --planner vlm_
 
 每轮 `outputs/carla_runs/<运行目录>/` 中：
 
-- `manifest.json` 保存完整规划配置、语义开关、记忆策略及最终路线结果。
+- `manifest.json` 保存完整规划配置、语义和模型调用开关、记忆策略及最终路线结果。
+  纯 PDM 运行目录含 `model_off`，报告与 `planner.jsonl` 标记 `model_inference=false`，
+  `semantic_decision` 和关联模型帧为 `null`，报告的全量认知间隔为 `null`。
 - 决策 JSONL 的 `model_decision_output` 保留模型语义，`decision_output` 保存规划后的指令与轨迹，
   `planning_output` 保存候选诊断，`decision_validation` 保存执行前数值校验结果。
 - `planner.jsonl` 记录每次 PDM 更新的仿真时间、关联语义帧、候选基础分/语义分/最终选择和校验结果。
@@ -1269,7 +1308,8 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --planner vlm_
   实际物理子步配置和车辆制动参数，便于区分规划停车、控制响应和仿真推进异常。
 - 记忆中的 `semantic_decision` 是模型建议，`planning_context` 是规划器选择；
   记录阶段为 `selected_before_execution`，不能据此断言已经成功完成该动作。
-- `paper_suite summarize` 增加 `planner_backend`、`semantic_influence` 和规划配置哈希，方便分组。
+- `paper_suite summarize` 保存 `planner_backend`、`semantic_influence`、`model_inference`
+  和规划配置哈希，方便分组。旧记录缺失模型调用开关时按 `true` 解释。
 
 验收仍要求**路线完成率 100% 且正常清理退出**，同时审查碰撞、违规和场景事件结果。
 本实现使用 CARLA GT 障碍物与地图，PDM 局部预测和 CARLA 实际控制存在模型差异；

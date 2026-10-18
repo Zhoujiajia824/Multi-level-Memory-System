@@ -12,6 +12,8 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+from carla_bridge.inference_mode import model_inference_enabled
+
 
 class BankLock:
     """OS-released exclusive lock, outside the bank; also protects read snapshots.
@@ -77,6 +79,7 @@ class RunSession:
         # Use the case filename (including split/seed) and portable path characters.
         scenario_label = re.sub(r"[^\w-]+", "_", self.scenario_path.stem).strip("_")[:64] or "scenario"
         planning = config.data.get("carla", {}).get("planning", {})
+        self.model_inference = model_inference_enabled(planning, mode)
         backend = planning.get("backend", "vlm_trajectory")
         planner_label = "pdm_closed" if backend == "pdm_closed" else "vlm_trajectory"
         semantic = ("sem_on" if planning.get("semantic_influence", True) else "sem_off") if backend == "pdm_closed" else "sem_na"
@@ -86,8 +89,11 @@ class RunSession:
                 memory_label += "_no_retrieval"
             if not self.short_term:
                 memory_label += "_no_short_term"
-        dirname = "__".join((self.started_at.strftime("%Y%m%d_%H%M%S"), scenario_label,
-                             memory_label, planner_label, semantic, self.run_id[:8]))
+        labels = [self.started_at.strftime("%Y%m%d_%H%M%S"), scenario_label,
+                  memory_label, planner_label, semantic]
+        if not self.model_inference:
+            labels.append("model_off")
+        dirname = "__".join(labels + [self.run_id[:8]])
         self.run_dir = Path(config.get("output_dir")) / "carla_runs" / dirname
 
     def _path(self, value):
@@ -179,6 +185,7 @@ class RunSession:
             self.manifest = {"run_id": self.run_id, "status": "prepared", "mode": self.mode,
                              "run_directory": self.run_dir.name,
                              "started_at": self.started_at.isoformat(),
+                             "model_inference": self.model_inference,
                              "memory_access": self.access, "memory_bank": str(bank),
                              "memory_seed": str(seed) if seed else None,
                              "commit": revision, "dirty": dirty,

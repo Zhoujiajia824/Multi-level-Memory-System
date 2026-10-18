@@ -17,9 +17,14 @@ from typing import Dict, List
 import carla  # 须在 mulmem_carla(3.9) 运行
 
 from src.vla_memory.common.logging_utils import get_logger
-from src.vla_memory.perception.surround_mosaic import build_surround_mosaic
 
 logger = get_logger("carla_camera")
+
+
+def build_surround_mosaic(*args, **kwargs):
+    """Load the perception package only when cognition actually captures images."""
+    from src.vla_memory.perception.surround_mosaic import build_surround_mosaic as build
+    return build(*args, **kwargs)
 
 
 class CameraManager:

@@ -42,8 +42,10 @@ def _render_md(run_info: dict, s: dict) -> str:
         f"- 模式: `{run_info.get('mode')}`",
         f"- 轨迹后端: `{run_info.get('planner_backend', 'vlm_trajectory')}`",
         f"- 语义影响候选选择: {run_info.get('semantic_influence', False)}",
+        f"- 模型调用（场景理解／驾驶决策／视觉特征）: {run_info.get('model_inference', True)}",
         f"- 仿真时长: {run_info.get('duration_s')} s",
-        f"- 全量认知间隔: {run_info.get('replan_interval_s')} s",
+        (f"- 全量认知间隔: {run_info.get('replan_interval_s')} s"
+         if run_info.get("model_inference", True) else "- 全量认知: 已关闭（纯 PDM，无模型决策及记忆读写）"),
         f"- PDM 重规划间隔: {run_info.get('pdm_replan_interval_s')} s",
     ]
     if run_info.get("early_terminated"):

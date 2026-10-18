@@ -46,6 +46,7 @@ from src.vla_memory.common.config import load_config
 from src.vla_memory.common.logging_utils import setup_logger, set_log_directory
 from carla_bridge.closed_loop import ClosedLoop
 from carla_bridge.run_session import RunSession
+from carla_bridge.inference_mode import model_inference_enabled
 
 
 def _resolve_scenario_path(scenario_arg: str, config) -> Path:
@@ -82,6 +83,8 @@ def main() -> None:
                     help="轨迹后端，默认 PDM-Closed；vlm_trajectory 为旧模型直接输出轨迹")
     ap.add_argument("--semantic-influence", choices=["on", "off"], default=None,
                     help="PDM 候选评分是否接受模型横纵向语义偏好；与记忆开关独立")
+    ap.add_argument("--model-inference", choices=["on", "off"], default=None,
+                    help="是否运行场景理解、语义决策和视觉特征模型；off 要求 pdm_closed、语义影响 off、memory_off")
     ap.add_argument("--dinov2-model-dir", help="本地 DINOv2 模型目录或缓存 snapshot 目录")
     ap.add_argument("--dinov2-cache-dir", help="Hugging Face 缓存目录（默认项目 .cache/huggingface）")
     ap.add_argument("--allow-model-download", action="store_true", help="显式允许 DINOv2 联网下载；默认仅使用本地文件")
@@ -102,6 +105,8 @@ def main() -> None:
     planning = carla_cfg.setdefault("carla", {}).setdefault("planning", {})
     if args.planner is not None:
         planning["backend"] = args.planner
+    if args.model_inference is not None:
+        planning["model_inference"] = args.model_inference == "on"
     if args.semantic_influence is not None:
         if planning.get("backend", "vlm_trajectory") != "pdm_closed":
             ap.error("--semantic-influence requires --planner pdm_closed")
@@ -117,6 +122,11 @@ def main() -> None:
     if args.allow_model_download:
         feature_cfg["local_files_only"] = False
     config = load_config(overrides=carla_cfg)
+    try:
+        model_inference = model_inference_enabled(
+            config.get_nested("carla", "planning", default={}) or {}, args.mode)
+    except ValueError as exc:
+        ap.error(str(exc))
 
     # fail-fast：VLM API Key 缺失立即报错（避免跑完 CARLA+DINOv2 setup 才在第一次 VLM 调用崩）
     import os as _os
@@ -127,7 +137,7 @@ def main() -> None:
             _envs.add(_e)
     if not _envs:
         _envs = {"DASHSCOPE_API_KEY"}
-    _missing = [e for e in _envs if not _os.environ.get(e, "")]
+    _missing = [e for e in _envs if not _os.environ.get(e, "")] if model_inference else []
     if _missing:
         _e0 = _missing[0]
         raise EnvironmentError(

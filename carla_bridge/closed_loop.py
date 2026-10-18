@@ -9,6 +9,7 @@
                其中每周期 5 次 raw 捕获（≈1.67Hz；mosaic+ego+感知，不跑 VLM）
                push 进短期记忆，使队列在控制阶段也保持最新；完整 VLM 仍 3s 一次。
                PDM 默认每 0.2s 根据最新 world 状态重规划，保持最近合法语义。
+              model_inference=false 时跳过认知和六路相机，按同一 PDM/控制节奏直接运行。
       [4 记录] 逐 tick 指标采集（碰撞/违规/路线/舒适度）+ 卡死检测
       [视频]  每个 CARLA 推进 tick 取一帧写视频（跳过 VLM 冻结期），
               视频时长 = 仿真实际驾驶时间；中断 flush 保存。
@@ -23,7 +24,7 @@ import math
 import json
 from copy import deepcopy
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import carla  # 须在 mulmem_carla(3.9) 运行
 
@@ -40,11 +41,14 @@ from carla_bridge.state import coords
 from carla_bridge.control.trajectory_tracker import TrajectoryTracker
 from carla_bridge.control.trajectory_validation import TrajectoryValidator
 from carla_bridge.memory_adapter.keyframe_builder import KeyframeBuilder
-from carla_bridge.memory_adapter.loop_runner import LoopRunner
+from carla_bridge.inference_mode import model_inference_enabled
 from carla_bridge.metrics.collector import MetricsCollector
 from carla_bridge.metrics.run_reporter import write_report
 
 logger = get_logger("carla_closed_loop")
+
+if TYPE_CHECKING:
+    from carla_bridge.memory_adapter.loop_runner import LoopRunner
 
 
 class ClosedLoop:
@@ -73,6 +77,7 @@ class ClosedLoop:
             raise ValueError("planning.semantic_influence must be a boolean")
         if self.planner_backend == "vlm_trajectory":
             self.semantic_influence = False
+        self.model_inference = model_inference_enabled(self.planning_cfg, mode)
         self.pdm_planner = None
         self._active_semantics = None
         self._semantic_frame_id = None
@@ -188,30 +193,33 @@ class ClosedLoop:
             self.carla_client.tick()
 
         # 3. 相机
-        mosaic_cfg = self.config.get_nested("perception", "mosaic", default={}) or {}
-        self.cameras = CameraManager(
-            world, ego, self.cameras_cfg,
-            image_dir=self.out_cfg.get("image_dir", "outputs/carla_images"),
-            mosaic_dir=self.out_cfg.get("mosaic_dir", "outputs/mosaic"),
-            mosaic_cell_w=int(mosaic_cfg.get("cell_width", 480)),
-            mosaic_cell_h=int(mosaic_cfg.get("cell_height", 270)),
-            label_subimages=bool(mosaic_cfg.get("label_subimages", True)),
-            capture_timeout_s=float(self.ccfg.get("capture_timeout_s", 2.0)),
-        )
-        self.cameras.install()
-        self.cameras.warmup(n_frames=2)
+        if self.model_inference:
+            mosaic_cfg = self.config.get_nested("perception", "mosaic", default={}) or {}
+            self.cameras = CameraManager(
+                world, ego, self.cameras_cfg,
+                image_dir=self.out_cfg.get("image_dir", "outputs/carla_images"),
+                mosaic_dir=self.out_cfg.get("mosaic_dir", "outputs/mosaic"),
+                mosaic_cell_w=int(mosaic_cfg.get("cell_width", 480)),
+                mosaic_cell_h=int(mosaic_cfg.get("cell_height", 270)),
+                label_subimages=bool(mosaic_cfg.get("label_subimages", True)),
+                capture_timeout_s=float(self.ccfg.get("capture_timeout_s", 2.0)),
+            )
+            self.cameras.install()
+            self.cameras.warmup(n_frames=2)
 
         # 4. 感知 / 状态 / 控制 / 记忆
-        oracle_cfg = self.config.get_nested("perception", "oracle", default={}) or {}
-        self.perception = PerceptionProvider(
-            world, max_distance_m=float(oracle_cfg.get("max_distance_m", 50.0))
-        )
+        if self.model_inference:
+            oracle_cfg = self.config.get_nested("perception", "oracle", default={}) or {}
+            self.perception = PerceptionProvider(
+                world, max_distance_m=float(oracle_cfg.get("max_distance_m", 50.0))
+            )
         self.ego_provider = EgoStateProvider(
             max_steer_rad=float(self.controller_cfg.get("max_steer_rad", 0.6))
         )
-        self.history = HistoryBuffer(
-            history_seconds=float(self.config.get("history_seconds", 5.0))
-        )
+        if self.model_inference:
+            self.history = HistoryBuffer(
+                history_seconds=float(self.config.get("history_seconds", 5.0))
+            )
         self.tracker = TrajectoryTracker(self.controller_cfg, control_dt_s=self.fixed_delta)
         if self.planner_backend == "pdm_closed":
             from carla_bridge.planning.pdm_planner import CarlaPDMPlanner
@@ -219,7 +227,8 @@ class ClosedLoop:
             planner_cfg["horizon_s"] = max(float(planner_cfg.get("horizon_s", 4.0)), self._execution_horizon)
             self.pdm_planner = CarlaPDMPlanner(world, ego, self.scenario.route, planner_cfg)
             self._bind_pdm_controller(ego)
-        self.kf_builder = KeyframeBuilder(scenario_name=self.scenario.scenario_name(), run_id=self.run_id)
+        if self.model_inference:
+            self.kf_builder = KeyframeBuilder(scenario_name=self.scenario.scenario_name(), run_id=self.run_id)
 
         # 5. 碰撞传感器 + 指标采集
         self._setup_collision_sensor(world, ego)
@@ -233,13 +242,17 @@ class ClosedLoop:
         self._write_control_context(world, ego)
 
         # 6. 记忆 loop
-        out_path = self._make_output_path()
-        self.loop = LoopRunner(
-            self.config, mode=self.mode, output_jsonl_path=out_path, resume=False,
-            decision_validator=self._validate_decision,
-            decision_processor=self._plan_semantic_decision if self.planner_backend == "pdm_closed" else None,
-        )
-        self.loop.setup()
+        if self.model_inference:
+            from carla_bridge.memory_adapter.loop_runner import LoopRunner
+            out_path = self._make_output_path()
+            self.loop = LoopRunner(
+                self.config, mode=self.mode, output_jsonl_path=out_path, resume=False,
+                decision_validator=self._validate_decision,
+                decision_processor=self._plan_semantic_decision if self.planner_backend == "pdm_closed" else None,
+            )
+            self.loop.setup()
+        else:
+            logger.info("[纯PDM] 模型调用已关闭：跳过场景VLM、决策VLM、DINOv2、记忆和六路认知相机；保留事件、指标及可选视频")
 
         # 7. Traffic Manager 起步：空转几帧
         for _ in range(10):
@@ -274,13 +287,17 @@ class ClosedLoop:
             logger.info("长尾事件调度器: %d 个事件", len(events_cfg))
 
         logger.info(
-            "ClosedLoop setup 完成 (scenario=%s, mode=%s, replan=%.1fs, dt=%.3fs, video=%s)",
+            "ClosedLoop setup 完成 (scenario=%s, mode=%s, replan=%.1fs, dt=%.3fs, video=%s, model_inference=%s)",
             self.scenario.scenario_name(), self.mode, self.replan_interval_s, self.fixed_delta,
-            self.recorder is not None,
+            self.recorder is not None, self.model_inference,
         )
 
     def run(self) -> None:
-        assert self.loop and self.carla_client and self.scenario
+        assert self.carla_client and self.scenario
+        if self.model_inference:
+            assert self.loop
+        else:
+            assert self.pdm_planner
         self.run_status = "running"
         duration = min(self.max_duration_s, self.scenario.duration_s())
         if not math.isfinite(duration) or duration <= 0:
@@ -288,7 +305,10 @@ class ClosedLoop:
         if not self.scenario.route:
             raise ValueError("a non-empty planned route is required for route completion")
         while not self._check_run_end():
-            self._replan_cycle()
+            if self.model_inference:
+                self._replan_cycle()
+            else:
+                self._pdm_only_tick()
             if self._early_terminated:
                 break
         self.run_status = self._termination_reason
@@ -486,7 +506,7 @@ class ClosedLoop:
             self._next_pdm_replan_at = self._elapsed + self._pdm_interval
         return result
 
-    def _merge_plan(self, decision: dict, semantic: dict, plan: dict) -> dict:
+    def _merge_plan(self, decision: dict, semantic: Optional[dict], plan: dict) -> dict:
         if not isinstance(plan, dict) or not isinstance(plan.get("planner_diagnostics"), dict):
             raise ValueError("PDM returned no auditable plan")
         diagnostics = plan["planner_diagnostics"]
@@ -519,6 +539,7 @@ class ClosedLoop:
                  "source": source, "semantic_frame_id": self._semantic_frame_id,
                  "semantic_decision": decision.get("semantic_decision"),
                  "semantic_influence": self.semantic_influence,
+                 "model_inference": self.model_inference,
                  "planner_diagnostics": decision.get("planner_diagnostics"),
                  "trajectory": decision.get("trajectory"), "validation": validation}
         with path.open("a", encoding="utf-8") as stream:
@@ -536,7 +557,7 @@ class ClosedLoop:
 
     def _refresh_pdm_control(self, tf, yaw: float, speed: float) -> None:
         """Replan against current actors between expensive semantic VLM calls."""
-        if (self.planner_backend != "pdm_closed" or self._active_semantics is None
+        if (self.planner_backend != "pdm_closed" or (self.model_inference and self._active_semantics is None)
                 or self._elapsed + 1e-8 < self._next_pdm_replan_at):
             return
         self._next_pdm_replan_at = self._elapsed + self._pdm_interval
@@ -575,6 +596,7 @@ class ClosedLoop:
                 "duration_s": round(self._elapsed, 3),
                 "trajectory_rejections": self._trajectory_rejections,
                 "planner_backend": self.planner_backend, "semantic_influence": self.semantic_influence,
+                "model_inference": self.model_inference,
                 "pdm_plan_count": self._pdm_plan_count,
                 "cleanup_errors": list(self._cleanup_errors), "experiment_events": event_result}
 
@@ -635,6 +657,31 @@ class ClosedLoop:
     # ------------------------------------------------------------------
     # 单次重规划周期
     # ------------------------------------------------------------------
+
+    def _pdm_only_tick(self) -> None:
+        """Use the normal PDM/control chain every physics tick, without cognition."""
+        ego = self.scenario.ego_vehicle
+        if self.event_scheduler is not None:
+            self.event_scheduler.tick()
+        self.carla_client.tick()
+        self._elapsed += self.fixed_delta
+        self._record_tick(ego)
+        if self._check_run_end():
+            return
+        tf = ego.get_transform()
+        yaw = coords.carla_yaw_deg_to_rad(tf.rotation.yaw)
+        velocity = ego.get_velocity()
+        speed = math.hypot(velocity.x, velocity.y)
+        self._refresh_pdm_control(tf, yaw, speed)
+        if self._early_terminated:
+            self._apply_brake()
+            return
+        self._apply_control(ego, self.tracker.compute_control(tf.location.x, tf.location.y, yaw, speed))
+        if self._elapsed + 1e-8 >= getattr(self, "_next_pdm_progress_log_at", 0.0):
+            self._check_stuck(speed)
+            logger.info("[纯PDM] t=%.1fs 路线完成度=%.1f%% speed=%.2fm/s 碰撞=%d",
+                        self._elapsed, self.route_completion * 100.0, speed, self._collision_count)
+            self._next_pdm_progress_log_at = self._elapsed + 3.0
 
     def _replan_cycle(self) -> None:
         ego = self.scenario.ego_vehicle
@@ -772,7 +819,19 @@ class ClosedLoop:
             ctrl = self.tracker.compute_control(tf2.location.x, tf2.location.y, yaw2, speed)
             self._apply_control(ego, ctrl)
 
-        # ---- 卡死检测（B5）：低速且无路线进展，先警告后提前终止 ----
+        self._check_stuck(speed)
+        if self._early_terminated:
+            return
+
+        # ---- [4 记录] ----
+        prog = (self.scenario.route.progress_fraction() * 100.0) if self.scenario.route else 0.0
+        logger.info(
+            "[cycle end] t=%.1fs 路线完成度=%.1f%% 碰撞=%d",
+            self._elapsed, prog, self._collision_count,
+        )
+
+    def _check_stuck(self, speed: float) -> None:
+        """Preserve the same no-progress guard in both cognition modes."""
         if self._stuck_enabled and not self._planned_stop:
             prog = (self.scenario.route.progress_fraction()
                     if self.scenario.route else 0.0)
@@ -801,13 +860,6 @@ class ClosedLoop:
             # A deliberate stop/yield can legitimately outlast the stuck timer.
             # The overall route timeout still bounds repeated stop decisions.
             self._stuck_since = None
-
-        # ---- [4 记录] ----
-        prog = (self.scenario.route.progress_fraction() * 100.0) if self.scenario.route else 0.0
-        logger.info(
-            "[cycle end] t=%.1fs 路线完成度=%.1f%% 碰撞=%d",
-            self._elapsed, prog, self._collision_count,
-        )
 
     def _record_tick(self, ego) -> None:
         # Read the server clock before observers/metrics, in the same callback as
@@ -1029,7 +1081,7 @@ class ClosedLoop:
             "scenario": self.scenario.scenario_name(),
             "mode": self.mode,
             "duration_s": round(self._elapsed, 2),
-            "replan_interval_s": self.replan_interval_s,
+            "replan_interval_s": self.replan_interval_s if self.model_inference else None,
             "pdm_replan_interval_s": self._pdm_interval if self.planner_backend == "pdm_closed" else None,
             "collision_raw_events": self._collision_raw,
             "collision_unique_actors": len(

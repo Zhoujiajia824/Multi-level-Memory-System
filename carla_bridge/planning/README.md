@@ -5,6 +5,12 @@
 地图、目标、车辆状态及轨迹坐标由本项目适配，属于 **PDM-Closed core + CARLA adapter**，
 不能称为原版 nuPlan benchmark，也不能直接比较其原版排行榜分数。
 
+常规驾驶入口支持 `--semantic-influence off --model-inference off --mode memory_off`
+运行纯 PDM：跳过场景/决策 VLM、DINOv2、记忆及六路认知相机，保留同一 PDM、控制、
+事件、指标和可选视频；不需要模型 API Key 或视觉特征缓存。默认模型调用开启，单独使用
+`--semantic-influence off` 仍保留原来的模型对照行为。完整命令和组合规则见
+[CARLA README 第 13 节](../README.md#13-语义决策与-pdm-closed)。
+
 ## 固定源码与安装
 
 - [tuplan_garage](https://github.com/autonomousvision/tuplan_garage/tree/b51d5d04fac1bd4389653b9ab2ff73ea88f435a3)：

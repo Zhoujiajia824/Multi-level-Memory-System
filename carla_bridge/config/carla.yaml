@@ -62,6 +62,7 @@ carla:
   planning:
     backend: "pdm_closed"       # pdm_closed | vlm_trajectory（旧版轨迹模式）
     semantic_influence: true    # 消融只切换语义加分；最终选择=PDM基础分+语义分
+    model_inference: true      # false跳过双VLM/DINO/记忆/认知相机；要求pdm_closed、semantic_influence=false、memory_off
     replan_interval_s: 0.2      # PDM 更新周期；VLM 意图在两次认知之间保持
     horizon_s: 4.0              # 不短于 VLM 周期；轨迹由官方 PDM 核心产生
     sample_interval_s: 0.1      # 固定版本官方 TTC 实现使用 10Hz 索引

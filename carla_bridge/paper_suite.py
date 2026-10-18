@@ -113,7 +113,7 @@ def validate_prepared(cfg):
 def summarize_runs(runs_dir, output):
     """One row per attempted paper run, including failures; never drop bad runs."""
     fields = ["run_id", "case_id", "category", "split", "seed", "mode", "memory_access",
-              "planner_backend", "semantic_influence", "planner_config_sha256",
+              "planner_backend", "semantic_influence", "model_inference", "planner_config_sha256",
               "retrieve", "write", "short_term", "memory_bank", "status", "success",
               "route_completion", "duration_s", "collision_count", "red_light_violations",
               "trajectory_rejections", "events_valid", "events_executed", "events_required",
@@ -137,6 +137,7 @@ def summarize_runs(runs_dir, output):
                **{key: access.get(key) for key in ("retrieve", "write", "short_term")},
                "planner_backend": planning.get("backend", "vlm_trajectory"),
                "semantic_influence": planning.get("semantic_influence", False),
+               "model_inference": planning.get("model_inference", True),
                "planner_config_sha256": digest(planning),
                **{key: outcome.get(key) for key in ("success", "route_completion", "duration_s", "trajectory_rejections")},
                **{key: metrics.get(key) for key in ("collision_count", "red_light_violations")},
