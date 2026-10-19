@@ -72,19 +72,23 @@ def main() -> None:
     ap.add_argument("--scenario", default=None, help="场景 YAML 名（不带扩展）或绝对路径")
     ap.add_argument(
         "--mode", choices=["memory_on", "memory_off"], default="memory_on",
-        help="memory_on 用三层记忆，memory_off 对照基线",
+        help="memory_on 启用记忆访问（模型记忆或无模型full数值记忆），memory_off禁止所有记忆读写",
     )
     ap.add_argument("--memory-bank", help="持久化记忆库路径；省略时为本轮独立库")
     ap.add_argument("--memory-access", choices=["read_write", "read_only"], default="read_write")
     ap.add_argument("--memory-seed", help="复制已有库到新目标库，原始库保持不变")
-    ap.add_argument("--no-memory-retrieval", action="store_true", help="不检索中长期记忆，仍按写入开关积累")
+    ap.add_argument("--no-memory-retrieval", action="store_true", help="不检索持久文本/数值经验，仍按写入开关积累")
     ap.add_argument("--no-short-term", action="store_true", help="关闭本轮短期记忆")
     ap.add_argument("--planner", choices=["pdm_closed", "vlm_trajectory"], default=None,
                     help="轨迹后端，默认 PDM-Closed；vlm_trajectory 为旧模型直接输出轨迹")
     ap.add_argument("--semantic-influence", choices=["on", "off"], default=None,
                     help="PDM 候选评分是否接受模型横纵向语义偏好；与记忆开关独立")
+    ap.add_argument("--semantic-policy", choices=["selective", "always", "shadow"], default=None,
+                    help="语义策略：selective 条件介入；always 旧版加分；shadow 仅记录建议，执行基础PDM")
+    ap.add_argument("--planning-memory", choices=["off", "gate", "full"], default=None,
+                    help="数值规划经验：off 关闭；gate 仅辅助介入判断；full 还提供已执行参数候选先验，受mode/access限制")
     ap.add_argument("--model-inference", choices=["on", "off"], default=None,
-                    help="是否运行场景理解、语义决策和视觉特征模型；off 要求 pdm_closed、语义影响 off、memory_off")
+                    help="模型调用开关；off 要求 pdm_closed、语义off，以及memory_off或显式planning-memory full的数值记忆模式")
     ap.add_argument("--dinov2-model-dir", help="本地 DINOv2 模型目录或缓存 snapshot 目录")
     ap.add_argument("--dinov2-cache-dir", help="Hugging Face 缓存目录（默认项目 .cache/huggingface）")
     ap.add_argument("--allow-model-download", action="store_true", help="显式允许 DINOv2 联网下载；默认仅使用本地文件")
@@ -105,6 +109,10 @@ def main() -> None:
     planning = carla_cfg.setdefault("carla", {}).setdefault("planning", {})
     if args.planner is not None:
         planning["backend"] = args.planner
+    if args.semantic_policy is not None:
+        planning["semantic_policy"] = args.semantic_policy
+    if args.planning_memory is not None:
+        planning["planning_memory"] = args.planning_memory
     if args.model_inference is not None:
         planning["model_inference"] = args.model_inference == "on"
     if args.semantic_influence is not None:

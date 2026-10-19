@@ -42,12 +42,20 @@ def _render_md(run_info: dict, s: dict) -> str:
         f"- 模式: `{run_info.get('mode')}`",
         f"- 轨迹后端: `{run_info.get('planner_backend', 'vlm_trajectory')}`",
         f"- 语义影响候选选择: {run_info.get('semantic_influence', False)}",
+        f"- 语义策略: `{run_info.get('semantic_policy', 'always')}`",
+        f"- 数值规划记忆: `{run_info.get('planning_memory', 'off')}`"
+        + ("（memory_off，本轮禁止读写）" if run_info.get("mode") == "memory_off" else ""),
         f"- 模型调用（场景理解／驾驶决策／视觉特征）: {run_info.get('model_inference', True)}",
         f"- 仿真时长: {run_info.get('duration_s')} s",
-        (f"- 全量认知间隔: {run_info.get('replan_interval_s')} s"
-         if run_info.get("model_inference", True) else "- 全量认知: 已关闭（纯 PDM，无模型决策及记忆读写）"),
+        ("- 全量认知: 已关闭（无场景/决策模型及文本记忆；数值记忆按本轮开关执行）"
+         if not run_info.get("model_inference", True) else
+         f"- 全量认知: 按条件查询（每 {run_info.get('query_check_interval_s')} s 检查），无固定咨询周期"
+         if run_info.get("cognition_scheduling") == "event_triggered" else
+         f"- 全量认知间隔: {run_info.get('replan_interval_s')} s"),
         f"- PDM 重规划间隔: {run_info.get('pdm_replan_interval_s')} s",
     ]
+    if run_info.get("semantic_policy") == "shadow":
+        lines.append("- Shadow: 实际执行基础 PDM；would-selection 仅为同快照候选比较，不是已执行结果")
     if run_info.get("early_terminated"):
         lines.append(
             f"- ⚠️ **提前终止**（原因: {run_info.get('early_terminated_reason', '?')}）"
@@ -95,6 +103,22 @@ def _render_md(run_info: dict, s: dict) -> str:
             "纵向 jerk 为有符号车体纵向加速度变化率，旧字段只计算加速度模长变化率。"
             "P95/RMS 按观测样本统计，未平滑或剔除启动、碰撞、紧急制动尖峰；"
             "采样缺口内的 jerk 仅为区间平均变化率。静止统计不区分合理等待与无必要停车。",
+        ]
+    advisory = run_info.get("advisory")
+    if isinstance(advisory, dict) and advisory:
+        lines += [
+            "", "## 语义顾问与耗时",
+            f"- 模型咨询轮数 / 跳过查询检查 / 咨询失败: {advisory.get('model_queries', 0)} / "
+            f"{advisory.get('query_checks_skipped', 0)} / {advisory.get('model_failures', 0)}",
+            f"- 实际语义改变选择 / 被拒绝的语义规划周期 / Shadow 假设改变选择: "
+            f"{advisory.get('semantic_changed_plans', 0)} / {advisory.get('semantic_rejected_plans', 0)} / "
+            f"{advisory.get('shadow_changed_plans', 0)}",
+            f"- 模型查询墙钟耗时: {_number(advisory.get('inference_wall_time_s'))} s；"
+            f"运行墙钟耗时: {_number(advisory.get('wall_time_s', run_info.get('wall_time_s')))} s",
+            f"- 额外停车归因代理: {_number(advisory.get('semantic_stop_proxy_s'))} s",
+            "> 额外停车归因代理表示语义改变候选且实测低速、基础候选仍有前进意图的时间；"
+            "它不是无必要停车真值，也不是另一条轨迹实际执行后的反事实结果。模型同步查询期间仿真冻结，"
+            "上述墙钟时间须与仿真时间分开报告。每轮咨询通常包含场景与决策两次模型请求，重试不另计咨询轮数。",
         ]
     lines += [
         "",

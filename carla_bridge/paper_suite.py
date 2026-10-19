@@ -113,7 +113,10 @@ def validate_prepared(cfg):
 def summarize_runs(runs_dir, output):
     """One row per attempted paper run, including failures; never drop bad runs."""
     fields = ["run_id", "case_id", "category", "split", "seed", "mode", "memory_access",
-              "planner_backend", "semantic_influence", "model_inference", "planner_config_sha256",
+              "planner_backend", "semantic_influence", "model_inference", "semantic_policy", "planning_memory",
+              "planner_config_sha256", "model_queries", "query_checks_skipped", "model_failures",
+              "inference_wall_time_s", "wall_time_s", "semantic_changed_plans", "semantic_rejected_plans",
+              "shadow_changed_plans", "semantic_stop_proxy_s",
               "retrieve", "write", "short_term", "memory_bank", "status", "success",
               "route_completion", "duration_s", "collision_count", "red_light_violations",
               "trajectory_rejections", "events_valid", "events_executed", "events_required",
@@ -128,7 +131,10 @@ def summarize_runs(runs_dir, output):
         outcome = manifest.get("outcome") or {}
         events = outcome.get("experiment_events") or {}
         reports = sorted(manifest_path.parent.glob("carla_run_*.json"))
-        metrics = json.loads(reports[0].read_text(encoding="utf-8")).get("metrics", {}) if reports else {}
+        report = json.loads(reports[0].read_text(encoding="utf-8")) if reports else {}
+        metrics = report.get("metrics", {})
+        run_info = report.get("run_info", {})
+        advisory = run_info.get("advisory") or outcome.get("advisory") or {}
         access = manifest.get("config", {}).get("memory_access", {})
         planning = manifest.get("config", {}).get("carla", {}).get("planning", {})
         row = {"run_id": manifest["run_id"], "seed": cfg["seed"],
@@ -138,6 +144,12 @@ def summarize_runs(runs_dir, output):
                "planner_backend": planning.get("backend", "vlm_trajectory"),
                "semantic_influence": planning.get("semantic_influence", False),
                "model_inference": planning.get("model_inference", True),
+               "semantic_policy": planning.get("semantic_policy", "always"),
+               "planning_memory": planning.get("planning_memory", "off"),
+               **{key: advisory.get(key) for key in ("model_queries", "query_checks_skipped", "model_failures",
+                   "inference_wall_time_s", "semantic_changed_plans", "semantic_rejected_plans",
+                   "shadow_changed_plans", "semantic_stop_proxy_s")},
+               "wall_time_s": advisory.get("wall_time_s", run_info.get("wall_time_s", outcome.get("wall_time_s"))),
                "planner_config_sha256": digest(planning),
                **{key: outcome.get(key) for key in ("success", "route_completion", "duration_s", "trajectory_rejections")},
                **{key: metrics.get(key) for key in ("collision_count", "red_light_violations")},

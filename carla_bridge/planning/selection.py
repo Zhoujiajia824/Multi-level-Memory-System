@@ -39,11 +39,21 @@ def _audit_value(value, invalid_paths, path=""):
     return value
 
 
-def choose_candidate(candidates, semantic, enabled, lateral_weight=0.8, longitudinal_weight=0.8):
+def choose_candidate(candidates, semantic, enabled, lateral_weight=0.8, longitudinal_weight=0.8,
+                     *, semantic_bonus_by_id=None):
     """Select by score only; reject numerically invalid trajectories or scores."""
     for value in (lateral_weight, longitudinal_weight):
         if not math.isfinite(value) or value < 0 or value > 2:
             raise ValueError("semantic weights must be finite and within [0, 2]")
+    if semantic_bonus_by_id is not None:
+        if not isinstance(semantic_bonus_by_id, dict):
+            raise ValueError("semantic_bonus_by_id must be a dictionary")
+        identities = {candidate.get("id") for candidate in candidates}
+        if any(identity not in identities for identity in semantic_bonus_by_id):
+            raise ValueError("semantic bonus refers to an unknown candidate")
+        if any(type(value) not in (int, float) or not 0 <= value <= 4
+               or not math.isfinite(value) for value in semantic_bonus_by_id.values()):
+            raise ValueError("semantic bonus overrides must be finite and within [0, 4]")
     semantic = semantic or {}
     lateral = semantic.get("lateral_decision")
     longitudinal = semantic.get("longitudinal_decision")
@@ -64,6 +74,8 @@ def choose_candidate(candidates, semantic, enabled, lateral_weight=0.8, longitud
         lateral_match = lateral in item.get("lateral_semantics", [])
         longitudinal_match = longitudinal == item.get("longitudinal")
         bonus = (lateral_weight * lateral_match + longitudinal_weight * longitudinal_match) if enabled else 0.0
+        if semantic_bonus_by_id is not None:
+            bonus = float(semantic_bonus_by_id.get(candidate.get("id"), 0.0)) if enabled else 0.0
         planning_score = float(item["base_score"]) if score_valid else None
         invalid_reasons = []
         if safety.get("finite") is not True:

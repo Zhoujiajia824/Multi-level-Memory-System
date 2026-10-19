@@ -1,6 +1,10 @@
 """CARLA 闭环主驱动
 ==================
-同步 tick + 周期重规划（默认 10Hz tick / 3s 重规划）：
+同步 tick + PDM 数值重规划（默认 10Hz tick / 0.2s 重规划）：
+
+选择性模式每 0.5s 检查是否需要认知，只在事件、规划困难或经验提示时咨询。
+建议经对象与条件核对后限时生效；模型不可用时沿用当前 PDM 数值规划。
+always 模式保留以下周期认知链路，用于对照：
 
     每个 replan 周期（默认 3s sim）：
       [1 捕获] tick -> 6 相机 mosaic + ego 状态 + GT 感知 + nav
@@ -22,6 +26,7 @@ from __future__ import annotations
 import queue
 import math
 import json
+import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
@@ -78,6 +83,24 @@ class ClosedLoop:
         if self.planner_backend == "vlm_trajectory":
             self.semantic_influence = False
         self.model_inference = model_inference_enabled(self.planning_cfg, mode)
+        self.semantic_policy = self.planning_cfg.get("semantic_policy", "always")
+        if self.semantic_policy not in ("always", "selective", "shadow"):
+            raise ValueError("semantic_policy must be always, selective or shadow")
+        self.planning_memory_mode = self.planning_cfg.get("planning_memory", "off")
+        if self.planning_memory_mode not in ("off", "gate", "full"):
+            raise ValueError("planning_memory must be off, gate or full")
+        self._selective_execution = (self.planner_backend == "pdm_closed" and self.model_inference
+                                    and self.semantic_influence and self.semantic_policy != "always")
+        self.experience_memory = None
+        self._experience_signature = None
+        self._last_plan_diagnostics = {}
+        self._next_query_check_at = 0.0
+        self._query_check_interval = .5
+        self._wall_started = time.perf_counter()
+        self.advisory_stats = {"model_queries": 0, "query_checks_skipped": 0,
+            "model_failures": 0, "inference_wall_time_s": 0.0,
+            "semantic_changed_plans": 0, "semantic_rejected_plans": 0,
+            "shadow_changed_plans": 0, "semantic_stop_proxy_s": 0.0}
         self.pdm_planner = None
         self._active_semantics = None
         self._semantic_frame_id = None
@@ -227,6 +250,15 @@ class ClosedLoop:
             planner_cfg["horizon_s"] = max(float(planner_cfg.get("horizon_s", 4.0)), self._execution_horizon)
             self.pdm_planner = CarlaPDMPlanner(world, ego, self.scenario.route, planner_cfg)
             self._bind_pdm_controller(ego)
+            if self.planning_memory_mode != "off" and self.mode != "memory_off":
+                from carla_bridge.planning.experience_memory import ExecutionExperienceMemory
+                access = self.config.get("memory_access", {}) or {}
+                self.experience_memory = ExecutionExperienceMemory(self.config.get("memory_db_dir"),
+                    memory_mode="read_write" if access.get("write", True) else "read_only",
+                    read_enabled=bool(access.get("retrieve", True)), write_enabled=bool(access.get("write", True)),
+                    run_id=self.run_id, run_dir=self.config.get("output_dir"),
+                    planner_version="carla_pdm_selective_v1")
+                self.pdm_planner.experience_memory = self.experience_memory
         if self.model_inference:
             self.kf_builder = KeyframeBuilder(scenario_name=self.scenario.scenario_name(), run_id=self.run_id)
 
@@ -252,7 +284,8 @@ class ClosedLoop:
             )
             self.loop.setup()
         else:
-            logger.info("[纯PDM] 模型调用已关闭：跳过场景VLM、决策VLM、DINOv2、记忆和六路认知相机；保留事件、指标及可选视频")
+            logger.info("[纯PDM] 模型调用已关闭：跳过场景VLM、决策VLM、DINOv2、文本/视觉记忆和六路认知相机；数值经验启用=%s；保留事件、指标及可选视频",
+                        self.experience_memory is not None)
 
         # 7. Traffic Manager 起步：空转几帧
         for _ in range(10):
@@ -305,7 +338,9 @@ class ClosedLoop:
         if not self.scenario.route:
             raise ValueError("a non-empty planned route is required for route completion")
         while not self._check_run_end():
-            if self.model_inference:
+            if getattr(self, "_selective_execution", False):
+                self._advisory_tick()
+            elif self.model_inference:
                 self._replan_cycle()
             else:
                 self._pdm_only_tick()
@@ -488,9 +523,11 @@ class ClosedLoop:
             raise ValueError("A valid semantic decision is required for PDM planning")
         semantic = {key: deepcopy(decision[key]) for key in (
             "lateral_decision", "longitudinal_decision", "behavior_reason", "risk_level", "safety_notes")}
+        if "intervention" in decision:
+            semantic["intervention"] = deepcopy(decision["intervention"])
         self._semantic_frame_id = kf.get("sample_token")
         try:
-            plan = self.pdm_planner.plan(semantic, semantic_enabled=self.semantic_influence)
+            plan = self._pdm_plan(semantic, update=True)
         except Exception as exc:
             # Geometry can fail before a plan dictionary exists. Audit it at
             # both update rates, while preserving the original exception and
@@ -525,6 +562,9 @@ class ClosedLoop:
                    "executed_behavior": selected_behavior,
                    "selected_lateral": lateral, "selected_longitudinal": longitudinal,
                    "record_stage": "selected_before_execution"}
+        if getattr(self, "semantic_policy", "always") != "always":
+            context.update(baseline_selected_id=diagnostics.get("baseline_selected_id"),
+                           semantic_policy=self.semantic_policy, governor=deepcopy(diagnostics.get("governor")))
         return {**decision, **plan, "trajectory_source": "pdm_closed",
                 "semantic_decision": deepcopy(semantic), "planning_context": context,
                 "behavior": selected_behavior,
@@ -544,6 +584,74 @@ class ClosedLoop:
                  "trajectory": decision.get("trajectory"), "validation": validation}
         with path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(audit, ensure_ascii=False, allow_nan=False) + "\n")
+        diagnostics = decision.get("planner_diagnostics") or {}
+        self._last_plan_diagnostics = diagnostics
+        stats = getattr(self, "advisory_stats", None)
+        if stats is not None:
+            changed = diagnostics.get("selected_id") != diagnostics.get("baseline_selected_id")
+            if changed and self.semantic_influence:
+                stats["semantic_changed_plans"] += 1
+            if diagnostics.get("shadow_selected_id") != diagnostics.get("baseline_selected_id") and diagnostics.get("shadow_only"):
+                stats["shadow_changed_plans"] += 1
+            governor = diagnostics.get("governor", {})
+            if governor and not governor.get("authorized") and governor.get("last_submission", {}).get("reason") != "no_submission":
+                stats["semantic_rejected_plans"] += 1
+        if validation.get("accepted"):
+            self._begin_execution_experience(decision)
+
+    def _special_situations(self):
+        # Scenario generation parameters/labels are NOT a perception channel.
+        # Detect visible obstacles through current GT; never leak future events.
+        return ()
+
+    def _pdm_plan(self, semantic, update=False):
+        if getattr(self, "semantic_policy", "always") != "always":
+            return self.pdm_planner.plan(semantic, semantic_enabled=self.semantic_influence,
+                semantic_update=update, sim_time_s=self._elapsed,
+                special_situations=self._special_situations())
+        return self.pdm_planner.plan(semantic, semantic_enabled=self.semantic_influence)
+
+    def _experience_telemetry(self):
+        ego = self.scenario.ego_vehicle
+        velocity, acceleration = ego.get_velocity(), ego.get_acceleration()
+        return {"sim_time_s": self._elapsed,
+                "route_progress_m": float(self.scenario.route.distance_completed_m()),
+                "ego_speed_mps": math.hypot(velocity.x, velocity.y),
+                "acceleration_mps2": math.hypot(acceleration.x, acceleration.y),
+                "jerk_mps3": getattr(self, "_experience_jerk", None),
+                "collision_count": self._collision_count,
+                "violation_count": (getattr(self.metrics, "red_light_violations", 0)
+                                    + getattr(self.metrics, "wrong_way_violations", 0))}
+
+    def _begin_execution_experience(self, decision):
+        memory = getattr(self, "experience_memory", None)
+        if memory is None:
+            return
+        d = decision.get("planner_diagnostics") or {}
+        context = d.get("planner_context")
+        candidate = next((c for c in d.get("candidates", []) if c["id"] == d.get("selected_id")), None)
+        if not context or not candidate:
+            return
+        action = {"lateral_decision": candidate["lateral"], "longitudinal_decision": candidate["longitudinal"]}
+        parameters = {"target_velocity_mps": candidate["desired_speed_mps"],
+                      "headway_time": candidate["idm_headway_s"],
+                      "min_gap_to_lead_agent": candidate.get("idm_min_gap_m", 1.5),
+                      "accel_max": candidate["idm_accel_max_mps2"], "decel_max": candidate["idm_decel_max_mps2"]}
+        signature = (action["lateral_decision"], action["longitudinal_decision"],
+                     tuple(sorted((k, round(v, 1)) for k, v in parameters.items())))
+        if self._experience_signature is not None and signature != self._experience_signature:
+            memory.finish("policy_changed")
+        self._experience_signature = signature
+        if memory.pending:
+            return
+        semantic = decision.get("semantic_decision") or {}
+        governor = d.get("governor") or {}
+        memory.begin(context, {"baseline_candidate_id": d.get("baseline_selected_id"),
+            "selected_candidate_id": d.get("selected_id"), "actual_action": action,
+            "selected_parameters": parameters, "requested_action": semantic,
+            "adopted": d.get("selected_id") != d.get("baseline_selected_id"),
+            "rejection_reason": governor.get("reason"),
+            "semantic_policy": getattr(self, "semantic_policy", "always")}, self._experience_telemetry())
 
     def _audit_pdm_error(self, exc, semantic, source):
         try:
@@ -557,12 +665,13 @@ class ClosedLoop:
 
     def _refresh_pdm_control(self, tf, yaw: float, speed: float) -> None:
         """Replan against current actors between expensive semantic VLM calls."""
-        if (self.planner_backend != "pdm_closed" or (self.model_inference and self._active_semantics is None)
+        if (self.planner_backend != "pdm_closed" or (self.model_inference and self._active_semantics is None
+                and not getattr(self, "_selective_execution", False))
                 or self._elapsed + 1e-8 < self._next_pdm_replan_at):
             return
         self._next_pdm_replan_at = self._elapsed + self._pdm_interval
         try:
-            plan = self.pdm_planner.plan(self._active_semantics, semantic_enabled=self.semantic_influence)
+            plan = self._pdm_plan(self._active_semantics)
             result = self._merge_plan({}, self._active_semantics, plan)
             validation = self._validate_decision(result, {"ego_state": {"speed": speed}})
             self._audit_pdm_plan(result, validation, "control_update")
@@ -598,6 +707,12 @@ class ClosedLoop:
                 "planner_backend": self.planner_backend, "semantic_influence": self.semantic_influence,
                 "model_inference": self.model_inference,
                 "pdm_plan_count": self._pdm_plan_count,
+                "semantic_policy": getattr(self, "semantic_policy", "always"),
+                "planning_memory": getattr(self, "planning_memory_mode", "off"),
+                "cognition_scheduling": ("disabled" if not self.model_inference else
+                                         "event_triggered" if getattr(self, "_selective_execution", False) else "periodic"),
+                "advisory": deepcopy(getattr(self, "advisory_stats", {})),
+                "wall_time_s": round(time.perf_counter()-getattr(self, "_wall_started", time.perf_counter()), 3),
                 "cleanup_errors": list(self._cleanup_errors), "experiment_events": event_result}
 
     def close(self) -> None:
@@ -622,6 +737,8 @@ class ClosedLoop:
             except Exception as exc:
                 logger.error("metrics snapshot: %s", exc)
                 self._cleanup_errors.append("metrics_snapshot")
+        if getattr(self, "experience_memory", None) is not None:
+            cleanup("execution_experience_finalize", lambda: self.experience_memory.finish(self.run_status))
         if self.recorder is not None:
             cleanup("video_flush", self.recorder.flush)
         if self.event_scheduler is not None:
@@ -658,6 +775,94 @@ class ClosedLoop:
     # 单次重规划周期
     # ------------------------------------------------------------------
 
+    def _advisory_tick(self) -> None:
+        """PDM runs every tick; expensive cognition is an optional consultation.
+
+        CARLA synchronous time remains frozen during a consultation. Model
+        failure never replaces the already validated numerical plan with STOP.
+        """
+        self._pdm_only_tick()
+        if self._early_terminated or self._termination_reason:
+            self.cameras.drain()
+            return
+        if self._elapsed+1e-8 < self._next_query_check_at:
+            self.cameras.drain()
+            return
+        self._next_query_check_at = self._elapsed+self._query_check_interval
+        query = self.pdm_planner.query_decision(self._elapsed)
+        if not query.get("query"):
+            self.advisory_stats["query_checks_skipped"] += 1
+            self.cameras.drain()
+            self._audit_advisory("skip", query)
+            return
+        ego = self.scenario.ego_vehicle
+        started = time.perf_counter()
+        try:
+            kf = self._advisory_keyframe(ego)
+            self.advisory_stats["model_queries"] += 1
+            logger.info("[选择性认知] t=%.1fs reason=%s；同步仿真暂停，PDM控制方案保留",
+                        self._elapsed, query.get("reason"))
+            record = self.loop.step(kf) or {}
+            self._last_scene_result = record.get("current_scene") or self._last_scene_result
+            self._last_nav = kf["nav_instruction"]
+            validation = record.get("decision_validation") or {}
+            decision = record.get("decision_output") or {}
+            if validation.get("accepted") is not True:
+                raise ValueError("advisory rejected: %s" % validation.get("reasons", ["missing_validation"]))
+            tf, v = ego.get_transform(), ego.get_velocity()
+            yaw = coords.carla_yaw_deg_to_rad(tf.rotation.yaw)
+            self.tracker.set_trajectory(decision["trajectory"], tf.location.x, tf.location.y, yaw,
+                                        decision["target_speed"], follow_speed_profile=True)
+            self._planned_stop = self._is_planned_stop(decision)
+            self._apply_control(ego, self.tracker.compute_control(tf.location.x, tf.location.y, yaw, math.hypot(v.x, v.y)))
+            self._audit_advisory("result", query, decision.get("planner_diagnostics", {}).get("governor"))
+        except Exception as exc:
+            self.advisory_stats["model_failures"] += 1
+            logger.warning("[选择性认知] 建议不可用，继续当前真值下的PDM规划: %s", exc, exc_info=True)
+            self._active_semantics = None
+            self.pdm_planner.governor.submit(None, self.pdm_planner.last_context, self._elapsed)
+            self._next_pdm_replan_at = 0.0
+            tf, v = ego.get_transform(), ego.get_velocity()
+            yaw = coords.carla_yaw_deg_to_rad(tf.rotation.yaw)
+            self._refresh_pdm_control(tf, yaw, math.hypot(v.x, v.y))
+            if not self._early_terminated:
+                self._apply_control(ego, self.tracker.compute_control(tf.location.x, tf.location.y, yaw, math.hypot(v.x, v.y)))
+            self._audit_advisory("unavailable", query, {"error_type": type(exc).__name__, "error": str(exc)})
+        finally:
+            self.advisory_stats["inference_wall_time_s"] += time.perf_counter()-started
+
+    def _audit_advisory(self, action, query, result=None):
+        path = Path(self.config.get("output_dir") or "outputs") / "advisory.jsonl"
+        audit = {"sim_time_s": self._elapsed, "action": action, "query": query,
+                 "semantic_policy": self.semantic_policy, "result": result,
+                 "context": self.pdm_planner.last_context}
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(audit, ensure_ascii=False, allow_nan=False)+"\n")
+
+    def _advisory_keyframe(self, ego):
+        frame_id = self.carla_client.get_world().get_snapshot().frame
+        token = self.kf_builder.next_token()
+        mosaic = self.cameras.capture(token, frame_id)
+        tf = ego.get_transform()
+        yaw = coords.carla_yaw_deg_to_rad(tf.rotation.yaw)
+        self.history.update(ego, self._elapsed)
+        state = self.ego_provider.build(ego, self._elapsed, yaw_rate=self.history.yaw_rate(self._elapsed, yaw))
+        state.timestamp = self.timestamp_origin_us+int(self._elapsed*1e6)
+        objs = self.perception.get_objects(ego, tf.location.x, tf.location.y, yaw)
+        objs = self._inject_route_centers(objs, ego, tf, yaw)
+        nav = self.scenario.route.nav_instruction()
+        kf = self.kf_builder.build(sample_token=token, timestamp_us=state.timestamp, mosaic_path=mosaic,
+            ego_state=state.to_ego_centric(),
+            history_trajectory=self.history.build_ego_centric(self._elapsed, tf.location.x, tf.location.y, yaw),
+            nav_instruction=nav, perception_objects=objs)
+        from carla_bridge.planning.navigation_context import build_navigation_context
+        kf.update(carla_frame_id=frame_id, sim_time_s=self._elapsed)
+        kf["planning_constraints"] = {"decision_mode": "semantic", "semantic_policy": self.semantic_policy,
+            "required_horizon_s": self._execution_horizon,
+            "planner_context": deepcopy(self.pdm_planner.last_context),
+            "navigation_context": build_navigation_context(self.scenario.route, ego, self._elapsed)}
+        return kf
+
     def _pdm_only_tick(self) -> None:
         """Use the normal PDM/control chain every physics tick, without cognition."""
         ego = self.scenario.ego_vehicle
@@ -677,9 +882,12 @@ class ClosedLoop:
             self._apply_brake()
             return
         self._apply_control(ego, self.tracker.compute_control(tf.location.x, tf.location.y, yaw, speed))
+        if self.history is not None:
+            self.history.update(ego, self._elapsed)
         if self._elapsed + 1e-8 >= getattr(self, "_next_pdm_progress_log_at", 0.0):
             self._check_stuck(speed)
-            logger.info("[纯PDM] t=%.1fs 路线完成度=%.1f%% speed=%.2fm/s 碰撞=%d",
+            logger.info("[%s] t=%.1fs 路线完成度=%.1f%% speed=%.2fm/s 碰撞=%d",
+                        "选择性PDM" if getattr(self, "_selective_execution", False) else "纯PDM",
                         self._elapsed, self.route_completion * 100.0, speed, self._collision_count)
             self._next_pdm_progress_log_at = self._elapsed + 3.0
 
@@ -738,6 +946,8 @@ class ClosedLoop:
             from carla_bridge.planning.navigation_context import build_navigation_context
             kf["planning_constraints"]["navigation_context"] = build_navigation_context(
                 self.scenario.route, ego, self._elapsed)
+            kf["planning_constraints"]["semantic_policy"] = getattr(self, "semantic_policy", "always")
+            kf["planning_constraints"]["planner_context"] = deepcopy(getattr(self.pdm_planner, "last_context", None))
         logger.info(
             "[replan] t=%.1fs token=%s nav=%s objs=%d speed=%.1f",
             self._elapsed, sample_token, nav, len(objs), ego_state.speed,
@@ -745,6 +955,8 @@ class ClosedLoop:
 
         # ---- [2 认知]（sim 冻结，约 5-30s，期间无日志属正常，请勿 Ctrl+C）----
         logger.info("[认知] 开始：场景VLM + 三层记忆检索 + 决策VLM（耗时 5-30s，请耐心等待）")
+        inference_started = time.perf_counter()
+        self.advisory_stats["model_queries"] += 1
         try:
             record = self.loop.step(kf)
             # 记录上次 VLM 场景结果 + nav，供控制阶段 raw 捕获沿用
@@ -759,6 +971,7 @@ class ClosedLoop:
                 target_speed = float(decision.get("target_speed", 0.0) or 0.0)
                 self._planned_stop = self._is_planned_stop(decision)
             else:
+                self.advisory_stats["model_failures"] += 1
                 traj, target_speed = [], 0.0
                 self._planned_stop = True
                 self._trajectory_rejections += 1
@@ -772,11 +985,14 @@ class ClosedLoop:
                 **({"follow_speed_profile": True} if self.planner_backend == "pdm_closed" and accepted else {})
             )
         except Exception as e:
+            self.advisory_stats["model_failures"] += 1
             # 认知步骤异常（如 VLM 调用失败）：打印完整 traceback 便于定位，本周期全刹，继续下一周期
             logger.error("认知步骤异常（本周期全刹，继续下一周期）: %s", e, exc_info=True)
             self.tracker.set_trajectory([], tf.location.x, tf.location.y, ego_yaw, 0.0)
             self._planned_stop = True
             self._active_semantics = None
+        finally:
+            self.advisory_stats["inference_wall_time_s"] += time.perf_counter() - inference_started
 
         if self._early_terminated:
             self._apply_brake()
@@ -879,8 +1095,23 @@ class ClosedLoop:
                 "acceleration": math.hypot(a.x, a.y),
                 "acceleration_x": a.x, "acceleration_y": a.y, "yaw_rad": yaw,
             }
+            previous = getattr(self, "_experience_kinematics", None)
+            self._experience_jerk = (math.hypot(a.x-previous[1], a.y-previous[2])/(self._elapsed-previous[0])
+                                    if previous and self._elapsed > previous[0] else None)
+            self._experience_kinematics = (self._elapsed, a.x, a.y)
             if self.metrics is not None:
                 self.metrics.on_tick(ego, self._elapsed, state)
+            memory = getattr(self, "experience_memory", None)
+            if memory is not None:
+                memory.observe(self._experience_telemetry())
+            diagnostics = getattr(self, "_last_plan_diagnostics", {})
+            if diagnostics and state["speed"] <= .3 and getattr(self, "advisory_stats", None) is not None:
+                baseline = next((c for c in diagnostics.get("candidates", [])
+                                 if c["id"] == diagnostics.get("baseline_selected_id")), {})
+                if (diagnostics.get("selected_id") != diagnostics.get("baseline_selected_id")
+                        and baseline.get("speed_at_0_2s_mps", 0) > .5):
+                    # Attribution proxy, not a claim that the stop was unnecessary.
+                    self.advisory_stats["semantic_stop_proxy_s"] += self.fixed_delta
             if self._control_audit_path is not None:
                 actual = ego.get_control()
                 audit = {
@@ -1081,7 +1312,10 @@ class ClosedLoop:
             "scenario": self.scenario.scenario_name(),
             "mode": self.mode,
             "duration_s": round(self._elapsed, 2),
-            "replan_interval_s": self.replan_interval_s if self.model_inference else None,
+            "replan_interval_s": (self.replan_interval_s if self.model_inference
+                                  and not getattr(self, "_selective_execution", False) else None),
+            "query_check_interval_s": (self._query_check_interval
+                                       if getattr(self, "_selective_execution", False) else None),
             "pdm_replan_interval_s": self._pdm_interval if self.planner_backend == "pdm_closed" else None,
             "collision_raw_events": self._collision_raw,
             "collision_unique_actors": len(

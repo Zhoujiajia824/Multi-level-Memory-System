@@ -25,7 +25,7 @@ feature_extractor:
   model_dir: null              # 可选：含 config.json 的本地模型或 snapshot 目录
 
 fallback:
-  allow_rule_fallback_for_format_error: false  # CARLA 解析失败必须制动，保留真实模型失败
+  allow_rule_fallback_for_format_error: false  # 不伪造模型建议；selective建议失败回到PDM，always保留旧制动
 
 # ---- 感知输入：固定六视角环视（复用 src 现有 surround_mosaic 路径）----
 perception:
@@ -58,20 +58,29 @@ carla:
   capture_timeout_s: 2.0       # 六路相机共享的等待截止时间，不推进仿真
   max_capture_failures: 3      # 连续采集失败时结束本轮，失败期间全刹
   # ---- 闭环节奏 ----
-  replan_interval_s: 3.0         # VLM 每 3s 更新语义意图，PDM 独立高频规划
+  replan_interval_s: 3.0         # always/语义off认知周期；selective/shadow语义on改为条件查询，PDM独立高频规划
   planning:
     backend: "pdm_closed"       # pdm_closed | vlm_trajectory（旧版轨迹模式）
-    semantic_influence: true    # 消融只切换语义加分；最终选择=PDM基础分+语义分
-    model_inference: true      # false跳过双VLM/DINO/记忆/认知相机；要求pdm_closed、semantic_influence=false、memory_off
-    replan_interval_s: 0.2      # PDM 更新周期；VLM 意图在两次认知之间保持
-    horizon_s: 4.0              # 不短于 VLM 周期；轨迹由官方 PDM 核心产生
+    semantic_influence: true    # false禁止语义影响；selective另需当前证据授权，shadow总执行基础PDM
+    semantic_policy: "selective"  # selective条件介入 | always旧版无条件加分 | shadow只记录would-selection
+    planning_memory: "full"     # off | gate仅辅助介入判断 | full另提供数值规划先验；memory_off仍禁读写
+    model_inference: true      # false不初始化双VLM/DINO/文本记忆/认知相机；语义必须off，可选memory_on+planning_memory=full
+    replan_interval_s: 0.2      # PDM更新周期；selective建议每次重验，过期/释放即丢弃
+    horizon_s: 4.0              # 数值轨迹时域；不等于语义建议租期，后者最多6s
     sample_interval_s: 0.1      # 固定版本官方 TTC 实现使用 10Hz 索引
     lqr_lateral_horizon_s: 2.0  # 横向预瞄；纵向保留原生1s制动预测；整数采样、>=2个采样且<=规划时域
     max_speed_mps: 8.0          # 适配首轮保守上限，同时服从当前道路限速
     map_radius_m: 100.0
     lane_change_length_m: 30.0
-    lateral_semantic_weight: 0.8
-    longitudinal_semantic_weight: 0.8
+    lateral_semantic_weight: 0.8       # always旧权重；selective默认横/纵各0.04、总上限0.08
+    longitudinal_semantic_weight: 0.8  # selective阈值见planning.semantic_governor（省略采用默认）
+    semantic_governor:          # selective/shadow；只限制顾问影响，不硬筛原生候选
+      base_regret_budget: 0.08
+      max_semantic_bonus: 0.08
+      lateral_weight: 0.04
+      longitudinal_weight: 0.04
+      min_query_interval_s: 2.0
+      wait_review_interval_s: 15.0
   max_duration_s: 300.0          # 超时保护；到时路线未完成则失败，不作为成功条件
   route_completion_tolerance_m: 2.0  # 按顺序经过整条路线，且当前距终点 <= 此值
   route_tracking_tolerance_m: 5.0    # 中途路线走廊，允许一次正常变道/避让

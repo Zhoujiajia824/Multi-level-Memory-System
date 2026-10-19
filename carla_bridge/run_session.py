@@ -80,6 +80,11 @@ class RunSession:
         scenario_label = re.sub(r"[^\w-]+", "_", self.scenario_path.stem).strip("_")[:64] or "scenario"
         planning = config.data.get("carla", {}).get("planning", {})
         self.model_inference = model_inference_enabled(planning, mode)
+        self.semantic_policy = planning.get("semantic_policy", "always")
+        self.planning_memory = planning.get("planning_memory", "off")
+        self.numeric_memory_only = not self.model_inference and self.planning_memory == "full"
+        if not self.model_inference:
+            self.short_term = False
         backend = planning.get("backend", "vlm_trajectory")
         planner_label = "pdm_closed" if backend == "pdm_closed" else "vlm_trajectory"
         semantic = ("sem_on" if planning.get("semantic_influence", True) else "sem_off") if backend == "pdm_closed" else "sem_na"
@@ -93,12 +98,45 @@ class RunSession:
                   memory_label, planner_label, semantic]
         if not self.model_inference:
             labels.append("model_off")
+        # Configurations predating these controls retain their legacy labels.
+        if "semantic_policy" in planning:
+            labels.append("policy_" + self.semantic_policy)
+        if "planning_memory" in planning:
+            labels.append("pm_" + self.planning_memory)
         dirname = "__".join(labels + [self.run_id[:8]])
-        self.run_dir = Path(config.get("output_dir")) / "carla_runs" / dirname
+        output_root = Path(config.get("output_dir")) / "carla_runs"
+        # Native Windows libraries can still enforce MAX_PATH despite Python's
+        # long-path support. Reserve room for decisions/reports and asset names;
+        # keep full experimental labels in the manifest instead of dropping IDs.
+        if os.name == "nt" and ("semantic_policy" in planning or "planning_memory" in planning):
+            reserve = max(96, len(f"decisions_carla_{self.scenario_path.stem}_{mode}.jsonl"))
+            budget = 258 - len(str(output_root.resolve())) - 1 - reserve
+            if len(dirname) > budget:
+                compact = "_".join((
+                    "pdm" if backend == "pdm_closed" else "vlm",
+                    "s1" if planning.get("semantic_influence", True) else "s0",
+                    "i1" if self.model_inference else "i0",
+                    {"always": "a", "selective": "s", "shadow": "h"}[self.semantic_policy],
+                    {"off": "o", "gate": "g", "full": "f"}[self.planning_memory],
+                    {"off": "mo", "read_write": "rw", "read_only": "ro"}.get(self.access, "mx"),
+                    "r" if self.retrieve else "nr", "st" if self.short_term else "nst"))
+                suffix = f"__{compact}__{self.run_id[:8]}"
+                prefix = self.started_at.strftime("%Y%m%d_%H%M%S")
+                room = budget - len(prefix) - len(suffix) - 2
+                dirname = prefix + ("__" + scenario_label[:room] if room > 0 else "") + suffix
+                if len(dirname) > budget:
+                    dirname = self.run_id
+                if len(dirname) > budget:
+                    raise ValueError("Windows 输出路径过长，请将 output_dir 配置为更短的目录")
+        self.run_dir = output_root / dirname
 
     def _path(self, value):
         p = Path(value)
         return (p if p.is_absolute() else self.config.root / p).resolve()
+
+    def _bank_exists(self, bank):
+        return ((bank / "mid_term_meta.json").is_file()
+                or (self.numeric_memory_only and (bank / "planning_experiences.jsonl").is_file()))
 
     def prepare(self):
         if self.access not in ("read_write", "read_only", "off"):
@@ -118,7 +156,7 @@ class RunSession:
                 if seed:
                     source_lock = BankLock(seed).acquire()
                     try:
-                        if not (seed / "mid_term_meta.json").is_file():
+                        if not self._bank_exists(seed):
                             raise ValueError(f"历史记忆库不存在或不完整: {seed}")
                         if bank.exists():
                             raise ValueError("复制历史记忆需要一个尚不存在的目标库")
@@ -147,11 +185,12 @@ class RunSession:
                                     shutil.copy2(original, target)
                                     return str(target)
                             return v
-                        meta.write_text(json.dumps(relocate(json.loads(meta.read_text(encoding="utf-8"))),
-                                                   ensure_ascii=False, indent=2), encoding="utf-8")
+                        if meta.is_file():
+                            meta.write_text(json.dumps(relocate(json.loads(meta.read_text(encoding="utf-8"))),
+                                                       ensure_ascii=False, indent=2), encoding="utf-8")
                     finally:
                         source_lock.close()
-                if self.access == "read_only" and not (bank / "mid_term_meta.json").is_file():
+                if self.access == "read_only" and not self._bank_exists(bank):
                     raise ValueError(f"只读记忆库不存在或不完整: {bank}")
                 if self.access == "read_write":
                     bank.mkdir(parents=True, exist_ok=True)
@@ -164,8 +203,9 @@ class RunSession:
             data["memory_access"] = {"retrieve": self.retrieve, "write": writable,
                                      "short_term": self.short_term}
             data.setdefault("mid_term", {})["persistence"] = {
-                "enabled": self.access != "off", "auto_load_on_init": self.access != "off",
-                "save_on_close": writable, "strict_load": True,
+                "enabled": self.access != "off" and self.model_inference,
+                "auto_load_on_init": self.access != "off" and self.model_inference,
+                "save_on_close": writable and self.model_inference, "strict_load": True,
             }
             data.setdefault("persistence", {})["save_dir"] = bank
             data["carla"]["output"] = {"image_dir": str(assets / "images"),
@@ -186,6 +226,14 @@ class RunSession:
                              "run_directory": self.run_dir.name,
                              "started_at": self.started_at.isoformat(),
                              "model_inference": self.model_inference,
+                             "semantic_policy": self.semantic_policy,
+                             "planning_memory": self.planning_memory,
+                             "planning_memory_effective": self.planning_memory if self.access != "off" else "off",
+                             "semantic_schema_version": data.get("semantic", {}).get(
+                                 "selective_schema_version" if self.semantic_policy in ("selective", "shadow") else "schema_version",
+                                 2 if self.semantic_policy in ("selective", "shadow") else 1),
+                             "semantic_prompt_version": data.get("semantic", {}).get(
+                                 "selective_prompt_version" if self.semantic_policy in ("selective", "shadow") else "prompt_version"),
                              "memory_access": self.access, "memory_bank": str(bank),
                              "memory_seed": str(seed) if seed else None,
                              "commit": revision, "dirty": dirty,

@@ -13,9 +13,11 @@
 ## 🚗 CARLA 闭环集成（carla-integration 分支）
 
 本分支将 **CARLA 0.9.15** 接入多层记忆系统：六视角相机、GT 感知、自车状态和导航
-经 `KeyframeBuilder` 喂入 `OnlineDrivingLoop`。CARLA 默认由 VLM 输出横纵向语义，
-由官方 PDM-Closed 核心的 CARLA 适配层生成、仿真和评分候选轨迹，再用 Pure Pursuit + PID 回控。
-默认 10 Hz 控制、0.2 秒 PDM 规划、3 秒语义推理；VLM 推理期间同步仿真暂停。
+经 `KeyframeBuilder` 喂入 `OnlineDrivingLoop`。官方 PDM-Closed 核心的 CARLA 适配层
+生成、仿真和评分候选轨迹，再用 Pure Pursuit + PID 回控。默认 `semantic-policy=selective`：
+PDM 负责常规驾驶，模型按条件提出短期横纵向建议，通过当前证据验证后才有限影响选择。
+默认 10 Hz 控制、0.2 秒 PDM 规划；旧 `always` 或语义关闭但保留模型调用时，每 3 秒认知。
+VLM 推理期间同步仿真暂停，当前尚未实现异步推理。
 首次使用需安装额外 PDM 依赖，见 [PDM 接入与消融](carla_bridge/README.md#13-语义决策与-pdm-closed)。
 **从零安装 CARLA/PDM 环境**或直接为现有 `mulmem_carla` 补装依赖，请按
 [CARLA 环境搭建第 5 节](carla_bridge/README.md#5-环境搭建) 执行，包含基础依赖、PDM 固定版本、
@@ -26,6 +28,12 @@ DINOv2 离线缓存、API、仿真器连接及预检。下文离线 nuScenes 的
 持续积累、场景专用库、只检索不写入、只积累不检索、短期消融和复制历史库的完整命令见
 [新场景与记忆库模式](carla_bridge/README.md#126-新场景与记忆库模式完整命令)。
 `--semantic-influence on|off` 控制语义是否影响候选选择；`--planner vlm_trajectory` 可运行旧轨迹输出路径。
+新策略及数值记忆的完整矩阵见[选择性顾问与规划记忆命令](carla_bridge/README.md#136-选择性语义顾问与数值规划记忆完整命令)：
+`--semantic-policy always|selective|shadow` 分别用于旧版对照、条件介入和仅记录建议；
+`--planning-memory off|gate|full` 控制数值经验，默认 `full`，但 `memory_off` 始终禁止记忆读写。
+无模型基线使用 `--semantic-influence off --model-inference off --planning-memory off --mode memory_off`；
+无模型另可显式选 `full + memory_on` 使用独立数值库。新选择性策略和数值经验的效果仍需完整闭环实验验证，
+下面的使用命令和单元测试不代表已经证明改善驾驶表现。
 
 闭环入口支持：
 
@@ -34,7 +42,7 @@ DINOv2 离线缓存、API、仿真器连接及预检。下文离线 nuScenes 的
 - 每轮独立输出、唯一帧 ID、异常清理和运行状态记录。
 - 记忆库可持续积累、按路径选择、只读检索或复制为独立实验库；短期记忆单独控制。
 - DINOv2 默认仅加载本地缓存，入口自动启用原生故障堆栈和及时日志输出。
-- 拦截不合理的决策轨迹并制动；被拒绝的决策不写入中期或事件记忆。
+- 数值轨迹校验失败时制动；选择性顾问建议不可用时保留基础 PDM，被拒绝建议不写入中期或事件记忆。
 - 随机 AI 行人从导航网格生成，定点行人事件按脚本运动；退出前先注销交通车辆再销毁。
 
 **验收标准是路线完成率 100%**：按顺序通过规划路线且当前距终点不超过默认 2 米，
@@ -66,6 +74,9 @@ CARLA 使用 Python 3.9 环境，离线 nuScenes 的 Python 3.12 说明不适用
 export DASHSCOPE_API_KEY='你的key'
 # 默认从仓库 .cache/huggingface 加载 DINOv2，无需额外运行前缀
 python carla_bridge/run_carla_demo.py --scenario straight_traffic --mode memory_on
+# 纯 PDM 快速基线：无需 API Key 或 DINOv2，不使用记忆
+python -m carla_bridge.run_carla_demo --scenario straight_traffic \
+  --semantic-influence off --model-inference off --planning-memory off --mode memory_off
 # 连续积累：后续运行使用同一路径即可续用旧库
 python -m carla_bridge.run_carla_demo --scenario straight_traffic --memory-bank outputs/memory_banks/general
 # 只检索：库文件和命中统计保持不变；本轮短期记忆默认启用
@@ -114,7 +125,7 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --memory-bank 
 | **完整提示词模板化** | 所有 VLM 提示词集中在 `config/prompts.yaml`，改提示词无需改 Python |
 | **中断恢复** | jsonl append + fsync；重启时扫已写记录自动跳过；中期记忆可选磁盘持久化跨次累积 |
 | **智驾标准评测** | ADE / FDE / **L2@1s/2s/3s** / 轨迹有效率 / 行为准确率 |
-| **CARLA 闭环驾驶** | `carla_bridge/` 接入 CARLA 0.9.15：3s 认知 + 10Hz 回控 + raw 捕获 + 驾驶视频录制，自定义场景闭环（carla-integration 分支） |
+| **CARLA 闭环驾驶** | `carla_bridge/` 接入 CARLA 0.9.15：5Hz PDM + 10Hz 回控 + 条件语义顾问（或旧周期认知）+ 数值经验 + 视频（carla-integration 分支） |
 | **预留接口** | `DynamicsPlanner`（轨迹→控制量，给 CARLA 闭环）+ `TrajectorySampler`（多模态轨迹选择，给扩散/AR 模型） |
 
 ### 1.2 第一版边界
@@ -682,7 +693,7 @@ vla_memory_demo/
 ├── carla_bridge/                       # 【v1.0 新增】CARLA 0.9.15 闭环集成
 │   ├── README.md                       #   CARLA 集成完整文档（框架/模块/指令/排查）
 │   ├── setup_env.sh                    #   一键建 mulmem_carla(Python 3.9) 环境
-│   ├── closed_loop.py                  #   主驱动：3s 认知 + 10Hz 回控 + raw 捕获 + 视频
+│   ├── closed_loop.py                  #   主驱动：条件/周期认知 + 5Hz PDM + 10Hz 回控 + 视频
 │   ├── run_carla_demo.py               #   入口（python -m carla_bridge.run_carla_demo）
 │   ├── run_session.py                  #   运行隔离、记忆库选择和进程锁
 │   ├── config/{carla.yaml, scenarios/} #   连接/相机/控制器/视频 + 场景 YAML
@@ -1427,7 +1438,7 @@ A: 编辑 `config/prompts.yaml`，所有提示词在此集中。详见 [docs/pro
 A: P6 已修复（默认 nav_to_behavior_map 自动注入 + 大小写归一化）。若仍为 0%，检查 jsonl 中 `behavior` 字段是否非空。
 
 **Q: 怎么接入 CARLA 闭环？**
-A: 已实现（v1.0），见 `carla_bridge/`（[carla_bridge/README.md](carla_bridge/README.md)）。`python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_on` 即可。记忆管线支持独立读写权限，CARLA 数据经 `KeyframeBuilder` 喂 `OnlineDrivingLoop.step()`，决策轨迹由 Pure Pursuit+PID 回控。`src/vla_memory/planning/dynamics_planner.py` 的 `DynamicsPlanner` 仍是预留 stub（CARLA 控制器在 `carla_bridge/control/` 独立实现，不依赖它）。
+A: 已实现，见 [CARLA README](carla_bridge/README.md)。`python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_on` 使用默认选择性顾问与 PDM。模型只给语义建议，PDM 生成轨迹，Pure Pursuit+PID 回控；另支持无模型纯 PDM 和独立数值经验，见[完整命令矩阵](carla_bridge/README.md#136-选择性语义顾问与数值规划记忆完整命令)。`src/vla_memory/planning/dynamics_planner.py` 仍是预留 stub，CARLA 控制器在 `carla_bridge/control/`，不依赖该 stub。
 
 **Q: FAISS 装不上怎么办？**
 A: 见 §3.4 故障排查表，**固定 `faiss-cpu==1.9.0`**，不要装 1.14.x。

@@ -75,19 +75,22 @@ def get_valid_behaviors() -> List[str]:
     return list(VALID_BEHAVIORS)
 
 
-def get_semantic_prompt_template() -> str:
+def get_semantic_prompt_template(semantic_policy: str = "always") -> str:
     """Semantic mode has its own output contract, separate from waypoints."""
-    template = (_load_decision_yaml().get("semantic") or {}).get("user_prompt")
+    key = "selective_user_prompt" if semantic_policy in ("selective", "shadow") else "user_prompt"
+    template = (_load_decision_yaml().get("semantic") or {}).get(key)
     if not isinstance(template, str) or not template.strip():
-        raise ValueError("config/decision.yaml 缺少 semantic.user_prompt")
+        raise ValueError("config/decision.yaml 缺少 semantic." + key)
     return template
 
 
 def get_decision_system_prompt(config) -> str:
     """Select the system contract consistently with the CARLA planner backend."""
     if config.get_nested("carla", "planning", "backend", default=None) == "pdm_closed":
-        prompt = (_load_decision_yaml().get("semantic") or {}).get("system_prompt")
+        policy = config.get_nested("carla", "planning", "semantic_policy", default="always")
+        key = "selective_system_prompt" if policy in ("selective", "shadow") else "system_prompt"
+        prompt = (_load_decision_yaml().get("semantic") or {}).get(key)
         if not isinstance(prompt, str) or not prompt.strip():
-            raise ValueError("config/decision.yaml 缺少 semantic.system_prompt")
+            raise ValueError("config/decision.yaml 缺少 semantic." + key)
         return prompt
     return (config.get("decision", {}) or {}).get("system_prompt", "")

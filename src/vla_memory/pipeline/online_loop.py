@@ -534,6 +534,7 @@ class OnlineDrivingLoop:
             ego_state=kf.get("ego_state"),
             nav_instruction=kf.get("nav_instruction", ""),
             decision_mode=(kf.get("planning_constraints") or {}).get("decision_mode", "trajectory"),
+            semantic_policy=(kf.get("planning_constraints") or {}).get("semantic_policy", "always"),
         )
 
         model_decision = deepcopy(parsed)
@@ -999,11 +1000,14 @@ class OnlineDrivingLoop:
         ego_state: Optional[Dict[str, Any]],
         nav_instruction: str,
         decision_mode: str = "trajectory",
+        semantic_policy: str = "always",
     ):
         """parse + 兜底 fallback 的统一逻辑。"""
         if decision_mode == "semantic":
             from src.vla_memory.decision.semantic_output_parser import parse_semantic_decision_output
-            parsed, errors = parse_semantic_decision_output(raw_response)
+            parsed, errors = parse_semantic_decision_output(
+                raw_response, require_intervention=semantic_policy in ("selective", "shadow"),
+            )
             if parsed is not None:
                 return parsed, [], "success", False
             # Never fabricate a semantic instruction or numerical VLM fallback.

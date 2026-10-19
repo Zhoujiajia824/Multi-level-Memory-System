@@ -2,12 +2,12 @@
 
 把多层次记忆系统（`src/vla_memory`）接入 CARLA 0.9.15：用 CARLA 实时
 感知（六视角图像 / GT 障碍物 / 天气 / 导航 / 自车状态）替代离线 nuScenes。
-默认链路为语义决策 → PDM-Closed 候选规划 → Pure Pursuit + 速度曲线 PID 回控。
+默认链路为 PDM-Closed 候选规划与条件语义顾问 → Pure Pursuit + 速度曲线 PID 回控。
 支持通过 `--semantic-influence on|off` 做语义影响对照；安装依赖及使用方式见[第 13 节](#13-语义决策与-pdm-closed)。
 
 首次配置按顺序阅读：[第 5 节：新环境或已有环境安装](#5-环境搭建) →
 [第 12.0 节：生成与运行新场景](#120-从服务器开始生成场景再运行场景) →
-[第 12.6 节：记忆库模式完整命令](#126-新场景与记忆库模式完整命令)。
+[第 13.6 节：策略与记忆完整命令](#136-选择性语义顾问与数值规划记忆完整命令)。
 
 > ⚠️ 研究用离线/仿真 Demo，**不可用于实车**。
 
@@ -140,17 +140,18 @@ python -m carla_bridge.run_carla_demo --scenario intersection_turn --memory-bank
 | ID 重复、维度不符、资料缺失 | 保留原库，先使用新库验证；不要覆盖旧库来消除错误 |
 
 只有 `route_completed` 且完成清理和报告保存才以退出码 0 结束，其他结束状态均为非 0。
-CARLA 默认禁用解析失败的规则轨迹兜底，保留原始模型失败供定位。
+CARLA 禁用模型解析失败的规则轨迹兜底，保留原始失败供定位；`always` 失败时制动，
+语义开启的 `selective` / `shadow` 建议不可用时保留基础 PDM，数值轨迹无效仍制动。
 
 ## 运行隔离与记忆库选择（当前入口行为）
 
 在仓库根目录、`mulmem_carla` 环境运行。每次生成独立的
 `outputs/carla_runs/<运行目录>/`，包含 manifest、决策、报告、视频和日志。
 manifest 记录实际配置、场景、代码提交号、工作区修改状态、记忆库来源和结束状态。
-新运行目录自动使用 `时间__场景文件名__记忆模式__规划器__语义开关__短编号`，例如：
+新运行目录使用 `时间__场景文件名__记忆模式__规划器__语义开关__策略__数值记忆__短编号`，例如：
 
 ```text
-20261017_143025__L05_crossing_eval_s101__memory_off__pdm_closed__sem_on__7efbaf53
+20261019_143025__L05_crossing_eval_s101__memory_off__pdm_closed__sem_on__policy_selective__pm_full__7efbaf53
 ```
 
 时间取运行机器的本地时间，场景文件名保留评估/训练划分与种子。
@@ -158,6 +159,7 @@ manifest 记录实际配置、场景、代码提交号、工作区修改状态�
 关闭检索或短期记忆时，分别追加 `_no_retrieval`、`_no_short_term`。
 PDM 的语义开关为 `sem_on` / `sem_off`，旧轨迹后端使用 `sem_na`。
 场景名中的特殊字符会替换为下划线，最多保留 64 个字符。
+旧配置未设置新字段时保留旧目录标签；Windows 路径较长时使用紧凑目录名，完整配置以 manifest 为准。
 启动时终端打印完整输出路径，无须修改运行命令。
 
 内部 `run_id` 仍为 16 位短 UUID，帧编号继续使用它；目录末尾取其前 8 位以区分重复运行。
@@ -211,8 +213,8 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
 | 项 | 说明 |
 |---|---|
 | **复用记忆管线** | 复用 `OnlineDrivingLoop`（setup/step/close），CARLA 数据经 `KeyframeBuilder` 组装成与 nuScenes 同构的 `kf` dict 喂入 |
-| **3s 全量认知** | 每 3s sim 做一次完整 DINOv2 + 场景VLM + 三层记忆检索 + 决策VLM（与 nuScenes keyframe 一致） |
-| **每周期 5 次 raw 捕获** | 控制阶段每周期 5 次（≈1.67Hz）捕获原始感知（图像+ego+障碍物，不跑 VLM）push 进短期记忆，队列时刻最新 |
+| **条件或周期认知** | 默认 selective、语义 on 时按当前 PDM/GT 证据查询；always 或语义 off 保留模型调用时，每3s sim认知；model-inference off完全跳过 |
+| **raw 捕获** | 旧周期认知路径每周期5次 raw 捕获供短期上下文；选择性路径在实际咨询时捕获模型图像，未咨询时排空相机队列 |
 | **5Hz PDM 规划** | 基于最新 world 状态和最近语义，生成、仿真、评分轨迹候选 |
 | **10Hz 回控** | Pure Pursuit(横向) + PID(纵向) 跟踪 PDM 轨迹及时间速度曲线，同步模式 |
 | **同步模式** | VLM 思考期间 CARLA 冻结（不 tick），wall-clock 慢但 sim 时间连续正确 |
@@ -227,7 +229,7 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
 CARLA server (CarlaUE4.exe, 端口2000, 手动启动, 同步模式)
         │   传感器/GT ↓   carla.VehicleControl ↑
         ▼
-carla_bridge.closed_loop  ──每 3s sim──>  keyframe_builder
+carla_bridge.closed_loop  ──条件查询/旧周期──>  keyframe_builder
         │                                    │  组装 kf dict（与 nuScenes 同构）
         │                                    ▼
         │                 src.vla_memory.pipeline.OnlineDrivingLoop.step(kf)
@@ -242,7 +244,7 @@ trajectory_tracker (Pure Pursuit + PID)  ->  carla.VehicleControl  ->  vehicle.a
         └── video: 每个 CARLA 推进 tick 取一帧（跳过 VLM 冻结）写视频
 ```
 
-**单周期时序（每 3s sim）：**
+**旧周期认知时序（always，或语义 off 但模型 on；每 3s sim）：**
 ```
 [1 捕获]  tick -> 6 相机 mosaic + ego + GT 感知 + nav         (推进 0.1s)
 [2 认知]  loop.step(kf) -> 横纵向语义 -> PDM轨迹              (sim 冻结, wall 5-30s)
@@ -251,6 +253,10 @@ trajectory_tracker (Pure Pursuit + PID)  ->  carla.VehicleControl  ->  vehicle.a
           其中每周期 5 次 raw 捕获 push 进短期记忆；其余 tick drain 相机防堆积
 [4 记录]  逐 tick 指标采集 + 视频取帧
 ```
+
+默认选择性路径先按 10Hz 推进/控制、每0.2s更新PDM，再每0.5s检查是否需要咨询。
+咨询仍同步冻结仿真，返回后更新短期建议；没有建议或建议失效时继续基础 PDM。
+无模型路径不经过图中的模型管线。完整行为与边界见第13节。
 
 ---
 
@@ -261,7 +267,7 @@ carla_bridge/
 ├── README.md                       # 本文件
 ├── __init__.py
 ├── setup_env.sh                    # 一键建 mulmem_carla(3.9) 环境
-├── closed_loop.py                  # 【主驱动】同步 tick + 3s 重规划 + raw 捕获 + 视频
+├── closed_loop.py                  # 【主驱动】同步tick + 条件/周期认知 + PDM更新 + 视频
 ├── run_carla_demo.py               # 【入口】CLI -> RunSession -> ClosedLoop
 ├── run_session.py                  # 产物隔离、记忆库选择、进程锁与 manifest
 │
@@ -578,10 +584,12 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
 |---|---|---|
 | `carla.host`/`port` | 127.0.0.1/2000 | CARLA 服务器 |
 | `carla.synchronous`/`fixed_delta_seconds` | true/0.1 | 同步模式 + 10Hz |
-| `carla.replan_interval_s` | 3.0 | 全量认知与语义更新周期 |
+| `carla.replan_interval_s` | 3.0 | always／语义off保留模型时的认知周期；selective/shadow语义on采用条件查询 |
 | `carla.planning.backend` | pdm_closed | PDM 核心；vlm_trajectory 为旧模型轨迹 |
 | `carla.planning.semantic_influence` | true | 语义候选偏好评分开关，与记忆开关独立 |
-| `carla.planning.model_inference` | true | 模型调用开关；false 跳过双 VLM、DINOv2、记忆和六路认知相机，要求 PDM、语义影响关闭及 memory_off |
+| `carla.planning.semantic_policy` | selective | selective条件介入／always旧版评分／shadow只记录假设选择；用于PDM后端 |
+| `carla.planning.planning_memory` | full | off关闭数值经验／gate辅助咨询／full另提供参数候选；memory_off优先禁读写 |
+| `carla.planning.model_inference` | true | false跳过双VLM、DINOv2、文本/视觉记忆和认知相机；要求PDM、语义off，以及memory_off或显式full数值记忆 |
 | `carla.planning.replan_interval_s` | 0.2 | 两次语义更新之间的 PDM 规划周期 |
 | `carla.max_duration_s` | 300.0 | 全局仿真时间保护上限，与场景 `duration_s` 取较小值；到时未完成为 `timeout` |
 | `carla.capture_timeout_s` | 2.0 | 六路相机共享等待上限（墙钟秒） |
@@ -774,7 +782,10 @@ python -m carla_bridge.run_carla_demo \
 
 此轮的关闭语义对照，只将同一命令的 `--semantic-influence on` 改成 `off`，同时更换日志文件名。
 常规/长尾是在比较场景条件，`on/off` 是在比较语义评分；不要把二者同时改变的两轮当作单因素对照。
-开关两侧仍调用模型；`off` 只去掉语义偏好评分，语义解析失败仍按共同规则制动。
+上述命令使用当前默认 selective。语义 on 时条件查询、建议失败回到基础PDM；off但模型on时
+保留旧周期认知与失败制动，所以这是整体语义策略对照，并非只改变一个评分权重。
+只比较旧版语义加分时，两边均追加 `--semantic-policy always --planning-memory off`；
+新策略和快速纯PDM的明确矩阵见第13.6节。
 
 文件名格式为 `<条件ID>_<train或eval>_s<seed>.yaml`。例如更换成占道停车：
 `outputs/paper_v1/eval/L05_blocked_lane_eval_s101.yaml`；更换评估 seed：
@@ -882,7 +893,8 @@ python -m carla_bridge.run_carla_demo \
 ```bash
 python -m carla_bridge.run_carla_demo \
   --scenario outputs/paper_v1/train/R05_multilane_train_s11.yaml \
-  --mode memory_off
+  --planner pdm_closed --semantic-influence off --model-inference off \
+  --planning-memory off --mode memory_off
 ```
 
 然后在训练 seed 下积累库，可以按 case/profile 分库，也可以在多个训练场景使用同一个 general 库：
@@ -1047,7 +1059,8 @@ BANK_CROSSING=outputs/memory_banks/paper_v1/train_crossing
 | 从已有库复制后独立积累 | train | `--memory-seed` + 不存在的目标库 | 只修改新库 | 开启 |
 | 无记忆对照 | train/eval | `--mode memory_off` | 不读不写 | 关闭 |
 
-这里的检索开关针对中长期记忆检索；固定长期规则仍受原有 `long_term` 配置控制。
+这里的权限对中长期文本/视觉记忆与独立数值经验共同生效；`--no-memory-retrieval`
+也关闭数值经验检索。固定长期规则仍受原有 `long_term` 配置控制。
 场景名不会自动决定使用哪个库，指定库不会自动筛选该库内部的某一种场景记录。
 想得到专用库，应从空目录开始，只在对应训练场景向该库积累。
 
@@ -1130,7 +1143,8 @@ python -m carla_bridge.run_carla_demo \
 ```
 
 语义开关与上述记忆模式独立。将同一条评估命令的 `--semantic-influence on` 改为 `off`，
-即可组成“有/无记忆 × 有/无语义评分”四组；`off` 保留模型调用及共同的解析失败制动规则。
+可组成“有/无记忆 × 有/无语义影响”四组；默认selective的两侧查询调度和建议失败处理不同。
+需要复现旧版仅评分对照时，各组显式使用 `--semantic-policy always --planning-memory off`。
 四组应使用相同场景 YAML、seed、规划参数和冻结库快照，并保留重复试验及失败记录。
 不要使用 eval 场景写库，也不要在只读对照之间继续更新训练库。
 
@@ -1166,15 +1180,25 @@ python -m pytest -q -p no:cacheprovider
 
 ### 13.2 语义接口与控制周期
 
-模型必须返回单个 JSON 对象，例如：
+默认 `--semantic-policy selective` 使用六字段协议 v2；`always` 保留原五字段协议。
+模型只提出短期建议，是否调用和采纳由规划顾问门控分别判断。例如无需介入时：
 
 ```json
 {
   "lateral_decision": "FOLLOW_ROUTE",
-  "longitudinal_decision": "DECELERATE",
-  "behavior_reason": "前方行人接近车道，提前减速观察。",
-  "risk_level": "medium",
-  "safety_notes": ["保持路线，留出制动距离。"]
+  "longitudinal_decision": "MAINTAIN",
+  "behavior_reason": "当前无需要补充的语义信息。",
+  "risk_level": "low",
+  "safety_notes": [],
+  "intervention": {
+    "needed": false,
+    "reason_code": "none",
+    "target_actor_ids": [],
+    "target_stop_line_id": null,
+    "activation": "immediate",
+    "release": "condition_cleared",
+    "valid_for_s": 1.0
+  }
 }
 ```
 
@@ -1186,9 +1210,11 @@ python -m pytest -q -p no:cacheprovider
 
 模型不得给出 `trajectory`、`target_speed` 等数值控制字段；导航路线决定道路转向，
 语义请求不能改写目的地或使禁止变道的路段变成合法变道。不可用的横向请求由候选诊断记录。
-候选按 `PDM基础分 + 语义加分` 直接选择，不再增加碰撞/道路/方向/TTC/红灯的独立
-硬筛选、必要回归或连续性扣分。PDM 原生基础分仍包含风险指标；0 基础分候选也可被
-语义加分选中。执行前数值与动力学一致性校验继续生效。
+`always` 按旧版 `PDM基础分 + 语义加分` 选择，0 基础分候选仍可能被旧语义分选中。
+默认 `selective` 保留有限候选及原生基础分，只在当前证据授权、建议未过期且候选相对
+基础最佳分的损失不超过预算时，提供有上限的语义加分。默认基础分损失预算和语义上限
+各为 0.08；这限制顾问影响，不是恢复碰撞/道路/方向/TTC/红灯的全局硬筛选。
+`shadow` 记录同快照下的假设选择，实际总执行基础 PDM。执行前数值与动力学一致性校验继续生效。
 
 适配版本 5 修正道路交界漏面和邻道导航连接。邻道通向直行/左转而本路线要求右转时，
 候选需要包含合法返回目标车道的空间路径；无法完成驶入并返回的新变道不生成。
@@ -1202,21 +1228,26 @@ LQR 纵向保留原生 1s 制动预测，横向独立预瞄默认 2s（`planning
 原七种纵向策略之外新增一个缓起步 IDM 候选，保留常规加速和急刹策略参数；
 是否选中仍由上述评分决定。分轴预测与新增候选的依据和局部复现见规划说明。
 
-默认每 **3 秒仿真时间**更新一次模型语义，每 **0.2 秒**使用最新 CARLA 状态重新规划，
+`always` 或语义off但模型on时，每 **3 秒仿真时间**更新模型语义；
+`selective` / `shadow` 在语义on时按条件查询并限制查询频率。
+每 **0.2 秒**使用最新 CARLA 状态重新规划，
 控制器每 **0.1 秒**按轨迹时间插值速度。规划不额外推进 world tick。
-无有效语义、规划异常或轨迹校验失败时制动；失败决策不会写入中期或事件记忆。
-语义格式失败的共同处理规则对 `on`、`off` 都生效。
+语义on的 `selective` / `shadow` 无有效建议、格式失败或调用失败时继续使用基础 PDM；数值规划异常
+或轨迹校验失败仍制动。`always` 保持原失败处理；失败决策不会写入中期或事件记忆。
+模型仍同步查询，查询时仿真冻结；条件触发能减少查询次数，尚未实现异步推理。
 
 ### 13.3 对照开关与记忆实验
 
-语义提示词版本 5 位于 `config/decision.yaml` 的 `semantic.system_prompt` 和 `semantic.user_prompt`。
+旧 `always` 提示词版本 5 位于 `config/decision.yaml` 的 `semantic.system_prompt` 和 `semantic.user_prompt`；
+默认 `selective` / `shadow` 使用 `selective_system_prompt`、`selective_user_prompt`（schema v2、prompt v6）。
 `pdm_closed` 不再使用 `config/api_models.yaml` 中要求输出路点的旧决策系统提示词；
 `vlm_trajectory` 保持原系统契约。场景理解提示词仍在 `config/prompts.yaml`。
 修改后重启驾驶进程使缓存配置生效；`[DECISION_PROMPT]` 日志记录实际系统/用户提示词哈希。
 
 提示词以当前证据与通行条件选择动作，畅通时持续前进；六个纵向动作中性定义，
 不使用长篇 STOP/YIELD 或低速探查示例引导。`behavior_reason` 只需一句短理由，
-建议不超过 40 字，`safety_notes` 通常为 `[]`，保留原五字段 JSON 协议。
+建议不超过 40 字，`safety_notes` 通常为 `[]`。v2 额外要求完整 `intervention`；
+未提供对象、停止线或当前证据的建议不会从理由文字中推断授权。
 历史轨迹显示相对时间，并从现有连续位姿计算有界的近静止时长，不把等待时间当作自动放行条件。
 该运动窗口来自各记忆模式共同的传感器历史，不增加 memory_off 的检索或短期记忆。
 路线锚点与真实 actor 分开显示；静止时长不能证明已在停止线完成停车，视觉估距也不是精确停止位置。
@@ -1245,23 +1276,26 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --planner pdm_
 python -m carla_bridge.run_carla_demo --scenario straight_traffic --planner vlm_trajectory --mode memory_off
 ```
 
-`--semantic-influence off` 保留模型调用、语义解析与日志，只关闭候选的语义评分，
-因此不是“完全不调用模型”的计算成本基线。给定同一车辆/地图/交通状态，开关两侧生成
-相同候选与基础分，只有语义加分不同；行驶动作不同后，两轮未来状态自然可能分化。
+单独 `--semantic-influence off` 不代表关闭模型：仍保留每个认知周期调用的计算对照行为。
+`selective` / `shadow` 在语义开关为 on 时才进入条件查询。彻底关闭调用需 `--model-inference off`。
+比较语义影响时固定 `--planning-memory` 和库快照；`full` 的数值参数先验可扩展候选，
+不能把同时改变数值记忆的两组解释成只有语义加分不同。
 
 `--model-inference on|off` 是独立的模型调用开关，默认 `on`，对应
 `carla.planning.model_inference`。组合如下：
 
 | 语义影响 | 模型调用 | 运行方式 |
 | --- | --- | --- |
-| on | on | 模型理解场景、输出语义，参与 PDM 候选评分 |
-| off | on | 保留模型理解、决策与日志，PDM 只按基础分选择；兼容原有对照 |
-| off | off | 跳过模型与记忆管线，直接按 PDM 基础分规划，适合快速跑场景 |
+| on | on | 按 semantic-policy 查询/采纳；shadow 实际不采纳 |
+| off | on | 模型仍按认知周期调用，PDM 不接收模型语义分 |
+| off | off | 跳过模型，可用 memory_off 纯 PDM，或 memory_on + full 数值记忆 |
 | on | off | 不支持，启动前报错：没有模型输出可用于语义加分 |
 
-纯 PDM 模式必须显式使用 `--planner pdm_closed --semantic-influence off
---model-inference off --mode memory_off`；旧 `vlm_trajectory` 后端或记忆开启时会在连接
-CARLA 前报错。没有真实认知输出，因此不生成模型决策记录，也不检索或积累记忆。
+纯 PDM 模式使用 `--planner pdm_closed --semantic-influence off
+--model-inference off --mode memory_off`，此时不读写任何记忆。无模型另可使用
+`--mode memory_on --planning-memory full` 启用独立数值经验库；不加载文本/视觉记忆，
+不会生成模型决策记录。无模型时，旧 `vlm_trajectory`、语义on或memory_on但未显式选full
+会在连接CARLA前报错；memory_off则始终禁读写，允许保留任意合法planning-memory配置值。
 该模式不安装六路认知相机、不加载 DINOv2、不创建双 VLM 客户端，不检查模型 API Key。
 仍使用 CARLA GT 地图与 actor、相同 PDM 候选生成/基础评分/执行前校验、0.2s 规划及
 0.1s 物理控制，保留场景事件、碰撞与路线指标、卡死检测、正常清理和可选驾驶视频。
@@ -1279,7 +1313,7 @@ python -m carla_bridge.run_carla_demo \
 ```
 
 恢复模型调用时将 `--model-inference off` 改为 `on` 或省略；模型调用开关关闭时，不可用
-该轮结果评价提示词、记忆或真实模型语义的作用。比较运行耗时时应分别报告模型调用状态；
+该轮结果评价提示词或真实模型语义的作用；数值记忆需单独对照。比较耗时时分别报告模型调用状态；
 移除认知相机会改变计算负载，不属于仅改变语义加分的同计算条件对照。
 
 `--mode memory_off` 与语义开关是两个独立实验维度。做对照时固定场景、seed、路线、
@@ -1292,6 +1326,9 @@ python -m carla_bridge.run_carla_demo \
 每轮 `outputs/carla_runs/<运行目录>/` 中：
 
 - `manifest.json` 保存完整规划配置、语义和模型调用开关、记忆策略及最终路线结果。
+  新运行目录含 `policy_selective|always|shadow` 与 `pm_off|gate|full`；manifest 单独记录
+  `semantic_policy`、`planning_memory`、实际有效记忆模式以及所选 schema / prompt 版本。
+  Windows 输出路径可能使用紧凑目录标签，完整模式信息仍以 manifest 为准；Linux 保留完整可读目录名。
   纯 PDM 运行目录含 `model_off`，报告与 `planner.jsonl` 标记 `model_inference=false`，
   `semantic_decision` 和关联模型帧为 `null`，报告的全量认知间隔为 `null`。
 - 决策 JSONL 的 `model_decision_output` 保留模型语义，`decision_output` 保存规划后的指令与轨迹，
@@ -1308,8 +1345,17 @@ python -m carla_bridge.run_carla_demo \
   实际物理子步配置和车辆制动参数，便于区分规划停车、控制响应和仿真推进异常。
 - 记忆中的 `semantic_decision` 是模型建议，`planning_context` 是规划器选择；
   记录阶段为 `selected_before_execution`，不能据此断言已经成功完成该动作。
-- `paper_suite summarize` 保存 `planner_backend`、`semantic_influence`、`model_inference`
-  和规划配置哈希，方便分组。旧记录缺失模型调用开关时按 `true` 解释。
+- `paper_suite summarize` 保存 `planner_backend`、`semantic_influence`、`model_inference`、
+  `semantic_policy`、`planning_memory`、顾问查询/采用/拒绝/墙钟耗时和规划配置哈希，方便分组。
+  旧记录缺失模型调用开关时按 `true`、缺失策略时按 `always`、缺失数值记忆时按 `off` 解释。
+- `advisory.jsonl` 区分查询跳过、模型返回及失败，`planner.jsonl` 记录基础选择、实际选择、
+  shadow 假设选择、当前目标证据、建议过期/释放及拒绝原因；`planning_experience_audit.jsonl`
+  为数值经验读写/观测审计（具体文件以输出目录为准）。报告的“额外停车归因代理”仅标识语义
+  改变候选且实测低速、基础候选仍有前进意图的时间，不是无必要停车真值或真实反事实通行结果。
+
+`advisory.model_queries` 统计完整认知咨询轮数，每轮通常包含场景理解与驾驶决策两次模型请求，
+不是底层 HTTP 请求计数；重试也不另算咨询轮数。旧 always 与语义off但模型on的认知周期同样计数、计时。
+数值库健康检查与真实配对证据导入见 [执行经验库工具](planning/EXPERIENCE_MEMORY.md)。
 
 验收仍要求**路线完成率 100% 且正常清理退出**，同时审查碰撞、违规和场景事件结果。
 本实现使用 CARLA GT 障碍物与地图，PDM 局部预测和 CARLA 实际控制存在模型差异；
@@ -1362,7 +1408,109 @@ python -m carla_bridge.tools.check_pdm_route \
 这个通过条件只验收路线可达性和上述运行检查，不验收压线、逆行、闯灯、舒适性或驾驶效率。
 还应检查实际车辆的速度、加速度、车道侵入及交通违规；候选预测评分与实际执行指标也应分别报告。
 
-2026-10-18 的本地真实物理验证保留原 R05 路线和 60 车 / 20 行人配置，固定语义的
+此前2026-10-18版本的本地真实物理验证保留原 R05 路线和60车/20行人配置，固定语义的
 on/off 两组分别在 316.2s / 313.6s 完成 100%，记录碰撞和轨迹拒绝均为 0。
-这不包含真实 VLM 和记忆验证，原始制动仍有明显尖峰；完整条件、结果及限制见
+这不是本轮新selective/full版本的验收，也不包含真实VLM或记忆验证，原始制动仍有明显尖峰；完整条件、结果及限制见
 [PDM 修复与物理验证说明](planning/README.md#本地完整路线物理验证2026-10-18)。
+
+### 13.6 选择性语义顾问与数值规划记忆：完整命令
+
+在已有 `mulmem_carla` 环境、项目根目录运行。先完成 12.0 / 12.2 的场景生成与出生检查；
+以下路径必须已经存在，不重新创建 conda 环境。评估场景只读，积累使用训练场景。
+
+```bash
+conda activate mulmem_carla
+SCENE_EVAL=outputs/paper_v1_spawncheck/eval/R05_multilane_eval_s101.yaml
+SCENE_TRAIN=outputs/paper_v1_spawncheck/train/R05_multilane_train_s11.yaml
+BANK_SHARED=outputs/memory_banks/selective_v1/train_general
+BANK_SCENE=outputs/memory_banks/selective_v1/R05_multilane
+```
+
+| 目的 | 语义策略 | 数值经验 | 记忆权限 |
+| --- | --- | --- | --- |
+| 纯 PDM 快速基线 | selective，语义 off、模型 off | off | memory_off，完全禁读写 |
+| 旧版语义对照 | always，语义 on、模型 on | off | memory_off |
+| 新选择性方法 | selective，语义 on、模型 on | off | memory_off，单独观察语义改动 |
+| 仅观察建议 | shadow，模型 on | off | memory_off，实际总执行基础 PDM |
+| 辅助查询门控的记忆消融 | selective | gate | 训练 read_write／评估 read_only |
+| 完整数值记忆方法 | selective | full | 训练 read_write／评估 read_only |
+| 无模型数值记忆 | 语义 off、模型 off | full | memory_on；不初始化文本/视觉记忆 |
+
+参数优先级为配置默认值→显式CLI覆盖→访问权限约束；例如memory_off始终禁读写，
+eval+memory_on仍必须read_only。shadow只关闭语义实际采纳，不自动关闭数值记忆：
+若启用full，其实际基础选择仍在包含数值参数先验的候选池内进行；严格纯PDM基线应显式关闭记忆。
+`semantic-policy` / `planning-memory` 属于PDM适配；旧 `vlm_trajectory` 不使用这些规划模块。
+
+```bash
+# 1. 纯 PDM 快速跑完整路线，无模型与记忆
+python -m carla_bridge.run_carla_demo --scenario "$SCENE_EVAL" \
+  --planner pdm_closed --semantic-policy selective --semantic-influence off \
+  --model-inference off --planning-memory off --mode memory_off
+
+# 2. 旧版无条件语义加分对照，保留五字段提示词/失败规则
+python -m carla_bridge.run_carla_demo --scenario "$SCENE_EVAL" \
+  --planner pdm_closed --semantic-policy always --semantic-influence on \
+  --model-inference on --planning-memory off --mode memory_off
+
+# 3. 新选择性顾问：先不使用任何记忆，检验语义策略本身
+python -m carla_bridge.run_carla_demo --scenario "$SCENE_EVAL" \
+  --planner pdm_closed --semantic-policy selective --semantic-influence on \
+  --model-inference on --planning-memory off --mode memory_off
+
+# 4. Shadow：可能按需调用模型并记录假设选择，实际始终执行基础 PDM
+python -m carla_bridge.run_carla_demo --scenario "$SCENE_EVAL" \
+  --planner pdm_closed --semantic-policy shadow --semantic-influence on \
+  --model-inference on --planning-memory off --mode memory_off
+
+# 5. 持续积累共享训练库；后续更换训练场景仍指定同一 BANK_SHARED
+python -m carla_bridge.run_carla_demo --scenario "$SCENE_TRAIN" \
+  --planner pdm_closed --semantic-policy selective --semantic-influence on \
+  --model-inference on --planning-memory full --mode memory_on \
+  --memory-bank "$BANK_SHARED" --memory-access read_write
+
+# 6. 指定场景库：独立积累 R05，可与其它场景库分别管理
+python -m carla_bridge.run_carla_demo --scenario "$SCENE_TRAIN" \
+  --planner pdm_closed --semantic-policy selective --semantic-influence on \
+  --model-inference on --planning-memory full --mode memory_on \
+  --memory-bank "$BANK_SCENE" --memory-access read_write
+
+# 7. 只读评估：读取训练库，不向库增加或修改经验
+python -m carla_bridge.run_carla_demo --scenario "$SCENE_EVAL" \
+  --planner pdm_closed --semantic-policy selective --semantic-influence on \
+  --model-inference on --planning-memory full --mode memory_on \
+  --memory-bank "$BANK_SCENE" --memory-access read_only
+
+# 8. 只积累不检索；no-short-term 同时去掉本轮短期上下文记忆
+python -m carla_bridge.run_carla_demo --scenario "$SCENE_TRAIN" \
+  --planner pdm_closed --semantic-policy selective --semantic-influence on \
+  --model-inference on --planning-memory full --mode memory_on \
+  --memory-bank "$BANK_SHARED" --memory-access read_write \
+  --no-memory-retrieval --no-short-term
+
+# 9. gate 消融：辅助咨询/介入及失败动作的语义分折扣，不新增数值参数候选
+python -m carla_bridge.run_carla_demo --scenario "$SCENE_EVAL" \
+  --planner pdm_closed --semantic-policy selective --semantic-influence on \
+  --model-inference on --planning-memory gate --mode memory_on \
+  --memory-bank "$BANK_SCENE" --memory-access read_only
+
+# 10. 不调用模型，仍使用 full 数值记忆；支持只有 planning_experiences.jsonl 的库
+python -m carla_bridge.run_carla_demo --scenario "$SCENE_EVAL" \
+  --planner pdm_closed --semantic-policy selective --semantic-influence off \
+  --model-inference off --planning-memory full --mode memory_on \
+  --memory-bank "$BANK_SHARED" --memory-access read_only
+```
+
+首次建立无模型数值库时，将第 10 条的场景换为 `"$SCENE_TRAIN"`、权限换为 `read_write`。
+这只建立数值经验文件，不需要 `mid_term_meta.json`、API Key、DINOv2 或文本嵌入模型。
+原三层文本/视觉库用于模型推理时仍需要其完整元数据和资产；无模型数值库不能冒充完整文本库。
+`--memory-seed` 仍可在新目标库复制已有库，源与目标都加锁，源保持不变。
+
+`memory_off` 优先于 `planning-memory full`，始终不读写经验；`--no-memory-retrieval`
+同时关闭持久文本与数值经验检索，但不禁写。`read_only` 运行可在本轮输出目录写审计，
+不能改变库文件。相同 bank 仍由独占 OS 锁保护，不并发写入；只读运行也需等现有使用者释放锁。
+
+默认是规则化选择性门控与执行结果库，**尚未训练可学习路由器**。full 数值记忆的参数先验
+进入候选后仍用当前 PDM 重新仿真评分；过去安全通过仅表示执行结果，不自动证明语义优于基础 PDM。
+Shadow 的假设候选同样不是已执行对照结果。模型调用仍同步冻结仿真；少调用可以节省墙钟时间，
+不能宣称已解决云端推理延迟。最终需要同场景/seed/版本/冻结库的独立配对实验，
+同时报告 100% 路线、碰撞/违规、速度、静止、制动/jerk、查询次数和两类耗时。

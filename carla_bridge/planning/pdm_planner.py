@@ -335,6 +335,22 @@ class CarlaPDMPlanner:
         self.transition_m = float(self.config.get("lane_change_length_m", 30.0))
         self.lateral_weight = float(self.config.get("lateral_semantic_weight", 0.8))
         self.longitudinal_weight = float(self.config.get("longitudinal_semantic_weight", 0.8))
+        self.semantic_policy = self.config.get("semantic_policy", "always")
+        if self.semantic_policy not in ("always", "selective", "shadow"):
+            raise ValueError("semantic_policy must be always, selective or shadow")
+        self.planning_memory_mode = self.config.get("planning_memory", "off")
+        if self.planning_memory_mode not in ("off", "gate", "full"):
+            raise ValueError("planning_memory must be off, gate or full")
+        self.experience_memory = None
+        self.last_context = None
+        self.last_candidates = []
+        self.last_query_decision = None
+        self._memory_policy_metadata = {}
+        if self.semantic_policy != "always":
+            from .semantic_governor import SelectiveSemanticGovernor
+            self.governor = SelectiveSemanticGovernor(self.config.get("semantic_governor"))
+        else:
+            self.governor = None
         self._reference_route_source = None
         self._resolved_route_waypoints = None
         self._route_resolution = None
@@ -817,7 +833,7 @@ class CarlaPDMPlanner:
                 stop_polygons.append(polygon)
         return lights, stop_polygons
 
-    def _policies(self, speed, limit):
+    def _policies(self, speed, limit, memory_priors=None):
         # Reject corrupted/sub-walking road limits instead of either exceeding
         # them with a target floor or creating millions of integration steps.
         if not math.isfinite(limit) or limit < 0.1:
@@ -837,6 +853,31 @@ class CarlaPDMPlanner:
         # generated in both semantic arms and competes under the same scoring.
         accelerations = [2.0] * 7 + [0.2]
         headways = [1.5, 2.5, 2.0, 2.5, 1.5, 1.5, 1.5, 2.5]
+        gaps, decelerations = [1.5] * 8, [4.0] * 8
+        self._memory_policy_metadata = {}
+        # Memory proposes bounded IDM parameters; all original policies remain.
+        # Re-simulate from the CURRENT measured state, never replay old XY points.
+        for prior in (memory_priors or [])[:2]:
+            if (not isinstance(prior, dict) or prior.get("status") != "execution_supported"
+                    or type(prior.get("support_count")) is not int or prior["support_count"] < 3):
+                continue
+            action = prior.get("action") or {}
+            longitudinal_action = action.get("longitudinal_decision")
+            if longitudinal_action not in ("FOLLOW", "MAINTAIN", "ACCELERATE", "DECELERATE"):
+                continue
+            parameters = prior.get("parameters") or {}
+            fields = ("target_velocity_mps", "headway_time", "min_gap_to_lead_agent", "accel_max", "decel_max")
+            if not all(type(parameters.get(k)) in (int, float) and math.isfinite(parameters[k]) for k in fields):
+                continue
+            index = len(labels)
+            labels.append("MEMORY_%d" % index)
+            targets.append(float(np.clip(parameters["target_velocity_mps"], min(2.0, limit), limit)))
+            headways.append(float(np.clip(parameters["headway_time"], 1.0, 3.0)))
+            gaps.append(float(np.clip(parameters["min_gap_to_lead_agent"], 1.5, 4.0)))
+            accelerations.append(float(np.clip(parameters["accel_max"], .2, 2.0)))
+            decelerations.append(float(np.clip(parameters["decel_max"], 2.0, 4.0)))
+            self._memory_policy_metadata[index] = {"action": longitudinal_action,
+                "support_count": prior.get("support_count"), "record_ids": prior.get("record_ids", [])}
         base = self.api.BatchIDMPolicy
 
         class WithStopPolicy(base):
@@ -861,14 +902,16 @@ class CarlaPDMPlanner:
                 return result
 
         policies = WithStopPolicy(fallback_target_velocity=targets, speed_limit_fraction=[1.0] * len(labels),
-                                  min_gap_to_lead_agent=1.5, headway_time=headways,
-                                  accel_max=accelerations, decel_max=4.0)
+                                  min_gap_to_lead_agent=gaps, headway_time=headways,
+                                  accel_max=accelerations, decel_max=decelerations)
         policies.update(None)  # Desired velocities are already capped to the road speed limit.
         return policies, labels, targets
 
-    def plan(self, semantic_decision, semantic_enabled=True):
+    def plan(self, semantic_decision, semantic_enabled=True, *, semantic_update=False,
+             sim_time_s=None, special_situations=()):
         from shapely.geometry import Point
         timestamp = int(round(self.world.get_snapshot().timestamp.elapsed_seconds * 1e6))
+        now = timestamp/1e6 if sim_time_s is None else float(sim_time_s)
         state, tf = self._ego_state(timestamp)
         self._geometry_diagnostics = {"ego_location": {"x": tf.location.x, "y": tf.location.y,
                                                        "z": tf.location.z}}
@@ -891,7 +934,17 @@ class CarlaPDMPlanner:
         if not math.isfinite(road_limit) or road_limit < 0.1:
             raise ValueError("CARLA returned a non-finite speed limit or a limit below the supported 0.1 m/s minimum")
         limit = min(self.max_speed, road_limit)
-        policies, longitudinal, targets = self._policies(state.dynamic_car_state.speed, limit)
+        context, memory_evidence = None, None
+        # Pure legacy/ablation runs do not incur context construction or memory I/O.
+        if getattr(self, "semantic_policy", "always") != "always" or getattr(self, "experience_memory", None) is not None:
+            from .scene_context import build_scene_context
+            context = build_scene_context(self.world, self.ego, self.route, now,
+                        reference=self._resolved_route_waypoints, special_situations=special_situations)
+            if self.experience_memory is not None:
+                memory_evidence = self.experience_memory.retrieve(context)
+        priors = ((memory_evidence or {}).get("parameter_priors", [])
+                  if getattr(self, "planning_memory_mode", "off") == "full" else [])
+        policies, longitudinal, targets = self._policies(state.dynamic_car_state.speed, limit, priors)
         manager = self.api.PDMProposalManager(paths, policies)
         proposals = self.generator.generate_proposals(state, observation, manager)
         simulated = self.simulator.simulate_proposals(proposals, state)
@@ -928,13 +981,16 @@ class CarlaPDMPlanner:
                                "forward_progress_m": float(centerline.project(Point(*proposals[index, -1, :2]))
                                                            - centerline.project(Point(*proposals[index, 0, :2]))) if finite else 0.0,
                                "terminal_speed_mps": float(self.generator._state_idm_array[index, -1, 1]) if finite else 0.0,
-                               "longitudinal": {"STOP_HARD": "STOP", "YIELD_GENTLE": "YIELD"}.get(
-                                   longitudinal[proposal.longitudinal_idx], longitudinal[proposal.longitudinal_idx]),
+                               "longitudinal": self._memory_policy_metadata.get(proposal.longitudinal_idx, {}).get("action",
+                                   {"STOP_HARD": "STOP", "YIELD_GENTLE": "YIELD"}.get(
+                                   longitudinal[proposal.longitudinal_idx], longitudinal[proposal.longitudinal_idx])),
                                "longitudinal_policy_id": longitudinal[proposal.longitudinal_idx],
                                "longitudinal_policy_index": int(proposal.longitudinal_idx),
                                "idm_accel_max_mps2": float(policies._accel_max[proposal.longitudinal_idx]),
                                "idm_decel_max_mps2": float(policies._decel_max[proposal.longitudinal_idx]),
                                "idm_headway_s": float(policies._headway_time[proposal.longitudinal_idx]),
+                               "idm_min_gap_m": float(policies._min_gap_to_lead_agent[proposal.longitudinal_idx]),
+                               "memory_prior": self._memory_policy_metadata.get(proposal.longitudinal_idx),
                                "predicted_collision_time_s": collision_time if math.isfinite(collision_time) else None,
                                "predicted_ttc_infraction_time_s": ttc_time if math.isfinite(ttc_time) else None,
                                "drivable_area_failure": area_failure,
@@ -944,8 +1000,41 @@ class CarlaPDMPlanner:
                                "desired_speed_mps": targets[proposal.longitudinal_idx],
                                "base_score": float(scores[index]) if finite else 0.0, "safety": safety,
                                "trajectory_sha256": hashlib.sha256(proposals[index].tobytes()).hexdigest()})
-        selected, diagnostics = choose_candidate(candidates, semantic_decision, semantic_enabled,
-                                                  self.lateral_weight, self.longitudinal_weight)
+        action_memory = None
+        if getattr(self, "experience_memory", None) is not None and semantic_decision:
+            # Scene-level paired support can invite consultation. Recheck the
+            # requested action separately; it never grants ungrounded STOP or
+            # expands the score budget. Candidate-specific failures are already
+            # carried by scene memory's action_feedback.
+            action_memory = self.experience_memory.retrieve(context, semantic_decision)
+        governor = getattr(self, "governor", None)
+        if governor is None:
+            selected, diagnostics = choose_candidate(candidates, semantic_decision, semantic_enabled,
+                                                      self.lateral_weight, self.longitudinal_weight)
+        else:
+            from .scene_context import candidate_summary
+            _, baseline_diagnostics = choose_candidate(candidates, None, False)
+            context["candidates_summary"] = candidate_summary(candidates, baseline_diagnostics["baseline_selected_id"])
+            if semantic_update:
+                governor.submit(semantic_decision, context, now)
+            selected, diagnostics = governor.select(candidates, context, now,
+                        enabled=semantic_enabled, memory_evidence=memory_evidence)
+            if self.semantic_policy == "shadow":
+                shadow_selected = diagnostics.get("selected_id")
+                shadow_candidates = diagnostics["candidates"]
+                selected, baseline_diagnostics = choose_candidate(candidates, None, False)
+                diagnostics.update(candidates=baseline_diagnostics["candidates"],
+                    selected_id=baseline_diagnostics["selected_id"], shadow_selected_id=shadow_selected,
+                    shadow_candidates=shadow_candidates, shadow_only=True)
+                diagnostics["governor"]["would_adopt"] = diagnostics["governor"]["adopted"]
+                diagnostics["governor"]["adopted"] = False
+            # Query scheduling happens at actual cognition checkpoints, not on
+            # every 5-Hz plan (which would consume a query without calling it).
+        self.last_context, self.last_candidates = context, candidates
+        diagnostics.update(semantic_policy=getattr(self, "semantic_policy", "always"),
+                           planner_context=context, query_decision=self.last_query_decision,
+                           planning_memory_mode=getattr(self, "planning_memory_mode", "off"),
+                           memory_evidence=memory_evidence, requested_action_memory=action_memory)
         diagnostics.update(backend="pdm_closed", provenance=self.provenance,
                            timestamp_us=timestamp, horizon_s=self.samples * self.dt, sample_interval_s=self.dt,
                            lqr_longitudinal_horizon_s=1.0,
@@ -1008,6 +1097,16 @@ class CarlaPDMPlanner:
         return {"trajectory": trajectory, "target_speed": trajectory[-1]["optional_v"],
                 "selected_lateral": selected["lateral"], "selected_longitudinal": selected["longitudinal"],
                 "planner_diagnostics": diagnostics}
+
+    def query_decision(self, sim_time_s):
+        if self.governor is None:
+            return {"query": True, "reason": "always_policy"}
+        if self.last_context is None:
+            return {"query": False, "reason": "no_current_context"}
+        evidence = self.experience_memory.retrieve(self.last_context) if self.experience_memory else None
+        self.last_query_decision = self.governor.query_decision(
+            self.last_context, self.last_candidates, sim_time_s, memory_evidence=evidence)
+        return self.last_query_decision
 
 
 if __name__ == "__main__":
