@@ -2,7 +2,7 @@
 
 把多层次记忆系统（`src/vla_memory`）接入 CARLA 0.9.15：用 CARLA 实时
 感知（六视角图像 / GT 障碍物 / 天气 / 导航 / 自车状态）替代离线 nuScenes。
-默认链路为 PDM-Closed 候选规划与条件语义顾问 → Pure Pursuit + 速度曲线 PID 回控。
+默认链路为 PDM-Closed 候选规划与条件语义顾问 → 所选原生 LQR 转向 + 速度曲线 PID 回控。
 支持通过 `--semantic-influence on|off` 做语义影响对照；安装依赖及使用方式见[第 13 节](#13-语义决策与-pdm-closed)。
 
 首次配置按顺序阅读：[第 5 节：新环境或已有环境安装](#5-环境搭建) →
@@ -216,7 +216,7 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
 | **条件或周期认知** | 默认 selective、语义 on 时按当前 PDM/GT 证据查询；always 或语义 off 保留模型调用时，每3s sim认知；model-inference off完全跳过 |
 | **raw 捕获** | 旧周期认知路径每周期5次 raw 捕获供短期上下文；选择性路径在实际咨询时捕获模型图像，未咨询时排空相机队列 |
 | **5Hz PDM 规划** | 基于最新 world 状态和最近语义，生成、仿真、评分轨迹候选 |
-| **10Hz 回控** | Pure Pursuit(横向) + PID(纵向) 跟踪 PDM 轨迹及时间速度曲线，同步模式 |
+| **10Hz 回控** | 默认执行 PDM 已评分的 LQR 转向样本，PID 跟踪时间速度曲线；可显式选择旧 Pure Pursuit 横向对照 |
 | **同步模式** | VLM 思考期间 CARLA 冻结（不 tick），wall-clock 慢但 sim 时间连续正确 |
 | **驾驶视频录制** | 仅在 CARLA 推进 tick 取帧（跳过 VLM 冻结期），按仿真帧率编码，丢帧时视频可能短于仿真时长 |
 | **CARLA 全优势** | 自定义地图/天气/交通流/车辆/路由，全 Python API |
@@ -238,7 +238,7 @@ carla_bridge.closed_loop  ──条件查询/旧周期──>  keyframe_builder
         │       CARLA adapter → PDM generator → simulator → scorer + optional semantic preference
         │  ◀──  validated trajectory + time/speed profile  ────────
         ▼
-trajectory_tracker (Pure Pursuit + PID)  ->  carla.VehicleControl  ->  vehicle.apply_control
+trajectory_tracker (PID + 横向基础跟踪) -> native_tracking (PDM 所选 LQR 转向) -> vehicle.apply_control
         │
         ├── metrics: 碰撞/违规/路线/舒适度 逐 tick 采集
         └── video: 每个 CARLA 推进 tick 取一帧（跳过 VLM 冻结）写视频
@@ -248,7 +248,7 @@ trajectory_tracker (Pure Pursuit + PID)  ->  carla.VehicleControl  ->  vehicle.a
 ```
 [1 捕获]  tick -> 6 相机 mosaic + ego + GT 感知 + nav         (推进 0.1s)
 [2 认知]  loop.step(kf) -> 横纵向语义 -> PDM轨迹              (sim 冻结, wall 5-30s)
-[3 控制]  10Hz × 29 tick：Pure Pursuit+PID 回控 CARLA          (推进 2.9s)
+[3 控制]  10Hz × 29 tick：所选 LQR 转向 + PID 回控 CARLA     (推进 2.9s)
           每 0.2s PDM 根据最新 world 状态重规划；和下一捕获 tick 合计 3.0s
           其中每周期 5 次 raw 捕获 push 进短期记忆；其余 tick drain 相机防堆积
 [4 记录]  逐 tick 指标采集 + 视频取帧
@@ -340,6 +340,7 @@ carla_bridge/
 - **`pure_pursuit.py`**：Pure Pursuit 横向，前瞻距离 `clamp(min+k·speed, min, max)`。
 - **`pid.py`**：PID 纵向速度跟踪，throttle/brake 互斥，积分抗饱和。
 - **`trajectory_tracker.py`**：捕获时刻把 ego-centric 轨迹转全局 waypoint，每 tick Pure Pursuit+PID -> `carla.VehicleControl`。`steer_sign` 修正左右。
+- **`planning/native_tracking.py`**：PDM 默认用实际所选 rollout 的短期 LQR 转向覆盖上述横向指令，纵向 PID 保持不变；旧 VLM 路点模式仍走 Pure Pursuit。
 - **`trajectory_validation.py`**：检查轨迹时间、有限数值及位移/速度合理性；拒绝结果触发制动，写入 `decision_validation` 审计，并禁止该决策写入中期或事件记忆。
 - **`scripted_vehicle.py`**：NPC 的 NOA（路由跟随）+ ACC（前方同车道有车则减速），复用 Pure Pursuit+PID。
 
@@ -1144,7 +1145,9 @@ python -m carla_bridge.run_carla_demo \
 
 语义开关与上述记忆模式独立。将同一条评估命令的 `--semantic-influence on` 改为 `off`，
 可组成“有/无记忆 × 有/无语义影响”四组；默认selective的两侧查询调度和建议失败处理不同。
-需要复现旧版仅评分对照时，各组显式使用 `--semantic-policy always --planning-memory off`。
+需要旧版无条件语义加分对照时，各组显式使用 `--semantic-policy always --planning-memory off`。
+当前版本的车道成本/持续绕行默认开启；若要禁用这两项新数值机制，另加
+`--lane-quality off --lane-maneuver off`。严格复现历史结果仍须使用当时的完整代码与控制配置。
 四组应使用相同场景 YAML、seed、规划参数和冻结库快照，并保留重复试验及失败记录。
 不要使用 eval 场景写库，也不要在只读对照之间继续更新训练库。
 
@@ -1210,21 +1213,25 @@ python -m pytest -q -p no:cacheprovider
 
 模型不得给出 `trajectory`、`target_speed` 等数值控制字段；导航路线决定道路转向，
 语义请求不能改写目的地或使禁止变道的路段变成合法变道。不可用的横向请求由候选诊断记录。
-`always` 按旧版 `PDM基础分 + 语义加分` 选择，0 基础分候选仍可能被旧语义分选中。
+`always` 保留旧版无条件语义加分，当前数值分为 `PDM基础分 - 车道软成本`，
+0基础分候选仍可能被旧语义分选中。
 默认 `selective` 保留有限候选及原生基础分，只在当前证据授权、建议未过期且候选相对
-基础最佳分的损失不超过预算时，提供有上限的语义加分。默认基础分损失预算和语义上限
+数值最佳分的损失不超过预算时，提供有上限的语义加分。默认数值分损失预算和语义上限
 各为 0.08；这限制顾问影响，不是恢复碰撞/道路/方向/TTC/红灯的全局硬筛选。
-`shadow` 记录同快照下的假设选择，实际总执行基础 PDM。执行前数值与动力学一致性校验继续生效。
+`shadow` 记录同快照下的假设选择，实际总执行同一数值PDM选择；车道居中/绕行数值模块也保持开启。
+执行前数值与动力学一致性校验继续生效，两个数值开关见13.8。
 
 适配版本 5 修正道路交界漏面和邻道导航连接。邻道通向直行/左转而本路线要求右转时，
 候选需要包含合法返回目标车道的空间路径；无法完成驶入并返回的新变道不生成。
-这改变候选几何，不改变上面的评分公式，语义开关两侧使用相同构造。
+这改变普通候选几何，不改变上面的评分公式，语义开关两侧的普通候选使用相同构造；
+13.7的模型恢复请求可另外增加局部路径，并对整池重新评分。
 `KEEP_LANE` 候选在出口前也可能包含导航所需的返回段。详见
 [路线几何与诊断说明](planning/README.md#路线几何与规划失败诊断)。
 
 规划与执行共用实测轴距、前轮距和后轴参考点；归一化转向、内轮转角及 bicycle
 等效中心角分别换算。PDM 初始轮角优先使用同步帧实测值。
-LQR 纵向保留原生 1s 制动预测，横向独立预瞄默认 2s（`planning.lqr_lateral_horizon_s`）。
+LQR纵向保留原生1s制动预测，横向可用 `--pdm-lateral-preview speed_scaled` 按实测速度
+在1–2s间调度；`fixed` 固定使用 `planning.lqr_lateral_horizon_s`（默认2s）。
 原七种纵向策略之外新增一个缓起步 IDM 候选，保留常规加速和急刹策略参数；
 是否选中仍由上述评分决定。分轴预测与新增候选的依据和局部复现见规划说明。
 
@@ -1334,7 +1341,9 @@ python -m carla_bridge.run_carla_demo \
 - 决策 JSONL 的 `model_decision_output` 保留模型语义，`decision_output` 保存规划后的指令与轨迹，
   `planning_output` 保存候选诊断，`decision_validation` 保存执行前数值校验结果。
 - `planner.jsonl` 记录每次 PDM 更新的仿真时间、关联语义帧、候选基础分/语义分/最终选择和校验结果。
-  `selection_rule=pdm_base_plus_semantic`，`eligible` 只表示数值有效，`safe` / `safety` 仅作
+  当前 `selection_rule=pdm_base_minus_numerical_cost_plus_semantic`，逐候选保存原生 `base_score`、
+  `numerical_cost`、`planning_score`、`lane_quality` 和语义加分；无成本字段的旧调用仍保留
+  `pdm_base_plus_semantic`。`eligible` 只表示数值有效，`safe` / `safety` 仅作
   风险诊断；`selected_zero_base_score` 标记是否选择了 0 基础分候选。选择阶段的必要回归门控已移除，
   `route_recovery_active=false`。`geometry` 保存实际车道连接、截断和变道许可诊断。
   几何失败也会写入 `semantic_error` / `control_error`；无数值有效候选时
@@ -1514,3 +1523,149 @@ python -m carla_bridge.run_carla_demo --scenario "$SCENE_EVAL" \
 Shadow 的假设候选同样不是已执行对照结果。模型调用仍同步冻结仿真；少调用可以节省墙钟时间，
 不能宣称已解决云端推理延迟。最终需要同场景/seed/版本/冻结库的独立配对实验，
 同时报告 100% 路线、碰撞/违规、速度、静止、制动/jerk、查询次数和两类耗时。
+
+### 13.7 模型请求候选扩展：原生 PDM 持续无法前进时脱困
+
+选择性顾问现在不仅影响已有候选的偏好，也可以在原生规划持续退化时请求增加候选。
+系统先验证连续退化证据，再调用模型；模型输出 `planner_degraded` +
+`planner_request=expand_candidates`，数值模块生成更多当前车道的位姿回接路径，
+与原路径一起重新运行 PDM 原生仿真、评分。没有让模型直接输出数值路点。
+
+已有 `mulmem_carla` 环境、已生成的同一场景直接使用：
+
+```bash
+# 允许模型在原生算法持续退化时请求候选扩展
+python -m carla_bridge.run_carla_demo \
+  --scenario outputs/paper_v1_spawncheck/eval/R10_downtown_eval_s101.yaml \
+  --planner pdm_closed --semantic-policy selective \
+  --semantic-influence on --model-inference on \
+  --planner-recovery on --pdm-lateral-control native_lqr \
+  --pdm-lateral-preview speed_scaled \
+  --planning-memory off --mode memory_off
+```
+
+`L10_night_rain_eval_s101.yaml` 或其它已生成场景只需更换 `--scenario`。
+`--planner-recovery on` 是允许开关，仍需模型明确请求和当前证据授权，不会启动即自动扩池。
+恢复授权不会因单帧候选恢复就立即撤销；要核对持续恢复及实际进展，且始终受TTL和当前交通条件限制。
+
+同场景做以下对照，其它配置、seed保持相同：
+
+| 对照 | 参数修改 |
+| --- | --- |
+| 允许模型请求候选扩展 | 上述命令 |
+| 仅对已有候选施加选择性语义偏好 | 只改 `--planner-recovery off` |
+| 纯 PDM 快速基线 | 改为 `--semantic-influence off --model-inference off --planner-recovery off` |
+| 观察模型恢复请求、实际执行原池 | 只改 `--semantic-policy shadow` |
+
+上述四组均保持 `--pdm-lateral-control native_lqr --pdm-lateral-preview speed_scaled`，
+避免把控制器和预瞄差异混入语义效果。
+该开关独立于模型、语义、恢复和记忆开关；纯 PDM 也执行同样的 LQR 转向。
+另用 `--pdm-lateral-control pure_pursuit` 可单独对照历史控制方式。
+默认配置文件为 `native_lqr + speed_scaled`；自定义旧配置若没有 `planning.lateral_control`，仍兼容旧 Pure Pursuit。
+LQR 模式执行所选原生模拟的下一时刻转角，每0.2秒更新，不是模型输出转角；
+车辆物理、纵向 PID 和原始加速度/jerk 指标均未修改。
+`speed_scaled` 低速保留两秒预瞄帮助起步，车速上升后逐步缩短至一秒，减少后续弯道跟踪偏移。
+调度由实测速度、轴距确定，同一帧所有候选共用；模型不输出预瞄参数。
+另用 `--pdm-lateral-preview fixed` 可单独对照固定两秒预瞄；旧自定义配置省略模式键仍为fixed。
+具体原因、执行审计和验证边界见[横向执行与原生评分的一致性](planning/README.md#横向执行与原生评分的一致性)。
+
+需要记忆时可沿用13.6的 `planning-memory`、bank和权限组合；
+`memory_off` 仍完全禁读写，评估 `memory_on` 仍使用 `read_only`。
+运行报告和CSV新增扩池、实际选中恢复候选、扩池但无正分前进候选的周期数。
+这些数量不代表脱困成功，验收仍看实际路线100%、停车恢复、碰撞违规和原始运动指标。
+恢复路径限制、协议、原池回退与逐帧字段详见
+[规划模块说明](planning/README.md#原生规划持续退化时由模型请求扩展候选)。
+
+### 13.8 车道居中、合法绕行与常规等待
+
+这次修复覆盖数值候选和模型查询门控，并非只修改提示词。原生可驾驶道路评分不能等同于
+车道居中，车道内偏移候选可能近似同分；变道过渡在每次重规划时从当前位置重新开始，
+可能一直没有及时离开被挡住的车道；等待门控之前又漏掉单辆前车等红灯和低速移动跟车，
+并每15秒复查模型。这些均可在真值数据准确时出现。
+
+| 功能 | 当前行为 | 独立对照 |
+| --- | --- | --- |
+| 车道位置 | 对未来0.1–2秒实际预测车身相对地图中心/边界计有界软成本，优先区分基础分接近的候选 | `--lane-quality off` |
+| 持续绕行 | 对持续慢速障碍提出固定地图锚点变道，实际选中后持续执行，超越并满足间距后合法返回 | `--lane-maneuver off` |
+| 常规等待 | selective/shadow中，有当前信号依据的等待、单辆前车队列及正常移动跟车不周期咨询模型 | 检查 `advisory.jsonl` 的跳过原因与模型调用数 |
+
+`--lane-quality`、`--lane-maneuver` 均默认 `on`，独立于语义、模型、恢复和记忆开关。
+纯PDM也使用相同数值机制。公式为 `final_score = base_score - numerical_cost + semantic_bonus`；
+原生 `base_score` 不改，数值成本总额不超过0.16，语义关闭时 `semantic_bonus=0`。
+默认中心/边界成本权重0.04/0.12，普通新变道另有0.02启动成本，也受0.16总上限限制。
+这不是把出界恢复成硬淘汰，也不保证所有实际轨迹都不压线；仍需审查实际车身与标线的关系。
+合法变道的中心成本跟随连续机动参考，边界成本则检查源/目标真实车道并集的外边界；
+不会用随参考移动的窄管道把合法跨虚线变道当成出界。
+另一个已确认问题是地图车道表面的数值微缝：Town10HD两条合法相邻车道的真实共享线处，
+直接并集后测到的边界距离仅0.52–2.96微米，软成本误把内部虚线当作外沿。
+现在仅在软边界参考中作1毫米拓扑闭合，恢复到约3.5米外的真实外沿；
+不修改原生PDM道路/可驾驶区域或基础分，也不因此放宽实线变道许可。
+
+绕行必须有实际连通的同向邻道、标线与方向性许可，以及足够前后间距和合法返回空间。
+普通变道和持续绕行共享标线许可检查，不能因CARLA宽泛的变道标志而跨越实线。
+横穿行人、人行横道附近行人、红灯队列不作为普通绕行目标；无合法候选时允许跟车/等待。
+新路径仍经过同一PDM生成、模拟和评分，提出候选不代表强制执行。
+只有新增绕行路径使用带曲率限速的纵向策略副本，普通候选保留原有速度与IDM参数；
+全池统一生成、模拟并评分。返回的首个合法空间锚点会缓存，避免起点随重规划前移。
+越障后通过间距核验的返回提议，普通零偏移目标候选和专属绕行候选共用同一核验空间路径，
+分别保留普通速度策略（默认最高8m/s）和专属限速策略（默认上限5m/s）。常速占据检查同时
+覆盖限速/实测速度与普通最高速度两种到达时序，实际获选者才提交返回状态。
+没有持续障碍时，实际获选的普通变道同样保存目标车道和空间路径；跨越中线后继续保留
+原变道语义，避免被重新生成的单车道居中偏好拉回。到达实际目标车道且中心误差小于0.35米、
+朝向误差小于0.15rad才确认完成，缓存最长20秒；TTL、时间/定位跳变或目标身份变化会清除。
+该机制由 `--lane-maneuver` 一并控制，不强制选中返回或把预测结果记作已执行。
+一次返道物理诊断对应的预测左前角曾越过对向实线约17厘米，原因是返回曲线的完整车身扫掠，
+并非GT位置错误。现增加受实际车宽/车道余量约束的目标车道内±0.25/±0.5米候选，
+每次都基于固定名义返回路径，不叠加上一轮偏移；保留原边界成本及权重，重新进行全池原生评分。
+实际获选的偏移路径才更新机动，普通/专属候选分别记录真实选择来源、长度与几何哈希。
+规划尾段沿真实地图后继扩展，评估路线和终点保持不变。always与其它模式共享当前信号/队列
+上下文来判断绕行资格；这不改变always原来的周期模型调用。
+
+在项目根目录、已有 `mulmem_carla` 环境中，以同一已生成场景作对照：
+
+```bash
+SCENE=outputs/paper_v1_spawncheck/eval/R05_multilane_eval_s101.yaml
+
+# 数值规划基线：不开模型，两个修复均启用
+python -m carla_bridge.run_carla_demo --scenario "$SCENE" \
+  --planner pdm_closed --semantic-influence off --model-inference off \
+  --planning-memory off --mode memory_off --lane-quality on --lane-maneuver on
+
+# 选择性语义：数值层保持一致；正常红灯/队列等待不周期查询模型
+python -m carla_bridge.run_carla_demo --scenario "$SCENE" \
+  --planner pdm_closed --semantic-policy selective \
+  --semantic-influence on --model-inference on \
+  --planning-memory off --mode memory_off --lane-quality on --lane-maneuver on
+```
+
+单独评估车道成本时只改 `--lane-quality off`，评估持续绕行时只改 `--lane-maneuver off`；
+两个都关用于旧数值机制对照，控制器、预瞄、种子、交通和记忆快照保持一致。
+数值配置为 `carla.planning.lane_quality` / `carla.planning.lane_maneuver`；
+机动阶段见 `planner.jsonl` 每条记录的 `lane_maneuver` / `ordinary_lane_intent`，逐候选成本位于
+`candidates[*].lane_quality`，不是将模型的理由文字作为数值评分。
+manifest、outcome、报告和汇总CSV同时记录 `lane_quality_enabled` / `lane_maneuver_enabled`；
+CSV的 `execution_planner_version` 用于区分数值配置版本，研究对照应一并保存。
+
+正常等待跳过原因为 `expected_signal_or_queue_wait`，正常移动跟车为
+`ordinary_same_lane_following`。仅等得久或建议TTL到期不再触发咨询；
+绿灯后仍异常堵塞、真实目标关系改变、对象侵入自车当前占据空间等情况会重新评估。
+`wait_review_interval_s` 为旧配置兼容保留，不再每15秒复核。
+该节的节流适用于语义on的selective/shadow；旧always和语义off但模型on仍按原认知周期调用。
+
+当前经验版本为 `carla_pdm_execution_v3:<配置哈希>`，规范化后的两个数值模块配置纳入哈希。
+旧版本经验保持原样但不跨版本检索，当前版本见 `manifest.json.outcome.execution_planner_version`；
+库检查/导入应显式指定该完整版本，见[经验库工具说明](planning/EXPERIENCE_MEMORY.md)。
+
+2026-10-19冻结代码后的真实CARLA专项结果，时长均为仿真时间：
+
+| 专项 | 结果 |
+| --- | --- |
+| 居中 | 初始偏差0.45米，80米100%/14.9秒；5秒后最大中心误差0.3563米、最小车身余量0.2571米 |
+| 车辆绕行 | 80米100%/14.8秒，完成超越并返回原车道；末态中心误差−0.1002米、车身余量+0.4706米 |
+| 同车道行人绕行 | 行人真实速度0.5m/s，80米100%/14.6秒，超越并返回原车道；末态中心误差−0.1848米、实际车身余量+0.1972米，无模型调用 |
+| 红灯单前车队列 | 20秒内20次查询检查均正常等待，模型请求0、绕行执行0，最终静止；模型/语义开关均on |
+
+四项碰撞均为0、源码未改变、清理后无遗留测试actor。永久红灯是等待专项，不以路线完成计成功。
+这些是局部工程检查，没有真实VLM，不能替代完整论文路线及动态交通验收。
+原始证据位置见[规划模块说明](planning/README.md#车道位置软成本与持续绕行)。
+纵向急制动与jerk仍是独立问题，局部到达终点和零碰撞不能证明舒适度已经解决。

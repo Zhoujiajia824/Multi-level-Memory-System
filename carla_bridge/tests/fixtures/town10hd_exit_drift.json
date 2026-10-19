@@ -1,0 +1,43 @@
+{
+  "note": "Physical Town10HD R10 tail at 38.4 s: real 1.774 m lateral drift, not a legal adjacent lane. Reuses the ordered route in town10hd_stopped_recovery.json.",
+  "map_sha256": "5d883b799f634030af92be1e9d79d107845540ba04338e8c60e095be1aef7be7",
+  "sim_time_s": 38.400000570714475,
+  "pose": {
+    "x": -43.43134307861328,
+    "y": 53.0117073059082,
+    "z": 0.0020944976713508368,
+    "yaw_rad": -1.8419644489928357
+  },
+  "route_progress": {
+    "index": 247,
+    "fraction": 0.7103660854212256,
+    "started": true
+  },
+  "vehicle": {
+    "wheelbase_m": 3.00464390702074,
+    "max_steer_rad": 1.0005290874624082,
+    "physical_inner_max_steer_rad": 1.2217303432379762,
+    "front_track_m": 1.6668277900991981,
+    "steering_mapping": "physx_perfect_ackermann",
+    "width_m": 2.163450002670288,
+    "length_m": 4.791779518127441,
+    "bounding_box_offset_xyz": [
+      0.02922031842172146,
+      -3.099441414633475e-08,
+      0.7358605265617371
+    ],
+    "rear_axle_to_center_m": 1.4156272633656002,
+    "rear_axle_to_center_source": "carla_world_wheel_positions",
+    "measured_rear_axle_to_center_m": 1.4156272633656002,
+    "rear_axle_actor_xyz_m": [
+      -1.3864069449438787,
+      1.2923177550305809e-06,
+      0.36806896211579443
+    ],
+    "planning_rear_axle_actor_xyz_m": [
+      -1.3864069449438787,
+      -3.099441414633475e-08,
+      0.36806896211579443
+    ]
+  }
+}

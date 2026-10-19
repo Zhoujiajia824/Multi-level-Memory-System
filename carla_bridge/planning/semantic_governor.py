@@ -28,16 +28,21 @@ DEFAULT_CONFIG = {
     "max_target_distance_m": 60.0,
     "conflict_ttc_s": 5.0,
     "max_context_age_s": 1.0,
-    "wait_review_interval_s": 15.0,
+    "wait_review_interval_s": 15.0,  # accepted for old configs; normal waits never query on a timer
+    "recovery_degraded_duration_s": 2.0,
+    "recovery_min_observations": 3,
+    "recovery_release_healthy_duration_s": 2.0,
+    "recovery_release_progress_m": 2.0,
 }
 _LATERAL = {"FOLLOW_ROUTE", "KEEP_LANE", "CHANGE_LANE_LEFT", "CHANGE_LANE_RIGHT"}
 _LONGITUDINAL = {"MAINTAIN", "ACCELERATE", "DECELERATE", "FOLLOW", "YIELD", "STOP"}
 _REASONS = {"none", "path_blocked", "interaction", "traffic_signal", "visibility",
-            "special_rule", "route_change"}
+            "special_rule", "route_change", "planner_degraded"}
 _ACTIVATIONS = {"immediate", "while_conflict", "approach_stop_line"}
 _RELEASES = {"condition_cleared", "target_passed", "signal_changed", "maneuver_complete"}
 _INTERVENTION_FIELDS = {"needed", "reason_code", "target_actor_ids", "target_stop_line_id",
                         "activation", "release", "valid_for_s"}
+_PLANNER_REQUESTS = {"none", "expand_candidates"}
 _CONTEXT_FIELDS = {"schema_version", "sim_time_s", "ego_speed_mps", "route_progress_m",
                    "in_junction", "lane_key", "navigation", "speed_limit_mps", "signals",
                    "actors", "blocked", "special_situations", "topology_signature",
@@ -77,9 +82,12 @@ def _configuration(config):
     for name in ("min_query_interval_s", "stall_duration_s", "stall_progress_m",
                  "moving_option_progress_m", "stop_distance_m", "stop_time_window_s",
                  "max_target_distance_m", "conflict_ttc_s", "max_context_age_s",
-                 "wait_review_interval_s"):
+                 "wait_review_interval_s", "recovery_degraded_duration_s",
+                 "recovery_release_healthy_duration_s", "recovery_release_progress_m"):
         if result[name] <= 0:
             raise ValueError("semantic governor %s must be positive" % name)
+    if type(result["recovery_min_observations"]) is not int or result["recovery_min_observations"] < 2:
+        raise ValueError("semantic governor recovery_min_observations must be an integer >= 2")
     if result["max_target_distance_m"] < result["stop_distance_m"]:
         raise ValueError("max_target_distance_m must cover stop_distance_m")
     return result
@@ -191,8 +199,12 @@ class SelectiveSemanticGovernor:
         self._last_observed_s = None
         self._progress_anchor = None
         self._wait_started_s = None
-        self._last_wait_review_s = None
         self._last_submission = {"accepted": False, "reason": "no_submission"}
+        self._recovery_anchor = None
+        self._recovery_last_sample_s = None
+        self._recovery_observations = 0
+        self._recovery_state = {"degraded": False, "sustained": False,
+                                "reason": "planner_health_unavailable"}
 
     def _observe(self, context, now_s):
         if not _number(now_s) or now_s < 0:
@@ -203,23 +215,129 @@ class SelectiveSemanticGovernor:
             self._last_query_s = None
             self._progress_anchor = None
             self._wait_started_s = None
-            self._last_wait_review_s = None
+            self._reset_recovery()
         self._last_observed_s = float(now_s)
         error = _context_error(context, now_s, self.config["max_context_age_s"])
         if error:
+            self._reset_recovery()
             return error
+        self._observe_recovery(context, now_s)
         if context["baseline_stop_expected"] and context["ego_speed_mps"] <= 0.5:
             if self._wait_started_s is None:
                 self._wait_started_s = float(now_s)
         else:
             self._wait_started_s = None
-            self._last_wait_review_s = None
         progress = context["route_progress_m"]
         if (context["baseline_stop_expected"]
                 or context["ego_speed_mps"] > 0.5 or self._progress_anchor is None
                 or abs(progress - self._progress_anchor[1]) >= self.config["stall_progress_m"]):
             self._progress_anchor = (float(now_s), progress)
         return None
+
+    def _reset_recovery(self):
+        self._recovery_anchor = None
+        self._recovery_last_sample_s = None
+        self._recovery_observations = 0
+        self._recovery_state = {"degraded": False, "sustained": False,
+                                "reason": "planner_health_unavailable"}
+
+    def _recovery_obstruction(self, context):
+        """Current evidence that forbids treating a stop as free-road failure."""
+        if context["baseline_stop_expected"]:
+            return "expected_signal_or_queue_wait"
+        if context.get("routine_following") is True:
+            return "ordinary_same_lane_following"
+        stop_range = max(12.0, context["ego_speed_mps"] * self.config["stop_time_window_s"])
+        if any(s["applicable"] and s["state"].upper() in ("RED", "YELLOW")
+               and 0 <= s["stop_line_distance_m"] <= stop_range for s in context["signals"]):
+            return "current_stop_signal"
+        if context["blocked"] or any(self._path_blocking(a) for a in context["actors"]):
+            return "current_path_blockage"
+        if any(a["conflict"] and a["ttc_s"] is not None
+               and a["ttc_s"] <= self.config["conflict_ttc_s"] for a in context["actors"]):
+            return "current_interaction_conflict"
+        return None
+
+    def _observe_recovery(self, context, now_s):
+        """Observe native health without consuming query cooldown or new samples twice."""
+        health = context.get("planner_health")
+        counts = ("candidate_count", "finite_candidate_count", "moving_candidate_count",
+                  "positive_progressing_count", "drivable_area_failure_count",
+                  "no_collision_failure_count")
+        valid = (isinstance(health, dict) and health.get("source") == "native_pdm_baseline"
+                 and all(type(health.get(k)) is int and health[k] >= 0 for k in counts)
+                 and type(health.get("baseline_stop")) is bool
+                 and type(health.get("no_positive_progressing_candidate")) is bool
+                 and health["positive_progressing_count"] <= health["moving_candidate_count"]
+                 <= health["finite_candidate_count"] <= health["candidate_count"]
+                 and health["no_positive_progressing_candidate"] ==
+                     (health["positive_progressing_count"] == 0))
+        if not valid:
+            self._reset_recovery()
+            return
+        obstruction = self._recovery_obstruction(context)
+        degraded = (health["positive_progressing_count"] == 0
+                    and (health["baseline_stop"] or health["finite_candidate_count"] == 0
+                         or context["ego_speed_mps"] <= 0.5))
+        if obstruction or not degraded:
+            self._reset_recovery()
+            self._recovery_state.update(reason=obstruction or "native_progressing_candidates_available",
+                                        native_health=deepcopy(health))
+            return
+        signature = (context["topology_signature"], context["navigation"], context["lane_key"])
+        sample_s = context["sim_time_s"]
+        # Repeated select/query/recovery checks of one physics snapshot never
+        # count as several independent observations. Gaps also cannot create a
+        # fabricated continuous failure interval from only two distant samples.
+        if (self._recovery_anchor is None or self._recovery_anchor[1] != signature
+                or self._recovery_last_sample_s is None
+                or sample_s - self._recovery_last_sample_s > self.config["max_context_age_s"]):
+            self._recovery_anchor = (float(sample_s), signature)
+            self._recovery_observations = 0
+            self._recovery_last_sample_s = None
+        if self._recovery_last_sample_s is None or sample_s > self._recovery_last_sample_s + 1e-9:
+            self._recovery_observations += 1
+            self._recovery_last_sample_s = float(sample_s)
+        elapsed = max(0.0, float(sample_s)-self._recovery_anchor[0])
+        sustained = (elapsed + 1e-9 >= self.config["recovery_degraded_duration_s"]
+                     and self._recovery_observations >= self.config["recovery_min_observations"])
+        self._recovery_state = {"degraded": True, "sustained": bool(sustained),
+                                "reason": "sustained_native_planner_degradation" if sustained
+                                          else "observing_native_planner_degradation",
+                                "duration_s": elapsed,
+                                "observation_count": self._recovery_observations,
+                                "native_health": deepcopy(health)}
+
+    def observe_planner_health(self, context, now_s):
+        """Record an ORIGINAL pool observation; do not replace it after expansion."""
+        error = self._observe(context, now_s)
+        result = deepcopy(self._recovery_state)
+        if error:
+            result.update(reason=error, context_error=error)
+        return result
+
+    def recovery_request(self, context, now_s):
+        """Authorize candidate generation only, never override native PDM scores."""
+        error = self._observe(context, now_s)
+        result = {"authorized": False, "request": "expand_candidates",
+                  "reason": error or "no_recovery_request",
+                  "planner_health": deepcopy(self._recovery_state),
+                  "native_score_override": False}
+        if error:
+            self._pending = None
+            return result
+        if self._pending is None:
+            return result
+        intervention = self._pending["semantic"]["intervention"]
+        if intervention.get("planner_request", "none") != "expand_candidates":
+            return result
+        rejection, evidence = self._authorization(context, now_s)
+        result.update(reason=rejection or "grounded_candidate_expansion",
+                      authorized=rejection is None, evidence=evidence,
+                      expires_at_s=self._pending["expires_at_s"])
+        if rejection:
+            self._pending = None
+        return result
 
     @staticmethod
     def _path_blocking(actor):
@@ -231,6 +349,8 @@ class SelectiveSemanticGovernor:
         native PDM proposals remain available.
         """
         return (actor.get("path_blocked") is True and actor.get("stationary") is True
+                and actor.get("routine_wait") is not True
+                and actor.get("blocking_kind") != "moving_lead"
                 and _number(actor.get("route_distance_m"))
                 and 1 < actor["route_distance_m"] < 30)
 
@@ -254,7 +374,8 @@ class SelectiveSemanticGovernor:
         # Existing, unmentioned actors can become urgent without acquiring a
         # new ID. Include activation bands for ALL conflicts, not just targets.
         active_conflicts = tuple(sorted((a["id"], a["distance_m"] <= stop_range,
-            a["ttc_s"] <= self.config["stop_time_window_s"])
+            a["ttc_s"] <= self.config["stop_time_window_s"],
+            a.get("occupied_ego_conflict") is True)
             for a in context["actors"] if conflict(a)))
         blockers = tuple(sorted(a["id"] for a in context["actors"] if self._path_blocking(a)))
         signals = tuple(sorted((s["id"], s["state"].upper(),
@@ -266,7 +387,8 @@ class SelectiveSemanticGovernor:
         summary = context.get("candidates_summary")
         quality = None
         if isinstance(summary, dict):
-            score, progress = summary.get("baseline_score"), summary.get("baseline_progress_m")
+            score = summary.get("baseline_planning_score", summary.get("baseline_score"))
+            progress = summary.get("baseline_progress_m")
             quality = (_number(score) and score < self.config["low_quality_threshold"],
                        _number(progress) and progress >= self.config["moving_option_progress_m"])
         return (context["topology_signature"], context["navigation"], context["lane_key"],
@@ -312,14 +434,14 @@ class SelectiveSemanticGovernor:
         moving = [item for item in valid
                   if _number(item.get("forward_progress_m"))
                   and item["forward_progress_m"] >= self.config["moving_option_progress_m"]
+                  and item["base_score"] > 0
                   and item.get("longitudinal") != "STOP"]
-        # blocked may denote an unexpected stationary obstacle, not a queue.
-        # Only the separately explained signal/lead-queue flag excuses waiting.
+        # Red lights and causally grounded signal queues are numerical driving
+        # tasks. Their duration, model lease expiry, fog tag or a memory prior
+        # never creates a reason to consult the VLM again by itself.
         legitimate_wait = context["baseline_stop_expected"]
-        wait_reference = (self._last_wait_review_s if self._last_wait_review_s is not None
-                          else self._wait_started_s)
-        wait_review_due = (wait_reference is not None and
-                           now_s - wait_reference >= self.config["wait_review_interval_s"])
+        routine_following = context.get("routine_following") is True
+        wait_review_due = False  # retained audit/config compatibility; no timer-driven query
         # A first-time crossing interaction can deserve consultation even when
         # native scores are high. Mere visibility, adjacent opposing traffic
         # and ordinary same-lane following are insufficient. These conflicts
@@ -330,6 +452,19 @@ class SelectiveSemanticGovernor:
                     and a["ttc_s"] <= self.config["conflict_ttc_s"]]
         urgent_crossing = [a for a in crossing
                            if a["ttc_s"] <= self.config["stop_time_window_s"]]
+        # While waiting, a route forecast assumes a hypothetical 2 m/s launch.
+        # Cross traffic meeting that hypothetical launch is ordinary at red.
+        # Only a forecast invading the MEASURED occupied ego body escalates.
+        waiting_hazards = [a for a in context["actors"]
+            if a["type"].startswith(("vehicle.", "walker.")) and not a["same_lane"]
+            and ((a.get("occupied_ego_conflict") is True
+                  and (_number(a.get("occupied_ego_conflict_ttc_s"))
+                       and a["occupied_ego_conflict_ttc_s"] <= self.config["stop_time_window_s"]))
+                 or ("occupied_ego_conflict" not in a and a in urgent_crossing
+                     and a["distance_m"] <= 3.0))]
+        waiting_obstacles = [a for a in context["actors"]
+            if self._path_blocking(a) and not a["type"].startswith("vehicle.")
+            and a["distance_m"] <= self.config["stop_distance_m"]]
         lease_changed = False
         if self._pending is not None:
             drop_reason, evidence = self._authorization(context, now_s)
@@ -340,7 +475,12 @@ class SelectiveSemanticGovernor:
                 intervention = self._pending["semantic"]["intervention"]
                 lease_changed = (self._conditions(context, intervention)
                                  != self._conditions(self._pending["context"], intervention))
-                if not lease_changed and not wait_review_due:
+                recovery_escalation = (self._recovery_state["sustained"]
+                    and intervention.get("planner_request", "none") != "expand_candidates")
+                continuing_search = intervention.get("planner_request", "none") == "expand_candidates"
+                if ((not lease_changed or continuing_search) and not recovery_escalation
+                        and not waiting_hazards
+                        and (not legitimate_wait or waiting_obstacles) and not routine_following):
                     result.update(reason="active_guidance_cached", active_guidance_cached=True,
                                   expires_at_s=self._pending["expires_at_s"],
                                   legitimate_wait=bool(legitimate_wait),
@@ -351,18 +491,22 @@ class SelectiveSemanticGovernor:
                     return result
         stalled = (self._progress_anchor is not None
                    and now_s - self._progress_anchor[0] >= self.config["stall_duration_s"])
-        if context["special_situations"]:
+        if legitimate_wait and waiting_hazards:
+            reason = "occupied_ego_crossing_conflict"
+        elif legitimate_wait and waiting_obstacles:
+            reason = "path_blocked"
+        elif legitimate_wait:
+            reason = "expected_signal_or_queue_wait"
+        elif routine_following and not urgent_crossing and not context["blocked"]:
+            reason = "ordinary_same_lane_following"
+        elif self._recovery_state["sustained"]:
+            reason = "sustained_native_planner_degradation"
+        elif context["special_situations"]:
             reason = "special_situation"
         elif memory["known_failure"]:
             reason = "verified_memory_failure"
         elif memory["supported_intervention_prior"]:
             reason = "memory_supported_intervention"
-        elif wait_review_due:
-            # A review is consultation only. It neither clears the red light nor
-            # labels a legitimate traffic queue as a planner failure.
-            reason = "expected_wait_review"
-        elif legitimate_wait:
-            reason = "expected_signal_or_queue_wait"
         elif lease_changed:
             reason = "advisory_conditions_changed"
         elif urgent_crossing:
@@ -373,16 +517,21 @@ class SelectiveSemanticGovernor:
             reason = "path_blocked"
         elif baseline is None:
             reason = "no_finite_pdm_proposal"
-        elif baseline["base_score"] < self.config["low_quality_threshold"]:
+        elif baseline.get("planning_score", baseline["base_score"]) < self.config["low_quality_threshold"]:
             reason = "low_pdm_quality"
+        elif not moving and self._recovery_state["degraded"]:
+            reason = "observing_native_planner_degradation"
         elif not moving:
             reason = "no_progressing_proposal"
         elif stalled:
             reason = "unexplained_stall"
         else:
             reason = "simple_cruising"
-        eligible = reason not in ("simple_cruising", "expected_signal_or_queue_wait")
+        eligible = reason not in ("simple_cruising", "expected_signal_or_queue_wait",
+                                  "ordinary_same_lane_following", "observing_native_planner_degradation")
         result.update(eligible=eligible, reason=reason, legitimate_wait=bool(legitimate_wait),
+                      routine_following=bool(routine_following),
+                      waiting_hazard_actor_ids=sorted(a["id"] for a in waiting_hazards),
                       wait_review_due=bool(wait_review_due),
                       wait_elapsed_s=(now_s-self._wait_started_s if self._wait_started_s is not None else 0.0),
                       crossing_conflict_actor_ids=sorted(a["id"] for a in crossing),
@@ -390,13 +539,12 @@ class SelectiveSemanticGovernor:
                       baseline_selected_id=audit["baseline_selected_id"],
                       moving_proposal_count=len(moving),
                       candidate_pool_sha256=audit["candidate_pool_sha256"],
+                      planner_recovery=deepcopy(self._recovery_state),
                       unexpected_stall=bool(stalled and not legitimate_wait))
         if eligible:
             if self._last_query_s is None or now_s + 1e-9 >= result["next_query_time_s"]:
                 result["query"] = True
                 self._last_query_s = float(now_s)
-                if self._wait_started_s is not None:
-                    self._last_wait_review_s = float(now_s)
                 result["next_query_time_s"] = now_s + self.config["min_query_interval_s"]
             else:
                 result["trigger_reason"] = reason
@@ -419,6 +567,13 @@ class SelectiveSemanticGovernor:
                          "submitted_at_s": float(now_s),
                          "expires_at_s": min(float(now_s), context["sim_time_s"])
                                           + intervention["valid_for_s"]}
+        if intervention.get("planner_request", "none") == "expand_candidates":
+            # A finite maneuver lease is distinct from the current native
+            # health observation. One improving numerical snapshot must not
+            # discard the search before the measured car has actually moved.
+            self._pending["recovery"] = {"initial_degradation": deepcopy(self._recovery_state),
+                "start_route_progress_m": context["route_progress_m"],
+                "healthy_since_s": None, "last_healthy_sample_s": None}
         reason, evidence = self._authorization(context, now_s)
         if reason:
             self._pending = None
@@ -438,7 +593,8 @@ class SelectiveSemanticGovernor:
         intervention = semantic.get("intervention")
         if not isinstance(intervention, dict):
             return "legacy_schema_has_no_intervention_authority"
-        if set(intervention) != _INTERVENTION_FIELDS:
+        if (not _INTERVENTION_FIELDS.issubset(intervention)
+                or set(intervention) - _INTERVENTION_FIELDS - {"planner_request"}):
             return "invalid_intervention_fields"
         if type(intervention["needed"]) is not bool:
             return "invalid_intervention_needed"
@@ -464,6 +620,20 @@ class SelectiveSemanticGovernor:
             return "inconsistent_intervention_need"
         if not intervention["needed"] and (targets or intervention["target_stop_line_id"] is not None):
             return "unneeded_intervention_has_targets"
+        request = intervention.get("planner_request", "none")
+        if not isinstance(request, str) or request not in _PLANNER_REQUESTS:
+            return "invalid_planner_request"
+        if (request == "expand_candidates") != (intervention["reason_code"] == "planner_degraded"):
+            return "planner_request_reason_mismatch"
+        if request == "expand_candidates":
+            if (not intervention["needed"] or targets
+                    or intervention["target_stop_line_id"] is not None):
+                return "planner_recovery_cannot_target_traffic_entities"
+            if (semantic["lateral_decision"] not in ("FOLLOW_ROUTE", "KEEP_LANE")
+                    or semantic["longitudinal_decision"] not in ("MAINTAIN", "ACCELERATE", "FOLLOW")
+                    or intervention["activation"] != "immediate"
+                    or intervention["release"] != "condition_cleared"):
+                return "invalid_planner_recovery_semantics"
         return None
 
     def _authorization(self, context, now_s):
@@ -512,7 +682,44 @@ class SelectiveSemanticGovernor:
                 if previous is None or signal["state"].upper() != previous["state"].upper():
                     return "signal_changed", evidence
         special = {item.lower() for item in context["special_situations"]}
-        if reason == "interaction":
+        if reason == "planner_degraded":
+            evidence["planner_recovery"] = deepcopy(self._recovery_state)
+            recovery = pending.get("recovery") or {}
+            if not recovery.get("initial_degradation", {}).get("sustained"):
+                return "planner_degradation_not_sustained", evidence
+            obstruction = self._recovery_obstruction(context)
+            if obstruction:
+                return obstruction, evidence
+            if context["lane_key"] != original["lane_key"]:
+                return "recovery_lane_context_changed", evidence
+            health = self._recovery_state.get("native_health")
+            if not isinstance(health, dict):
+                return "planner_health_unavailable", evidence
+            native_healthy = (health["positive_progressing_count"] > 0
+                              and health["baseline_stop"] is False)
+            sample_s = context["sim_time_s"]
+            if native_healthy:
+                last = recovery["last_healthy_sample_s"]
+                if (recovery["healthy_since_s"] is None or last is None
+                        or sample_s-last > self.config["max_context_age_s"]):
+                    recovery["healthy_since_s"] = sample_s
+                recovery["last_healthy_sample_s"] = sample_s
+            else:
+                recovery["healthy_since_s"] = None
+                recovery["last_healthy_sample_s"] = None
+            healthy_duration = (max(0.0, sample_s-recovery["healthy_since_s"])
+                                if recovery["healthy_since_s"] is not None else 0.0)
+            progress = max(0.0, context["route_progress_m"]-recovery["start_route_progress_m"])
+            evidence.update(recovery_authorization=("initial_sustained_degradation"
+                if now_s == pending["submitted_at_s"] else "continuing_recovery"),
+                native_planner_currently_healthy=bool(native_healthy),
+                native_healthy_duration_s=healthy_duration, recovery_progress_m=progress,
+                recovery_release_progress_m=self.config["recovery_release_progress_m"],
+                recovery_release_healthy_duration_s=self.config["recovery_release_healthy_duration_s"])
+            if (native_healthy and healthy_duration + 1e-9 >= self.config["recovery_release_healthy_duration_s"]
+                    and progress + 1e-9 >= self.config["recovery_release_progress_m"]):
+                return "native_planner_recovery_confirmed", evidence
+        elif reason == "interaction":
             if not relevant or not any(conflicts(actor) for actor in relevant):
                 return "no_current_interaction_conflict", evidence
         elif reason == "path_blocked":
@@ -566,17 +773,19 @@ class SelectiveSemanticGovernor:
         if rejection:
             self._pending = None
         authorized = rejection is None and baseline is not None
+        generation_request = (semantic.get("intervention", {}).get("planner_request") == "expand_candidates")
         bonuses = {}
         regrets = {}
         memory_discounts = {}
         for item in baseline_audit["candidates"]:
             memory_discounts[item["id"]] = 0.0
-            regret = (max(0.0, baseline["base_score"] - item["base_score"])
+            regret = (max(0.0, baseline.get("planning_score", baseline["base_score"])
+                          - item.get("planning_score", item["base_score"]))
                       if baseline is not None and item["eligible"] else None)
             regrets[item["id"]] = regret
             stop_bonus_allowed = (item.get("longitudinal") not in ("STOP", "YIELD")
                                   or evidence.get("stop_or_yield_authorized") is True)
-            if (authorized and stop_bonus_allowed and item["eligible"]
+            if (authorized and not generation_request and stop_bonus_allowed and item["eligible"]
                     and regret <= self.config["base_regret_budget"] + 1e-12):
                 raw = (self.config["lateral_weight"]
                        * (semantic.get("lateral_decision") in item.get("lateral_semantics", []))
@@ -613,5 +822,7 @@ class SelectiveSemanticGovernor:
             "memory": _memory_summary(memory_evidence),
             "global_pdm_candidate_gate_applied": False,
             "numerical_planner_continuity_reset": False,
+            "planner_recovery": deepcopy(self._recovery_state),
+            "candidate_generation_only": bool(generation_request and authorized),
         }
         return selected, diagnostics

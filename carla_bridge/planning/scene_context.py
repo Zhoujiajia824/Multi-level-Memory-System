@@ -66,11 +66,111 @@ def constant_velocity_conflict(ego_station, speed, points, actor_xy, actor_veloc
     return False, None
 
 
+def occupied_body_conflict(ego_xy, ego_velocity, ego_yaw, ego_extent,
+                          actor_xy, actor_velocity, actor_yaw, actor_extent):
+    """Two-second constant-heading body overlap using measured ego velocity.
+
+    The route forecast above deliberately asks what could happen IF a stopped
+    car proceeded. That is useful before entering a junction, but it must not
+    turn normal cross traffic beyond a red stop line into a threat to a car
+    that is actually waiting. This separate SAT proxy tests the occupied body.
+    It is neither a safety veto nor privileged knowledge of future motion.
+    """
+    ex, ey = math.cos(ego_yaw), math.sin(ego_yaw)
+    ax, ay = math.cos(actor_yaw), math.sin(actor_yaw)
+    axes = ((ex, ey), (-ey, ex), (ax, ay), (-ay, ax))
+    for step in range(9):
+        t = step * .25
+        dx = actor_xy[0] + actor_velocity[0]*t - ego_xy[0] - ego_velocity[0]*t
+        dy = actor_xy[1] + actor_velocity[1]*t - ego_xy[1] - ego_velocity[1]*t
+        if all(abs(dx*ux+dy*uy) <= (
+                ego_extent[0]*abs(ex*ux+ey*uy) + ego_extent[1]*abs(-ey*ux+ex*uy)
+                + actor_extent[0]*abs(ax*ux+ay*uy) + actor_extent[1]*abs(-ay*ux+ax*uy)
+                + .15) for ux, uy in axes):
+            return True, t
+    return False, None
+
+
+def _route_lane_at(station, local):
+    """Actual lane identities bracketing a projection on the ordered route."""
+    arc = 0.0
+    for a, b in zip(local, local[1:]):
+        pa, pb = a.transform.location, b.transform.location
+        length = math.hypot(pb.x-pa.x, pb.y-pa.y)
+        if length > 1e-6 and arc+length >= station-1e-6:
+            return {lane_key(a), lane_key(b)}, min(float(a.lane_width), float(b.lane_width))
+        arc += length
+    return {lane_key(local[-1])}, float(local[-1].lane_width)
+
+
+def _body_pose(actor, pose):
+    """CARLA actor origins and bounding-box centers need not coincide."""
+    yaw = math.radians(pose.rotation.yaw)
+    offset = getattr(actor.bounding_box, "location", None)
+    dx, dy = (float(offset.x), float(offset.y)) if offset is not None else (0.0, 0.0)
+    box_rotation = getattr(actor.bounding_box, "rotation", None)
+    box_yaw = math.radians(box_rotation.yaw) if box_rotation is not None else 0.0
+    return ((pose.location.x + dx*math.cos(yaw)-dy*math.sin(yaw),
+             pose.location.y + dx*math.sin(yaw)+dy*math.cos(yaw)), yaw+box_yaw)
+
+
+def _traffic_wait(result, ego_half_length):
+    """Explain current traffic constraints; an isolated stopped car is not a queue."""
+    speed = result["ego_speed_mps"]
+    signals = [s for s in result["signals"] if s["state"].upper() in ("RED", "YELLOW")
+               and 0 <= s["stop_line_distance_m"] <= 100]
+    leads = sorted((a for a in result["actors"] if a["type"].startswith("vehicle.")
+                    and a["same_lane"] and 0 < a["route_distance_m"] < 65),
+                   key=lambda a: a["route_distance_m"])
+    stopping_range = max(12.0, speed*2.0 + speed*speed/5.0)
+    wait = {"active": False, "reason": "none", "signal_id": None,
+            "lead_actor_id": leads[0]["id"] if leads else None, "actor_ids": [],
+            "stop_line_distance_m": None}
+    for signal in signals:
+        stop_station = signal["stop_line_distance_m"] + ego_half_length
+        # Follow a compact chain back from the stop line. A parked car far
+        # before a red signal cannot acquire queue status merely from its ID.
+        queue = []
+        tail = stop_station
+        for actor in reversed(leads):
+            front = actor["route_distance_m"] + actor["length_m"]/2
+            if actor["speed_mps"] <= 1.0 and -1 <= tail-front <= 14:
+                queue.append(actor)
+                tail = actor["route_distance_m"] - actor["length_m"]/2
+        queue.reverse()
+        near_queue = bool(queue and queue[0]["route_distance_m"] <= max(15.0, speed*2+5))
+        if signal["stop_line_distance_m"] <= stopping_range or near_queue:
+            wait.update(active=True, reason="signal_queue" if near_queue else "traffic_signal",
+                        signal_id=signal["id"], actor_ids=[a["id"] for a in queue],
+                        stop_line_distance_m=signal["stop_line_distance_m"])
+            break
+    # Moving same-route following is ordinary even when IDM predicts little
+    # forward progress. Do not label a static single vehicle a legitimate wait.
+    following = bool(leads and .2 < leads[0]["speed_mps"]
+                     and leads[0]["route_distance_m"] < max(15.0, speed*2+5))
+    result["traffic_wait"] = wait
+    result["routine_following"] = bool(following and not wait["active"])
+    result["baseline_stop_expected"] = bool(wait["active"])
+    wait_ids = set(wait["actor_ids"])
+    for actor in result["actors"]:
+        actor["routine_wait"] = actor["id"] in wait_ids
+        actor["blocking_kind"] = ("signal_queue" if actor["routine_wait"] else
+            "moving_lead" if actor["same_lane"] and actor["speed_mps"] > .2 else
+            "stationary_obstacle" if actor["path_blocked"] else
+            "crossing_actor" if not actor["same_lane"] and actor["conflict"] else "none")
+    # Preserve each actor's raw geometric path_blocked evidence. The scene-level
+    # flag describes unexpected blockage, separate from a grounded signal queue.
+    result["blocked"] = any(a["path_blocked"] and not a["routine_wait"]
+                            and a["blocking_kind"] != "moving_lead"
+                            for a in result["actors"])
+
+
 def build_scene_context(world, ego, route, sim_time_s, *, reference=None, special_situations=()):
     tf, velocity = ego.get_transform(), ego.get_velocity()
     location = tf.location
     speed = math.hypot(velocity.x, velocity.y)
     heading = math.radians(tf.rotation.yaw)
+    ego_body_xy, ego_body_yaw = _body_pose(ego, tf)
     carla_map = world.get_map()
     current = carla_map.get_waypoint(location)
     reference = reference or getattr(route, "_route_waypoints", None) or []
@@ -87,6 +187,10 @@ def build_scene_context(world, ego, route, sim_time_s, *, reference=None, specia
     if ego_projection is None:
         raise ValueError("Ordered map route has no distinct local segments")
     ego_station = ego_projection[0]
+    ego_route_keys, ego_route_width = _route_lane_at(ego_station, local)
+    ego_route_aligned = (current is not None and lane_key(current) in ego_route_keys
+                         and ego_projection[1] <= ego_route_width/2
+                         and math.cos(heading-ego_projection[2]) > .8)
     route_keys = {lane_key(wp) for wp in local}
     road_limit = float(ego.get_speed_limit())/3.6
     result = {"schema_version": 1, "source": "CARLA_GT_route_constant_velocity_proxy",
@@ -132,40 +236,40 @@ def build_scene_context(world, ego, route, sim_time_s, *, reference=None, specia
         relative_s = dx*math.cos(heading)+dy*math.sin(heading)
         relative_l = dx*math.sin(heading)-dy*math.cos(heading)
         other_wp = carla_map.get_waypoint(p)
-        same_lane = (current is not None and other_wp is not None
-                     and lane_key(current) == lane_key(other_wp)
-                     and math.cos(math.radians(actor.get_transform().rotation.yaw)-heading) > .8)
         projection = project_polyline(p.x, p.y, points)
         along = projection[0]-ego_station
         extent = actor.bounding_box.extent
+        actor_tf = actor.get_transform()
+        actor_yaw = math.radians(actor_tf.rotation.yaw)
+        actor_body_xy, actor_body_yaw = _body_pose(actor, actor_tf)
+        projected_keys, projected_width = _route_lane_at(projection[0], local)
+        route_aligned = (other_wp is not None and lane_key(other_wp) in projected_keys
+                         and projection[1] <= projected_width/2
+                         and math.cos(actor_yaw-projection[2]) > .8)
+        same_lane = route_aligned and ego_route_aligned
         conflict, ttc = constant_velocity_conflict(ego_station, speed, points,
                         (p.x, p.y), (v.x, v.y),
                         ego_radius=float(ego.bounding_box.extent.y), actor_radius=float(extent.y))
         stationary = math.hypot(v.x, v.y) < .5
         path_block = stationary and 1 < along < 30 and projection[1] < 1.1+float(extent.y)
+        occupied_conflict, occupied_ttc = occupied_body_conflict(
+            ego_body_xy, (velocity.x, velocity.y), ego_body_yaw,
+            (float(ego.bounding_box.extent.x), float(ego.bounding_box.extent.y)),
+            actor_body_xy, (v.x, v.y), actor_body_yaw, (float(extent.x), float(extent.y)))
         result["blocked"] |= bool(path_block)
         result["actors"].append({"id": int(actor.id), "type": kind,
             "distance_m": distance, "relative_s_m": relative_s, "relative_l_m": relative_l,
             "same_lane": bool(same_lane), "ahead": bool(relative_s > 0),
             "conflict": bool(conflict), "ttc_s": ttc, "stationary": stationary,
             "path_blocked": bool(path_block), "speed_mps": math.hypot(v.x, v.y),
-            "route_distance_m": along, "lane_key": lane_key(other_wp)})
+            "route_distance_m": along, "lane_key": lane_key(other_wp),
+            "route_aligned": bool(route_aligned), "route_lateral_distance_m": projection[1],
+            "length_m": float(extent.x)*2, "width_m": float(extent.y)*2,
+            "occupied_ego_conflict": bool(occupied_conflict),
+            "occupied_ego_conflict_ttc_s": occupied_ttc})
     result["actors"].sort(key=lambda a: (not a["conflict"], not a["path_blocked"], a["distance_m"]))
     result["signals"].sort(key=lambda a: a["stop_line_distance_m"])
-    # These explain a legitimate stop, not an unconditional command to stop now.
-    signal_wait = any(s["state"] in ("Red", "Yellow") and 0 <= s["stop_line_distance_m"] < 12
-                      for s in result["signals"])
-    # One stationary object can be a parked car, a road barrier or a pedestrian;
-    # it is insufficient evidence of a legitimate vehicle queue. This remains
-    # a current-state queue proxy, never an instruction to stop or to proceed.
-    queue_vehicles = sorted((a for a in result["actors"]
-        if a["type"].startswith("vehicle.") and a["same_lane"] and a["ahead"]
-        and a["speed_mps"] < 1.0 and 0 < a["route_distance_m"] < 30),
-        key=lambda a: a["route_distance_m"])
-    queue_wait = bool(queue_vehicles and queue_vehicles[0]["distance_m"] < 12
-                     and any(3 <= a["route_distance_m"] - queue_vehicles[0]["route_distance_m"] <= 15
-                             for a in queue_vehicles[1:]))
-    result["baseline_stop_expected"] = bool(signal_wait or queue_wait)
+    _traffic_wait(result, float(ego.bounding_box.extent.x))
     # No map/actor identity in the similarity key: topology and navigation generalize.
     signature = (str(getattr(carla_map, "name", "unknown")), result["navigation"],
                  result["in_junction"], round(float(local[0].lane_width), 1),
@@ -178,8 +282,53 @@ def candidate_summary(candidates, baseline_id):
     baseline = next((c for c in candidates if c["id"] == baseline_id), None) or {}
     finite_scores = [c["base_score"] for c in candidates if math.isfinite(c["base_score"])]
     return {"baseline_candidate_id": baseline_id, "baseline_score": baseline.get("base_score"),
+            "baseline_planning_score": (baseline["base_score"]-baseline.get("numerical_cost", 0.0)
+                if isinstance(baseline.get("base_score"), (int, float))
+                and isinstance(baseline.get("numerical_cost", 0.0), (int, float)) else None),
             "baseline_progress_m": baseline.get("forward_progress_m"),
             "baseline_speed_mps": baseline.get("terminal_speed_mps"),
             "best_score": max(finite_scores) if finite_scores else None,
             "candidate_count": len(candidates),
             "available_lateral_semantics": sorted({s for c in candidates for s in c.get("lateral_semantics", [])})}
+
+
+def planner_health(candidates, baseline_id, *, moving_progress_m=2.0):
+    """Summarize the ORIGINAL native pool before model-requested expansion.
+
+    A finite trajectory whose PDM score is zero is not a usable forward option.
+    Keep this separate from ``candidate_summary`` so the original observation is
+    retained when expanded trajectories subsequently enter the scored pool.
+    The counts describe PDM predictions, not actual collisions or violations.
+    """
+    def finite(value):
+        return type(value) in (int, float) and math.isfinite(value)
+
+    finite_pool = [c for c in candidates
+                   if c.get("safety", {}).get("finite") is True
+                   and finite(c.get("base_score"))]
+    moving = [c for c in finite_pool if c.get("longitudinal") != "STOP"
+              and finite(c.get("forward_progress_m"))
+              and c["forward_progress_m"] >= moving_progress_m]
+    progressing = [c for c in moving if c["base_score"] > 0]
+    baseline = next((c for c in finite_pool if c.get("id") == baseline_id), None)
+    baseline_stop = (baseline is not None and (baseline.get("longitudinal") == "STOP"
+                     or (finite(baseline.get("forward_progress_m"))
+                         and baseline["forward_progress_m"] < moving_progress_m)))
+
+    def failed(name):
+        return sum(1 for c in finite_pool
+                   if finite(c.get("safety", {}).get(name))
+                   and c["safety"][name] < 1.0-1e-8)
+
+    return {"source": "native_pdm_baseline", "candidate_count": len(candidates),
+            "finite_candidate_count": len(finite_pool),
+            "moving_candidate_count": len(moving),
+            "positive_progressing_count": len(progressing),
+            "drivable_area_failure_count": failed("drivable_area"),
+            "no_collision_failure_count": failed("no_collision"),
+            "baseline_candidate_id": baseline_id,
+            "baseline_score": baseline.get("base_score") if baseline else None,
+            "baseline_longitudinal": baseline.get("longitudinal") if baseline else None,
+            "baseline_progress_m": baseline.get("forward_progress_m") if baseline else None,
+            "baseline_stop": bool(baseline_stop),
+            "no_positive_progressing_candidate": not progressing}

@@ -123,9 +123,10 @@ def test_near_obstacle_or_pedestrian_is_not_misclassified_as_a_vehicle_queue(kin
 
 
 @pytest.mark.parametrize("speed", [0.0, 0.6])
-def test_two_nearby_same_direction_slow_vehicles_explain_queue_wait(speed):
+def test_vehicle_count_alone_cannot_explain_a_signal_queue(speed):
     context = scene(vehicle(7, 8, vx=speed), vehicle(8, 16, vx=speed))
-    assert context["baseline_stop_expected"]
+    assert not context["baseline_stop_expected"]
+    assert context["routine_following"] is bool(speed > .2)
 
 
 @pytest.mark.parametrize("second", [vehicle(8, 29), vehicle(8, 16, yaw=180),
@@ -244,3 +245,85 @@ def test_stationary_ego_prediction_is_explicit_possible_proceeding_proxy():
     points = [(0, 0), (100, 0)]
     conflict, ttc = constant_velocity_conflict(0, 0, points, (4, -4), (0, 2))
     assert conflict and 0 < ttc <= 2
+
+
+@pytest.mark.parametrize("lead_x,stop_x", [(8, 22), (8, 40)])
+def test_single_or_compact_multi_vehicle_signal_queue_explains_far_stop(lead_x, stop_x):
+    cars = [vehicle(7, lead_x)]
+    if stop_x == 40:
+        cars += [vehicle(8, 18), vehicle(9, 28)]
+    context = scene(*cars, traffic_light(11, waypoint(stop_x)), ego=vehicle(1, 0))
+    assert context["baseline_stop_expected"]
+    assert context["traffic_wait"]["reason"] == "signal_queue"
+    assert context["traffic_wait"]["actor_ids"] == [a.id for a in cars]
+    assert not context["blocked"]
+    assert all(a["routine_wait"] and a["path_blocked"] == (a["route_distance_m"] < 30)
+               for a in context["actors"])
+
+
+def test_parked_vehicle_far_before_red_does_not_acquire_signal_queue_status():
+    context = scene(vehicle(7, 8), traffic_light(11, waypoint(80)), ego=vehicle(1, 0))
+    assert not context["baseline_stop_expected"]
+    assert context["blocked"] and not context["actors"][0]["routine_wait"]
+    assert context["actors"][0]["blocking_kind"] == "stationary_obstacle"
+
+
+def test_red_to_green_releases_signal_queue_and_stationary_vehicle_remains_an_obstacle():
+    waiting = scene(vehicle(7, 8), traffic_light(11, waypoint(22)), ego=vehicle(1, 0))
+    green_stopped = scene(vehicle(7, 8), traffic_light(11, waypoint(22), state="Green"),
+                          ego=vehicle(1, 0))
+    green_moving = scene(vehicle(7, 8, vx=2), traffic_light(11, waypoint(22), state="Green"),
+                         ego=vehicle(1, 0))
+    assert waiting["baseline_stop_expected"] and not waiting["blocked"]
+    assert not green_stopped["baseline_stop_expected"] and green_stopped["blocked"]
+    assert not green_moving["baseline_stop_expected"] and green_moving["routine_following"]
+    assert not green_moving["blocked"]
+
+
+def test_route_continuation_across_lane_identity_seam_is_a_lead_without_faking_map_identity():
+    reference = [waypoint(x, road=1 if x < 10 else 2) for x in range(0, 102, 2)]
+    context = scene(vehicle(7, 12, vx=1, road=2), ego=vehicle(1, 0), reference=reference)
+    assert context["actors"][0]["same_lane"] and context["routine_following"]
+    assert context["actors"][0]["lane_key"] == "2:0:1"
+    assert context["lane_key"] == "1:0:1"
+
+
+def test_stopped_ego_route_launch_conflict_does_not_mean_current_body_is_threatened():
+    context = scene(vehicle(7, 8, y=-8, yaw=90, vy=4, road=2),
+                    traffic_light(11, waypoint(6)), ego=vehicle(1, 0))
+    actor = context["actors"][0]
+    assert actor["conflict"]
+    assert not actor["occupied_ego_conflict"]
+    assert actor["occupied_ego_conflict_ttc_s"] is None
+
+
+def test_crossing_toward_actual_waiting_body_is_an_occupied_ego_conflict():
+    context = scene(vehicle(7, 0, y=-8, yaw=90, vy=4, road=2),
+                    traffic_light(11, waypoint(6)), ego=vehicle(1, 0))
+    actor = context["actors"][0]
+    assert actor["occupied_ego_conflict"]
+    assert 0 < actor["occupied_ego_conflict_ttc_s"] <= 2
+
+
+def test_occupied_body_forecast_uses_carla_local_box_center_and_rotation():
+    actor = vehicle(7, 8)
+    actor.bounding_box.location = location(-6)
+    assert scene(actor, ego=vehicle(1, 0))["actors"][0]["occupied_ego_conflict"]
+    actor = vehicle(7, 4)
+    actor.bounding_box.rotation = NS(yaw=90)
+    assert not scene(actor, ego=vehicle(1, 0))["actors"][0]["occupied_ego_conflict"]
+
+
+@pytest.mark.parametrize("lead_speed", [.3, .4, .6, 2.0])
+def test_actual_scene_geometry_slow_following_never_becomes_static_blockage_or_model_query(lead_speed):
+    context = scene(vehicle(7, 8, vx=lead_speed), ego=vehicle(1, 0, vx=.1), fog_density=50)
+    assert context["routine_following"] and not context["blocked"]
+    assert context["actors"][0]["blocking_kind"] == "moving_lead"
+    governor = SelectiveSemanticGovernor()
+    candidates = [{"id": "slow", "base_score": .1, "forward_progress_m": .3,
+                   "lateral_semantics": ["FOLLOW_ROUTE"], "longitudinal": "FOLLOW",
+                   "safety": {"finite": True}}]
+    for tick in range(500):
+        now = 10+tick*.1
+        context["sim_time_s"] = now
+        assert not governor.query_decision(context, candidates, now)["query"]

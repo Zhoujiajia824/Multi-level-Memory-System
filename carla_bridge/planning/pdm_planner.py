@@ -12,6 +12,7 @@ import json
 import logging
 import math
 from collections import defaultdict
+from copy import deepcopy
 from types import SimpleNamespace
 
 import numpy as np
@@ -95,6 +96,47 @@ def _lane_corridor(reference, closest, side, progress):
             break
         end = i
     return lanes[start:end + 1], cut
+
+
+def _quality_boundary_lane_keys(reference, origin, sides):
+    """Only the connected source/target lanes of this legal transition."""
+    points = np.array([_xy(wp) for wp in reference])
+    closest = int(np.argmin(np.linalg.norm(points - origin, axis=1)))
+    progress = np.r_[0., np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))]
+    keys = set()
+    for side in sides:
+        corridor, _ = _lane_corridor(reference, closest, side, progress)
+        keys.update(_lane_key(wp) for wp in corridor)
+    return sorted(keys)
+
+
+def _reference_projection_lane(reference, progress, station, projected_wp):
+    """Keep a nearest-map lookup on the already resolved route connection.
+
+    Several junction connections can occupy exactly the same surface. A
+    second nearest-road query must not replace the route's resolved identity
+    and invent an adjacent lane. At ordinary road seams either endpoint of
+    the connected reference segment remains a valid station identity.
+    """
+    index = min(len(reference) - 2, max(0, int(np.searchsorted(progress, station, side="right") - 1)))
+    allowed = {_lane_key(reference[index]), _lane_key(reference[index + 1])}
+    # Projection roundoff at a checkpoint may select the station immediately
+    # across its predecessor/successor seam. Allow only a real connected seam
+    # within five centimetres of that endpoint, never a nearby crossing road.
+    if (index > 0 and station - progress[index] <= .05
+            and _connected(reference[index - 1], reference[index])):
+        allowed.add(_lane_key(reference[index - 1]))
+    if (index + 2 < len(reference) and progress[index + 1] - station <= .05
+            and _connected(reference[index + 1], reference[index + 2])):
+        allowed.add(_lane_key(reference[index + 2]))
+    projected_key = _lane_key(projected_wp) if projected_wp is not None else None
+    accepted = projected_key in allowed
+    nearest = index if station - progress[index] <= progress[index + 1] - station else index + 1
+    result = projected_wp if accepted else reference[nearest]
+    return result, {"method": "nearest_map_on_resolved_segment" if accepted else "resolved_segment_identity",
+                    "projected_lane_key": projected_key, "reference_segment_index": index,
+                    "reference_segment_lane_keys": [_lane_key(reference[index]), _lane_key(reference[index + 1])],
+                    "projection_station_m": float(station), "nearest_map_identity_accepted": accepted}
 
 
 def _junction_lane_match(reference, closest, origin, heading, height):
@@ -209,6 +251,7 @@ def _route_compatible_lane_points(reference, closest, side, progress, cut, trans
     """
     import carla
     from scipy.interpolate import CubicHermiteSpline
+    from .lane_maneuver import lane_change_permitted
 
     if side == "center" or cut is None:
         return None, None
@@ -241,14 +284,12 @@ def _route_compatible_lane_points(reference, closest, side, progress, cut, trans
     if end - start < 2:
         return None, {"reason": "route_exit_has_insufficient_connected_samples",
                       "distance_to_exit_m": float(progress[end] - ahead)}
-    direction = carla.LaneChange.Right if side == "left" else carla.LaneChange.Left
+    direction = "right" if side == "left" else "left"
     stations = [i for i, station in enumerate(progress) if merge_start - 2 <= station <= merge_end + 2]
     for i in stations:
         source = _adjacent(reference[i], side)
         target = reference[i]
-        if (source is None or source.is_junction or target.is_junction
-                or not int(source.lane_change) & int(direction)
-                or source.lane_type != carla.LaneType.Driving or not _same_direction(source, target)):
+        if not lane_change_permitted(source, target, direction):
             return None, {"reason": "route_exit_has_no_legal_return", "reference_index": i,
                           "source_lane_key": _lane_key(source) if source else None}
     # The shared reference station parameter keeps inner/outer curve samples
@@ -336,11 +377,21 @@ class CarlaPDMPlanner:
         self.lateral_weight = float(self.config.get("lateral_semantic_weight", 0.8))
         self.longitudinal_weight = float(self.config.get("longitudinal_semantic_weight", 0.8))
         self.semantic_policy = self.config.get("semantic_policy", "always")
+        self.lateral_control = self.config.get("lateral_control", "pure_pursuit")
+        if self.lateral_control not in ("native_lqr", "pure_pursuit"):
+            raise ValueError("lateral_control must be native_lqr or pure_pursuit")
         if self.semantic_policy not in ("always", "selective", "shadow"):
             raise ValueError("semantic_policy must be always, selective or shadow")
         self.planning_memory_mode = self.config.get("planning_memory", "off")
         if self.planning_memory_mode not in ("off", "gate", "full"):
             raise ValueError("planning_memory must be off, gate or full")
+        from .recovery import validate_recovery_config
+        self.recovery_config = validate_recovery_config(self.config.get("recovery"))
+        from .lane_quality import validate_lane_quality_config
+        self.lane_quality_config = validate_lane_quality_config(self.config.get("lane_quality"))
+        from .lane_maneuver import LaneManeuver
+        self.lane_maneuver = LaneManeuver(self.config.get("lane_maneuver"))
+        self._ordinary_lane_intent = None
         self.experience_memory = None
         self.last_context = None
         self.last_candidates = []
@@ -372,6 +423,19 @@ class CarlaPDMPlanner:
                 or not 2 <= self.lqr_lateral_horizon_samples <= self.samples):
             raise ValueError("lqr_lateral_horizon_s must be an exact sample_interval_s multiple, "
                              "at least two samples and no longer than the planning horizon")
+        self.lqr_lateral_preview = self.config.get("lqr_lateral_preview", "fixed")
+        if self.lqr_lateral_preview not in ("fixed", "speed_scaled"):
+            raise ValueError("lqr_lateral_preview must be fixed or speed_scaled")
+        self.lqr_lateral_min_horizon_s = float(self.config.get("lqr_lateral_min_horizon_s", 1.0))
+        minimum_steps = self.lqr_lateral_min_horizon_s / self.dt
+        if (not math.isfinite(minimum_steps)
+                or not math.isclose(minimum_steps, round(minimum_steps), abs_tol=1e-8)
+                or minimum_steps < 2
+                or (self.lqr_lateral_preview == "speed_scaled" and minimum_steps > tracking_steps)):
+            raise ValueError("lqr_lateral_min_horizon_s must be an exact sample_interval_s multiple, "
+                             "at least two samples and no greater than the speed-scaled maximum")
+        self._lqr_lateral_min_samples = round(minimum_steps)
+        self._lqr_lateral_max_samples = self.lqr_lateral_horizon_samples
         self.sampling = self.api.TrajectorySampling(num_poses=self.samples, interval_length=self.dt)
         # Upstream's update_rate=2 leaves the freshly reset t=1 leader state at
         # zero, creating a phantom stopped leader on every short replan. Updating
@@ -396,6 +460,24 @@ class CarlaPDMPlanner:
         self.simulator._motion_model = self.api.BatchKinematicBicycleModel(
             vehicle=self.vehicle_parameters, max_steering_angle=self.max_steer)
         self.provenance = dict(self.api.provenance)
+
+    def _bind_lateral_preview(self, speed_mps):
+        """Bind one preview to the entire snapshot, including shadow replays.
+
+        Native simulator state is refreshed by each rollout. A different native
+        tracker is needed only when the quantized lateral sample count changes;
+        its independent longitudinal controller always keeps ten samples.
+        """
+        if self.lqr_lateral_preview == "fixed":
+            return
+        from .lqr_tracker import build_lqr_tracker, speed_scaled_lateral_samples
+        steps = speed_scaled_lateral_samples(speed_mps, self.vehicle_parameters.wheel_base,
+            discretization_time=self.dt, min_samples=self._lqr_lateral_min_samples,
+            max_samples=self._lqr_lateral_max_samples)
+        if steps != self.lqr_lateral_horizon_samples:
+            self.simulator._tracker = build_lqr_tracker(self.api, self.vehicle_parameters, self.dt,
+                longitudinal_tracking_horizon_samples=10, lateral_tracking_horizon_samples=steps)
+            self.lqr_lateral_horizon_samples = steps
 
     def _vehicle_parameters(self):
         box = self.ego.bounding_box
@@ -558,6 +640,7 @@ class CarlaPDMPlanner:
         import carla
         from shapely.geometry import Polygon, LineString, Point
         from shapely.ops import unary_union
+        from .lane_maneuver import lane_change_permitted
         reference = self._reference_waypoints()
         self._reference_for_height = reference
         ego_wp = self.map.get_waypoint(self.ego.get_location(), project_to_road=True,
@@ -567,14 +650,14 @@ class CarlaPDMPlanner:
         rear = ego_state.rear_axle.point.array
         origin = np.array([self.ego.get_location().x, -self.ego.get_location().y])
         reference_line = LineString([_xy(wp) for wp in reference])
-        projected = reference_line.interpolate(reference_line.project(Point(*origin)))
-        base_wp = self.map.get_waypoint(carla.Location(x=projected.x, y=-projected.y,
+        projection_station = reference_line.project(Point(*origin))
+        projected = reference_line.interpolate(projection_station)
+        projected_wp = self.map.get_waypoint(carla.Location(x=projected.x, y=-projected.y,
                                                        z=self.ego.get_location().z), project_to_road=True,
                                        lane_type=carla.LaneType.Driving)
-        if base_wp is None:
-            raise ValueError("Reference projection is outside driving lanes")
         closest = min(range(len(reference)), key=lambda i: float(np.linalg.norm(_xy(reference[i]) - origin)))
         progress = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff([_xy(wp) for wp in reference], axis=0), axis=1))]
+        base_wp, projection_identity = _reference_projection_lane(reference, progress, projection_station, projected_wp)
         current_side = None
         for side, candidate in (("center", base_wp), ("left", base_wp.get_left_lane()),
                                  ("right", base_wp.get_right_lane())):
@@ -587,6 +670,7 @@ class CarlaPDMPlanner:
                 self.ego.get_location().z)
         self._geometry_diagnostics.update(
             ego_lane_key=_lane_key(ego_wp), reference_lane_key=_lane_key(base_wp),
+            reference_projection=projection_identity,
             current_side=current_side, lane_match=match, closest_reference_index=closest,
             reference_lane_keys=list(dict.fromkeys(_lane_key(wp) for wp in reference)))
         if current_side is None:
@@ -644,6 +728,11 @@ class CarlaPDMPlanner:
         self._geometry_diagnostics["junction_drivable_area"] = junction_info
         for key, polygon in junction_polygons.items():
             polygons[key] = polygons[key].union(polygon) if key in polygons else polygon
+        # Unpadded actual ribbons are used only as a soft lateral-boundary
+        # reference. Native road polygons/scoring above remain unchanged.
+        self._lane_quality_boundary_polygons = {key: unary_union(value) for key, value in strips.items()}
+        self._lane_quality_boundary_polygons.update(dense_polygons)
+        self._lane_quality_boundary_polygons.update(junction_polygons)
         occupancy = self.api.PDMOccupancyMap(list(polygons), np.array(list(polygons.values()), dtype=object))
 
         paths, metadata, excluded = [], [], {}
@@ -672,15 +761,15 @@ class CarlaPDMPlanner:
                 if reason is None and side != current_side and distance_ahead <= self.transition_m + 4:
                     source = _adjacent(base, current_side)
                     direction = side if current_side == "center" else ("right" if current_side == "left" else "left")
-                    permission = carla.LaneChange.Left if direction == "left" else carla.LaneChange.Right
-                    if (source is None or wp is None or base.is_junction or source.is_junction or wp.is_junction
-                            or not (int(source.lane_change) & int(permission))):
+                    if base.is_junction or not lane_change_permitted(source, wp, direction):
                         reason = "lane_change_not_permitted_or_intersection"
                         details["permission_failure_distance_m"] = distance_ahead
                         details["permission_failure"] = {
                             "source_lane_key": _lane_key(source) if source else None,
                             "target_lane_key": _lane_key(wp) if wp else None,
                             "source_lane_change": int(source.lane_change) if source else None,
+                            "source_lane_marking_type": str(getattr(getattr(source, direction + "_lane_marking", None),
+                                                                   "type", "unknown")).split(".")[-1],
                             "reference_is_junction": bool(base.is_junction)}
             # Do not start a lane change that cannot finish inside this finite
             # corridor. Staying on a short lane is still a valid braking path.
@@ -735,7 +824,28 @@ class CarlaPDMPlanner:
             paths.append(path)
             details["path_length_m"] = float(path.length)
             base_metadata = {"id": side, "label": label, "semantics": sorted(set(semantics)),
-                             "physical_lane_side": side, "route_target": side == "center", "lane_offset_m": 0.0}
+                             "physical_lane_side": side, "route_target": side == "center", "lane_offset_m": 0.0,
+                             "transition_length_m": float(transition)}
+            # The native drivable-area score is a union of road surfaces; it
+            # does not distinguish a lane center from riding its boundary.
+            # All within-lane offset/recovery proposals retain the independent
+            # map center as their quality reference. A legal lane change uses
+            # its continuous numerical transition, so crossing a permitted
+            # dashed boundary receives no artificial lane-centering charge.
+            quality_points = target_points
+            if side != current_side:
+                states = path.discrete_path
+                quality_points = np.array([[point.x + self.vehicle_parameters.rear_axle_to_center * math.cos(point.heading),
+                                            point.y + self.vehicle_parameters.rear_axle_to_center * math.sin(point.heading)]
+                                           for point in states])
+            quality_width = min(float(wp.lane_width) for wp in corridor)
+            base_metadata.update(lane_quality_reference_points=np.asarray(quality_points).tolist(),
+                                 lane_quality_widths=quality_width,
+                                 lane_quality_transition=side != current_side)
+            if side != current_side or route_points is not None:
+                base_metadata["lane_quality_boundary_keys"] = _quality_boundary_lane_keys(
+                    reference, origin, (current_side, side, "center") if route_points is not None
+                    else (current_side, side))
             metadata.append(base_metadata)
             # Upstream PDM includes parallel lateral proposals, whereas the old
             # CARLA adapter had one centreline per lane. A single LQR rollout
@@ -907,12 +1017,200 @@ class CarlaPDMPlanner:
         policies.update(None)  # Desired velocities are already capped to the road speed limit.
         return policies, labels, targets
 
+    def _evaluate_candidates(self, paths, lateral, policies, longitudinal, targets, state, observation,
+                             centerline, lanes, area, tf, initial_collisions):
+        from shapely.geometry import Point
+        from .lane_maneuver import maneuver_proposal_manager
+        manager, longitudinal, targets, source_indices = maneuver_proposal_manager(
+            self.api, paths, lateral, policies, longitudinal, targets)
+        policies = manager.longitudinal_policies
+        proposals = self.generator.generate_proposals(state, observation, manager)
+        simulated = self.simulator.simulate_proposals(proposals, state)
+        scores = self.scorer.score_proposals(simulated, state, observation, centerline, lanes, area,
+                                             _IntersectionMap(self.map, tf.location.z, self.api))
+        # Retain the geometry associated with this exact evaluated pool. A
+        # restored shadow pool replaces these references together with native
+        # generator/scorer state, so only the actual executed winner is adopted.
+        self._evaluated_lateral_paths = paths
+        self._evaluated_lateral_metadata = lateral
+        from .lane_quality import LaneQualityReference, footprint_lane_quality, lane_surface_union
+        quality_references, boundary_references = {}, {}
+        candidates = []
+        for index in range(len(manager)):
+            proposal = manager[index]
+            source_policy_index = source_indices[proposal.longitudinal_idx]
+            lat = lateral[proposal.lateral_idx]
+            idm_states = self.generator._state_idm_array[index]
+            profile = idm_states[:, 1]
+            finite = bool(np.isfinite(proposals[index]).all() and np.isfinite(simulated[index]).all()
+                          and np.isfinite(idm_states).all() and np.isfinite(scores[index]))
+            multi, weighted = self.scorer._multi_metrics, self.scorer._weighted_metrics
+            safety = {"no_collision": float(multi[self.api.MultiMetricIndex.NO_COLLISION, index]),
+                      "drivable_area": float(multi[self.api.MultiMetricIndex.DRIVABLE_AREA, index]),
+                      "driving_direction": float(multi[self.api.MultiMetricIndex.DRIVING_DIRECTION, index]),
+                      "ttc": float(weighted[self.api.WeightedMetricIndex.TTC, index]), "finite": finite}
+            if initial_collisions:
+                safety["no_collision"] = 0.0
+            offroad_steps = np.flatnonzero(self.scorer._ego_areas[index, :, self.api.EgoAreaIndex.NON_DRIVABLE_AREA])
+            first_offroad = int(offroad_steps[0]) if len(offroad_steps) else None
+            area_failure = None
+            if first_offroad is not None and finite:
+                area_failure = {"time_s": first_offroad * self.dt,
+                                "footprint_corners_xy": self.scorer._ego_coords[index, first_offroad, :4].tolist()}
+            collision_time = float(self.scorer.time_to_at_fault_collision(index))
+            ttc_time = float(self.scorer.time_to_ttc_infraction(index))
+            quality_cost, quality = 0., {"enabled": False, "reason": "no_reference"}
+            if finite and lat.get("lane_quality_reference_points") is not None:
+                if proposal.lateral_idx not in quality_references:
+                    quality_references[proposal.lateral_idx] = LaneQualityReference(
+                        lat["lane_quality_reference_points"], lat["lane_quality_widths"],
+                        kind=("committed_maneuver" if lat.get("lane_quality_shared_maneuver") else
+                              "legal_maneuver" if lat.get("lane_quality_transition") else "resolved_lane_center"))
+                boundary_keys = tuple(lat.get("lane_quality_boundary_keys", ()))
+                if boundary_keys and boundary_keys not in boundary_references:
+                    available = getattr(self, "_lane_quality_boundary_polygons", {})
+                    pieces = [available[key] for key in boundary_keys if key in available]
+                    boundary_references[boundary_keys] = lane_surface_union(pieces)
+                quality_cost, quality = footprint_lane_quality(
+                    self.scorer._ego_coords[index, :, :4], quality_references[proposal.lateral_idx],
+                    self.vehicle_parameters.width, self.dt, config=self.lane_quality_config,
+                    lane_change_start=(lat["label"].startswith("CHANGE_LANE_")
+                                       and not lat.get("maneuver", False)
+                                       and not lat.get("lane_quality_continuing_maneuver", False)),
+                    boundary_polygon=boundary_references.get(boundary_keys))
+                quality["boundary_topology_seam_tolerance_m"] = .001 if boundary_keys else None
+            candidates.append({"id": "%s:%s" % (lat["id"], longitudinal[proposal.longitudinal_idx]),
+                               "index": index, "lateral": lat["label"], "lateral_semantics": lat["semantics"],
+                               "lateral_path_index": int(proposal.lateral_idx),
+                               "route_target": lat["route_target"],
+                               "recovery": bool(lat.get("recovery", False)),
+                               "recovery_recipe": lat.get("recovery_recipe"),
+                               "recovery_transition_m": lat.get("transition_length_m"),
+                               "maneuver": bool(lat.get("maneuver", False)),
+                               "maneuver_id": lat.get("maneuver_id"),
+                               "maneuver_phase": lat.get("maneuver_phase"),
+                               "maneuver_blocker_id": lat.get("maneuver_blocker_id"),
+                               "maneuver_speed_cap_mps": lat.get("maneuver_speed_cap_mps"),
+                               "maneuver_continuation": bool(lat.get("maneuver_continuation", False)),
+                               "maneuver_geometry_source": lat.get("maneuver_geometry_source"),
+                               "maneuver_executed_geometry_sha256": lat.get("maneuver_executed_geometry_sha256"),
+                               "maneuver_continuation_adjustment": bool(lat.get("maneuver_continuation_adjustment", False)),
+                               "physical_lane_side": lat["physical_lane_side"],
+                               "lane_offset_m": lat["lane_offset_m"],
+                               "forward_progress_m": float(centerline.project(Point(*proposals[index, -1, :2]))
+                                                           - centerline.project(Point(*proposals[index, 0, :2]))) if finite else 0.0,
+                               "terminal_speed_mps": float(self.generator._state_idm_array[index, -1, 1]) if finite else 0.0,
+                               "longitudinal": self._memory_policy_metadata.get(source_policy_index, {}).get("action",
+                                   {"STOP_HARD": "STOP", "YIELD_GENTLE": "YIELD"}.get(
+                                   longitudinal[proposal.longitudinal_idx], longitudinal[proposal.longitudinal_idx])),
+                               "longitudinal_policy_id": longitudinal[proposal.longitudinal_idx],
+                               "longitudinal_policy_index": int(proposal.longitudinal_idx),
+                               "source_longitudinal_policy_index": int(source_policy_index),
+                               "idm_accel_max_mps2": float(policies._accel_max[proposal.longitudinal_idx]),
+                               "idm_decel_max_mps2": float(policies._decel_max[proposal.longitudinal_idx]),
+                               "idm_headway_s": float(policies._headway_time[proposal.longitudinal_idx]),
+                               "idm_min_gap_m": float(policies._min_gap_to_lead_agent[proposal.longitudinal_idx]),
+                               "memory_prior": self._memory_policy_metadata.get(source_policy_index),
+                               "predicted_collision_time_s": collision_time if math.isfinite(collision_time) else None,
+                               "predicted_ttc_infraction_time_s": ttc_time if math.isfinite(ttc_time) else None,
+                               "drivable_area_failure": area_failure,
+                               "speed_at_0_2s_mps": float(profile[2]) if finite else None,
+                               "acceleration_range_mps2": [float(np.min(np.diff(profile) / self.dt)),
+                                                            float(np.max(np.diff(profile) / self.dt))] if finite else None,
+                               "desired_speed_mps": targets[proposal.longitudinal_idx],
+                               "base_score": float(scores[index]) if finite else 0.0,
+                               "numerical_cost": quality_cost, "lane_quality": quality, "safety": safety,
+                               "trajectory_sha256": hashlib.sha256(proposals[index].tobytes()).hexdigest()})
+        return candidates
+
+    def _continue_ordinary_lane_intent(self, paths, lateral, state, now, numerical_maneuver):
+        """Continue an actual ordinary lane change across a lane-ID boundary."""
+        intent = self._ordinary_lane_intent
+        audit = {"active": False, "reason": "no_executed_ordinary_lane_change"}
+        if intent is None:
+            return audit
+        origin = np.array([self.ego.get_location().x, -self.ego.get_location().y])
+        if (now == intent["started_at"] == intent["last_time"]
+                and np.linalg.norm(origin - intent["last_origin"]) < .01):
+            return dict(audit, reason="awaiting_next_physical_snapshot")
+        if numerical_maneuver["diagnostics"].get("committed"):
+            reason = "handed_to_numerical_overtaking"
+        elif not self.lane_maneuver.config["enabled"]:
+            reason = "disabled"
+        elif now < intent["last_time"] or now - intent["last_time"] > 1.:
+            reason = "time_discontinuity"
+        elif now - intent["started_at"] > min(20., self.lane_maneuver.config["maximum_maneuver_s"]):
+            reason = "expired"
+        elif np.linalg.norm(origin - intent["last_origin"]) > max(8., 2 * state.dynamic_car_state.speed + 5.):
+            reason = "pose_discontinuity"
+        else:
+            reason = None
+        target = next((i for i, entry in enumerate(lateral) if entry["id"] == intent["target_side"]
+                       and not entry.get("maneuver")), None)
+        if reason is None and target is None:
+            reason = "target_corridor_no_longer_available"
+        if reason is None:
+            reference = self._reference_for_height
+            closest = self._geometry_diagnostics["closest_reference_index"]
+            target_wp = _adjacent(reference[closest], intent["target_side"])
+            expected = intent["target_lane_keys"]
+            if target_wp is None or _lane_key(target_wp) not in expected:
+                reason = "route_or_target_identity_changed"
+            else:
+                tangent = np.array([math.cos(_heading(target_wp)), math.sin(_heading(target_wp))])
+                error = abs(np.cross(tangent, origin - _xy(target_wp)))
+                heading_error = abs(math.atan2(math.sin(state.rear_axle.heading - _heading(target_wp)),
+                                               math.cos(state.rear_axle.heading - _heading(target_wp))))
+                if (self._geometry_diagnostics["current_side"] == intent["target_side"]
+                        and error < .35 and heading_error < .15):
+                    reason = "completed_centered_in_actual_target_lane"
+        if reason is not None:
+            self._ordinary_lane_intent = None
+            return dict(audit, reason=reason)
+        intent.update(last_time=now, last_origin=origin)
+        paths[target] = intent["path"]
+        entry = lateral[target]
+        entry.update(maneuver_continuation=True, maneuver_geometry_source="actual_ordinary_lane_change_anchor",
+                     maneuver_executed_geometry_sha256=intent["geometry_sha256"])
+        entry["semantics"] = sorted(set(entry["semantics"]) | {intent["label"]})
+        for item in lateral:
+            item.update(lane_quality_reference_points=intent["reference_points"],
+                lane_quality_widths=intent["width"], lane_quality_boundary_keys=intent["boundary_keys"],
+                lane_quality_shared_maneuver=True,
+                lane_quality_continuing_maneuver=item["physical_lane_side"] == intent["target_side"])
+        return dict(active=True, reason="actual_ordinary_lane_change_continuation",
+            target_side=intent["target_side"], actual_selected_id=intent["selected_id"],
+            executed_geometry_sha256=intent["geometry_sha256"], started_at_s=intent["started_at"])
+
+    def _commit_ordinary_lane_intent(self, selected, path, metadata, state, now):
+        if (self._ordinary_lane_intent is not None
+                and selected["physical_lane_side"] != self._ordinary_lane_intent["target_side"]
+                and selected["terminal_speed_mps"] > .3):
+            self._ordinary_lane_intent = None
+        if (not self.lane_maneuver.config["enabled"] or self.lane_maneuver._active is not None
+                or self._ordinary_lane_intent is not None or metadata.get("maneuver")
+                or metadata.get("recovery") or not metadata["label"].startswith("CHANGE_LANE_")
+                or selected["forward_progress_m"] < .5):
+            return False
+        reference = self._reference_for_height
+        target_points = [_adjacent(wp, metadata["physical_lane_side"]) for wp in reference]
+        keys = {_lane_key(wp) for wp in target_points if wp is not None}
+        points = np.array([[p.x, p.y] for p in path.discrete_path])
+        self._ordinary_lane_intent = dict(path=path, target_side=metadata["physical_lane_side"],
+            target_lane_keys=keys, label=metadata["label"], selected_id=selected["id"],
+            geometry_sha256=hashlib.sha256(points.tobytes()).hexdigest(),
+            reference_points=metadata["lane_quality_reference_points"], width=metadata["lane_quality_widths"],
+            boundary_keys=metadata.get("lane_quality_boundary_keys", []), started_at=now, last_time=now,
+            last_origin=np.array([self.ego.get_location().x, -self.ego.get_location().y]))
+        return True
+
     def plan(self, semantic_decision, semantic_enabled=True, *, semantic_update=False,
              sim_time_s=None, special_situations=()):
         from shapely.geometry import Point
         timestamp = int(round(self.world.get_snapshot().timestamp.elapsed_seconds * 1e6))
         now = timestamp/1e6 if sim_time_s is None else float(sim_time_s)
         state, tf = self._ego_state(timestamp)
+        self._bind_lateral_preview(state.dynamic_car_state.speed)
         self._geometry_diagnostics = {"ego_location": {"x": tf.location.x, "y": tf.location.y,
                                                        "z": tf.location.z}}
         try:
@@ -935,71 +1233,113 @@ class CarlaPDMPlanner:
             raise ValueError("CARLA returned a non-finite speed limit or a limit below the supported 0.1 m/s minimum")
         limit = min(self.max_speed, road_limit)
         context, memory_evidence = None, None
-        # Pure legacy/ablation runs do not incur context construction or memory I/O.
-        if getattr(self, "semantic_policy", "always") != "always" or getattr(self, "experience_memory", None) is not None:
+        # Numerical maneuvers need the same current signal/queue evidence in
+        # every policy, including model-off. No memory I/O occurs without an
+        # explicitly configured experience memory.
+        if (getattr(self, "semantic_policy", "always") != "always"
+                or getattr(self, "experience_memory", None) is not None
+                or self.lane_maneuver.config["enabled"]):
             from .scene_context import build_scene_context
             context = build_scene_context(self.world, self.ego, self.route, now,
                         reference=self._resolved_route_waypoints, special_situations=special_situations)
             if self.experience_memory is not None:
                 memory_evidence = self.experience_memory.retrieve(context)
+        # Numerical overtaking is part of the common PDM baseline, including
+        # model-off and shadow runs. Its fixed map anchor is committed only
+        # after the actual executed winner has been chosen below.
+        maneuver = self.lane_maneuver.update(self.world, self.ego,
+            self._resolved_route_waypoints, now, context=context,
+            current_side=self._geometry_diagnostics["current_side"],
+            route_index=self.route._nearest_index(self.ego.get_location()), candidate_speed_mps=limit)
+        ordinary_intent = self._continue_ordinary_lane_intent(paths, lateral, state, now, maneuver)
+        if maneuver["active"]:
+            points = maneuver["points"]
+            fixed_path = self.api.PDMPath(_path_states(points, self.api))
+            meta = deepcopy(maneuver["metadata"])
+            nominal_points = maneuver.get("nominal_points", points)
+            nominal_path = self.api.PDMPath(_path_states(nominal_points, self.api))
+            states = nominal_path.discrete_path
+            # Offset alternatives share the original map-anchored target;
+            # selecting an offset never moves the definition of lane center.
+            meta["lane_quality_widths"] = float(np.min(meta["lane_quality_widths"]))
+            # PDM paths are rear-axle poses; compare the simulated body to the
+            # body-center continuation of this same fixed numerical reference.
+            meta["lane_quality_reference_points"] = [
+                [point.x + self.vehicle_parameters.rear_axle_to_center * math.cos(point.heading),
+                 point.y + self.vehicle_parameters.rear_axle_to_center * math.sin(point.heading)]
+                for point in states]
+            meta["maneuver_speed_cap_mps"] = maneuver["speed_cap_mps"]
+            meta["lane_quality_boundary_keys"] = _quality_boundary_lane_keys(
+                self._reference_for_height, state.rear_axle.point.array,
+                ("center", maneuver["diagnostics"]["side"]))
+            paths.append(fixed_path)
+            lateral.append(meta)
+            if maneuver["diagnostics"].get("committed") and not maneuver["diagnostics"].get("conflict"):
+                pending_return = (maneuver["phase"] == "returning"
+                                  and maneuver["diagnostics"].get("executed_phase") == "passing")
+                if (pending_return or
+                        maneuver["phase"] == maneuver["diagnostics"].get("executed_phase")):
+                    # Continue the spatial path that actually won, with its
+                    # ordinary IDM policies. Recreating a fresh transition at
+                    # every 0.2-s replan moves the merge endpoint forward even
+                    # though the previous numerical maneuver is still active.
+                    # Only the canonical same-target path is replaced; offset
+                    # alternatives keep their own geometry and native scoring.
+                    for path_index, entry in enumerate(lateral[:-1]):
+                        if (entry["id"] == meta["physical_lane_side"]
+                                and entry["physical_lane_side"] == meta["physical_lane_side"]
+                                and float(entry["lane_offset_m"]) == 0.):
+                            paths[path_index] = fixed_path
+                            entry.update(maneuver_continuation=True,
+                                transition_length_m=float(maneuver["diagnostics"]["transition_length_m"]),
+                                maneuver_geometry_source=("pending_verified_return_geometry" if pending_return
+                                                          else "actual_selected_map_anchor"),
+                                maneuver_executed_geometry_sha256=(None if pending_return else
+                                    maneuver["diagnostics"].get("executed_geometry_sha256")))
+                # Compare every option against the same already executed
+                # maneuver intent. Otherwise staying in the old lane awards
+                # itself perfect centering while a legal return pays for its
+                # changing reference. This is a bounded soft objective only.
+                for entry in lateral:
+                    entry.update(lane_quality_reference_points=meta["lane_quality_reference_points"],
+                        lane_quality_widths=meta["lane_quality_widths"],
+                        lane_quality_boundary_keys=meta["lane_quality_boundary_keys"],
+                        lane_quality_shared_maneuver=True,
+                        lane_quality_continuing_maneuver=(
+                            entry["physical_lane_side"] == meta["physical_lane_side"]
+                            and entry["label"] == meta["label"]))
+                if maneuver["phase"] == "returning":
+                    # A real curved-road body sweep may need a few decimetres
+                    # of compensation inside the target lane. Generate native
+                    # alternatives from the same fixed nominal path, rather
+                    # than reducing boundary cost or restarting the merge.
+                    target = next((entry for entry in lateral if not entry.get("maneuver")
+                        and entry["id"] == meta["physical_lane_side"]), None)
+                    if target is not None:
+                        room = max(0., min(.5, (meta["lane_quality_widths"] - self.vehicle_parameters.width) / 2 - .1))
+                        room = math.floor(room * 100 + 1e-9) / 100
+                        known = {entry["id"]: i for i, entry in enumerate(lateral)}
+                        for offset in sorted({sign * min(amount, room) for sign in (-1, 1)
+                                              for amount in (.25, .5)} if room >= .05 else ()):
+                            identity = meta["physical_lane_side"] + "@%+.2f" % offset
+                            shifted = _lane_offset_points(nominal_points, offset, self.api)
+                            shifted_path = self.api.PDMPath(_path_states(shifted, self.api))
+                            shifted_meta = dict(target, id=identity, lane_offset_m=offset,
+                                transition_length_m=float(maneuver["diagnostics"]["transition_length_m"]),
+                                maneuver_continuation_adjustment=True, maneuver_adjustment_limit_m=room,
+                                maneuver_geometry_source="fixed_nominal_return_lane_offset")
+                            if identity in known:
+                                index = known[identity]
+                                paths[index], lateral[index] = shifted_path, shifted_meta
+                            else:
+                                known[identity] = len(paths)
+                                paths.append(shifted_path)
+                                lateral.append(shifted_meta)
         priors = ((memory_evidence or {}).get("parameter_priors", [])
                   if getattr(self, "planning_memory_mode", "off") == "full" else [])
         policies, longitudinal, targets = self._policies(state.dynamic_car_state.speed, limit, priors)
-        manager = self.api.PDMProposalManager(paths, policies)
-        proposals = self.generator.generate_proposals(state, observation, manager)
-        simulated = self.simulator.simulate_proposals(proposals, state)
-        scores = self.scorer.score_proposals(simulated, state, observation, centerline, lanes, area,
-                                             _IntersectionMap(self.map, tf.location.z, self.api))
-        candidates = []
-        for index in range(len(manager)):
-            proposal = manager[index]
-            lat = lateral[proposal.lateral_idx]
-            idm_states = self.generator._state_idm_array[index]
-            profile = idm_states[:, 1]
-            finite = bool(np.isfinite(proposals[index]).all() and np.isfinite(simulated[index]).all()
-                          and np.isfinite(idm_states).all() and np.isfinite(scores[index]))
-            multi, weighted = self.scorer._multi_metrics, self.scorer._weighted_metrics
-            safety = {"no_collision": float(multi[self.api.MultiMetricIndex.NO_COLLISION, index]),
-                      "drivable_area": float(multi[self.api.MultiMetricIndex.DRIVABLE_AREA, index]),
-                      "driving_direction": float(multi[self.api.MultiMetricIndex.DRIVING_DIRECTION, index]),
-                      "ttc": float(weighted[self.api.WeightedMetricIndex.TTC, index]), "finite": finite}
-            if initial_collisions:
-                safety["no_collision"] = 0.0
-            offroad_steps = np.flatnonzero(self.scorer._ego_areas[index, :, self.api.EgoAreaIndex.NON_DRIVABLE_AREA])
-            first_offroad = int(offroad_steps[0]) if len(offroad_steps) else None
-            area_failure = None
-            if first_offroad is not None and finite:
-                area_failure = {"time_s": first_offroad * self.dt,
-                                "footprint_corners_xy": self.scorer._ego_coords[index, first_offroad, :4].tolist()}
-            collision_time = float(self.scorer.time_to_at_fault_collision(index))
-            ttc_time = float(self.scorer.time_to_ttc_infraction(index))
-            candidates.append({"id": "%s:%s" % (lat["id"], longitudinal[proposal.longitudinal_idx]),
-                               "index": index, "lateral": lat["label"], "lateral_semantics": lat["semantics"],
-                               "route_target": lat["route_target"],
-                               "physical_lane_side": lat["physical_lane_side"],
-                               "lane_offset_m": lat["lane_offset_m"],
-                               "forward_progress_m": float(centerline.project(Point(*proposals[index, -1, :2]))
-                                                           - centerline.project(Point(*proposals[index, 0, :2]))) if finite else 0.0,
-                               "terminal_speed_mps": float(self.generator._state_idm_array[index, -1, 1]) if finite else 0.0,
-                               "longitudinal": self._memory_policy_metadata.get(proposal.longitudinal_idx, {}).get("action",
-                                   {"STOP_HARD": "STOP", "YIELD_GENTLE": "YIELD"}.get(
-                                   longitudinal[proposal.longitudinal_idx], longitudinal[proposal.longitudinal_idx])),
-                               "longitudinal_policy_id": longitudinal[proposal.longitudinal_idx],
-                               "longitudinal_policy_index": int(proposal.longitudinal_idx),
-                               "idm_accel_max_mps2": float(policies._accel_max[proposal.longitudinal_idx]),
-                               "idm_decel_max_mps2": float(policies._decel_max[proposal.longitudinal_idx]),
-                               "idm_headway_s": float(policies._headway_time[proposal.longitudinal_idx]),
-                               "idm_min_gap_m": float(policies._min_gap_to_lead_agent[proposal.longitudinal_idx]),
-                               "memory_prior": self._memory_policy_metadata.get(proposal.longitudinal_idx),
-                               "predicted_collision_time_s": collision_time if math.isfinite(collision_time) else None,
-                               "predicted_ttc_infraction_time_s": ttc_time if math.isfinite(ttc_time) else None,
-                               "drivable_area_failure": area_failure,
-                               "speed_at_0_2s_mps": float(profile[2]) if finite else None,
-                               "acceleration_range_mps2": [float(np.min(np.diff(profile) / self.dt)),
-                                                            float(np.max(np.diff(profile) / self.dt))] if finite else None,
-                               "desired_speed_mps": targets[proposal.longitudinal_idx],
-                               "base_score": float(scores[index]) if finite else 0.0, "safety": safety,
-                               "trajectory_sha256": hashlib.sha256(proposals[index].tobytes()).hexdigest()})
+        candidates = self._evaluate_candidates(paths, lateral, policies, longitudinal, targets, state,
+            observation, centerline, lanes, area, tf, initial_collisions)
         action_memory = None
         if getattr(self, "experience_memory", None) is not None and semantic_decision:
             # Scene-level paired support can invite consultation. Recheck the
@@ -1008,30 +1348,97 @@ class CarlaPDMPlanner:
             # carried by scene memory's action_feedback.
             action_memory = self.experience_memory.retrieve(context, semantic_decision)
         governor = getattr(self, "governor", None)
+        baseline_candidates = candidates
+        _, original_baseline = choose_candidate(baseline_candidates, None, False)
+        recovery = {"authorized": False, "expanded": False, "selected": False,
+                    "reason": "semantic_recovery_disabled", "added_paths": 0}
+        degradation = None
         if governor is None:
             selected, diagnostics = choose_candidate(candidates, semantic_decision, semantic_enabled,
                                                       self.lateral_weight, self.longitudinal_weight)
         else:
-            from .scene_context import candidate_summary
-            _, baseline_diagnostics = choose_candidate(candidates, None, False)
-            context["candidates_summary"] = candidate_summary(candidates, baseline_diagnostics["baseline_selected_id"])
+            from .scene_context import candidate_summary, planner_health
+            context["candidates_summary"] = candidate_summary(baseline_candidates, original_baseline["baseline_selected_id"])
+            context["planner_health"] = planner_health(baseline_candidates,
+                original_baseline["baseline_selected_id"],
+                moving_progress_m=governor.config["moving_option_progress_m"])
+            degradation = governor.observe_planner_health(context, now)
+            context["planner_degradation"] = {key: deepcopy(value) for key, value in degradation.items()
+                                              if key != "native_health"}
             if semantic_update:
                 governor.submit(semantic_decision, context, now)
+            if semantic_enabled and self.recovery_config["enabled"]:
+                recovery.update(governor.recovery_request(context, now))
+                if recovery["authorized"]:
+                    from .recovery import propose_recovery_paths
+                    stage = "generate_paths"
+                    try:
+                        augmented_paths, augmented_metadata, search = propose_recovery_paths(
+                            paths, lateral, self._reference_for_height, state, self.api,
+                            self.vehicle_parameters, config=self.recovery_config)
+                        recovery["search"] = search
+                        recovery["added_paths"] = len(augmented_paths) - len(paths)
+                        if len(augmented_paths) > len(paths):
+                            # Recompute the WHOLE pool with native scoring: progress
+                            # normalization cannot be mixed across separate pools.
+                            stage = "evaluate_candidates"
+                            candidates = self._evaluate_candidates(augmented_paths, augmented_metadata,
+                                policies, longitudinal, targets, state, observation, centerline,
+                                lanes, area, tf, initial_collisions)
+                            recovery["expanded"] = True
+                    except Exception as exc:
+                        # Expansion is optional. Its native evaluation mutates the
+                        # generator/scorer, so restore them by evaluating the original
+                        # pool, not merely by restoring a list of candidate records.
+                        logger.warning("PDM recovery failed at %s; restoring original pool: %s", stage, exc)
+                        governor.submit(None, context, now)
+                        recovery.update(authorized=False, expanded=False, added_paths=0,
+                            reason="recovery_failed_original_pool_restored", fallback_to_original=True,
+                            error={"stage": stage, "type": type(exc).__name__, "message": str(exc)})
+                        candidates = baseline_candidates = self._evaluate_candidates(paths, lateral,
+                            policies, longitudinal, targets, state, observation, centerline,
+                            lanes, area, tf, initial_collisions)
             selected, diagnostics = governor.select(candidates, context, now,
                         enabled=semantic_enabled, memory_evidence=memory_evidence)
+            recovery["would_select_recovery"] = bool(selected and selected.get("recovery"))
+            recovery["positive_recovery_candidates"] = sum(
+                bool(c.get("recovery")) and c["base_score"] > 0 and c["forward_progress_m"] > .2
+                for c in candidates)
+            recovery["selected"] = bool(selected and selected.get("recovery"))
             if self.semantic_policy == "shadow":
                 shadow_selected = diagnostics.get("selected_id")
                 shadow_candidates = diagnostics["candidates"]
-                selected, baseline_diagnostics = choose_candidate(candidates, None, False)
+                shadow_pool_hash = diagnostics["candidate_pool_sha256"]
+                if recovery["expanded"]:
+                    # Restore generator and rollout state before executing the
+                    # original baseline index; shadow never executes new paths.
+                    baseline_candidates = self._evaluate_candidates(paths, lateral, policies,
+                        longitudinal, targets, state, observation, centerline, lanes, area,
+                        tf, initial_collisions)
+                selected, baseline_diagnostics = choose_candidate(baseline_candidates, None, False)
                 diagnostics.update(candidates=baseline_diagnostics["candidates"],
-                    selected_id=baseline_diagnostics["selected_id"], shadow_selected_id=shadow_selected,
+                    selected_id=baseline_diagnostics["selected_id"],
+                    baseline_selected_id=baseline_diagnostics["baseline_selected_id"],
+                    candidate_pool_sha256=baseline_diagnostics["candidate_pool_sha256"],
+                    shadow_candidate_pool_sha256=shadow_pool_hash, shadow_selected_id=shadow_selected,
                     shadow_candidates=shadow_candidates, shadow_only=True)
                 diagnostics["governor"]["would_adopt"] = diagnostics["governor"]["adopted"]
                 diagnostics["governor"]["adopted"] = False
+                recovery["selected"] = False
             # Query scheduling happens at actual cognition checkpoints, not on
             # every 5-Hz plan (which would consume a query without calling it).
-        self.last_context, self.last_candidates = context, candidates
+        # Query health must describe the ordinary planner, not conceal its
+        # persistent failure behind model-requested additional candidates.
+        self.last_context, self.last_candidates = context, baseline_candidates
+        diagnostics.update(recovery=recovery, planner_degradation=degradation,
+            lane_maneuver=deepcopy(maneuver["diagnostics"]),
+            original_baseline_selected_id=original_baseline["baseline_selected_id"],
+            original_candidate_pool_sha256=original_baseline["candidate_pool_sha256"],
+            original_baseline_candidates=original_baseline["candidates"] if recovery["expanded"] else None)
         diagnostics.update(semantic_policy=getattr(self, "semantic_policy", "always"),
+                           ordinary_lane_intent=ordinary_intent,
+                           lateral_control=self.lateral_control,
+                           lane_quality_config=dict(self.lane_quality_config),
                            planner_context=context, query_decision=self.last_query_decision,
                            planning_memory_mode=getattr(self, "planning_memory_mode", "off"),
                            memory_evidence=memory_evidence, requested_action_memory=action_memory)
@@ -1039,6 +1446,9 @@ class CarlaPDMPlanner:
                            timestamp_us=timestamp, horizon_s=self.samples * self.dt, sample_interval_s=self.dt,
                            lqr_longitudinal_horizon_s=1.0,
                            lqr_longitudinal_horizon_samples=10,
+                           lqr_lateral_preview=self.lqr_lateral_preview,
+                           lqr_lateral_max_horizon_s=self.lqr_lateral_horizon_s,
+                           lqr_lateral_min_horizon_s=self.lqr_lateral_min_horizon_s,
                            lqr_lateral_horizon_s=self.lqr_lateral_horizon_samples * self.dt,
                            lqr_lateral_horizon_samples=self.lqr_lateral_horizon_samples,
                            lqr_lateral_velocity_forecast="finite_forward_constant_acceleration_stop_at_zero",
@@ -1073,6 +1483,32 @@ class CarlaPDMPlanner:
             return {"trajectory": [], "target_speed": 0.0, "selected_lateral": "KEEP_LANE",
                     "selected_longitudinal": "STOP", "planner_diagnostics": diagnostics}
         index = selected["index"]
+        diagnostics["lane_maneuver"]["selected"] = bool(selected.get("maneuver"))
+        selected_path_index = selected["lateral_path_index"]
+        selected_path = self._evaluated_lateral_paths[selected_path_index]
+        selected_path_metadata = dict(self._evaluated_lateral_metadata[selected_path_index],
+            actual_selected_candidate_id=selected["id"],
+            actual_selected_policy_id=selected["longitudinal_policy_id"])
+        diagnostics["lane_maneuver"]["committed_after_selection"] = self.lane_maneuver.commit_selected(
+            selected["id"], now,
+            selected_path_points=np.array([[point.x, point.y] for point in selected_path.discrete_path]),
+            selected_metadata=selected_path_metadata)
+        diagnostics["lane_maneuver"]["actual_selected_id"] = selected["id"]
+        diagnostics["lane_maneuver"]["actual_selected_path_label"] = selected["lateral"]
+        diagnostics["lane_maneuver"]["execution_commit"] = dict(self.lane_maneuver.last_commit_audit)
+        diagnostics["ordinary_lane_intent"]["committed_after_selection"] = self._commit_ordinary_lane_intent(
+            selected, selected_path, selected_path_metadata, state, now)
+        if self.lateral_control == "native_lqr":
+            # Execute the lateral law used to score the actual selected pool.
+            # This also applies to the pure-PDM and restored shadow baseline;
+            # neither semantic adoption nor its expiry changes tracking laws.
+            diagnostics["native_tracking"] = {
+                "active": True, "source": "native_pdm_scored_rollout",
+                "issued_at_s": now, "expires_at_s": now + .3,
+                "sample_interval_s": self.dt,
+                "bicycle_angles_rad": self.scorer._states[
+                    index, :4, self.api.StateIndex.STEERING_ANGLE].tolist(),
+            }
         generated = self.generator.generate_trajectory(index)
         states = generated.get_sampled_trajectory()
         from carla_bridge.state.coords import global_to_ego

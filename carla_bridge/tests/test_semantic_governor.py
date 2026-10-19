@@ -149,15 +149,15 @@ def test_native_stop_is_preserved_even_without_any_semantic_stop_authority():
     assert audit["governor"]["authorized"] is False
 
 
-def test_local_blocked_lead_actor_is_evidence_and_long_queue_gets_review_only():
+def test_local_blocked_lead_actor_is_evidence_but_long_explained_queue_does_not_query():
     governor = SelectiveSemanticGovernor()
     scene = context(blocked=True, baseline_stop_expected=True, ego_speed_mps=0.0,
                     actors=[blocked_actor()])
     assert governor.submit(semantic(reason_code="path_blocked", activation="immediate"), scene, 0)["accepted"]
     scene["sim_time_s"] = 20.0
     request = governor.query_decision(scene, pool(), 20.0)
-    assert request["query"] is True
-    assert request["reason"] == "expected_wait_review"
+    assert request["query"] is False
+    assert request["reason"] == "expected_signal_or_queue_wait"
     assert request["legitimate_wait"] is True
     assert request["unexpected_stall"] is False
 
@@ -309,8 +309,8 @@ def test_stall_is_measured_from_observed_progress_and_excludes_legal_waiting():
     waiting = SelectiveSemanticGovernor()
     waiting.query_decision(context(ego_speed_mps=0, baseline_stop_expected=True), pool(), 0)
     request = waiting.query_decision(context(20, ego_speed_mps=0, baseline_stop_expected=True), pool(), 20)
-    assert request["query"] is True and request["unexpected_stall"] is False
-    assert request["reason"] == "expected_wait_review"
+    assert request["query"] is False and request["unexpected_stall"] is False
+    assert request["reason"] == "expected_signal_or_queue_wait"
 
 
 def test_unexpected_obstacle_is_not_misclassified_as_a_legal_queue_wait():
@@ -565,12 +565,12 @@ def test_same_lane_label_and_global_blockage_do_not_allow_indirect_stop_bonus():
     assert audit["candidates"][1]["semantic_stop_bonus_withheld"]
 
 
-def test_legal_red_wait_is_reviewed_periodically_without_releasing_the_signal():
+def test_legal_red_wait_does_not_consult_periodically_or_release_the_signal():
     governor = SelectiveSemanticGovernor({"wait_review_interval_s": 15})
     signal = {"id": "red", "state": "Red", "stop_line_distance_m": 2, "applicable": True}
     scene = context(ego_speed_mps=0, baseline_stop_expected=True, signals=[signal])
     assert not governor.query_decision(scene, pool(), 0)["query"]
-    for now, expected in ((14.9, False), (15, True), (16, False), (29.9, False), (30, True)):
+    for now, expected in ((14.9, False), (15, False), (16, False), (29.9, False), (30, False)):
         scene["sim_time_s"] = now
         query = governor.query_decision(scene, pool(), now)
         assert query["query"] is expected
@@ -726,7 +726,7 @@ def test_complex_interaction_requires_two_current_crossing_conflicts_in_scope(se
     assert not query["query"]
 
 
-def test_explained_red_or_queue_wait_with_crossing_traffic_only_gets_periodic_review():
+def test_explained_red_or_queue_wait_with_distant_crossing_traffic_never_gets_periodic_review():
     governor = SelectiveSemanticGovernor()
     scene = context(ego_speed_mps=0, baseline_stop_expected=True,
                     actors=[actor(ttc_s=1), actor(id=8, ttc_s=3)])
@@ -736,7 +736,7 @@ def test_explained_red_or_queue_wait_with_crossing_traffic_only_gets_periodic_re
         assert not query["query"] and query["reason"] == "expected_signal_or_queue_wait"
     scene["sim_time_s"] = 15
     query = governor.query_decision(scene, pool(), 15)
-    assert query["query"] and query["reason"] == "expected_wait_review"
+    assert not query["query"] and query["reason"] == "expected_signal_or_queue_wait"
     assert query["legitimate_wait"] and not query["unexpected_stall"]
 
 
@@ -750,3 +750,106 @@ def test_new_crossing_during_authorized_queue_guidance_does_not_bypass_wait_revi
                       actors=[blocked_actor(), actor(id=8, ttc_s=1)])
     query = governor.query_decision(current, pool(), 2)
     assert not query["query"] and query["reason"] == "expected_signal_or_queue_wait"
+
+
+@pytest.mark.parametrize("special", [[], ["limited_visibility_fog"], ["construction_officer"]])
+def test_500_ticks_red_queue_wait_never_dispatches_vlm_despite_old_review_timer_memory_or_lease_expiry(special):
+    governor = SelectiveSemanticGovernor()
+    signal = {"id": "red", "state": "Red", "stop_line_distance_m": 30, "applicable": True}
+    lead = blocked_actor(routine_wait=True, blocking_kind="signal_queue")
+    # A formerly useful piece of advice expires at six seconds. Neither expiry
+    # nor 15-second wait-review multiples authorize another model consultation.
+    initial = context(ego_speed_mps=0, baseline_stop_expected=True, signals=[signal],
+                      special_situations=special, actors=[lead])
+    advice = semantic("MAINTAIN", reason_code="traffic_signal", target_actor_ids=[],
+                      target_stop_line_id="red", activation="immediate", valid_for_s=6)
+    assert governor.submit(advice, initial, 0)["accepted"]
+    for tick in range(500):
+        now = tick*.1
+        current = deepcopy(initial)
+        current["sim_time_s"] = now
+        request = governor.query_decision(current, [candidate("stop", 1, "STOP", 0)], now,
+                                           positive_intervention_memory())
+        assert not request["query"] and not request["eligible"]
+        assert request["reason"] == "expected_signal_or_queue_wait"
+        assert not request["wait_review_due"] and not request["unexpected_stall"]
+        assert not governor.recovery_request(current, now)["authorized"]
+
+
+def test_500_ticks_ordinary_slow_following_is_handled_without_model_and_blocked_static_lead_is_not():
+    governor = SelectiveSemanticGovernor()
+    lead = actor(same_lane=True, conflict=True, ttc_s=1, speed_mps=.4,
+                 stationary=True, path_blocked=True, routine_wait=False)
+    # The contextual routine-following flag explains creeping behind a moving
+    # vehicle; it does not exempt an independently stationary obstacle.
+    lead.update(stationary=False, path_blocked=False)
+    for tick in range(500):
+        now = tick*.1
+        current = context(now, ego_speed_mps=.2, routine_following=True,
+                          actors=[lead], special_situations=["limited_visibility_fog"])
+        query = governor.query_decision(current, [candidate("slow", .1, "FOLLOW", .3)], now)
+        assert not query["query"] and query["reason"] == "ordinary_same_lane_following"
+    stopped = context(50, ego_speed_mps=0, blocked=True, routine_following=False,
+                      actors=[blocked_actor()])
+    assert governor.query_decision(stopped, pool(), 50)["reason"] == "path_blocked"
+    assert governor.query_decision(context(52, **{k:v for k,v in stopped.items()
+        if k != "sim_time_s"}), pool(), 52)["query"]
+
+
+def test_red_to_green_still_stationary_single_lead_immediately_ends_routine_wait():
+    governor = SelectiveSemanticGovernor()
+    red = context(ego_speed_mps=0, baseline_stop_expected=True,
+                  actors=[blocked_actor(routine_wait=True)])
+    assert not governor.query_decision(red, pool(), 0)["query"]
+    green_stuck = context(2, ego_speed_mps=0, blocked=True, baseline_stop_expected=False,
+                          actors=[blocked_actor(routine_wait=False)])
+    request = governor.query_decision(green_stuck, pool(), 2)
+    assert request["query"] and request["reason"] == "path_blocked"
+    green_moving = context(4, ego_speed_mps=1, routine_following=True,
+        actors=[actor(same_lane=True, conflict=False, ttc_s=None, speed_mps=2)])
+    request = governor.query_decision(green_moving, pool(), 4)
+    assert not request["query"] and request["reason"] == "ordinary_same_lane_following"
+
+
+def test_new_crossing_toward_actual_waiting_body_can_escalate_despite_red_and_cached_lease():
+    governor = SelectiveSemanticGovernor()
+    red = context(ego_speed_mps=0, baseline_stop_expected=True,
+                  special_situations=["fog"], actors=[actor(occupied_ego_conflict=False)])
+    assert not governor.query_decision(red, pool(), 0)["query"]
+    dangerous = deepcopy(red)
+    dangerous.update(sim_time_s=2)
+    dangerous["actors"][0].update(occupied_ego_conflict=True, occupied_ego_conflict_ttc_s=.5)
+    request = governor.query_decision(dangerous, pool(), 2)
+    assert request["query"] and request["reason"] == "occupied_ego_crossing_conflict"
+    assert request["waiting_hazard_actor_ids"] == [7]
+
+
+def test_new_near_nonqueue_obstacle_during_red_wait_is_still_consultable():
+    scene = context(ego_speed_mps=0, baseline_stop_expected=True, blocked=True,
+        actors=[blocked_actor(type="static.prop.barrier", distance_m=5, routine_wait=False)])
+    request = SelectiveSemanticGovernor().query_decision(scene, pool(), 0)
+    assert request["query"] and request["reason"] == "path_blocked"
+
+
+def test_semantic_regret_uses_full_numerical_planning_score_and_retains_raw_native_score():
+    governor = SelectiveSemanticGovernor({"max_semantic_bonus": .2,
+        "lateral_weight": .1, "longitudinal_weight": .1})
+    candidates = [candidate("deviating", 1.0), candidate("center", .95)]
+    candidates[0]["numerical_cost"] = .16
+    candidates[1]["lateral_semantics"] = ["KEEP_LANE"]
+    scene = context(actors=[actor()])
+    assert governor.submit(semantic("MAINTAIN"), scene, 0)["accepted"]
+    selected, audit = governor.select(candidates, scene, 0)
+    assert selected["id"] == "center"
+    deviating = audit["candidates"][0]
+    assert deviating["base_score"] == 1 and deviating["planning_score"] == pytest.approx(.84)
+    assert deviating["semantic_base_regret"] == pytest.approx(.11)
+    assert deviating["semantic_bonus_withheld_by_regret"] and deviating["semantic_bonus"] == 0
+
+
+def test_low_quality_query_compares_numerical_planning_score_without_rewriting_native_base():
+    candidates = [candidate("sole", .5)]
+    candidates[0]["numerical_cost"] = .16
+    query = SelectiveSemanticGovernor().query_decision(context(), candidates, 0)
+    assert query["query"] and query["reason"] == "low_pdm_quality"
+    assert candidates[0]["base_score"] == .5

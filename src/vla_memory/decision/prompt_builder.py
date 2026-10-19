@@ -487,7 +487,7 @@ class DecisionPromptBuilder:
                 result = {}
                 keys = list(value)
                 if depth == 0:
-                    priority = ("source", "sim_time_s", "snapshot_time_s", "signals",
+                    priority = ("source", "sim_time_s", "snapshot_time_s", "planner_degradation", "planner_health", "signals",
                                 "candidates_summary", "ego", "ego_state", "actors")
                     keys = [key for key in priority if key in value] + [
                         key for key in keys if key not in priority

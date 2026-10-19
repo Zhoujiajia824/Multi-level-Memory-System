@@ -82,6 +82,13 @@ class RunSession:
         self.model_inference = model_inference_enabled(planning, mode)
         self.semantic_policy = planning.get("semantic_policy", "always")
         self.planning_memory = planning.get("planning_memory", "off")
+        self.pdm_lateral_control = planning.get("lateral_control", "pure_pursuit")
+        self.pdm_lateral_preview = planning.get("lqr_lateral_preview", "fixed")
+        self.lane_quality_enabled = (planning.get("lane_quality") or {}).get("enabled", True)
+        self.lane_maneuver_enabled = (planning.get("lane_maneuver") or {}).get("enabled", True)
+        # This records the configured search switch, not a claim that a model
+        # request was authorized or an expanded trajectory was executed.
+        self.planner_recovery = {"enabled": True, **(planning.get("recovery") or {})}
         self.numeric_memory_only = not self.model_inference and self.planning_memory == "full"
         if not self.model_inference:
             self.short_term = False
@@ -228,6 +235,11 @@ class RunSession:
                              "model_inference": self.model_inference,
                              "semantic_policy": self.semantic_policy,
                              "planning_memory": self.planning_memory,
+                             "pdm_lateral_control": self.pdm_lateral_control,
+                             "pdm_lateral_preview": self.pdm_lateral_preview,
+                             "lane_quality_enabled": self.lane_quality_enabled,
+                             "lane_maneuver_enabled": self.lane_maneuver_enabled,
+                             "planner_recovery": _safe_config(self.planner_recovery),
                              "planning_memory_effective": self.planning_memory if self.access != "off" else "off",
                              "semantic_schema_version": data.get("semantic", {}).get(
                                  "selective_schema_version" if self.semantic_policy in ("selective", "shadow") else "schema_version",

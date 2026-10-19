@@ -99,12 +99,33 @@ class RedLight:
         return [Waypoint(self.road, self.x, lane) for lane in (-1, 0, 1)]
 
 
+def add_scene_context_fixture(world, ego, route):
+    """Supply current GT context while preserving each geometry fixture's cursor.
+
+    A separate production RoutePlanner implements navigation and progress from
+    the same fixed route. It never replaces the fixture's intentionally chosen
+    nearest-index rule, nor contacts a simulator or fabricates model evidence.
+    """
+    from carla_bridge.env.route_planner import RoutePlanner
+    if not hasattr(world, "get_weather"):
+        world.get_weather = lambda: NS(fog_density=0.)
+    if not hasattr(route, "nav_instruction") or not hasattr(route, "distance_completed_m"):
+        navigation = RoutePlanner(world, ego)
+        navigation.load_fixed_points([dict(x=p.x, y=p.y, z=p.z) for p in route._route])
+        if not hasattr(route, "nav_instruction"):
+            route.nav_instruction = navigation.nav_instruction
+        if not hasattr(route, "distance_completed_m"):
+            route.distance_completed_m = navigation.distance_completed_m
+    return route
+
+
 def make_planner(speed=0, x=0, length=100, allow_change=True, seam=None, others=None):
     road, ego = Road(allow_change, seam), Vehicle(speed=speed, x=x)
     world = NS(get_map=lambda: road, get_actors=lambda: [ego] + (others or []),
                get_snapshot=lambda: NS(timestamp=NS(elapsed_seconds=2.0)))
     route = NS(_route=[carla.Location(x=float(value)) for value in range(0, length + 1, 2)],
                _nearest_index=lambda location: min(length // 2 - 1, max(0, int(location.x / 2))))
+    add_scene_context_fixture(world, ego, route)
     return CarlaPDMPlanner(world, ego, route, {"horizon_s": 4.0})
 
 
@@ -114,14 +135,14 @@ def semantic(longitudinal="MAINTAIN", lateral="FOLLOW_ROUTE"):
 
 def assert_score_only_selection(diagnostics):
     """Check the actual rank formula, including zero-base and unsafe candidates."""
-    assert diagnostics["selection_rule"] == "pdm_base_plus_semantic"
+    assert diagnostics["selection_rule"] in ("pdm_base_plus_semantic", "pdm_base_minus_numerical_cost_plus_semantic")
     assert not diagnostics["safety_gate_applied"]
     assert not diagnostics["route_recovery_gate_applied"]
     assert not diagnostics["continuity_penalty_applied"]
     eligible = [candidate for candidate in diagnostics["candidates"] if candidate["eligible"]]
     for candidate in eligible:
-        assert candidate["planning_score"] == candidate["base_score"]
-        assert candidate["final_score"] == pytest.approx(candidate["base_score"] + candidate["semantic_bonus"])
+        assert candidate["planning_score"] == pytest.approx(candidate["base_score"] - candidate.get("numerical_cost", 0.0))
+        assert candidate["final_score"] == pytest.approx(candidate["planning_score"] + candidate["semantic_bonus"])
         assert candidate["safety"]["finite"]
     if eligible:
         selected = max(eligible, key=lambda candidate: candidate["final_score"])
@@ -379,6 +400,7 @@ def test_real_core_continuous_ninety_degree_intersection_turn():
                get_snapshot=lambda: NS(timestamp=NS(elapsed_seconds=2.0)))
     route = NS(_route=[CurvedWaypoint(road, value).transform.location for value in range(-10, 92, 2)],
                _nearest_index=lambda location: max(0, int((road.parameter(location) + 10) / 2)))
+    add_scene_context_fixture(world, ego, route)
     planner = CarlaPDMPlanner(world, ego, route, {"horizon_s": 4.0})
     plan = planner.plan(semantic())
     assert plan["trajectory"]

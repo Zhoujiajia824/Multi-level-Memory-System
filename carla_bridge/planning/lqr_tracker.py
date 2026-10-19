@@ -12,6 +12,31 @@ import math
 import numpy as np
 
 
+def speed_scaled_lateral_samples(speed_mps, wheelbase_m, *, discretization_time,
+                                 min_samples, max_samples):
+    """Quantize a two-wheelbase preview to the nearest supported sample.
+
+    At rest the configured maximum is retained. At driving speed the preview
+    covers approximately two measured wheelbases, bounded by the configured
+    horizons. Half-sample ties retain the longer preview.
+    """
+    speed, wheelbase, dt = float(speed_mps), float(wheelbase_m), float(discretization_time)
+    if not math.isfinite(speed) or speed < 0:
+        raise ValueError("LQR preview speed_mps must be nonnegative and finite")
+    if not math.isfinite(wheelbase) or wheelbase <= 0:
+        raise ValueError("LQR preview wheelbase_m must be positive and finite")
+    if not math.isfinite(dt) or dt <= 0:
+        raise ValueError("LQR preview discretization_time must be positive and finite")
+    for name, value in (("min_samples", min_samples), ("max_samples", max_samples)):
+        if isinstance(value, bool) or not isinstance(value, Integral) or value < 2:
+            raise ValueError("LQR preview " + name + " must be an integer of at least two samples")
+    if min_samples > max_samples:
+        raise ValueError("LQR preview min_samples must not exceed max_samples")
+    raw_steps = 2.0 * wheelbase / max(speed, 1e-3) / dt
+    bounded = min(max_samples, max(min_samples, raw_steps))
+    return min(max_samples, max(min_samples, int(math.floor(bounded + .5 + 1e-9))))
+
+
 def build_lqr_tracker(api, vehicle, discretization_time, *,
                       longitudinal_tracking_horizon_samples=10,
                       lateral_tracking_horizon_samples=20):

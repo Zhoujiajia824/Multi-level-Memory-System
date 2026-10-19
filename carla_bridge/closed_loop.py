@@ -92,6 +92,7 @@ class ClosedLoop:
         self._selective_execution = (self.planner_backend == "pdm_closed" and self.model_inference
                                     and self.semantic_influence and self.semantic_policy != "always")
         self.experience_memory = None
+        self.execution_planner_version = None
         self._experience_signature = None
         self._last_plan_diagnostics = {}
         self._next_query_check_at = 0.0
@@ -100,7 +101,9 @@ class ClosedLoop:
         self.advisory_stats = {"model_queries": 0, "query_checks_skipped": 0,
             "model_failures": 0, "inference_wall_time_s": 0.0,
             "semantic_changed_plans": 0, "semantic_rejected_plans": 0,
-            "shadow_changed_plans": 0, "semantic_stop_proxy_s": 0.0}
+            "shadow_changed_plans": 0, "semantic_stop_proxy_s": 0.0,
+            "recovery_expanded_plans": 0, "recovery_selected_plans": 0,
+            "recovery_no_solution_plans": 0}
         self.pdm_planner = None
         self._active_semantics = None
         self._semantic_frame_id = None
@@ -123,6 +126,13 @@ class ClosedLoop:
                 not math.isfinite(self._pdm_interval) or self._pdm_interval < self.fixed_delta
                 or self._pdm_interval > self._execution_horizon):
             raise ValueError("PDM replan interval must be between physics tick and semantic interval")
+        if (self.planner_backend == "pdm_closed"
+                and self.planning_cfg.get("lateral_control", "pure_pursuit") == "native_lqr"):
+            from .planning.native_tracking import MAX_PROFILE_LIFETIME_S, SAMPLE_INTERVAL_S
+            if abs(self.fixed_delta - SAMPLE_INTERVAL_S) > 1e-8:
+                raise ValueError("Native LQR tracking requires fixed_delta_seconds=0.1")
+            if self._pdm_interval > MAX_PROFILE_LIFETIME_S + 1e-9:
+                raise ValueError("Native LQR tracking requires PDM replan_interval_s <= 0.3")
         self.trajectory_validator = TrajectoryValidator(ccfg.get("trajectory_validation"))
         self._trajectory_rejections = 0
         self._consecutive_trajectory_rejections = 0
@@ -250,14 +260,15 @@ class ClosedLoop:
             planner_cfg["horizon_s"] = max(float(planner_cfg.get("horizon_s", 4.0)), self._execution_horizon)
             self.pdm_planner = CarlaPDMPlanner(world, ego, self.scenario.route, planner_cfg)
             self._bind_pdm_controller(ego)
+            from carla_bridge.planning.experience_memory import ExecutionExperienceMemory, execution_planner_version
+            self.execution_planner_version = execution_planner_version(planner_cfg, self.controller_cfg)
             if self.planning_memory_mode != "off" and self.mode != "memory_off":
-                from carla_bridge.planning.experience_memory import ExecutionExperienceMemory
                 access = self.config.get("memory_access", {}) or {}
                 self.experience_memory = ExecutionExperienceMemory(self.config.get("memory_db_dir"),
                     memory_mode="read_write" if access.get("write", True) else "read_only",
                     read_enabled=bool(access.get("retrieve", True)), write_enabled=bool(access.get("write", True)),
                     run_id=self.run_id, run_dir=self.config.get("output_dir"),
-                    planner_version="carla_pdm_selective_v1")
+                    planner_version=self.execution_planner_version)
                 self.pdm_planner.experience_memory = self.experience_memory
         if self.model_inference:
             self.kf_builder = KeyframeBuilder(scenario_name=self.scenario.scenario_name(), run_id=self.run_id)
@@ -381,6 +392,15 @@ class ClosedLoop:
                                 source="direct_brake")
 
     def _apply_control(self, ego, control, *, source="tracker") -> None:
+        native_tracking = None
+        diagnostics = getattr(self, "_last_plan_diagnostics", {}) or {}
+        if (source == "tracker" and getattr(self, "planner_backend", None) == "pdm_closed"
+                and diagnostics.get("native_tracking", {}).get("active") is True):
+            from .planning.native_tracking import override_native_tracking
+            velocity = ego.get_velocity()
+            control, native_tracking = override_native_tracking(control, diagnostics,
+                now_s=self._elapsed, speed_mps=math.hypot(velocity.x, velocity.y),
+                steering_model=self.pdm_planner.steering_model)
         # Apply before bookkeeping: diagnostics must never delay an emergency.
         ego.apply_control(control)
         tracking = getattr(self.tracker, "last_control_diagnostics", None)
@@ -390,6 +410,7 @@ class ClosedLoop:
             "semantic_frame_id": self._semantic_frame_id,
             **self._control_audit_values(control),
             "tracking": deepcopy(tracking) if source == "tracker" and isinstance(tracking, dict) else None,
+            "native_tracking": native_tracking,
         }
 
     @staticmethod
@@ -588,11 +609,19 @@ class ClosedLoop:
         self._last_plan_diagnostics = diagnostics
         stats = getattr(self, "advisory_stats", None)
         if stats is not None:
-            changed = diagnostics.get("selected_id") != diagnostics.get("baseline_selected_id")
+            baseline_id = diagnostics.get("original_baseline_selected_id", diagnostics.get("baseline_selected_id"))
+            changed = diagnostics.get("selected_id") != baseline_id
             if changed and self.semantic_influence:
                 stats["semantic_changed_plans"] += 1
             if diagnostics.get("shadow_selected_id") != diagnostics.get("baseline_selected_id") and diagnostics.get("shadow_only"):
                 stats["shadow_changed_plans"] += 1
+            recovery = diagnostics.get("recovery") or {}
+            for key, occurred in (
+                ("recovery_expanded_plans", recovery.get("expanded")),
+                ("recovery_selected_plans", recovery.get("selected")),
+                ("recovery_no_solution_plans", recovery.get("expanded") and not recovery.get("positive_recovery_candidates"))):
+                if occurred:
+                    stats[key] = stats.get(key, 0) + 1
             governor = diagnostics.get("governor", {})
             if governor and not governor.get("authorized") and governor.get("last_submission", {}).get("reason") != "no_submission":
                 stats["semantic_rejected_plans"] += 1
@@ -609,7 +638,8 @@ class ClosedLoop:
             return self.pdm_planner.plan(semantic, semantic_enabled=self.semantic_influence,
                 semantic_update=update, sim_time_s=self._elapsed,
                 special_situations=self._special_situations())
-        return self.pdm_planner.plan(semantic, semantic_enabled=self.semantic_influence)
+        return self.pdm_planner.plan(semantic, semantic_enabled=self.semantic_influence,
+                                     sim_time_s=self._elapsed)
 
     def _experience_telemetry(self):
         ego = self.scenario.ego_vehicle
@@ -638,7 +668,9 @@ class ClosedLoop:
                       "min_gap_to_lead_agent": candidate.get("idm_min_gap_m", 1.5),
                       "accel_max": candidate["idm_accel_max_mps2"], "decel_max": candidate["idm_decel_max_mps2"]}
         signature = (action["lateral_decision"], action["longitudinal_decision"],
-                     tuple(sorted((k, round(v, 1)) for k, v in parameters.items())))
+                     tuple(sorted((k, round(v, 1)) for k, v in parameters.items())),
+                     candidate.get("recovery_recipe"), candidate.get("recovery_transition_m"),
+                     candidate.get("lane_offset_m"))
         if self._experience_signature is not None and signature != self._experience_signature:
             memory.finish("policy_changed")
         self._experience_signature = signature
@@ -646,10 +678,13 @@ class ClosedLoop:
             return
         semantic = decision.get("semantic_decision") or {}
         governor = d.get("governor") or {}
-        memory.begin(context, {"baseline_candidate_id": d.get("baseline_selected_id"),
+        original_baseline = d.get("original_baseline_selected_id", d.get("baseline_selected_id"))
+        memory.begin(context, {"baseline_candidate_id": original_baseline,
             "selected_candidate_id": d.get("selected_id"), "actual_action": action,
             "selected_parameters": parameters, "requested_action": semantic,
-            "adopted": d.get("selected_id") != d.get("baseline_selected_id"),
+            "selected_geometry": {key: candidate.get(key) for key in
+                ("recovery", "recovery_recipe", "recovery_transition_m", "lane_offset_m")},
+            "adopted": d.get("selected_id") != original_baseline,
             "rejection_reason": governor.get("reason"),
             "semantic_policy": getattr(self, "semantic_policy", "always")}, self._experience_telemetry())
 
@@ -705,6 +740,11 @@ class ClosedLoop:
                 "duration_s": round(self._elapsed, 3),
                 "trajectory_rejections": self._trajectory_rejections,
                 "planner_backend": self.planner_backend, "semantic_influence": self.semantic_influence,
+                "pdm_lateral_control": getattr(self, "planning_cfg", {}).get("lateral_control", "pure_pursuit"),
+                "pdm_lateral_preview": getattr(self, "planning_cfg", {}).get("lqr_lateral_preview", "fixed"),
+                "execution_planner_version": getattr(self, "execution_planner_version", None),
+                "lane_quality_enabled": (getattr(self, "planning_cfg", {}).get("lane_quality") or {}).get("enabled", True),
+                "lane_maneuver_enabled": (getattr(self, "planning_cfg", {}).get("lane_maneuver") or {}).get("enabled", True),
                 "model_inference": self.model_inference,
                 "pdm_plan_count": self._pdm_plan_count,
                 "semantic_policy": getattr(self, "semantic_policy", "always"),
@@ -1048,7 +1088,16 @@ class ClosedLoop:
 
     def _check_stuck(self, speed: float) -> None:
         """Preserve the same no-progress guard in both cognition modes."""
-        if self._stuck_enabled and not self._planned_stop:
+        diagnostics = getattr(self, "_last_plan_diagnostics", {}) or {}
+        degradation = diagnostics.get("planner_degradation") or {}
+        health = degradation.get("native_health") or {}
+        planner_deadlock = (degradation.get("sustained") is True
+                            and health.get("positive_progressing_count") == 0
+                            and health.get("drivable_area_failure_count", 0) > 0)
+        # A numerical-planner deadlock is not an explained traffic wait merely
+        # because its winning trajectory is stationary. Context-grounded
+        # degradation has already excluded current red lights/queues/conflicts.
+        if self._stuck_enabled and (not self._planned_stop or planner_deadlock):
             prog = (self.scenario.route.progress_fraction()
                     if self.scenario.route else 0.0)
             if speed < self._stuck_speed_thresh and (prog - self._stuck_progress) < 0.005:
@@ -1106,9 +1155,10 @@ class ClosedLoop:
                 memory.observe(self._experience_telemetry())
             diagnostics = getattr(self, "_last_plan_diagnostics", {})
             if diagnostics and state["speed"] <= .3 and getattr(self, "advisory_stats", None) is not None:
-                baseline = next((c for c in diagnostics.get("candidates", [])
-                                 if c["id"] == diagnostics.get("baseline_selected_id")), {})
-                if (diagnostics.get("selected_id") != diagnostics.get("baseline_selected_id")
+                original_id = diagnostics.get("original_baseline_selected_id", diagnostics.get("baseline_selected_id"))
+                baseline = next((c for c in (diagnostics.get("original_baseline_candidates") or diagnostics.get("candidates", []))
+                                 if c["id"] == original_id), {})
+                if (diagnostics.get("selected_id") != original_id
                         and baseline.get("speed_at_0_2s_mps", 0) > .5):
                     # Attribution proxy, not a claim that the stop was unnecessary.
                     self.advisory_stats["semantic_stop_proxy_s"] += self.fixed_delta

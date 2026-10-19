@@ -81,12 +81,22 @@ def main() -> None:
     ap.add_argument("--no-short-term", action="store_true", help="关闭本轮短期记忆")
     ap.add_argument("--planner", choices=["pdm_closed", "vlm_trajectory"], default=None,
                     help="轨迹后端，默认 PDM-Closed；vlm_trajectory 为旧模型直接输出轨迹")
+    ap.add_argument("--pdm-lateral-control", choices=["native_lqr", "pure_pursuit"], default=None,
+                    help="PDM横向执行：native_lqr使用原生评分预测的LQR转向；pure_pursuit为旧控制对照；纵向均为PID")
+    ap.add_argument("--pdm-lateral-preview", choices=["fixed", "speed_scaled"], default=None,
+                    help="PDM LQR预瞄：speed_scaled随实测速度在1–2秒间调度；fixed保持配置的固定预瞄，用于对照")
+    ap.add_argument("--lane-quality", choices=["on", "off"], default=None,
+                    help="车道居中和车身边界数值软成本；默认on，off用于消融对照")
+    ap.add_argument("--lane-maneuver", choices=["on", "off"], default=None,
+                    help="合法慢障碍绕行与回归车道候选；默认on，off用于消融对照")
     ap.add_argument("--semantic-influence", choices=["on", "off"], default=None,
                     help="PDM 候选评分是否接受模型横纵向语义偏好；与记忆开关独立")
     ap.add_argument("--semantic-policy", choices=["selective", "always", "shadow"], default=None,
                     help="语义策略：selective 条件介入；always 旧版加分；shadow 仅记录建议，执行基础PDM")
     ap.add_argument("--planning-memory", choices=["off", "gate", "full"], default=None,
                     help="数值规划经验：off 关闭；gate 仅辅助介入判断；full 还提供已执行参数候选先验，受mode/access限制")
+    ap.add_argument("--planner-recovery", choices=["on", "off"], default=None,
+                    help="选择性语义策略下是否允许模型请求扩展脱困候选；off仅保留普通语义加分")
     ap.add_argument("--model-inference", choices=["on", "off"], default=None,
                     help="模型调用开关；off 要求 pdm_closed、语义off，以及memory_off或显式planning-memory full的数值记忆模式")
     ap.add_argument("--dinov2-model-dir", help="本地 DINOv2 模型目录或缓存 snapshot 目录")
@@ -109,10 +119,20 @@ def main() -> None:
     planning = carla_cfg.setdefault("carla", {}).setdefault("planning", {})
     if args.planner is not None:
         planning["backend"] = args.planner
+    if args.pdm_lateral_control is not None:
+        planning["lateral_control"] = args.pdm_lateral_control
+    if args.pdm_lateral_preview is not None:
+        planning["lqr_lateral_preview"] = args.pdm_lateral_preview
+    for field in ("lane_quality", "lane_maneuver"):
+        value = getattr(args, field)
+        if value is not None:
+            planning.setdefault(field, {})["enabled"] = value == "on"
     if args.semantic_policy is not None:
         planning["semantic_policy"] = args.semantic_policy
     if args.planning_memory is not None:
         planning["planning_memory"] = args.planning_memory
+    if args.planner_recovery is not None:
+        planning.setdefault("recovery", {})["enabled"] = args.planner_recovery == "on"
     if args.model_inference is not None:
         planning["model_inference"] = args.model_inference == "on"
     if args.semantic_influence is not None:

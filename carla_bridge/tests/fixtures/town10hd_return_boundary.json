@@ -1,0 +1,283 @@
+{
+  "kind": "recorded_CARLA_physics_pose_offline_native_replay_not_future_GT",
+  "map_sha256": "5d883b799f634030af92be1e9d79d107845540ba04338e8c60e095be1aef7be7",
+  "pose": {
+    "x": 58.31651306152344,
+    "y": -58.31235885620117,
+    "z": 0.0020453643519431353,
+    "yaw_rad": -0.1296049898132543
+  },
+  "vehicle": {
+    "wheelbase_m": 3.004645347696983,
+    "max_steer_rad": 1.000529201713229,
+    "physical_inner_max_steer_rad": 1.2217303432379762,
+    "front_track_m": 1.6668276203473786,
+    "steering_mapping": "physx_perfect_ackermann",
+    "width_m": 2.163450002670288,
+    "length_m": 4.791779518127441,
+    "bounding_box_offset_xyz": [
+      0.02921966090798378,
+      -1.5821711940589012e-06,
+      0.7358605265617371
+    ],
+    "rear_axle_to_center_m": 1.4156254269887363,
+    "rear_axle_to_center_source": "carla_world_wheel_positions",
+    "measured_rear_axle_to_center_m": 1.4156254269887363,
+    "rear_axle_actor_xyz_m": [
+      -1.3864057660807525,
+      7.790280247346737e-07,
+      0.3680514526972547
+    ],
+    "planning_rear_axle_actor_xyz_m": [
+      -1.3864057660807525,
+      -1.5821711940589012e-06,
+      0.3680514526972547
+    ]
+  },
+  "route_xy": [
+    [
+      -2.613255500793457,
+      -61.01890182495117
+    ],
+    [
+      -0.6173421740531921,
+      -60.988243103027344
+    ],
+    [
+      1.3824028968811035,
+      -60.95630645751953
+    ],
+    [
+      3.3871965408325195,
+      -60.925533294677734
+    ],
+    [
+      5.3989129066467285,
+      -60.90597915649414
+    ],
+    [
+      7.410714626312256,
+      -60.899993896484375
+    ],
+    [
+      9.411115646362305,
+      -60.90081787109375
+    ],
+    [
+      11.411115646362305,
+      -60.901634216308594
+    ],
+    [
+      13.411115646362305,
+      -60.90245056152344
+    ],
+    [
+      15.411115646362305,
+      -60.90326690673828
+    ],
+    [
+      17.411115646362305,
+      -60.904083251953125
+    ],
+    [
+      19.411115646362305,
+      -60.904903411865234
+    ],
+    [
+      21.411115646362305,
+      -60.90571975708008
+    ],
+    [
+      23.411115646362305,
+      -60.90653610229492
+    ],
+    [
+      25.411115646362305,
+      -60.907352447509766
+    ],
+    [
+      27.411115646362305,
+      -60.90816879272461
+    ],
+    [
+      29.411115646362305,
+      -60.90898895263672
+    ],
+    [
+      31.411115646362305,
+      -60.90980529785156
+    ],
+    [
+      33.41111373901367,
+      -60.910621643066406
+    ],
+    [
+      35.41111373901367,
+      -60.91143798828125
+    ],
+    [
+      37.41111373901367,
+      -60.912254333496094
+    ],
+    [
+      39.41111373901367,
+      -60.9130744934082
+    ],
+    [
+      41.41111373901367,
+      -60.91389083862305
+    ],
+    [
+      43.41111373901367,
+      -60.91470718383789
+    ],
+    [
+      45.41111373901367,
+      -60.915523529052734
+    ],
+    [
+      47.41111373901367,
+      -60.91633987426758
+    ],
+    [
+      49.411109924316406,
+      -60.91716003417969
+    ],
+    [
+      51.411109924316406,
+      -60.91797637939453
+    ],
+    [
+      53.411109924316406,
+      -60.918792724609375
+    ],
+    [
+      55.411109924316406,
+      -60.91960906982422
+    ],
+    [
+      57.411109924316406,
+      -60.92042541503906
+    ],
+    [
+      59.411109924316406,
+      -60.92124557495117
+    ],
+    [
+      61.411109924316406,
+      -60.922061920166016
+    ],
+    [
+      63.411109924316406,
+      -60.92287826538086
+    ],
+    [
+      65.40646362304688,
+      -60.92355728149414
+    ],
+    [
+      67.31672668457031,
+      -60.87078094482422
+    ],
+    [
+      69.22184753417969,
+      -60.72117614746094
+    ],
+    [
+      71.11693572998047,
+      -60.475128173828125
+    ],
+    [
+      72.99710083007812,
+      -60.133270263671875
+    ],
+    [
+      74.85749816894531,
+      -59.69649124145508
+    ],
+    [
+      76.693359375,
+      -59.16590118408203
+    ]
+  ],
+  "route_progress": {
+    "index": 30,
+    "fraction": 0.766539415203808
+  },
+  "planning": {
+    "backend": "pdm_closed",
+    "lateral_control": "native_lqr",
+    "semantic_influence": false,
+    "semantic_policy": "selective",
+    "planning_memory": "off",
+    "model_inference": false,
+    "replan_interval_s": 0.2,
+    "horizon_s": 4.0,
+    "sample_interval_s": 0.1,
+    "lqr_lateral_preview": "speed_scaled",
+    "lqr_lateral_horizon_s": 2.0,
+    "lqr_lateral_min_horizon_s": 1.0,
+    "max_speed_mps": 8.0,
+    "map_radius_m": 100.0,
+    "lane_change_length_m": 30.0,
+    "lane_quality": {
+      "enabled": true
+    },
+    "lane_maneuver": {
+      "enabled": true
+    },
+    "lateral_semantic_weight": 0.8,
+    "longitudinal_semantic_weight": 0.8,
+    "semantic_governor": {
+      "base_regret_budget": 0.08,
+      "max_semantic_bonus": 0.08,
+      "lateral_weight": 0.04,
+      "longitudinal_weight": 0.04,
+      "min_query_interval_s": 2.0,
+      "wait_review_interval_s": 15.0,
+      "recovery_degraded_duration_s": 2.0,
+      "recovery_min_observations": 3,
+      "recovery_release_healthy_duration_s": 2.0,
+      "recovery_release_progress_m": 2.0
+    },
+    "recovery": {
+      "enabled": true,
+      "max_paths": 15,
+      "transition_lengths_m": [
+        2.0,
+        3.0,
+        4.0
+      ],
+      "max_offset_m": 0.5,
+      "side_clearance_m": 0.1
+    }
+  },
+  "timestamp_s": 12.2,
+  "velocity_xy": [
+    7.178993225097656,
+    -0.9810256958007812
+  ],
+  "steering": {
+    "source": "carla_measured_front_wheels",
+    "front_left_deg": -2.82847261428833,
+    "front_right_deg": -2.7531352043151855,
+    "command_estimate_bicycle_rad": 0.048728054844166174,
+    "bicycle_angle_rad": 0.04869985021553386,
+    "normalized_command": -0.045683324337005615,
+    "input_latency_modeled": false
+  },
+  "maneuver": {
+    "serial": 11,
+    "side": "right",
+    "phase": "returning",
+    "anchor": 49.38994756028156,
+    "length": 30.0,
+    "speed_cap": 5.0,
+    "committed_at": 3.0,
+    "blocker_id": 37,
+    "blocker_station": 36.0,
+    "blocker_half_length": 0.3,
+    "commit_source": "executed_generic_numerical_candidate"
+  },
+  "recorded_canonical_clearance_m": -0.17007870648135182
+}

@@ -1,4 +1,4 @@
-"""Rank finite proposals by the PDM score plus the optional semantic bonus.
+"""Rank finite proposals by native PDM, numerical lane cost and semantic bonus.
 
 Safety metrics remain observable diagnostics. They do not independently exclude
 candidates in this experimental selection rule.
@@ -11,6 +11,8 @@ import math
 
 
 SELECTION_RULE = "pdm_base_plus_semantic"
+LANE_SELECTION_RULE = "pdm_base_minus_numerical_cost_plus_semantic"
+MAX_NUMERICAL_COST = 0.16
 
 
 def _pool_identity(value):
@@ -65,7 +67,10 @@ def choose_candidate(candidates, semantic, enabled, lateral_weight=0.8, longitud
         metrics = [safety.get(k) for k in ("no_collision", "drivable_area", "driving_direction", "ttc")]
         score_valid = (type(candidate.get("base_score")) in (int, float)
                        and math.isfinite(candidate["base_score"]))
-        numerically_valid = safety.get("finite") is True and score_valid
+        cost = candidate.get("numerical_cost", 0.0)
+        cost_valid = (type(cost) in (int, float) and math.isfinite(cost)
+                      and 0.0 <= cost <= MAX_NUMERICAL_COST + 1e-12)
+        numerically_valid = safety.get("finite") is True and score_valid and cost_valid
         # Retain the former safety assessment for comparison with older logs.
         # It is deliberately independent from eligibility in this version.
         safe = (all(type(v) in (int, float) and math.isfinite(v) and 1.0 - 1e-8 <= v <= 1 for v in metrics)
@@ -76,13 +81,16 @@ def choose_candidate(candidates, semantic, enabled, lateral_weight=0.8, longitud
         bonus = (lateral_weight * lateral_match + longitudinal_weight * longitudinal_match) if enabled else 0.0
         if semantic_bonus_by_id is not None:
             bonus = float(semantic_bonus_by_id.get(candidate.get("id"), 0.0)) if enabled else 0.0
-        planning_score = float(item["base_score"]) if score_valid else None
+        planning_score = float(item["base_score"] - cost) if score_valid and cost_valid else None
         invalid_reasons = []
         if safety.get("finite") is not True:
             invalid_reasons.append("non_finite_trajectory")
         if not score_valid:
             invalid_reasons.append("invalid_base_score")
             item["base_score"] = None
+        if not cost_valid:
+            invalid_reasons.append("invalid_numerical_cost")
+        item["numerical_cost"] = float(cost) if cost_valid else None
         item.update(safe=safe, semantic_bonus=float(bonus),
                     numerically_valid=numerically_valid,
                     invalid_numeric_reasons=invalid_reasons,
@@ -100,7 +108,9 @@ def choose_candidate(candidates, semantic, enabled, lateral_weight=0.8, longitud
                                          separators=(",", ":")).encode("utf-8")).hexdigest()
     available = sorted({s for c in eligible for s in c.get("lateral_semantics", [])})
     return selected, {"semantic_enabled": bool(enabled), "semantic_requested": dict(semantic),
-                      "selection_rule": SELECTION_RULE,
+                      "selection_rule": (LANE_SELECTION_RULE if any("numerical_cost" in c for c in candidates)
+                                         else SELECTION_RULE),
+                      "numerical_cost_applied": any(c.get("numerical_cost", 0.0) > 0 for c in eligible),
                       "safety_gate_applied": False, "safety_is_diagnostic_only": True,
                       "continuity_penalty_applied": False,
                       "route_recovery_gate_applied": False, "route_recovery_active": False,

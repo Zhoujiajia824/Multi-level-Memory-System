@@ -46,7 +46,7 @@ def test_explicit_no_intervention_preserved_without_inferred_targets(duration):
     assert parsed["trajectory"] == []
 
 
-@pytest.mark.parametrize("reason", [r for r in INTERVENTION_REASON_CODES if r != "none"])
+@pytest.mark.parametrize("reason", [r for r in INTERVENTION_REASON_CODES if r not in ("none", "planner_degraded")])
 def test_parser_validates_syntax_without_inventing_physical_grounding(reason):
     # An unknown ID is retained for the current-state governor to reject. The
     # parser cannot claim a visibility/special-rule request has physical support.

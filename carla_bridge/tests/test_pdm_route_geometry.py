@@ -6,7 +6,7 @@ import carla
 import numpy as np
 import pytest
 from carla_bridge.planning.pdm_planner import _lane_corridor, _junction_lane_match
-from carla_bridge.tests.test_pdm_planner import Waypoint, Road, Vehicle
+from carla_bridge.tests.test_pdm_planner import Waypoint, Road, Vehicle, add_scene_context_fixture
 
 
 class EndingWaypoint(Waypoint):
@@ -54,6 +54,7 @@ def ending_planner(road=None, x=0, y=-3.5, speed=5):
                get_snapshot=lambda: NS(timestamp=NS(elapsed_seconds=2.0)))
     route = NS(_route=[carla.Location(x=float(value)) for value in range(-20, 160, 2)],
                _nearest_index=lambda location: max(0, int((location.x + 20) / 2)))
+    add_scene_context_fixture(world, ego, route)
     return CarlaPDMPlanner(world, ego, route, {"horizon_s": 4.0})
 
 

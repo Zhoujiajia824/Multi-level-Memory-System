@@ -6,7 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from carla_bridge.planning.experience_memory import ExecutionExperienceMemory, EXPERIENCE_FILENAME
+from carla_bridge.planning.experience_memory import (
+    ExecutionExperienceMemory, EXPERIENCE_FILENAME, execution_planner_version,
+)
 
 
 VERSION = "test_pdm_execution_v1"
@@ -56,6 +58,141 @@ def executed(bank, run_id, *, ctx=None, final=None, initial=None, action=ACTION,
         records.extend(m.observe(last))
     assert len(records) == 1 and records[0]["id"] == ident
     return m, records[0]
+
+
+def versioned_support(bank, version):
+    for run in ("a", "b", "c"):
+        writer = ExecutionExperienceMemory(bank, planner_version=version, run_id=run,
+                                          observation_horizon_s=1.0)
+        writer.begin(context(), {}, telemetry())
+        for tick in range(1, 11):
+            writer.observe(telemetry(tick / 10))
+
+
+def test_execution_version_defaults_match_explicit_numerical_settings_without_mutation():
+    explicit = {"lateral_control": "pure_pursuit", "lqr_lateral_preview": "fixed",
+        "lqr_lateral_horizon_s": 2, "lqr_lateral_min_horizon_s": 1,
+        "sample_interval_s": .1, "horizon_s": 4, "max_speed_mps": 8,
+        "lane_change_length_m": 30}
+    controller = {"wheelbase_m": 2.8, "max_steer_rad": .6, "lookahead_min_m": 3,
+        "lookahead_max_m": 12, "lookahead_k": .5, "steer_sign": -1.,
+        "pid": {"kp": 1, "ki": .05, "kd": .05, "max_throttle": .75,
+                "max_brake": .8, "deadband_mps": .15}}
+    before = copy.deepcopy((explicit, controller))
+    version = execution_planner_version(explicit, controller)
+    assert version == execution_planner_version({})
+    assert version.startswith("carla_pdm_execution_v3:")
+    assert len(version.rsplit(":", 1)[1]) == 64
+    assert (explicit, controller) == before
+    # YAML/map insertion ordering and int/float spelling do not split banks.
+    assert execution_planner_version(dict(reversed(list(explicit.items()))),
+        dict(reversed(list(controller.items())))) == version
+
+
+@pytest.mark.parametrize("key,value", [
+    ("lateral_control", "native_lqr"), ("lqr_lateral_preview", "speed_scaled"),
+    ("lqr_lateral_horizon_s", 1.5), ("lqr_lateral_min_horizon_s", .5),
+    ("sample_interval_s", .2), ("horizon_s", 5), ("max_speed_mps", 10),
+    ("lane_change_length_m", 40),
+    ("lane_quality", {"enabled": False}),
+    ("lane_quality", {"center_weight": .03}),
+    ("lane_maneuver", {"enabled": False}),
+    ("lane_maneuver", {"minimum_gap_m": 8.0}),
+])
+def test_each_numerical_planner_change_isolates_execution_evidence(key, value):
+    assert execution_planner_version({key: value}) != execution_planner_version({})
+
+
+def test_semantic_memory_and_recovery_ablation_switches_share_the_numerical_version():
+    base = {"lateral_control": "native_lqr", "lqr_lateral_preview": "speed_scaled"}
+    switches = {"semantic_influence": False, "semantic_policy": "shadow", "model_inference": False,
+        "planning_memory": "full", "recovery": {"enabled": False, "max_paths": 9},
+        "semantic_governor": {"enabled": False}, "memory_access": {"retrieve": False, "write": False},
+        "memory_mode": "memory_off", "lateral_semantic_weight": .1, "longitudinal_semantic_weight": 0.}
+    assert execution_planner_version(dict(base, **switches)) == execution_planner_version(base)
+
+
+def test_old_v1_records_are_excluded_without_modifying_a_read_only_bank(tmp_path):
+    bank = tmp_path / "bank"
+    versioned_support(bank, "carla_pdm_selective_v1")
+    path = bank / EXPERIENCE_FILENAME
+    before, modified = path.read_bytes(), path.stat().st_mtime_ns
+    current = execution_planner_version({"lateral_control": "native_lqr", "lqr_lateral_preview": "speed_scaled"})
+    reader = ExecutionExperienceMemory(bank, memory_mode="read_only", planner_version=current, run_id="query",
+        run_dir=tmp_path / "audit", observation_horizon_s=1.)
+    result = reader.retrieve(context())
+    assert result["status"] == "unknown"
+    assert result["support_count"] == 0 and result["parameter_priors"] == []
+    assert result["bank_health"]["incompatible_records"] > 0
+    reader.begin(context(), {}, telemetry())
+    reader.observe(telemetry(1.))
+    reader.finish("route_complete")
+    assert path.read_bytes() == before and path.stat().st_mtime_ns == modified
+    assert reader.summarize()["persisted_updates"] == 0
+
+
+@pytest.mark.parametrize("trained,current,controller", [
+    ({"lateral_control": "pure_pursuit"}, {"lateral_control": "native_lqr"}, None),
+    ({"lqr_lateral_preview": "fixed"}, {"lqr_lateral_preview": "speed_scaled"}, None),
+    ({}, {}, {"pid": {"kp": 1.6}}),
+])
+def test_changed_tracking_or_pid_cannot_retrieve_previous_execution_support(tmp_path, trained, current, controller):
+    trained_version = execution_planner_version(trained)
+    versioned_support(tmp_path, trained_version)
+    compatible = ExecutionExperienceMemory(tmp_path, memory_mode="read_only", planner_version=trained_version,
+                                           run_id="query")
+    assert compatible.retrieve(context())["status"] == "supported"
+    changed = ExecutionExperienceMemory(tmp_path, memory_mode="read_only",
+        planner_version=execution_planner_version(current, controller), run_id="query")
+    result = changed.retrieve(context())
+    assert result["status"] == "unknown" and result["support_count"] == 0
+    assert result["parameter_priors"] == []
+
+
+def test_closed_loop_versions_the_effective_planner_horizon_and_controller(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from carla_bridge import closed_loop as module
+    from carla_bridge.planning import pdm_planner, experience_memory
+    from src.vla_memory.common.config import Config
+
+    controller = {"pid": {"kp": 1.6}}
+    cfg = Config(overrides={"output_dir": str(tmp_path / "run"),
+        "memory_db_dir": str(tmp_path / "bank"), "memory_access": {"retrieve": True, "write": False},
+        "carla": {"fixed_delta_seconds": .1, "planning": {"backend": "pdm_closed", "semantic_influence": False,
+            "model_inference": False, "planning_memory": "full", "semantic_policy": "selective",
+            "lateral_control": "native_lqr", "lqr_lateral_preview": "speed_scaled", "horizon_s": 3.},
+            "controller": controller, "video": {"enabled": False}}})
+    world, ego, client = Mock(), Mock(), Mock()
+    scenario = SimpleNamespace(world=world, ego_vehicle=ego, cfg={}, route=Mock(),
+        setup=Mock(), destroy=Mock(return_value=True), scenario_name=Mock(return_value="versioned_setup"))
+    monkeypatch.setattr(module, "CarlaClient", Mock(return_value=client))
+    monkeypatch.setattr(module.ScenarioManager, "from_yaml", Mock(return_value=scenario))
+    monkeypatch.setattr(pdm_planner, "validate_dependencies", Mock())
+    planner_factory = Mock(return_value=Mock())
+    monkeypatch.setattr(pdm_planner, "CarlaPDMPlanner", planner_factory)
+    memory_factory = Mock(return_value=Mock())
+    monkeypatch.setattr(experience_memory, "ExecutionExperienceMemory", memory_factory)
+    metrics = Mock()
+    metrics.summary.return_value = {}
+    monkeypatch.setattr(module, "MetricsCollector", Mock(return_value=metrics))
+    monkeypatch.setattr(module, "TrajectoryTracker", Mock(return_value=Mock()))
+    loop = module.ClosedLoop(cfg, "unused", mode="memory_on")
+    loop._execution_horizon = 5.
+    loop._bind_pdm_controller = Mock()
+    loop._setup_collision_sensor = Mock()
+    loop._write_control_context = Mock()
+    try:
+        loop.setup()
+        actual_planning = planner_factory.call_args.args[3]
+        assert actual_planning["horizon_s"] == 5.
+        kwargs = memory_factory.call_args.kwargs
+        assert kwargs["planner_version"] == execution_planner_version(actual_planning, loop.controller_cfg)
+        assert kwargs["planner_version"] != execution_planner_version(loop.planning_cfg, loop.controller_cfg)
+        assert kwargs["memory_mode"] == "read_only"
+        assert loop.pdm_planner.experience_memory is loop.experience_memory
+    finally:
+        loop.close()
 
 
 def test_memory_off_never_reads_or_creates_bank(tmp_path, monkeypatch):

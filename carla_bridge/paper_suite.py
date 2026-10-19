@@ -113,10 +113,13 @@ def validate_prepared(cfg):
 def summarize_runs(runs_dir, output):
     """One row per attempted paper run, including failures; never drop bad runs."""
     fields = ["run_id", "case_id", "category", "split", "seed", "mode", "memory_access",
-              "planner_backend", "semantic_influence", "model_inference", "semantic_policy", "planning_memory",
+              "planner_backend", "pdm_lateral_control", "pdm_lateral_preview", "semantic_influence", "model_inference", "semantic_policy", "planning_memory",
+              "lane_quality_enabled", "lane_maneuver_enabled", "execution_planner_version",
               "planner_config_sha256", "model_queries", "query_checks_skipped", "model_failures",
               "inference_wall_time_s", "wall_time_s", "semantic_changed_plans", "semantic_rejected_plans",
               "shadow_changed_plans", "semantic_stop_proxy_s",
+              "planner_recovery", "recovery_expanded_plans", "recovery_selected_plans",
+              "recovery_no_solution_plans",
               "retrieve", "write", "short_term", "memory_bank", "status", "success",
               "route_completion", "duration_s", "collision_count", "red_light_violations",
               "trajectory_rejections", "events_valid", "events_executed", "events_required",
@@ -134,21 +137,31 @@ def summarize_runs(runs_dir, output):
         report = json.loads(reports[0].read_text(encoding="utf-8")) if reports else {}
         metrics = report.get("metrics", {})
         run_info = report.get("run_info", {})
-        advisory = run_info.get("advisory") or outcome.get("advisory") or {}
+        advisory = {**(outcome.get("advisory") or {}), **(run_info.get("advisory") or {})}
         access = manifest.get("config", {}).get("memory_access", {})
         planning = manifest.get("config", {}).get("carla", {}).get("planning", {})
+        # New manifests make the default switch explicit. Historical manifests
+        # without either field remain unknown, rather than fabricating recovery.
+        recovery = {**(manifest.get("planner_recovery") or {}), **(planning.get("recovery") or {})}
         row = {"run_id": manifest["run_id"], "seed": cfg["seed"],
                **{key: exp.get(key) for key in ("case_id", "category", "split", "route_sha256", "geometry_sha256")},
                **{key: manifest.get(key) for key in ("mode", "memory_access", "memory_bank", "status", "commit", "dirty")},
                **{key: access.get(key) for key in ("retrieve", "write", "short_term")},
                "planner_backend": planning.get("backend", "vlm_trajectory"),
+               "pdm_lateral_control": planning.get("lateral_control", manifest.get("pdm_lateral_control")),
+               "pdm_lateral_preview": planning.get("lqr_lateral_preview", manifest.get("pdm_lateral_preview")),
+               "lane_quality_enabled": (planning.get("lane_quality") or {}).get("enabled", manifest.get("lane_quality_enabled")),
+               "lane_maneuver_enabled": (planning.get("lane_maneuver") or {}).get("enabled", manifest.get("lane_maneuver_enabled")),
+               "execution_planner_version": outcome.get("execution_planner_version"),
                "semantic_influence": planning.get("semantic_influence", False),
                "model_inference": planning.get("model_inference", True),
                "semantic_policy": planning.get("semantic_policy", "always"),
                "planning_memory": planning.get("planning_memory", "off"),
+               "planner_recovery": recovery.get("enabled"),
                **{key: advisory.get(key) for key in ("model_queries", "query_checks_skipped", "model_failures",
                    "inference_wall_time_s", "semantic_changed_plans", "semantic_rejected_plans",
-                   "shadow_changed_plans", "semantic_stop_proxy_s")},
+                   "shadow_changed_plans", "semantic_stop_proxy_s", "recovery_expanded_plans",
+                   "recovery_selected_plans", "recovery_no_solution_plans")},
                "wall_time_s": advisory.get("wall_time_s", run_info.get("wall_time_s", outcome.get("wall_time_s"))),
                "planner_config_sha256": digest(planning),
                **{key: outcome.get(key) for key in ("success", "route_completion", "duration_s", "trajectory_rejections")},

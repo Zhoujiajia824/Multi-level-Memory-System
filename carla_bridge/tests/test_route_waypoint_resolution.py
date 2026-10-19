@@ -8,6 +8,7 @@ import carla
 import pytest
 
 from carla_bridge.planning.route_waypoints import resolve_route_waypoints
+from carla_bridge.tests.test_pdm_planner import add_scene_context_fixture
 
 
 class ForkWaypoint:
@@ -146,6 +147,7 @@ def test_real_town05_vehicle_already_at_the_wrong_exit_gets_a_finite_stop_diagno
         get_snapshot=lambda: SimpleNamespace(timestamp=SimpleNamespace(elapsed_seconds=2)))
     route = SimpleNamespace(_route=points, _route_waypoints=waypoints,
         _nearest_index=lambda location: min(range(len(points)), key=lambda i: points[i].distance(location)))
+    add_scene_context_fixture(world, ego, route)
     diagnostics = CarlaPDMPlanner(world, ego, route).plan(semantic("MAINTAIN"))["planner_diagnostics"]
     left = diagnostics["geometry"]["lateral_paths"]["left"]
     assert left["route_connection"]["reason"] == "route_exit_return_is_too_late"
@@ -243,6 +245,7 @@ def test_real_town05_native_offsets_provide_a_road_compliant_moving_rollout(poin
         get_snapshot=lambda:SimpleNamespace(timestamp=SimpleNamespace(elapsed_seconds=2)))
     route = SimpleNamespace(_route=locations,_route_waypoints=waypoints,
         _nearest_index=lambda loc:min(range(len(locations)),key=lambda i:locations[i].distance(loc)))
+    add_scene_context_fixture(world, ego, route)
     planner = CarlaPDMPlanner(world,ego,route,{"lqr_lateral_horizon_s":preview_s})
     diagnostics = [planner.plan(semantic("MAINTAIN","FOLLOW_ROUTE"),semantic_enabled=enabled)["planner_diagnostics"]
                    for enabled in (False,True)]
@@ -300,6 +303,7 @@ def test_real_town05_zero_wheel_angle_restart_has_a_native_road_compliant_choice
         get_snapshot=lambda:SimpleNamespace(timestamp=SimpleNamespace(elapsed_seconds=2)))
     route=SimpleNamespace(_route=locations,
         _nearest_index=lambda loc:min(range(len(locations)),key=lambda i:locations[i].distance(loc)))
+    add_scene_context_fixture(world, ego, route)
     outcomes=[]
     for preview in (1.,2.):
         planner=CarlaPDMPlanner(world,ego,route,{"lqr_lateral_horizon_s":preview})
@@ -355,6 +359,7 @@ def test_real_town05_adjacent_proposal_returns_before_required_right_exit(enable
                             get_snapshot=lambda: SimpleNamespace(timestamp=SimpleNamespace(elapsed_seconds=2)))
     route = SimpleNamespace(_route=points, _route_waypoints=waypoints,
         _nearest_index=lambda location: min(range(len(points)), key=lambda i: points[i].distance(location)))
+    add_scene_context_fixture(world, ego, route)
     planner = CarlaPDMPlanner(world, ego, route)
     saw_return_proposal = False
     for step in range(35):
@@ -424,6 +429,7 @@ def test_real_town05_continuous_low_speed_turn_with_pinned_pdm(length, width, wh
                             get_snapshot=lambda: SimpleNamespace(timestamp=SimpleNamespace(elapsed_seconds=2)))
     route = SimpleNamespace(_route=points,
         _nearest_index=lambda location: min(range(len(points)), key=lambda i: points[i].distance(location)))
+    add_scene_context_fixture(world, ego, route)
     planner = CarlaPDMPlanner(world, ego, route)
     # Recorded suspension/standstill acceleration must not be silently removed
     # to pass the map check. A valid driving surface accepts this snapshot too.

@@ -199,9 +199,10 @@ def test_bypass_replans_every_point_two_seconds_without_cognition_or_extra_ticks
     loop._replan_cycle.assert_not_called()
     loop._raw_capture.assert_not_called()
     assert loop.pdm_planner.plan.call_count == 5
-    for call in loop.pdm_planner.plan.call_args_list:
+    for index, call in enumerate(loop.pdm_planner.plan.call_args_list):
         assert call.args == (None,)
-        assert call.kwargs == {"semantic_enabled": False}
+        assert call.kwargs["semantic_enabled"] is False
+        assert call.kwargs["sim_time_s"] == pytest.approx(.1 + .2 * index)
     rows = [json.loads(line) for line in (tmp_path / "planner.jsonl").read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 5
     assert [row["sim_time_s"] for row in rows] == pytest.approx([.1, .3, .5, .7, .9])

@@ -28,10 +28,13 @@ INTERVENTION_FIELDS = frozenset((
     "needed", "reason_code", "target_actor_ids", "target_stop_line_id",
     "activation", "release", "valid_for_s",
 ))
+INTERVENTION_OPTIONAL_FIELDS = frozenset(("planner_request",))
+INTERVENTION_PLANNER_REQUESTS = ("none", "expand_candidates")
 INTERVENTION_REASON_CODES = (
     "none", "path_blocked", "interaction", "traffic_signal", "visibility",
-    "special_rule", "route_change",
+    "special_rule", "route_change", "planner_degraded",
 )
+MAX_SEMANTIC_OUTPUT_CHARS = 16384
 INTERVENTION_ACTIVATIONS = ("immediate", "while_conflict", "approach_stop_line")
 INTERVENTION_RELEASES = (
     "condition_cleared", "target_passed", "signal_changed", "maneuver_complete",
@@ -44,7 +47,7 @@ def _validate_intervention(value: Any) -> List[str]:
         return ["intervention 必须为完整对象"]
     errors = []
     missing = sorted(INTERVENTION_FIELDS - value.keys())
-    unexpected = sorted(value.keys() - INTERVENTION_FIELDS)
+    unexpected = sorted(value.keys() - INTERVENTION_FIELDS - INTERVENTION_OPTIONAL_FIELDS)
     if missing:
         errors.append("intervention 缺少字段: " + ", ".join(missing))
     if unexpected:
@@ -60,6 +63,10 @@ def _validate_intervention(value: Any) -> List[str]:
             not isinstance(value[field], str) or value[field] not in choices
         ):
             errors.append("无效的 intervention." + field + ": " + repr(value[field]))
+    planner_request = value.get("planner_request", "none")
+    if (not isinstance(planner_request, str)
+            or planner_request not in INTERVENTION_PLANNER_REQUESTS):
+        errors.append("无效的 intervention.planner_request: " + repr(planner_request))
     actor_ids = value.get("target_actor_ids")
     if not isinstance(actor_ids, list) or any(type(item) is not int for item in actor_ids):
         errors.append("intervention.target_actor_ids 必须为整数列表")
@@ -83,6 +90,13 @@ def _validate_intervention(value: Any) -> List[str]:
             errors.append("无需介入时 intervention 目标必须为空")
     elif value.get("needed") is True and value.get("reason_code") == "none":
         errors.append("需要介入时 intervention.reason_code 不得为 none")
+    if planner_request == "expand_candidates":
+        if value.get("needed") is not True or value.get("reason_code") != "planner_degraded":
+            errors.append("expand_candidates 必须配套 needed=true 和 reason_code=planner_degraded")
+        if actor_ids != [] or stop_line_id is not None:
+            errors.append("候选扩展请求不得绑定交通目标；退化证据由当前 planner_health 核实")
+    elif value.get("reason_code") == "planner_degraded":
+        errors.append("planner_degraded 必须配套 planner_request=expand_candidates")
     return errors
 
 
@@ -132,6 +146,8 @@ def parse_semantic_decision_output(
     """
     if not isinstance(raw_text, str) or not raw_text.strip():
         return None, ["VLM 语义输出为空或非字符串"]
+    if len(raw_text) > MAX_SEMANTIC_OUTPUT_CHARS:
+        return None, ["VLM 语义输出超过16384字符上限"]
     text = raw_text.strip()
     fence = re.fullmatch(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
     if fence:
@@ -154,6 +170,14 @@ def parse_semantic_decision_output(
         errors.append("语义输出包含不允许的字段: " + ", ".join(unexpected))
     if "intervention" in parsed:
         errors.extend(_validate_intervention(parsed["intervention"]))
+        request = parsed["intervention"]
+        if isinstance(request, dict) and request.get("planner_request") == "expand_candidates":
+            if parsed.get("lateral_decision") not in ("FOLLOW_ROUTE", "KEEP_LANE"):
+                errors.append("候选扩展仅接受 FOLLOW_ROUTE 或 KEEP_LANE 横向语义")
+            if parsed.get("longitudinal_decision") not in ("MAINTAIN", "ACCELERATE", "FOLLOW"):
+                errors.append("候选扩展仅接受 MAINTAIN、ACCELERATE 或 FOLLOW 纵向语义")
+            if request.get("activation") != "immediate" or request.get("release") != "condition_cleared":
+                errors.append("候选扩展必须使用 immediate 和 condition_cleared")
     elif require_intervention:
         errors.append("选择性语义模式缺少 intervention；不会从自由文本推断介入授权")
     for field, choices in (

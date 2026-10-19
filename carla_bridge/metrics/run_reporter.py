@@ -41,6 +41,10 @@ def _render_md(run_info: dict, s: dict) -> str:
         f"- 场景: `{run_info.get('scenario')}`",
         f"- 模式: `{run_info.get('mode')}`",
         f"- 轨迹后端: `{run_info.get('planner_backend', 'vlm_trajectory')}`",
+        f"- PDM 横向控制: `{run_info.get('pdm_lateral_control', 'unknown')}`",
+        f"- PDM 横向预瞄: `{run_info.get('pdm_lateral_preview', 'unknown')}`",
+        f"- 车道位置软成本: {run_info.get('lane_quality_enabled', 'unknown')}",
+        f"- 持续绕行候选: {run_info.get('lane_maneuver_enabled', 'unknown')}",
         f"- 语义影响候选选择: {run_info.get('semantic_influence', False)}",
         f"- 语义策略: `{run_info.get('semantic_policy', 'always')}`",
         f"- 数值规划记忆: `{run_info.get('planning_memory', 'off')}`"
@@ -113,6 +117,9 @@ def _render_md(run_info: dict, s: dict) -> str:
             f"- 实际语义改变选择 / 被拒绝的语义规划周期 / Shadow 假设改变选择: "
             f"{advisory.get('semantic_changed_plans', 0)} / {advisory.get('semantic_rejected_plans', 0)} / "
             f"{advisory.get('shadow_changed_plans', 0)}",
+            f"- 脱困扩候选 / 实际选用 / 无正分脱困候选的规划周期: "
+            f"{advisory.get('recovery_expanded_plans', 0)} / {advisory.get('recovery_selected_plans', 0)} / "
+            f"{advisory.get('recovery_no_solution_plans', 0)}",
             f"- 模型查询墙钟耗时: {_number(advisory.get('inference_wall_time_s'))} s；"
             f"运行墙钟耗时: {_number(advisory.get('wall_time_s', run_info.get('wall_time_s')))} s",
             f"- 额外停车归因代理: {_number(advisory.get('semantic_stop_proxy_s'))} s",

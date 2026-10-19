@@ -14,7 +14,7 @@
 
 本分支将 **CARLA 0.9.15** 接入多层记忆系统：六视角相机、GT 感知、自车状态和导航
 经 `KeyframeBuilder` 喂入 `OnlineDrivingLoop`。官方 PDM-Closed 核心的 CARLA 适配层
-生成、仿真和评分候选轨迹，再用 Pure Pursuit + PID 回控。默认 `semantic-policy=selective`：
+生成、仿真和评分候选轨迹，再执行所选原生 LQR 转向及 PID 纵向控制。默认 `semantic-policy=selective`：
 PDM 负责常规驾驶，模型按条件提出短期横纵向建议，通过当前证据验证后才有限影响选择。
 默认 10 Hz 控制、0.2 秒 PDM 规划；旧 `always` 或语义关闭但保留模型调用时，每 3 秒认知。
 VLM 推理期间同步仿真暂停，当前尚未实现异步推理。
@@ -31,6 +31,18 @@ DINOv2 离线缓存、API、仿真器连接及预检。下文离线 nuScenes 的
 新策略及数值记忆的完整矩阵见[选择性顾问与规划记忆命令](carla_bridge/README.md#136-选择性语义顾问与数值规划记忆完整命令)：
 `--semantic-policy always|selective|shadow` 分别用于旧版对照、条件介入和仅记录建议；
 `--planning-memory off|gate|full` 控制数值经验，默认 `full`，但 `memory_off` 始终禁止记忆读写。
+原生规划持续退化时，选择性模型还可请求扩展当前车道的局部路径，由数值模块统一仿真评分；
+`--planner-recovery on|off` 用于该功能及消融，见[模型请求候选扩展](carla_bridge/README.md#137-模型请求候选扩展原生-pdm-持续无法前进时脱困)。
+`--pdm-lateral-control native_lqr|pure_pursuit` 独立选择横向执行方式，默认 `native_lqr`；
+`--pdm-lateral-preview speed_scaled|fixed` 独立选择预瞄，默认随实测速度在1–2秒间调度；
+语义开关对照需保持控制和预瞄两项一致，`pure_pursuit` 用于历史控制方式对照。
+车道居中和持续绕行属于数值规划层，纯 PDM 与语义开启时共用：
+`--lane-quality on|off` 控制预测车身的车道中心/边界软成本，
+`--lane-maneuver on|off` 控制针对持续慢速障碍的合法变道、超越和返回候选，均默认开启。
+绕行路径单独使用受曲率限速的纵向策略副本，普通候选不全局降速，整池仍统一仿真评分。
+常规红灯、可由当前信号解释的前车排队以及正常移动跟车，在选择性模式下不因等待时长
+或建议过期而周期调用模型；实际风险变化、绿灯后的异常堵塞仍重新评估。
+原因、实验命令和验证边界见[车道居中、绕行与常规等待](carla_bridge/README.md#138-车道居中合法绕行与常规等待)。
 无模型基线使用 `--semantic-influence off --model-inference off --planning-memory off --mode memory_off`；
 无模型另可显式选 `full + memory_on` 使用独立数值库。新选择性策略和数值经验的效果仍需完整闭环实验验证，
 下面的使用命令和单元测试不代表已经证明改善驾驶表现。
@@ -1438,7 +1450,7 @@ A: 编辑 `config/prompts.yaml`，所有提示词在此集中。详见 [docs/pro
 A: P6 已修复（默认 nav_to_behavior_map 自动注入 + 大小写归一化）。若仍为 0%，检查 jsonl 中 `behavior` 字段是否非空。
 
 **Q: 怎么接入 CARLA 闭环？**
-A: 已实现，见 [CARLA README](carla_bridge/README.md)。`python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_on` 使用默认选择性顾问与 PDM。模型只给语义建议，PDM 生成轨迹，Pure Pursuit+PID 回控；另支持无模型纯 PDM 和独立数值经验，见[完整命令矩阵](carla_bridge/README.md#136-选择性语义顾问与数值规划记忆完整命令)。`src/vla_memory/planning/dynamics_planner.py` 仍是预留 stub，CARLA 控制器在 `carla_bridge/control/`，不依赖该 stub。
+A: 已实现，见 [CARLA README](carla_bridge/README.md)。`python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_on` 使用默认选择性顾问与 PDM。模型给语义建议及候选扩展请求，PDM 生成轨迹，默认执行所选 LQR 转向与 PID 纵向控制；另支持无模型纯 PDM 和独立数值经验，见[完整命令矩阵](carla_bridge/README.md#136-选择性语义顾问与数值规划记忆完整命令)。`src/vla_memory/planning/dynamics_planner.py` 仍是预留 stub，CARLA 控制器在 `carla_bridge/control/`，不依赖该 stub。
 
 **Q: FAISS 装不上怎么办？**
 A: 见 §3.4 故障排查表，**固定 `faiss-cpu==1.9.0`**，不要装 1.14.x。

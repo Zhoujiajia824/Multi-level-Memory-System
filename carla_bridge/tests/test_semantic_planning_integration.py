@@ -93,7 +93,7 @@ def test_planning_precedes_admission_and_preserves_semantics_in_memory(
         assert record["model_decision_output"]["behavior"] == "SLOW_DOWN"
         assert record["decision_output"]["behavior"] == "KEEP_LANE"
         closed.pdm_planner.plan.assert_called_once_with(
-            SEMANTIC, semantic_enabled=semantic_enabled)
+            SEMANTIC, semantic_enabled=semantic_enabled, sim_time_s=closed._elapsed)
         online.mid_term.add_record.assert_called_once()
         stored = online.mid_term.add_record.call_args.args[0]
         assert stored.semantic_decision == SEMANTIC

@@ -24,6 +24,9 @@ from carla_bridge.control.trajectory_tracker import TrajectoryTracker
 from carla_bridge.control.trajectory_validation import TrajectoryValidator
 from carla_bridge.env.carla_client import CarlaClient
 from carla_bridge.env.scenario_manager import ScenarioManager
+from carla_bridge.planning.native_tracking import (
+    MAX_PROFILE_LIFETIME_S, SAMPLE_INTERVAL_S, override_native_tracking,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -131,6 +134,10 @@ def run_diagnostic(args, *, planner_factory=None, collision_grace_s=.25):
         ccfg["experiment_output_dir"] = str(output)
         dt = float(ccfg.get("fixed_delta_seconds", .1))
         planning = deepcopy(ccfg.get("planning") or {})
+        if args.pdm_lateral_control is not None:
+            planning["lateral_control"] = args.pdm_lateral_control
+        report["pdm_lateral_control"] = planning.get("lateral_control", "pure_pursuit")
+        report["pdm_lateral_preview"] = planning.get("lqr_lateral_preview", "fixed")
         interval = float(planning.get("replan_interval_s", .2))
         required_horizon = float(ccfg.get("replan_interval_s", 3.0))
         maximum = float(args.max_duration_s if args.max_duration_s is not None else config.get("duration_s", 900))
@@ -138,6 +145,11 @@ def run_diagnostic(args, *, planner_factory=None, collision_grace_s=.25):
             raise ValueError("time steps, horizons and maximum duration must be finite and positive")
         if interval < dt:
             raise ValueError("PDM interval cannot be shorter than one CARLA tick")
+        if planning.get("lateral_control", "pure_pursuit") == "native_lqr":
+            if abs(dt - SAMPLE_INTERVAL_S) > 1e-8:
+                raise ValueError("Native LQR tracking requires fixed_delta_seconds=0.1")
+            if interval > MAX_PROFILE_LIFETIME_S + 1e-9:
+                raise ValueError("Native LQR tracking requires PDM replan_interval_s <= 0.3")
         planning["horizon_s"] = max(float(planning.get("horizon_s", 4)), required_horizon)
         planning["semantic_influence"] = report["semantic_influence"]
         ticks_per_plan = max(1, round(interval / dt))
@@ -215,7 +227,8 @@ def run_diagnostic(args, *, planner_factory=None, collision_grace_s=.25):
                 sequence += 1
                 report["planner_count"] = sequence
                 try:
-                    plan = planner.plan(deepcopy(CONSTANT_SEMANTICS), semantic_enabled=report["semantic_influence"])
+                    plan = planner.plan(deepcopy(CONSTANT_SEMANTICS),
+                                        semantic_enabled=report["semantic_influence"], sim_time_s=elapsed)
                 except Exception as exc:
                     _append_json(output / "planner.jsonl", {"sim_time_s": elapsed, "sequence": sequence,
                         "semantic_decision": CONSTANT_SEMANTICS, "error": type(exc).__name__ + ": " + str(exc),
@@ -237,8 +250,14 @@ def run_diagnostic(args, *, planner_factory=None, collision_grace_s=.25):
                 tracker.set_trajectory(plan["trajectory"], state["x"], state["y"], state["yaw_rad"],
                                        plan["target_speed"], follow_speed_profile=True)
             control = tracker.compute_control(state["x"], state["y"], state["yaw_rad"], state["speed"])
+            native_tracking = None
+            diagnostics = plan.get("planner_diagnostics") or {}
+            if diagnostics.get("native_tracking", {}).get("active") is True:
+                control, native_tracking = override_native_tracking(control, diagnostics,
+                    now_s=elapsed, speed_mps=state["speed"], steering_model=planner.steering_model)
             command = {"sim_time_s": elapsed, "planner_sequence": sequence,
-                       **_control_values(control), "tracking": deepcopy(tracker.last_control_diagnostics)}
+                       **_control_values(control), "tracking": deepcopy(tracker.last_control_diagnostics),
+                       "native_tracking": native_tracking}
             ego.apply_control(control)
             frame = client.tick()
             tick += 1
@@ -328,6 +347,8 @@ def parse_args(argv=None):
     parser.add_argument("--port", type=int, default=2000)
     parser.add_argument("--timeout-s", type=float, default=120.0)
     parser.add_argument("--semantic-influence", choices=("on", "off"), default="off")
+    parser.add_argument("--pdm-lateral-control", choices=("native_lqr", "pure_pursuit"), default=None,
+                        help="PDM横向执行模式；省略时使用carla.yaml，纵向仍PID")
     parser.add_argument("--empty-traffic", action="store_true")
     parser.add_argument("--rendering", action="store_true", help="enable rendering (diagnostic defaults to no rendering)")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "outputs/pdm_diagnostics" /

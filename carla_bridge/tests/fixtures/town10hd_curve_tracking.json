@@ -1,0 +1,27 @@
+{
+  "note": "Measured CARLA Town10HD bend pose before the fixed-two-second LQR drift failure. Uses the ordered route and map hash in town10hd_stopped_recovery.json. No live actors or future information.",
+  "map_sha256": "5d883b799f634030af92be1e9d79d107845540ba04338e8c60e095be1aef7be7",
+  "sim_time_s": 38.0,
+  "pose": {
+    "x": -42.73549270629883,
+    "y": 55.34326934814453,
+    "z": 0.0020549774635583162,
+    "yaw_rad": -1.9963212657738285
+  },
+  "route_progress": {
+    "index": 245,
+    "fraction": 0.7070432701067391
+  },
+  "speed_mps": 6.161259853094396,
+  "acceleration_xyz": [
+    2.224273681640625,
+    -0.8667135238647461,
+    4.100799560546875e-05
+  ],
+  "yaw_rate_deg_s": 26.093271255493164,
+  "normalized_steer": 0.18266819417476654,
+  "wheel_steer_deg": {
+    "FL_Wheel": 10.311842918395996,
+    "FR_Wheel": 11.440460205078125
+  }
+}

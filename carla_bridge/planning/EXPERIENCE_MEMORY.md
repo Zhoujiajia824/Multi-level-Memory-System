@@ -6,15 +6,34 @@
 
 ## 查看已有经验库
 
-在仓库根目录、已有 `mulmem_carla` 环境中运行。将示例银行目录换成实际使用的 `--memory-bank`：
+在仓库根目录、已有 `mulmem_carla` 环境中运行。将示例银行目录换成实际使用的 `--memory-bank`。
+当前闭环版本为 `carla_pdm_execution_v3:<配置哈希>`，完整值来自已结束运行的
+`manifest.json.outcome.execution_planner_version`。不同控制器、预瞄、PID及规范化后的
+`lane_quality` / `lane_maneuver` 开关和参数会产生不同版本；语义、模型、记忆和恢复开关
+本身不改变数值版本。下面先从实际运行读取版本，再检查该版本的库：
 
 ```bash
 conda activate mulmem_carla
+RUN_DIR=outputs/carla_runs/替换为实际运行目录
+PLANNER_VERSION=$(python - "$RUN_DIR/manifest.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    manifest = json.load(f)
+version = manifest.get("outcome", {}).get("execution_planner_version")
+if not isinstance(version, str) or not version.startswith("carla_pdm_execution_v3:"):
+    raise SystemExit("该运行未记录当前v3数值版本，请核对运行目录和代码版本")
+print(version)
+PY
+)
 python -m carla_bridge.planning.experience_cli inspect \
-  --bank outputs/memory_banks/paper_v1/train_general
+  --bank outputs/memory_banks/paper_v1/train_general \
+  --planner-version "$PLANNER_VERSION"
 ```
 
-默认规划版本为 `carla_pdm_selective_v1`，与当前闭环记录版本一致。查看旧版本时可以显式指定：
+工具为历史兼容仍默认 `carla_pdm_selective_v1`，**不等于当前闭环版本**。
+省略 `--planner-version` 可能把当前记录统计为不兼容，不能据此认为当前库为空。
+旧v1/v2记录保留，但当前规划不跨版本检索，不迁移或删除原经验。需要查看旧版本时显式指定：
 
 ```bash
 python -m carla_bridge.planning.experience_cli inspect \
@@ -23,6 +42,10 @@ python -m carla_bridge.planning.experience_cli inspect \
 ```
 
 输出包含所选版本、检测到的版本和 schema、兼容记录的种类和最终状态、坏行及版本不兼容数量。`detected_*` 统计原始 JSONL 行；`compatible_record_states` 按同一 ID 的最新有效记录统计。`raw_json_invalid_lines` 还会标出非法 JSON、重复键所在行。`health` 中运行计数器属于本次工具对象，不是历史训练轮数；`trained_model` 固定为 `false`。
+
+汇总CSV同时保存 `execution_planner_version`、`lane_quality_enabled` 与
+`lane_maneuver_enabled`。两项数值功能与语义/模型/记忆开关应分别分组，避免把绕行限速副本
+或车道成本的差异归因为模型、记忆收益。实际绕行参数和后续观测仍以逐帧审计和执行经验为准。
 
 查看不会修改经验文件、文本库或创建不存在的记忆库。已有库使用与 `RunSession` 相同的独占锁读取一致快照，可能在**库目录外**留下 `.库名.lock`；锁文件不能手工删除。实验运行正在占用该库时工具直接报忙，待实验结束再运行。
 
@@ -34,7 +57,7 @@ python -m carla_bridge.planning.experience_cli inspect \
 python -m carla_bridge.planning.experience_cli import-pairs \
   --bank outputs/memory_banks/paper_v1/train_general \
   --input /data/zjj/experiments/paired_train/evaluated_pairs.jsonl \
-  --planner-version carla_pdm_selective_v1
+  --planner-version "$PLANNER_VERSION"
 ```
 
 输入支持单个 JSON 对象、JSON 对象数组，或扩展名为 `.jsonl` 的逐行对象；整批上限为 32 MiB。必须预先固定评价协议和效用定义，不能根据测试结果挑选最有利的指标、协议或动作再回填。
@@ -62,6 +85,7 @@ python -m carla_bridge.planning.experience_cli import-pairs \
 python -m carla_bridge.planning.experience_cli import-pairs \
   --bank outputs/memory_banks/paper_v1/train_general \
   --input /data/zjj/experiments/paired_train/evaluated_pairs.jsonl \
+  --planner-version "$PLANNER_VERSION" \
   --artifact-root /data/zjj/experiments/paired_train/artifacts
 ```
 

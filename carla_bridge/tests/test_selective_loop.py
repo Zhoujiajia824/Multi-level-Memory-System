@@ -166,6 +166,32 @@ def test_unfinished_route_and_interrupted_window_never_become_learned_success(tm
     assert rows(tmp_path / "bank" / "planning_experiences.jsonl")[-1]["status"] == "censored"
 
 
+def test_expansion_records_original_baseline_and_ends_window_when_geometry_changes(tmp_path):
+    loop = execution_loop(tmp_path)
+    decision = experience_decision()
+    diagnostics = decision["planner_diagnostics"]
+    diagnostics["original_baseline_selected_id"] = "center:STOP"
+    diagnostics["baseline_selected_id"] = diagnostics["selected_id"]
+    candidate = diagnostics["candidates"][0]
+    candidate.update(recovery=True, recovery_recipe="short_pose_rejoin",
+                     recovery_transition_m=3.0, lane_offset_m=-.5)
+    loop._elapsed = .1
+    loop._begin_execution_experience(decision)
+    old_id, pending = next(iter(loop.experience_memory.pending.items()))
+    record = pending["record"]
+    assert record["baseline_candidate_id"] == "center:STOP"
+    assert record["decision"]["adopted"] is True
+    assert record["decision"]["selected_geometry"]["recovery_transition_m"] == 3.0
+    loop._elapsed = .2
+    loop._record_tick(loop.scenario.ego_vehicle)
+    candidate["recovery_transition_m"] = 4.0
+    loop._elapsed = .3
+    loop._begin_execution_experience(decision)
+    assert old_id not in loop.experience_memory.pending
+    records = rows(tmp_path / "bank" / "planning_experiences.jsonl")
+    assert [r for r in records if r["id"] == old_id][-1]["status"] == "censored"
+
+
 def test_read_only_observation_audit_does_not_create_or_modify_bank(tmp_path):
     bank = tmp_path / "bank"
     bank.mkdir()
@@ -219,6 +245,9 @@ def test_real_shadow_executes_identical_baseline_and_retains_would_select(tmp_pa
     baseline = planner.plan(None, semantic_enabled=False)
     planner.semantic_policy = "shadow"
     planner.governor = Mock()
+    planner.governor.config = {"moving_option_progress_m": 2.0}
+    planner.governor.observe_planner_health.return_value = {"sustained": False}
+    planner.governor.recovery_request.return_value = {"authorized": False}
     context = experience_decision()["planner_diagnostics"]["planner_context"]
     monkeypatch.setattr(scene_context, "build_scene_context", lambda *a, **kw: deepcopy(context))
     def forced_selection(candidates, *_a, **_kw):

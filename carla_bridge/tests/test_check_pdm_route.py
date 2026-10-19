@@ -11,6 +11,7 @@ import yaml
 from carla_bridge.env.route_progress import RouteProgress
 from carla_bridge.control.steering_model import SteeringModel
 from carla_bridge.tools import check_pdm_route as diagnostic
+from carla_bridge.planning.native_tracking import TRACKING_SOURCE
 
 
 class Sensor:
@@ -137,25 +138,34 @@ class Scenario:
 
 class Planner:
     calls = []
+    plan_times = []
     invalid = False
     error = False
+    profile_angles = None
 
     def __init__(self, world, ego, route, planning):
+        self.planning = deepcopy(planning)
         self.vehicle_parameters = NS(wheel_base=3.0)
         self.steering_model = SteeringModel(1.2, wheelbase_m=3, front_track_m=1.6)
         self.max_steer = self.steering_model.max_steer_rad
         self.rear_axle_actor_xyz_m = (-1.3, 0, .3)
 
-    def plan(self, semantic, semantic_enabled):
+    def plan(self, semantic, semantic_enabled, *, sim_time_s):
         self.calls.append((deepcopy(semantic), semantic_enabled))
+        self.plan_times.append(sim_time_s)
         if self.error:
             raise RuntimeError("planning failed")
         points = [{"t": i * .1, "x": i * .1, "y": 0, "optional_v": 1.0,
                    "optional_heading_rad": 0} for i in range(41)]
         if self.invalid:
             points[2]["x"] = 100
-        return {"trajectory": points, "target_speed": 1.0,
-                "planner_diagnostics": {"emergency_brake": False, "selected_id": "center:MAINTAIN"}}
+        diagnostics = {"emergency_brake": False, "selected_id": "center:MAINTAIN",
+                       "lateral_control": self.planning.get("lateral_control", "pure_pursuit")}
+        if self.profile_angles is not None:
+            diagnostics["native_tracking"] = {"active": True, "source": TRACKING_SOURCE,
+                "issued_at_s": sim_time_s, "expires_at_s": sim_time_s+.3,
+                "sample_interval_s": .1, "bicycle_angles_rad": list(self.profile_angles)}
+        return {"trajectory": points, "target_speed": 1.0, "planner_diagnostics": diagnostics}
 
 
 @pytest.fixture
@@ -164,7 +174,8 @@ def diagnostic_case(tmp_path, monkeypatch):
     monkeypatch.setattr(diagnostic, "ScenarioManager", Scenario)
     for cls, attrs in ((Client, {"collision": False}),
                        (Scenario, {"setup_error": False, "cleanup_error": False}),
-                       (Planner, {"invalid": False, "error": False, "calls": []})):
+                       (Planner, {"invalid": False, "error": False, "calls": [],
+                                  "plan_times": [], "profile_angles": None})):
         for name, value in attrs.items():
             monkeypatch.setattr(cls, name, value)
     scenario = tmp_path / "case.yaml"
@@ -218,6 +229,83 @@ def test_empty_traffic_preserves_route_seed_and_original_yaml(diagnostic_case):
     assert report["traffic_conditions"]["spawned_vehicles"] == report["traffic_conditions"]["spawned_walkers"] == 0
     assert args.scenario.read_bytes() == before
     assert all(enabled for semantic, enabled in Planner.calls)
+
+
+@pytest.mark.parametrize("semantics", ["off", "on"])
+def test_diagnostic_executes_selected_native_samples_with_the_same_relative_clock(
+        diagnostic_case, monkeypatch, semantics):
+    args, _ = diagnostic_case
+    args.semantic_influence = semantics
+    monkeypatch.setattr(Planner, "profile_angles", [0., -.1, -.2, -.3])
+    report = run(args)
+    assert report["success"]
+    assert report["pdm_lateral_control"] == "native_lqr"
+    assert report["parameters"]["planning"]["lateral_control"] == "native_lqr"
+    assert Planner.plan_times[:2] == [0., .2]
+    rows = [json.loads(line) for line in (args.output_dir / "control.jsonl").read_text(encoding="utf-8").splitlines()]
+    model = SteeringModel(1.2, wheelbase_m=3, front_track_m=1.6)
+    for row, index, magnitude in zip(rows[:2], (1, 2), (.1, .2)):
+        command = row["command"]
+        assert command["native_tracking"]["applied"] is True
+        assert command["native_tracking"]["profile_sample_index"] == index
+        assert command["steer"] == pytest.approx(model.bicycle_to_normalized(magnitude, 1.))
+        assert row["applied_control"]["steer"] == command["steer"]
+        assert command["throttle"] == pytest.approx(command["tracking"]["throttle"])
+        assert command["brake"] == pytest.approx(command["tracking"]["brake"])
+
+
+def test_diagnostic_cli_preserves_explicit_pure_pursuit_control_and_labels(diagnostic_case, monkeypatch):
+    args, _ = diagnostic_case
+    args = diagnostic.parse_args(["--scenario", str(args.scenario), "--output-dir", str(args.output_dir),
+                                  "--pdm-lateral-control", "pure_pursuit"])
+    monkeypatch.setattr(Planner, "profile_angles", [0., -.1, -.2, -.3])
+    report = run(args)
+    assert report["success"]
+    assert report["pdm_lateral_control"] == "pure_pursuit"
+    assert report["parameters"]["planning"]["lateral_control"] == "pure_pursuit"
+    rows = [json.loads(line) for line in (args.output_dir / "control.jsonl").read_text(encoding="utf-8").splitlines()]
+    for row in rows:
+        command = row["command"]
+        assert command["steer"] == pytest.approx(command["tracking"]["steer"])
+        assert command["native_tracking"] == {"applied": False, "reason": "native_lqr_control_not_selected"}
+
+
+def patch_diagnostic_timing(monkeypatch, *, delta, interval):
+    original_load = yaml.safe_load
+    def load(text):
+        result = original_load(text)
+        if isinstance(result, dict) and "carla" in result:
+            result["carla"]["fixed_delta_seconds"] = delta
+            result["carla"]["planning"]["replan_interval_s"] = interval
+        return result
+    monkeypatch.setattr(diagnostic.yaml, "safe_load", load)
+
+
+@pytest.mark.parametrize("delta,interval,error", [
+    (.05, .2, "fixed_delta_seconds=0.1"),
+    (.2, .2, "fixed_delta_seconds=0.1"),
+    (.1, .4, "PDM replan_interval_s <= 0.3"),
+    (.1, 1., "PDM replan_interval_s <= 0.3"),
+])
+def test_native_diagnostic_rejects_expired_profile_schedules_before_connecting(
+        diagnostic_case, monkeypatch, delta, interval, error):
+    args, _ = diagnostic_case
+    args.pdm_lateral_control = "native_lqr"
+    patch_diagnostic_timing(monkeypatch, delta=delta, interval=interval)
+    monkeypatch.setattr(diagnostic, "CarlaClient", lambda **kwargs: pytest.fail("must not connect"))
+    report = run(args)
+    assert report["status"] == "error" and not report["success"]
+    assert error in report["error"]
+
+
+def test_pure_pursuit_diagnostic_keeps_legacy_tick_and_replan_configuration(diagnostic_case, monkeypatch):
+    args, _ = diagnostic_case
+    args.pdm_lateral_control = "pure_pursuit"
+    patch_diagnostic_timing(monkeypatch, delta=.05, interval=.5)
+    report = run(args)
+    assert report["success"]
+    assert report["parameters"]["fixed_delta_seconds"] == .05
+    assert report["parameters"]["pdm_interval_s"] == .5
 
 
 @pytest.mark.parametrize("failure,status", [("invalid", "invalid_trajectory"), ("error", "error")])

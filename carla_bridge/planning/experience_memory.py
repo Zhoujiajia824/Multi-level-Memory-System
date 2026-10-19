@@ -55,6 +55,48 @@ def _digest(value):
                                     separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
+def execution_planner_version(planning, controller=None):
+    """Identify numerical execution settings without splitting semantic arms.
+
+    Older outcomes predate native-LQR execution, lane costs and persistent
+    maneuvers and cannot support the current controller. Versioned loading excludes them;
+    constructing this identifier never reads, migrates or modifies a bank.
+    Defaults match CarlaPDMPlanner and TrajectoryTracker, rather than the YAML
+    preset, so omitted and explicitly supplied equivalent settings agree.
+    """
+    planning, controller = dict(planning or {}), copy.deepcopy(dict(controller or {}))
+    numeric = {key: float(planning.get(key, default)) for key, default in (
+        ("lqr_lateral_horizon_s", 2.0), ("lqr_lateral_min_horizon_s", 1.0),
+        ("sample_interval_s", .1), ("horizon_s", 4.0), ("max_speed_mps", 8.0),
+        ("lane_change_length_m", 30.0))}
+    numeric.update(lateral_control=planning.get("lateral_control", "pure_pursuit"),
+                   lqr_lateral_preview=planning.get("lqr_lateral_preview", "fixed"))
+    from .lane_quality import validate_lane_quality_config
+    from .lane_maneuver import validate_maneuver_config
+    numeric["lane_quality"] = validate_lane_quality_config(planning.get("lane_quality"))
+    numeric["lane_maneuver"] = validate_maneuver_config(planning.get("lane_maneuver"))
+    effective_controller = {"wheelbase_m": 2.8, "max_steer_rad": .6,
+        "lookahead_min_m": 3.0, "lookahead_max_m": 12.0, "lookahead_k": .5, "steer_sign": -1,
+        **{key: value for key, value in controller.items() if key != "pid"}}
+    effective_controller["pid"] = {"kp": 1.0, "ki": .05, "kd": .05,
+        "max_throttle": .75, "max_brake": .8, "deadband_mps": .15,
+        **(controller.get("pid") or {})}
+
+    def canonical(value):
+        if type(value) in (int, float):
+            if not math.isfinite(value):
+                raise ValueError("execution planner version requires finite numerical settings")
+            return float(value)
+        if isinstance(value, dict):
+            return {str(key): canonical(item) for key, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            return [canonical(item) for item in value]
+        return value
+
+    return "carla_pdm_execution_v3:" + _digest(canonical({"planning": numeric,
+                                                         "controller": effective_controller}))
+
+
 def _action(value):
     if isinstance(value, str):
         return {"longitudinal_decision": value.upper()}
