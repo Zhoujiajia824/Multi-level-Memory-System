@@ -79,8 +79,8 @@ def main() -> None:
     ap.add_argument("--memory-seed", help="复制已有库到新目标库，原始库保持不变")
     ap.add_argument("--no-memory-retrieval", action="store_true", help="不检索持久文本/数值经验，仍按写入开关积累")
     ap.add_argument("--no-short-term", action="store_true", help="关闭本轮短期记忆")
-    ap.add_argument("--planner", choices=["pdm_closed", "vlm_trajectory"], default=None,
-                    help="轨迹后端，默认 PDM-Closed；vlm_trajectory 为旧模型直接输出轨迹")
+    ap.add_argument("--planner", choices=["mpc", "pdm_closed", "vlm_trajectory"], default=None,
+                    help="轨迹后端，默认 MPC约束滚动优化；pdm_closed保留对照，vlm_trajectory为旧模型直接输出轨迹")
     ap.add_argument("--pdm-lateral-control", choices=["native_lqr", "pure_pursuit"], default=None,
                     help="PDM横向执行：native_lqr使用原生评分预测的LQR转向；pure_pursuit为旧控制对照；纵向均为PID")
     ap.add_argument("--pdm-lateral-preview", choices=["fixed", "speed_scaled"], default=None,
@@ -90,21 +90,21 @@ def main() -> None:
     ap.add_argument("--lane-maneuver", choices=["on", "off"], default=None,
                     help="合法慢障碍绕行与回归车道候选；默认on，off用于消融对照")
     ap.add_argument("--semantic-influence", choices=["on", "off"], default=None,
-                    help="PDM 候选评分是否接受模型横纵向语义偏好；与记忆开关独立")
+                    help="数值规划是否接受模型横纵向语义偏好；与记忆开关独立")
     ap.add_argument("--semantic-policy", choices=["selective", "always", "shadow"], default=None,
-                    help="语义策略：selective 条件介入；always 旧版加分；shadow 仅记录建议，执行基础PDM")
+                    help="语义策略：selective 条件介入；always 旧版加分；shadow 仅记录建议，执行基础数值规划")
     ap.add_argument("--planning-memory", choices=["off", "gate", "full"], default=None,
                     help="数值规划经验：off 关闭；gate 仅辅助介入判断；full 还提供已执行参数候选先验，受mode/access限制")
     ap.add_argument("--planner-recovery", choices=["on", "off"], default=None,
                     help="选择性语义策略下是否允许模型请求扩展脱困候选；off仅保留普通语义加分")
     ap.add_argument("--model-inference", choices=["on", "off"], default=None,
-                    help="模型调用开关；off 要求 pdm_closed、语义off，以及memory_off或显式planning-memory full的数值记忆模式")
+                    help="模型调用开关；off 要求 mpc/pdm_closed、语义off，以及memory_off或显式planning-memory full的数值记忆模式")
     ap.add_argument("--replay-audit", choices=["on", "off"], default=None,
                     help="模型调用证据与离线回放报告，默认on；保存实际模型输入图片、提示词和输出")
     ap.add_argument("--record-video", choices=["on", "off"], default=None,
                     help="录制驾驶视频及CARLA帧索引，配合模型调用回放")
     ap.add_argument("--trajectory-visualization", choices=["on", "off"], default=None,
-                    help="在CARLA世界绘制PDM评分候选和通过验证的执行轨迹，默认off")
+                    help="在CARLA世界绘制MPC/PDM候选和通过验证的执行轨迹，默认off")
     ap.add_argument("--dinov2-model-dir", help="本地 DINOv2 模型目录或缓存 snapshot 目录")
     ap.add_argument("--dinov2-cache-dir", help="Hugging Face 缓存目录（默认项目 .cache/huggingface）")
     ap.add_argument("--allow-model-download", action="store_true", help="显式允许 DINOv2 联网下载；默认仅使用本地文件")
@@ -149,8 +149,8 @@ def main() -> None:
     if args.model_inference is not None:
         planning["model_inference"] = args.model_inference == "on"
     if args.semantic_influence is not None:
-        if planning.get("backend", "vlm_trajectory") != "pdm_closed":
-            ap.error("--semantic-influence requires --planner pdm_closed")
+        if planning.get("backend", "vlm_trajectory") not in ("pdm_closed", "mpc"):
+            ap.error("--semantic-influence requires --planner pdm_closed or mpc")
         planning["semantic_influence"] = args.semantic_influence == "on"
     if planning.get("backend") == "vlm_trajectory":
         planning["semantic_influence"] = False

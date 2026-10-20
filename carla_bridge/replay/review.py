@@ -23,6 +23,7 @@ TRIGGER_LABELS = {
     "occupied_ego_crossing_conflict": "横穿交通与自车实际占用空间冲突",
     "path_blocked": "当前行驶路径被阻挡",
     "sustained_native_planner_degradation": "数值规划持续异常，需要协助脱困",
+    "sustained_low_efficiency_following": "持续被慢障碍压速，存在合法邻道可评估绕行",
     "special_situation": "检测到特殊驾驶情况",
     "verified_memory_failure": "执行记忆提示相似场景曾失败",
     "memory_supported_intervention": "执行记忆支持介入处理",

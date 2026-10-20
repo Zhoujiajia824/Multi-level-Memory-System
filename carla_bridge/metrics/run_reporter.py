@@ -41,8 +41,12 @@ def _render_md(run_info: dict, s: dict) -> str:
         f"- 场景: `{run_info.get('scenario')}`",
         f"- 模式: `{run_info.get('mode')}`",
         f"- 轨迹后端: `{run_info.get('planner_backend', 'vlm_trajectory')}`",
-        f"- PDM 横向控制: `{run_info.get('pdm_lateral_control', 'unknown')}`",
-        f"- PDM 横向预瞄: `{run_info.get('pdm_lateral_preview', 'unknown')}`",
+        ("- MPC 横向执行: 优化所得转向输入；纵向执行优化速度曲线PID"
+         if run_info.get("planner_backend") == "mpc" else
+         f"- PDM 横向控制: `{run_info.get('pdm_lateral_control', 'unknown')}`"),
+        ("- MPC 预瞄: 由有限时域优化决定，不使用PDM LQR预瞄"
+         if run_info.get("planner_backend") == "mpc" else
+         f"- PDM 横向预瞄: `{run_info.get('pdm_lateral_preview', 'unknown')}`"),
         f"- 车道位置软成本: {run_info.get('lane_quality_enabled', 'unknown')}",
         f"- 持续绕行候选: {run_info.get('lane_maneuver_enabled', 'unknown')}",
         f"- 语义影响候选选择: {run_info.get('semantic_influence', False)}",
@@ -56,10 +60,10 @@ def _render_md(run_info: dict, s: dict) -> str:
          f"- 全量认知: 按条件查询（每 {run_info.get('query_check_interval_s')} s 检查），无固定咨询周期"
          if run_info.get("cognition_scheduling") == "event_triggered" else
          f"- 全量认知间隔: {run_info.get('replan_interval_s')} s"),
-        f"- PDM 重规划间隔: {run_info.get('pdm_replan_interval_s')} s",
+        f"- 数值重规划间隔: {run_info.get('numerical_replan_interval_s', run_info.get('pdm_replan_interval_s'))} s",
     ]
     if run_info.get("semantic_policy") == "shadow":
-        lines.append("- Shadow: 实际执行基础 PDM；would-selection 仅为同快照候选比较，不是已执行结果")
+        lines.append("- Shadow: 实际执行基础数值规划；would-selection 仅为同快照候选比较，不是已执行结果")
     usage = run_info.get("model_usage")
     if isinstance(usage, dict):
         ratio = usage.get("model_call_frame_ratio")

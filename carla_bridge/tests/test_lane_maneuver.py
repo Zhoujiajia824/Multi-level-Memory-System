@@ -165,10 +165,10 @@ def test_normal_lead_speed_is_not_an_obstacle_even_if_persistent():
 
 
 def test_very_close_blocker_cannot_force_an_impossible_lane_change():
-    engine, world, ego, reference = fixture([Obstacle(actor_id=7, x=10)])
+    engine, world, ego, reference = fixture([Obstacle(actor_id=7, x=6)])
     result = observed(engine, world, ego, reference)
     assert not result["active"]
-    assert result["diagnostics"]["reason"] == "insufficient_space_before_obstacle"
+    assert result["diagnostics"]["reason"] == "no_safe_legal_overtaking_corridor"
 
 
 def test_lane_return_waits_until_actual_blocker_is_behind_then_anchors_once():

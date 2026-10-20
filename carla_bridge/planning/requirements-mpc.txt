@@ -1,0 +1,7 @@
+# Independent MPC numerical and adapter runtime; no nuPlan/tuplan source installation.
+# Install the CARLA/base environment separately (carla_bridge/README.md section 5).
+# Compatible with the existing Python 3.9 mulmem_carla numerical environment.
+numpy>=1.24,<2
+scipy>=1.10,<1.14
+# CARLA adapter lane geometry, swept footprint and maneuver gap checks.
+Shapely==2.0.7

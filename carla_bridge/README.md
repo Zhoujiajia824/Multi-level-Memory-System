@@ -2,12 +2,15 @@
 
 把多层次记忆系统（`src/vla_memory`）接入 CARLA 0.9.15：用 CARLA 实时
 感知（六视角图像 / GT 障碍物 / 天气 / 导航 / 自车状态）替代离线 nuScenes。
-默认链路为 PDM-Closed 候选规划与条件语义顾问 → 所选原生 LQR 转向 + 速度曲线 PID 回控。
-支持通过 `--semantic-influence on|off` 做语义影响对照；安装依赖及使用方式见[第 13 节](#13-语义决策与-pdm-closed)。
+当前默认链路为 **MPC 约束滚动优化 + 条件语义顾问 → 优化转向区间输入 + 速度曲线 PID 回控**。
+`--planner pdm_closed` 保留原 PDM 对照，`--planner vlm_trajectory` 保留旧模型路点模式。
+MPC 不依赖 nuPlan/tuplan；安装、完整命令及约束说明见[第 14 节](#14-mpc-滚动轨迹规划当前默认后端)。
 
 首次配置按顺序阅读：[第 5 节：新环境或已有环境安装](#5-环境搭建) →
-[第 12.0 节：生成与运行新场景](#120-从服务器开始生成场景再运行场景) →
-[第 13.6 节：策略与记忆完整命令](#136-选择性语义顾问与数值规划记忆完整命令)。
+[第 12.0 节：生成新场景](#120-从服务器开始生成场景再运行场景) →
+[第 14 节：MPC 与对照运行](#14-mpc-滚动轨迹规划当前默认后端)。
+第 12、13 节显式使用 `--planner pdm_closed` 的命令和已有闭环结果属于 PDM 对照；
+未指定 planner 的命令现在使用 MPC，不能把旧 PDM 验收结果视为 MPC 验收。
 运行后的模型调用、图像、输入输出与视频定位见[第 13.11 节](#1311-模型调用审核视频定位与仿真轨迹绘制)。
 全部入口开关、当前默认值与记忆组合速查见[第 13.12 节](#1312-运行开关总表与记忆使用形式)。
 
@@ -33,13 +36,14 @@ python -m pip install "pytest>=7.4,<9"
 
 **先检查环境，不连接仿真器或调用 API：**
 
-PDM 是新增可选依赖，但已作为 CARLA 默认后端。首次更新先按第 13 节安装并预检；
-缺依赖会在加载 CARLA 场景之前报错，不会静默回退到旧模型轨迹。
+MPC 是当前默认后端。已有 `mulmem_carla` 通常已具有所需 NumPy/SciPy；按第 5.3 节检查，
+无需重建环境或卸载已有 PDM。仅在选择 PDM 对照时安装并核验固定 nuPlan/tuplan 来源。
+缺依赖会明确报错，不会静默换成另一规划算法。
 
 ```bash
 python -c "import sys, carla, faiss, torch, pydantic; from carla_bridge.closed_loop import ClosedLoop; print('Python:', sys.version); print('CUDA:', torch.cuda.is_available()); print('IMPORT_OK')"
 python -m carla_bridge.run_carla_demo --help
-python -m pytest -q -p no:cacheprovider
+python -m pytest carla_bridge/tests/test_mpc_solver.py carla_bridge/tests/test_mpc_runtime.py -q -p no:cacheprovider
 ```
 
 测试使用本地 CARLA Python 绑定和 FAISS，不启动 CARLA、不下载模型、不调用 VLM。
@@ -215,10 +219,10 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
 | 项 | 说明 |
 |---|---|
 | **复用记忆管线** | 复用 `OnlineDrivingLoop`（setup/step/close），CARLA 数据经 `KeyframeBuilder` 组装成与 nuScenes 同构的 `kf` dict 喂入 |
-| **条件或周期认知** | 默认 selective、语义 on 时按当前 PDM/GT 证据查询；always 或语义 off 保留模型调用时，每3s sim认知；model-inference off完全跳过 |
+| **条件或周期认知** | 默认 selective、语义 on 时按当前数值规划/GT证据查询；always或语义off保留模型调用时，每3s sim认知；model-inference off完全跳过 |
 | **raw 捕获** | 旧周期认知路径每周期5次 raw 捕获供短期上下文；选择性路径在实际咨询时捕获模型图像，未咨询时排空相机队列 |
-| **5Hz PDM 规划** | 基于最新 world 状态和最近语义，生成、仿真、评分轨迹候选 |
-| **10Hz 回控** | 默认执行 PDM 已评分的 LQR 转向样本，PID 跟踪时间速度曲线；可显式选择旧 Pure Pursuit 横向对照 |
+| **5Hz 数值规划** | 默认MPC根据实测后轴状态、合法走廊与时变障碍滚动求解；PDM保留候选仿真评分对照 |
+| **10Hz 回控** | MPC按区间执行优化转向、PID跟踪优化速度；PDM执行所选LQR样本或显式Pure Pursuit对照 |
 | **同步模式** | VLM 思考期间 CARLA 冻结（不 tick），wall-clock 慢但 sim 时间连续正确 |
 | **驾驶视频录制** | 仅在 CARLA 推进 tick 取帧（跳过 VLM 冻结期），按仿真帧率编码，丢帧时视频可能短于仿真时长 |
 | **CARLA 全优势** | 自定义地图/天气/交通流/车辆/路由，全 Python API |
@@ -237,10 +241,10 @@ carla_bridge.closed_loop  ──条件查询/旧周期──>  keyframe_builder
         │                 src.vla_memory.pipeline.OnlineDrivingLoop.step(kf)
         │                                    │  DINOv2 + 场景VLM + 三层记忆 + 决策VLM
         │                                    ▼  decision = {lateral_decision, longitudinal_decision, ...}
-        │       CARLA adapter → PDM generator → simulator → scorer + optional semantic preference
+        │       CARLA adapter → MPC constrained optimization / PDM comparison + optional semantic preference
         │  ◀──  validated trajectory + time/speed profile  ────────
         ▼
-trajectory_tracker (PID + 横向基础跟踪) -> native_tracking (PDM 所选 LQR 转向) -> vehicle.apply_control
+trajectory_tracker (PID) -> mpc_tracking (优化转向) / native_tracking (PDM LQR) -> vehicle.apply_control
         │
         ├── metrics: 碰撞/违规/路线/舒适度 逐 tick 采集
         └── video: 每个 CARLA 推进 tick 取一帧（跳过 VLM 冻结）写视频
@@ -256,9 +260,9 @@ trajectory_tracker (PID + 横向基础跟踪) -> native_tracking (PDM 所选 LQR
 [4 记录]  逐 tick 指标采集 + 视频取帧
 ```
 
-默认选择性路径先按 10Hz 推进/控制、每0.2s更新PDM，再每0.5s检查是否需要咨询。
-咨询仍同步冻结仿真，返回后更新短期建议；没有建议或建议失效时继续基础 PDM。
-无模型路径不经过图中的模型管线。完整行为与边界见第13节。
+默认选择性路径先按10Hz推进/控制、每0.2s更新数值规划，再每0.5s检查是否需要咨询。
+咨询仍同步冻结仿真，返回后更新短期建议；没有建议或建议失效时继续基础数值规划。
+无模型路径不经过图中的模型管线。MPC见第14节，PDM特有行为与历史结果见第13节。
 
 ---
 
@@ -312,7 +316,7 @@ carla_bridge/
 │   ├── collector.py                #   碰撞/闯红灯/逆行/超速/路线/舒适度 采集
 │   └── run_reporter.py             #   Markdown + JSON 报告
 │
-└── video/                          # 驾驶视频录制（独立小功能，默认关）
+└── video/                          # 驾驶视频录制及真实帧索引（默认开）
     └── recorder.py                 #   仅 CARLA 推进 tick 取帧，时长=仿真驾驶时间
 ```
 
@@ -343,6 +347,7 @@ carla_bridge/
 - **`pid.py`**：PID 纵向速度跟踪，throttle/brake 互斥，积分抗饱和。
 - **`trajectory_tracker.py`**：捕获时刻把 ego-centric 轨迹转全局 waypoint，每 tick Pure Pursuit+PID -> `carla.VehicleControl`。`steer_sign` 修正左右。
 - **`planning/native_tracking.py`**：PDM 默认用实际所选 rollout 的短期 LQR 转向覆盖上述横向指令，纵向 PID 保持不变；旧 VLM 路点模式仍走 Pure Pursuit。
+- **`planning/mpc_solver.py` / `mpc_planner.py` / `mpc_tracking.py`**：独立SciPy MPC核心、地图/GT适配、优化转向执行；不用PDM生成器或评分器。
 - **`trajectory_validation.py`**：检查轨迹时间、有限数值及位移/速度合理性；拒绝结果触发制动，写入 `decision_validation` 审计，并禁止该决策写入中期或事件记忆。
 - **`scripted_vehicle.py`**：NPC 的 NOA（路由跟随）+ ACC（前方同车道有车则减速），复用 Pure Pursuit+PID。
 
@@ -367,7 +372,7 @@ carla_bridge/
 
 本节面向 Linux x86_64 服务器，使用本项目选定的 **Python 3.9 + CARLA 0.9.15** 组合。
 环境名不是程序硬编码要求；下面统一使用 `mulmem_carla`，不要求额外创建 `mulmem_pdm`。
-离线 nuScenes 的 Python 3.12 环境和根目录通用安装步骤不用于此 CARLA/PDM 路径。
+离线nuScenes的Python 3.12环境和根目录通用安装步骤不用于此CARLA入口。
 
 ### 5.1 取得代码，选择一种环境方式
 
@@ -386,10 +391,10 @@ cd Multi-level-Memory-System
 ```bash
 conda activate mulmem_carla
 python --version
-python -m pip freeze > /tmp/mulmem_carla_before_pdm.txt
+python -m pip freeze > /tmp/mulmem_carla_before_planner_update.txt
 ```
 
-接着进入 **5.3** 安装 PDM；已有有效 API Key、DINOv2 缓存和 CARLA 服务配置可继续使用。
+接着进入 **5.3** 检查MPC数值依赖；已有有效API Key、DINOv2缓存和CARLA服务配置可继续使用。
 
 **方式 B：从空环境开始。** 只有环境尚不存在时才执行：
 
@@ -421,13 +426,28 @@ python -m pip install \
   "openai>=1.6,<3" "requests>=2.31,<3" "pytest>=7.4,<9"
 ```
 
-这里按 CARLA 运行链路安装基础依赖，PDM 的数值/地图依赖在下一步补齐。
+这里按CARLA运行链路安装基础依赖，MPC数值依赖在下一步补齐，PDM按需安装。
 不需要 nuScenes 数据集，也不需要安装 `nuscenes-devkit`。
 不要再叠加根目录 `requirements.txt` 或 `pip install -e .`：它们面向另一套离线流程，
 会引入不必要的依赖或不同的 Python 约束；本入口从仓库根目录直接运行。
 固定 NumPy/OpenCV 是为了与 PDM 的 NumPy `<2` 约束保持一致，避免未限定的新版 OpenCV 要求 NumPy 2。
 
-### 5.3 新旧环境都需要：安装固定版本 PDM
+### 5.3 选择规划依赖：默认 MPC，按需安装 PDM 对照
+
+**当前默认MPC：** 直接复用已有 `mulmem_carla`，补NumPy/SciPy/Shapely，无需GitHub源码包、
+nuPlan数据或MPC训练权重。已有满足版本范围的依赖不会被重装：
+
+```bash
+python -m pip install -r carla_bridge/planning/requirements-mpc.txt \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 120 --retries 5
+python -c "import numpy, scipy; from carla_bridge.planning.mpc_solver import MPCConfig, MPCSolver; print('MPC_OK', numpy.__version__, scipy.__version__)"
+```
+
+`requirements-mpc.txt` 列独立数值核心及CARLA绕行几何依赖，完整新环境仍需上面的CARLA/基础安装。
+纯MPC且模型off不需要API Key或DINOv2；模型on时仍需第5.4节的模型准备。
+
+**仅在运行 `--planner pdm_closed` 时：** 安装下列固定PDM依赖。现有已可运行的PDM环境
+可跳过重复安装；不用为切换MPC卸载它们。
 
 以下会安装或调整当前激活环境中的依赖。已有环境保留 PyTorch，显式对齐 NumPy/OpenCV：
 
@@ -459,12 +479,15 @@ python -m pip install --no-deps -e .deps/tuplan_garage
 ```bash
 python -m pip check
 python -c "import carla, cv2, faiss, torch, transformers; from carla_bridge.closed_loop import ClosedLoop; print('CUDA:', torch.cuda.is_available()); print('IMPORT_OK')"
-python -m carla_bridge.planning.pdm_planner --check
-python -m pytest carla_bridge/tests -q -p no:cacheprovider
+python -m carla_bridge.planning.mpc_planner --check
+python -m pytest carla_bridge/tests/test_mpc_solver.py carla_bridge/tests/test_mpc_runtime.py -q -p no:cacheprovider
+# 仅安装PDM并准备跑其对照时执行：
+# python -m carla_bridge.planning.pdm_planner --check
 ```
 
-`--check` 核验 PDM 来源，不连接 CARLA 或模型 API。测试使用模拟场景接口，不能替代服务器真实驾驶。
-PDM 依赖清单同时包含 nuPlan 间接导入所需的 matplotlib/图像处理/pytest，
+MPC核心测试不连接CARLA或模型API；运行时测试使用CARLA绑定与场景替身，不能替代服务器真实驾驶。
+完整测试集中仍有PDM测试，未安装PDM时不要用全量PDM测试的依赖错误来判断MPC不可用。
+PDM的 `--check` 单独核验上游来源。PDM依赖清单包含nuPlan间接导入所需的matplotlib/图像处理/pytest，
 以及 tuplan 元数据要求的 scikit-learn 1.2.2、positional-encodings 6.0.1。
 已有 scikit-learn 版本会按该要求调整；不能仅凭两个源码包安装成功就跳过依赖检查。
 若 `pip check` 报已有包与 NumPy/Shapely 等冲突，保留输出定位，不将检查失败当作安装完成。
@@ -588,12 +611,12 @@ python -m carla_bridge.run_carla_demo --scenario straight_traffic --mode memory_
 | `carla.host`/`port` | 127.0.0.1/2000 | CARLA 服务器 |
 | `carla.synchronous`/`fixed_delta_seconds` | true/0.1 | 同步模式 + 10Hz |
 | `carla.replan_interval_s` | 3.0 | always／语义off保留模型时的认知周期；selective/shadow语义on采用条件查询 |
-| `carla.planning.backend` | pdm_closed | PDM 核心；vlm_trajectory 为旧模型轨迹 |
+| `carla.planning.backend` | mpc | 独立约束MPC；pdm_closed保留对照；vlm_trajectory为旧模型轨迹 |
 | `carla.planning.semantic_influence` | true | 语义候选偏好评分开关，与记忆开关独立 |
-| `carla.planning.semantic_policy` | selective | selective条件介入／always旧版评分／shadow只记录假设选择；用于PDM后端 |
+| `carla.planning.semantic_policy` | selective | 条件介入／旧版加分／只记录假设选择；MPC与PDM均可用 |
 | `carla.planning.planning_memory` | full | off关闭数值经验／gate辅助咨询／full另提供参数候选；memory_off优先禁读写 |
-| `carla.planning.model_inference` | true | false跳过双VLM、DINOv2、文本/视觉记忆和认知相机；要求PDM、语义off，以及memory_off或显式full数值记忆 |
-| `carla.planning.replan_interval_s` | 0.2 | 两次语义更新之间的 PDM 规划周期 |
+| `carla.planning.model_inference` | true | false跳过双VLM、DINOv2、文本/视觉记忆和认知相机；要求MPC/PDM、语义off，以及memory_off或显式full数值记忆 |
+| `carla.planning.replan_interval_s` | 0.2 | 数值规划更新周期，以仿真秒计 |
 | `carla.max_duration_s` | 300.0 | 全局仿真时间保护上限，与场景 `duration_s` 取较小值；到时未完成为 `timeout` |
 | `carla.capture_timeout_s` | 2.0 | 六路相机共享等待上限（墙钟秒） |
 | `carla.max_capture_failures` | 3 | 连续缺帧达到阈值时结束运行 |
@@ -716,6 +739,9 @@ CARLA 全局：x 前、y 右、z 上。项目 ego-centric：x 前、**y 左**。
 - [ ] P6 服务器验证：完整路线完成率 100%、清理完成且退出码 0；验证原生崩溃修复及 memory_on/off 对比
 
 ## 12. 服务器论文实验套件 paper_v1
+
+场景生成与train/eval划分对MPC和PDM共用。本节显式指定PDM的驾驶命令保留作历史对照；
+当前MPC完整驾驶命令见第14节。不要把PDM的既有路线验收结果记作MPC结果。
 
 这是项目自定义实验套件，不是 CARLA Leaderboard 或其他公开基准的复现。
 配置来源为 [paper_suite.yaml](config/paper_suite.yaml)，工具为 [paper_suite.py](paper_suite.py)。
@@ -911,7 +937,7 @@ python -m carla_bridge.run_carla_demo \
 其他训练条件/seed 更换 `--scenario`，库路径不变则继续积累。普通场景、长尾场景都应纳入训练覆盖，
 不保证每一帧入库；不要用验证条件补充训练库。
 
-以上命令默认使用 PDM 且语义评分开启，也可显式追加
+以上未指定planner的命令当前使用MPC且语义开启；复现本节PDM对照时显式追加
 `--planner pdm_closed --semantic-influence on`。持续积累默认是 `--memory-access read_write`。
 如果只积累横穿行人专用库，将库路径统一替换为
 `outputs/memory_banks/paper_v1/train_crossing`，并使用相应 `train` 场景。
@@ -1161,7 +1187,10 @@ python -m carla_bridge.run_carla_demo \
 
 ## 13. 语义决策与 PDM-Closed
 
-CARLA 默认使用 `pdm_closed`。模型只输出横向、纵向意图及文字解释；轨迹位置、时间与速度
+本节保留PDM接入、历史故障分析和PDM对照命令；**当前默认后端已改为MPC**，见第14节。
+13.11的模型调用审计/回放和13.12的通用入口开关同时支持两个数值后端。
+
+选择 `--planner pdm_closed` 后，模型只输出横向、纵向意图及文字解释；轨迹位置、时间与速度
 由规划器生成。离线 nuScenes 入口仍保留原有数值轨迹输出；CARLA 可通过
 `--planner vlm_trajectory` 显式选择旧路径。
 
@@ -1654,7 +1683,8 @@ CSV的 `execution_planner_version` 用于区分数值配置版本，研究对照
 `wait_review_interval_s` 为旧配置兼容保留，不再每15秒复核。
 该节的节流适用于语义on的selective/shadow；旧always和语义off但模型on仍按原认知周期调用。
 
-当前经验版本为 `carla_pdm_execution_v4:<配置哈希>`，规范化后的两个数值模块配置纳入哈希。
+该历史版本的经验前缀为 `carla_pdm_execution_v4:<配置哈希>`，规范化后的两个数值模块配置纳入哈希。
+当前PDM对照已升级至v5，MPC另用独立v1前缀；均不跨版本加载数值先验，见第14.4节。
 旧版本经验保持原样但不跨版本检索，当前版本见 `manifest.json.outcome.execution_planner_version`；
 库检查/导入应显式指定该完整版本，见[经验库工具说明](planning/EXPERIENCE_MEMORY.md)。
 
@@ -1777,7 +1807,7 @@ python -m carla_bridge.run_carla_demo \
 | --- | --- |
 | `--replay-audit on/off` | 模型调用证据归档和审核页面；默认on |
 | `--record-video on/off` | 驾驶视频和逐帧索引；当前 `carla_bridge/config/carla.yaml` 为on |
-| `--trajectory-visualization on/off` | 在CARLA世界绘制候选及执行计划；默认off，使用PDM后端时生效 |
+| `--trajectory-visualization on/off` | 在CARLA世界绘制候选及执行计划；默认off，支持MPC/PDM后端 |
 
 命令行优先于YAML。上面示例用于记录模型运行；需要观察世界轨迹时，将最后一项改为
 `--trajectory-visualization on`。观测开关不修改数值规划、候选评分或语义选择规则；
@@ -1940,17 +1970,17 @@ carla:
 | 参数 | 可选值 / 当前默认 | 含义 |
 | --- | --- | --- |
 | `--scenario` | 场景名或YAML路径；默认 `straight_traffic` | 选择运行场景；论文场景须已完成准备/出生检查 |
-| `--planner` | `pdm_closed`（默认）、`vlm_trajectory` | 数值PDM规划，或旧模型直接输出路点后端 |
+| `--planner` | `mpc`（默认）、`pdm_closed`、`vlm_trajectory` | 独立约束MPC、PDM对照，或旧模型直接输出路点 |
 | `--model-inference` | `on`（默认）、`off` | 是否初始化并调用场景理解/决策模型；off跳过认知相机、DINO和文本/视觉记忆 |
-| `--semantic-influence` | `on`（默认）、`off` | 模型横纵向语义是否允许影响PDM选择；off本身不会关闭模型调用 |
+| `--semantic-influence` | `on`（默认）、`off` | 模型横纵向语义是否允许影响数值候选选择；off本身不会关闭模型调用 |
 | `--semantic-policy` | `selective`（默认）、`always`、`shadow` | 条件查询和介入；旧版周期查询/无条件语义加分；按需查询并记录假设选择但不实际采纳 |
-| `--planner-recovery` | `on`（默认）、`off` | selective/shadow且语义on时，是否允许模型明确请求扩展脱困候选；shadow仅观察，不执行假设扩展 |
-| `--pdm-lateral-control` | `native_lqr`（默认）、`pure_pursuit` | PDM横向执行控制；纵向均为PID |
-| `--pdm-lateral-preview` | `speed_scaled`（默认）、`fixed` | LQR预瞄随实测速度调度，或固定预瞄对照；pure_pursuit不使用该LQR预瞄 |
-| `--lane-quality` | `on`（默认）、`off` | 车道居中和车身边界的数值软成本，不是额外硬筛规则 |
+| `--planner-recovery` | `on`（默认）、`off` | 允许selective/shadow模型明确请求额外参考；MPC在合法管道内偏移再约束优化，PDM使用其局部扩展；shadow只记录不执行 |
+| `--pdm-lateral-control` | `native_lqr`（默认）、`pure_pursuit` | 仅PDM的横向执行对照；不改变MPC优化转向执行 |
+| `--pdm-lateral-preview` | `speed_scaled`（默认）、`fixed` | 仅PDM的LQR预瞄对照；MPC不使用LQR预瞄 |
+| `--lane-quality` | `on`（默认）、`off` | PDM车道软成本消融；MPC自身跟踪成本与车身走廊约束仍生效 |
 | `--lane-maneuver` | `on`（默认）、`off` | 为持续慢障碍构造合法绕行/变道及返回候选，不保证一定选择绕行 |
 
-`--model-inference off` 只允许PDM后端且语义off。此时使用 `memory_off`，或使用
+`--model-inference off` 只允许MPC/PDM后端且语义off。此时使用 `memory_off`，或使用
 `memory_on + planning-memory full` 的独立数值记忆；不能使用无模型的gate/text-only组合。
 selective/shadow只有语义on时走条件咨询；语义off但模型on仍保留周期认知。
 shadow只关闭语义采纳，不自动关闭full数值记忆。严格无模型、无记忆PDM基线：
@@ -1989,7 +2019,7 @@ python -m carla_bridge.run_carla_demo \
 | 仅持久库、无短期 | 只读或可写bank组合追加 `--no-short-term` |
 | 从已有库复制后独立改进 | `--mode memory_on --memory-seed <已有源库> --memory-bank <尚不存在的新库> --memory-access read_write` |
 | 仅模型文本/视觉记忆 | 模型on、memory_on及bank权限组合，显式 `--planning-memory off` |
-| 无模型、仅数值经验 | `--planner pdm_closed --semantic-influence off --model-inference off --planning-memory full --mode memory_on`，再选择bank和读写权限 |
+| 无模型、仅数值经验 | `--planner mpc --semantic-influence off --model-inference off --planning-memory full --mode memory_on`，再选择bank和读写权限；PDM可显式替换planner |
 
 `read_only` 禁止向持久库新增/修改记忆，但允许本轮短期上下文演化和运行审计落盘；
 需要把短期也关闭时加 `--no-short-term`。论文 `paper_v1` 的eval场景在memory_on时强制read_only，
@@ -2012,3 +2042,203 @@ python -m carla_bridge.run_carla_demo \
 `perception.oracle_objects`（GT对象输入）、`perception.mosaic.label_subimages`（拼图视角标签）、
 `carla.video.hud`（录像HUD）和 `fallback.allow_rule_fallback_for_format_error`（格式错误规则回退）。
 它们属于实验配置，修改后应保留配置快照；上述CLI总表不意味着这些配置项可直接写成命令行参数。
+
+## 14. MPC 滚动轨迹规划：当前默认后端
+
+### 14.1 这次更换了什么
+
+`carla.planning.backend` 当前默认是 `mpc`。`planning/mpc_solver.py` 使用独立的
+SciPy SLSQP直接打靶优化：状态为后轴 `[x,y,yaw,v]`，输入为 `[加速度,等效前轮转角]`，
+按中点自行车模型滚动预测，提供目标梯度、状态敏感度和约束Jacobian。
+这不是PDM的改名或PDM候选后处理；MPC后端不导入nuPlan/tuplan，也不调用其生成器、
+模拟器或评分器。PDM仍可通过 `--planner pdm_closed` 显式运行，旧模型路点模式为 `vlm_trajectory`。
+
+保持车道与合法慢障碍绕行走廊分别优化自己的速度/转向。慢行人占据当前车道时，
+不再先把全部候选按同一个前方行人压到跟随速度；相邻可行候选可减速起步、横移、超越，
+再按真实优化的前进距离与跟踪/舒适成本选择。绕行数值候选不需要模型先宣告“算法异常”。
+模型对当前可行候选施加经过门控的语义偏好，也可在持续退化时明确请求额外参考；
+不能凭自由文本生成未经求解的路点。
+
+`--planner-recovery on` 在MPC的selective/shadow且语义on时允许经过当前证据授权的
+显式扩展请求。MPC只在合法CRUISE参考管道内尝试约±0.25/±0.45m偏移，并受
+`recovery.max_offset_m` 和可用走廊宽度收紧；偏移后缩窄管道，重新执行整套优化约束。
+`recovery.enabled/max_paths/max_offset_m` 两后端共用；`transition_lengths_m/side_clearance_m`
+仍是PDM扩展参数。shadow记录假设扩展/选择，实际恢复原基础池执行。
+这项模型请求扩展与无需模型的普通合法变道绕行是两个机制。
+
+绕行仍需要真实同向Driving邻道、地图换道权限、可跨越边界、足够的连续道路及前后车间隙。
+路口、横穿行人、人行横道附近、实线隔离或邻道有冲突时不把“超过慢行人”当成必做动作。
+如果两条路都不可行，应等待并记录原因，不能以必须超车为由取消几何与碰撞约束。
+
+另增加“有进展但效率持续很低”的咨询依据：默认至少4秒、3次不同时间观测，
+当前同道慢障碍明确、存在合法且当前间隙可用的邻道、实测速度持续偏低，且不是红灯/队列/
+路口等待时，可触发 `sustained_low_efficiency_following`。仅有正分或车辆还在蠕动不再足以
+判定一切正常。该触发只是允许咨询，邻道间隙代理不直接授权执行；数值轨迹仍须重新求解。
+
+### 14.2 已有 mulmem_carla 的安装与预检
+
+在仓库根目录执行，无需另建环境：
+
+```bash
+conda activate mulmem_carla
+python -m pip install -r carla_bridge/planning/requirements-mpc.txt \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 120 --retries 5
+python -m carla_bridge.planning.mpc_planner --check
+python -m pytest carla_bridge/tests/test_mpc_solver.py carla_bridge/tests/test_mpc_runtime.py -q
+```
+
+MPC清单包含 `numpy>=1.24,<2`、`scipy>=1.10,<1.14` 和 `Shapely==2.0.7`，后者供
+CARLA绕行几何/车体间隙检查使用；与已使用的NumPy 1.26.4 / SciPy 1.13.1兼容。
+MPC无需安装新的nuPlan/tuplan Git源码，也不需要CasADi、OSQP、
+商业求解器或MPC训练模型。已有PDM依赖可保留；运行PDM对照才另用第5.3节的固定来源安装。
+纯MPC、模型off可跳过DINOv2和API准备；模型on时仍按第5.4节准备。
+`--check` 只验证导入与默认配置，不等于驾驶、求解实时性或完整路线验收。
+
+### 14.3 同场景三种对照命令
+
+下面使用服务器已准备的R05场景。先启动CARLA 0.9.15，同一world一次只运行一个驱动：
+
+```bash
+SCENE=outputs/paper_v1_spawncheck/eval/R05_multilane_eval_s101.yaml
+
+# A. 纯MPC：不开模型、不用任何记忆，最快定位数值规划/执行问题
+python -m carla_bridge.run_carla_demo \
+  --scenario "$SCENE" --planner mpc \
+  --semantic-influence off --model-inference off \
+  --planning-memory off --mode memory_off \
+  --replay-audit on --record-video on --trajectory-visualization off
+
+# B. MPC + 条件语义顾问：先不引入记忆，隔离模型影响
+python -m carla_bridge.run_carla_demo \
+  --scenario "$SCENE" --planner mpc --semantic-policy selective \
+  --semantic-influence on --model-inference on \
+  --planning-memory off --mode memory_off \
+  --replay-audit on --record-video on --trajectory-visualization off
+
+# C. 纯PDM对照：须先安装固定PDM依赖，与A使用相同场景/种子
+python -m carla_bridge.run_carla_demo \
+  --scenario "$SCENE" --planner pdm_closed \
+  --semantic-influence off --model-inference off \
+  --planning-memory off --mode memory_off \
+  --replay-audit on --record-video on --trajectory-visualization off
+```
+
+`--semantic-policy shadow` 在MPC上同样可用：按条件咨询、记录假设选择，实际执行同一
+数值候选池的基础选择。`always` 用于周期咨询/旧加分对照，建议先用selective。
+`--semantic-influence off` 不会自动关闭模型；需要快速纯数值运行时必须同时指定模型off。
+
+### 14.4 记忆与回放继续使用原有开关
+
+第12.6、13.6、13.11、13.12节的bank权限、短期消融、只积累/只检索、复制、图像归档及
+视频联动仍适用；运行命令明确替换为 `--planner mpc` 即可。建议MPC使用新的库路径，
+例如 `outputs/memory_banks/mpc_v1/R05_train`，便于区分旧规划器的实验。
+
+```bash
+TRAIN=outputs/paper_v1_spawncheck/train/R05_multilane_train_s11.yaml
+EVAL=outputs/paper_v1_spawncheck/eval/R05_multilane_eval_s101.yaml
+BANK=outputs/memory_banks/mpc_v1/R05_train
+
+# 训练：反复运行同一路径，持续积累文本/视觉与数值经验
+python -m carla_bridge.run_carla_demo \
+  --scenario "$TRAIN" --planner mpc --semantic-policy selective \
+  --semantic-influence on --model-inference on \
+  --planning-memory full --mode memory_on \
+  --memory-bank "$BANK" --memory-access read_write
+
+# 评估：只检索已有库，绝不向持久库增加本轮记忆
+python -m carla_bridge.run_carla_demo \
+  --scenario "$EVAL" --planner mpc --semantic-policy selective \
+  --semantic-influence on --model-inference on \
+  --planning-memory full --mode memory_on \
+  --memory-bank "$BANK" --memory-access read_only
+```
+
+只积累、不检索时在**train可写**命令追加 `--no-memory-retrieval`；连短期也不使用再加
+`--no-short-term`。只用模型文本/视觉记忆则设 `--planning-memory off`。无模型、仅数值经验
+使用 `--semantic-influence off --model-inference off --planning-memory full --mode memory_on`，
+并为这种库单独选择bank路径；无模型数值库不包含完整模型记忆资料，不能冒充上面模型库。
+paper_v1的eval记忆仍必须read_only，不能借切换规划器绕过训练/评估隔离。
+
+MPC数值经验使用独立 `carla_mpc_execution_v1:<配置哈希>`；旧
+`carla_pdm_execution_v4:*` 以及当前PDM对照的 `carla_pdm_execution_v5:*` 不会被当成MPC
+已执行参数先验读取。原记录不迁移、不删除，只读原字节不变。此隔离针对数值执行经验；
+文本/视觉记忆仍服从原bank选择，因此分库仍有实验价值。MPC的full目前从支持充分的
+执行经验提出目标速度候选，并重新求解，旧IDM字段名仅为兼容存储，不代表运行IDM。
+实际版本见 `manifest.json` 中的 `outcome.execution_planner_version`。
+
+调用审计仍打开本轮 `replay/index.html`；纯MPC模型off时实际SDK调用比例应为0。
+`--trajectory-visualization on` 绘制优化后的候选及实际下发的计划，颜色沿用13.11。
+世界线会进入RGB，正式模型对照仍推荐绘制off；下载回放时保留整个运行目录。
+
+### 14.5 当前数值配置、约束与失败定位
+
+在 `carla_bridge/config/carla.yaml` 的 `carla.planning` 中配置，以下不是新CLI参数：
+
+| 项 | 当前默认 | 含义 |
+| --- | --- | --- |
+| `backend` | `mpc` | 当前默认数值后端 |
+| `mpc.dt` / `mpc.horizon_steps` | 0.2s / 20 | 4秒有限时域；每次只执行前段再由实测状态重求解 |
+| `replan_interval_s` | 0.2s | 规划更新的仿真时间周期；控制与仿真仍为0.1s |
+| `mpc.max_iterations` | 55 | 每个SLSQP初值的最大迭代数，不是固定毫秒时限 |
+| `mpc.multi_start` | true | 参考跟踪、可用热启动与障碍场景制动初值；均经过同样求解/约束检查 |
+| `mpc.accel_min` / `accel_max` | -4 / 2m/s² | 预测输入的纵向加速度上下界 |
+| `mpc.jerk_max` | 8m/s³ | 优化相邻加速度输入变化上限 |
+| `mpc.steer_rate_max` | 0.6rad/s | 优化等效前轮转角变化上限 |
+| `mpc.lateral_accel_max` | 3m/s² | 自行车模型预测横向加速度上限 |
+| `mpc.collision_margin` | 0.2m | 自车与障碍包络的附加净空 |
+| `mpc.ftol` / `constraint_tolerance` | 1e-5 / 2e-3 | 求解停止与独立可行性容差；各约束单位不同，不等于统一外扩2mm |
+| `max_speed_mps` | 8m/s | 同时服从当前CARLA道路限速；绕行专属上限默认5m/s且受曲率限制 |
+
+车长、车宽、轴距、后轴偏移来自CARLA实测车辆；实际转角边界同时受车辆Ackermann模型、
+速度转向曲线与显式 `mpc.steer_max` 上限约束，不把独立核心的假设车辆默认值当作实车测量。
+完整目标权重和数据接口见[规划模块说明](planning/README.md#mpc-独立数值核心)。
+入口要求MPC重规划间隔不大于0.3s，预测时域必须覆盖认知执行周期（当前3s）；
+默认4s满足此条件。不得只把时域缩短到低于执行周期以隐藏计算开销。
+
+首步jerk边界使用上一实际下发的期望加速度输入；CARLA实测加速度另存审计，
+不能把静止制动或接触冲量当作上一控制输入。静止保持、直接制动或控制中断后明确重置
+期望输入；假设候选、shadow及被拒绝的轨迹不会更新该下发记录。
+
+MPC硬约束包含前进速度、控制/变化率、横加速度、车身前后角的参考走廊范围、预测车体
+碰撞、适用红灯/黄灯的后轴停止线和制动距离余量。圆形行人与完整有向车身矩形精确求距；
+非圆形障碍使用保守椭圆与车体覆盖圆，可能牺牲部分间隙。碰撞在预测端点及dt/2自行车
+中点检查，仍不是连续时间安全证明。这里是新MPC求解问题自身的约束；此前删除的PDM
+额外否决规则没有因此重新加回PDM对照。
+
+每个候选在 `planner.jsonl` 有 `optimizer_status`、`optimizer_converged`、
+`optimization_feasible`、`solver_cost` 及 `solver`：后者包含每个初值的求解状态、迭代数、
+耗时、数值警告、各约束最小余量、最大违反量和初始车身走廊净空。
+`feasible_not_converged` 是满足检查但优化器没有声明收敛的有限解，不冒称最优；
+`infeasible` 候选不能被语义加分选中。整池不可行时记录
+`no_feasible_mpc_solution` 并制动，不静默退回PDM、Pure Pursuit或模型数字轨迹。
+
+若仍无法前进，优先核对 `lane_maneuver` 的候选缺失原因、慢障碍actor ID、邻道权限/间隙、
+求解器 `worst_constraint`、`initial_corridor`，再对照真实帧的模型输入与选择。
+已存在的物理压线、路线切换不连续或初始超速可能使首步约束不可行，需要定位数据/执行
+偏差，不能通过隐藏失败或把容差放大来宣称解决。
+
+### 14.6 验证与使用边界
+
+2026-10-20 在本地 CARLA 0.9.15 / Town05 做了两组实车闭环定向回归：同向双车道右侧
+车道、约64m完整路线，前方分别6m/8m各有一名以0.7m/s同向行走的行人。测试固定绿灯，
+不添加其它交通，关闭模型、记忆、图像渲染和录像，用于隔离慢障碍绕行机制。
+两组均实际进入左车道绕过行人、返回右侧并完成100%路线，碰撞与轨迹拒绝均为0。
+6m组仿真耗时20.6s，8m组19.7s，实际车身投影最小间距分别约1.62m/0.77m。
+这是定向回归；没有据此声称多车交通、复杂路口或整套论文场景已经全部通过。
+当时与其它回归并行运行，原始墙钟耗时约257s/217s，不作为实时性能基准。
+本地逐帧证据在 `outputs/mpc_validation/physical_180950/` 与
+`outputs/mpc_validation/physical_180530/`，这些运行产物不纳入Git。
+
+核心回归覆盖解析梯度、实测状态热启动、弯道中心跟踪、车身角点、停止线、近距慢行人
+绕行、横穿中点碰撞、静止保持后的释放和明确不可行状态。这些是数值与接口证据，不代表所有CARLA场景
+完成率100%。第13节已有PDM闭环成功结果仍保留其后端、交通配置和种子标记。
+
+MPC采用当前GT地图/actor及匀速未来代理，不是真实未来，也没有建模轮胎侧滑、转向
+输入迟滞或完整PhysX动力学。优化转向按区间执行，纵向仍由PID跟踪优化速度，
+因此预测加速度/jerk边界不保证真实物理加速度/jerk达标。不得用滤波指标掩盖尖峰。
+
+SLSQP是局部非线性求解器；多个候选/初值与障碍数量都会增加墙钟耗时。配置0.2秒更新
+表示仿真周期，并不保证每次求解在0.2墙钟秒内完成。同步模式下求解/模型调用期间世界
+暂停，仍需报告规划耗时、模型耗时和整轮墙钟时间，不能仅报告仿真速度。
+服务器仍按同一标准验收：有交通的完整固定路线完成率100%、`route_completed`、
+无不可接受碰撞/违规，并同时检查速度效率、真实压线、停车恢复及原始舒适性指标。

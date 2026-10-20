@@ -17,7 +17,7 @@ import numpy as np
 from .scene_context import lane_key, project_polyline
 
 
-DEFAULTS = {"enabled": True, "observation_s": 1.0, "minimum_gap_m": 6.0,
+DEFAULTS = {"enabled": True, "observation_s": 1.0, "minimum_gap_m": 1.0,
             "maximum_blocker_distance_m": 45.0, "slow_speed_fraction": .6,
             "maximum_pass_speed_mps": 5.0, "lateral_acceleration_mps2": 1.4,
             "return_clearance_m": 8.0, "maximum_maneuver_s": 45.0}
@@ -100,6 +100,37 @@ def _curvature(points):
     second = np.gradient(first, arc, axis=0)
     denominator = np.maximum(np.sum(first * first, axis=1) ** 1.5, 1e-8)
     return np.abs(first[:, 0] * second[:, 1] - first[:, 1] * second[:, 0]) / denominator
+
+
+def _curvature_limit(ego, speed_mps=0., *, physics=None):
+    """Equivalent bicycle steering bound from CARLA's measured wheel geometry.
+
+    This is a proposal-generation bound, not a substitute for downstream
+    dynamics/rollout. With an old actor provider use a conservative fallback.
+    """
+    getter = getattr(ego, "get_physics_control", None)
+    if physics is None and not callable(getter):
+        return .18
+    physics = getter() if physics is None else physics
+    wheels = physics.wheels
+    if len(wheels) < 4:
+        return .18
+    front = np.mean([[w.position.x, w.position.y, w.position.z] for w in wheels[:2]], axis=0)
+    rear = np.mean([[w.position.x, w.position.y, w.position.z] for w in wheels[-2:]], axis=0)
+    wheelbase = float(np.linalg.norm(front-rear)*.01)
+    track = float(np.linalg.norm(np.array([wheels[0].position.x, wheels[0].position.y,
+                                          wheels[0].position.z])-np.array([
+        wheels[1].position.x, wheels[1].position.y, wheels[1].position.z]))*.01)
+    maximum = math.radians(min(float(w.max_steer_angle) for w in wheels[:2]))
+    if not 1 < wheelbase < 6 or not .5 < track < 4 or not 0 < maximum < math.pi/2:
+        return .18
+    # PhysX specifies inner-wheel maximum. CARLA's steering curve reduces it
+    # with speed (curve abscissas are km/h). Retain tracking headroom too.
+    from carla_bridge.control.steering_model import SteeringModel
+    model = SteeringModel(maximum,
+        [(point.x, point.y) for point in getattr(physics, "steering_curve", ())],
+        wheelbase_m=wheelbase, front_track_m=track)
+    return .9*math.tan(model.limit_at(speed_mps))/wheelbase
 
 
 def _actor_data(actor, reference_points, ego_z):
@@ -433,7 +464,7 @@ class LaneManeuver:
             return False
         length = metadata.get("transition_length_m")
         if (not isinstance(length, Real) or isinstance(length, bool)
-                or not math.isfinite(length) or not 9 <= length <= 60):
+                or not math.isfinite(length) or not 6 <= length <= 60):
             self.last_commit_audit["reason"] = "executed_transition_has_no_verified_length"
             return False
         if same_phase and abs(length - pending["length"]) > 1e-6:
@@ -638,6 +669,7 @@ class LaneManeuver:
         limit = min(float(ego.get_speed_limit()) / 3.6, 8.)
         lane_width = float(reference[nearest].lane_width)
         possible = [a for a in actors if self.config["minimum_gap_m"] < a["station"] - station < self.config["maximum_blocker_distance_m"]
+            and a["station"] - station - a["half_length"] - ego.bounding_box.extent.x > .5
             and a["lateral"] < min(lane_width / 2 - .1, ego.bounding_box.extent.y + a["half_width"] + .15)
             and a["along_speed"] >= -.3 and a["speed"] < self.config["slow_speed_fraction"] * limit
             and (a["aligned"] or a["speed"] < .3) and abs(a["cross_speed"]) < .35]
@@ -655,20 +687,25 @@ class LaneManeuver:
         if now - self._observed["since"] < self.config["observation_s"] or self._observed["count"] < 3:
             return self._inactive("observing_slow_obstacle", actor_id=blocker["id"])
         clearance = blocker["station"] - station - blocker["half_length"] - ego.bounding_box.extent.x - 1.5
-        # A short curve needs reduced speed, not aggressive high-speed steering.
-        # Minimum nine metres bounds the geometry even when already stopped.
-        length = min(24., clearance)
-        if length < 9.:
-            return self._inactive("insufficient_space_before_obstacle", available_m=clearance)
+        # Completion of the ENTIRE lane change before the actor's longitudinal
+        # station is unnecessary: the occupied bodies can already be separated
+        # laterally while the transition is still in progress. Search geometry
+        # and verify actual envelopes instead of imposing a fixed 9 m vacancy.
+        preferred = min(24., max(6., clearance))
+        lengths = [preferred] + [n for n in (24., 20., 16., 12., 10., 9., 8., 7., 6.)
+                                  if abs(n-preferred) > 1e-6]
+        getter = getattr(ego, "get_physics_control", None)
+        physics = getter() if callable(getter) else None
+        maximum_curvature = _curvature_limit(ego, physics=physics)
         failures = {}
         for side in ("left", "right"):
-            allowed, reason = self._corridor(reference, stations, station, station + length, side)
+            allowed, reason = self._corridor(reference, stations, station, station + 6., side)
             if not allowed:
                 failures[side] = reason
                 continue
             # A finite adjacent route is not a licence to take another junction
             # exit. Leave enough real, legally returnable road after the obstacle.
-            end = station + length
+            end = station
             for i in range(nearest, len(reference)):
                 adjacent = _adjacent(reference[i], side)
                 if (adjacent is None or reference[i].is_junction or adjacent.is_junction
@@ -676,36 +713,56 @@ class LaneManeuver:
                         or (i > nearest and not _connected(_adjacent(reference[i - 1], side), adjacent))):
                     break
                 end = float(stations[i])
-            return_start = blocker["station"] + blocker["half_length"] + ego.bounding_box.extent.x + self.config["return_clearance_m"]
-            return_end = return_start + length
-            allowed, reason = self._corridor(reference, stations, return_start, return_end, side, returning=True)
-            if return_end + 4 > end or not allowed:
-                failures[side] = "no_complete_legal_return_corridor"
-                continue
-            built = self._build(reference, stations, station, length, side, end - 2)
-            if built is None:
-                failures[side] = "path_construction_failed"
-                continue
-            kmax = max(float(np.max(_curvature(built[0]))), .001)
-            cap = min(self.config["maximum_pass_speed_mps"], limit,
-                      math.sqrt(self.config["lateral_acceleration_mps2"] / kmax))
-            if cap < max(1.0, blocker["along_speed"] + .75):
-                failures[side] = "insufficient_numerical_passing_advantage"
-                continue
-            clear, conflict = self._target_gap_clear(actors, reference, stations, station, ego, side, cap,
-                                                   candidate_speed_mps=candidate_speed_mps)
-            if clear:
-                clear, conflict = self._gap_clear(actors, built[0], built[1], station, ego, cap,
-                                                  blocker_id=blocker["id"], candidate_speed_mps=candidate_speed_mps)
-            if not clear:
-                failures[side] = conflict
-                continue
-            self._counter += 1
-            plan = {"serial": self._counter, "side": side, "phase": "passing", "anchor": station,
-                "length": length, "points": built[0], "sample_s": built[1], "widths": built[2],
-                "speed_cap": cap, "blocker_id": blocker["id"], "blocker_station": blocker["station"],
-                "blocker_half_length": blocker["half_length"], "corridor_end": end}
-            return self._result(plan, "passing", committed=False)
+            attempts = []
+            for length in lengths:
+                allowed, reason = self._corridor(reference, stations, station, station + length, side)
+                if not allowed:
+                    attempts.append({"length_m": length, "reason": reason})
+                    continue
+                return_start = max(station+length, blocker["station"] + blocker["half_length"]
+                    + ego.bounding_box.extent.x + self.config["return_clearance_m"])
+                return_end = return_start + length
+                allowed, reason = self._corridor(reference, stations, return_start, return_end, side, returning=True)
+                if return_end + 4 > end or not allowed:
+                    attempts.append({"length_m": length, "reason": "no_complete_legal_return_corridor"})
+                    continue
+                built = self._build(reference, stations, station, length, side, end - 2)
+                if built is None:
+                    attempts.append({"length_m": length, "reason": "path_construction_failed"})
+                    continue
+                kmax = max(float(np.max(_curvature(built[0]))), .001)
+                if kmax > maximum_curvature:
+                    attempts.append({"length_m": length, "reason": "steering_curvature_unreachable",
+                                     "curvature_inv_m": kmax, "limit_inv_m": maximum_curvature})
+                    continue
+                cap = min(self.config["maximum_pass_speed_mps"], limit,
+                          math.sqrt(self.config["lateral_acceleration_mps2"] / kmax))
+                minimum_advantage = max(1.0, blocker["along_speed"] + .75)
+                feasible_caps = [float(speed) for speed in np.linspace(cap, minimum_advantage, 16)
+                    if minimum_advantage <= speed <= cap
+                    and kmax <= _curvature_limit(ego, speed, physics=physics)]
+                if not feasible_caps:
+                    attempts.append({"length_m": length, "reason": "no_speed_with_reachable_steering_advantage"})
+                    continue
+                cap = feasible_caps[0]
+                if cap < minimum_advantage:
+                    attempts.append({"length_m": length, "reason": "insufficient_numerical_passing_advantage"})
+                    continue
+                clear, conflict = self._target_gap_clear(actors, reference, stations, station, ego, side, cap,
+                                                       candidate_speed_mps=candidate_speed_mps)
+                if clear:
+                    clear, conflict = self._gap_clear(actors, built[0], built[1], station, ego, cap,
+                        blocker_id=blocker["id"], candidate_speed_mps=candidate_speed_mps)
+                if not clear:
+                    attempts.append(dict(conflict, length_m=length))
+                    continue
+                self._counter += 1
+                plan = {"serial": self._counter, "side": side, "phase": "passing", "anchor": station,
+                    "length": length, "points": built[0], "sample_s": built[1], "widths": built[2],
+                    "speed_cap": cap, "blocker_id": blocker["id"], "blocker_station": blocker["station"],
+                    "blocker_half_length": blocker["half_length"], "corridor_end": end}
+                return self._result(plan, "passing", committed=False)
+            failures[side] = {"reason": "no_feasible_transition", "attempts": attempts}
         return self._inactive("no_safe_legal_overtaking_corridor", excluded=failures, actor_id=blocker["id"])
 
 

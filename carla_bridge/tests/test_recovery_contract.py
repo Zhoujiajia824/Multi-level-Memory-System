@@ -146,7 +146,7 @@ def test_prompts_describe_health_gate_and_keep_parseable_nonintervention_default
                                   "planner_context": {"planner_health": {"sustained_failure": True}}},
     )
     for phrase in ("planner_health", "持续退化", "红灯、排队", "不保证起步",
-                   "相同原生仿真评分", "expand_candidates", "planner_degraded"):
+                   "当前后端约束核验", "expand_candidates", "planner_degraded"):
         assert phrase in prompt
     section = prompt.split("## 输出要求", 1)[1]
     example, _ = json.JSONDecoder().raw_decode(section[section.index("{"):])

@@ -79,11 +79,14 @@ class RunSession:
         # Use the case filename (including split/seed) and portable path characters.
         scenario_label = re.sub(r"[^\w-]+", "_", self.scenario_path.stem).strip("_")[:64] or "scenario"
         planning = config.data.get("carla", {}).get("planning", {})
+        self.planner_backend = planning.get("backend", "vlm_trajectory")
         self.model_inference = model_inference_enabled(planning, mode)
         self.semantic_policy = planning.get("semantic_policy", "always")
         self.planning_memory = planning.get("planning_memory", "off")
-        self.pdm_lateral_control = planning.get("lateral_control", "pure_pursuit")
-        self.pdm_lateral_preview = planning.get("lqr_lateral_preview", "fixed")
+        self.pdm_lateral_control = (planning.get("lateral_control", "pure_pursuit")
+                                    if self.planner_backend == "pdm_closed" else None)
+        self.pdm_lateral_preview = (planning.get("lqr_lateral_preview", "fixed")
+                                    if self.planner_backend == "pdm_closed" else None)
         self.lane_quality_enabled = (planning.get("lane_quality") or {}).get("enabled", True)
         self.lane_maneuver_enabled = (planning.get("lane_maneuver") or {}).get("enabled", True)
         # This records the configured search switch, not a claim that a model
@@ -93,8 +96,8 @@ class RunSession:
         if not self.model_inference:
             self.short_term = False
         backend = planning.get("backend", "vlm_trajectory")
-        planner_label = "pdm_closed" if backend == "pdm_closed" else "vlm_trajectory"
-        semantic = ("sem_on" if planning.get("semantic_influence", True) else "sem_off") if backend == "pdm_closed" else "sem_na"
+        planner_label = backend if backend in ("pdm_closed", "mpc") else "vlm_trajectory"
+        semantic = ("sem_on" if planning.get("semantic_influence", True) else "sem_off") if backend in ("pdm_closed", "mpc") else "sem_na"
         memory_label = "memory_off" if self.access == "off" else "memory_" + self.access
         if mode != "memory_off":
             if not self.retrieve:
@@ -120,7 +123,7 @@ class RunSession:
             budget = 258 - len(str(output_root.resolve())) - 1 - reserve
             if len(dirname) > budget:
                 compact = "_".join((
-                    "pdm" if backend == "pdm_closed" else "vlm",
+                    {"pdm_closed": "pdm", "mpc": "mpc"}.get(backend, "vlm"),
                     "s1" if planning.get("semantic_influence", True) else "s0",
                     "i1" if self.model_inference else "i0",
                     {"always": "a", "selective": "s", "shadow": "h"}[self.semantic_policy],
@@ -230,6 +233,9 @@ class RunSession:
             except (OSError, subprocess.CalledProcessError):
                 revision, dirty = "unknown", None
             self.manifest = {"run_id": self.run_id, "status": "prepared", "mode": self.mode,
+                             "planner_backend": self.planner_backend,
+                             "numerical_lateral_control": ("optimized_mpc_inputs" if self.planner_backend == "mpc"
+                                                            else self.pdm_lateral_control),
                              "run_directory": self.run_dir.name,
                              "started_at": self.started_at.isoformat(),
                              "model_inference": self.model_inference,

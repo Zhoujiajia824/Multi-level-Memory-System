@@ -212,7 +212,8 @@ class TrajectoryTracker:
             requested_inner_wheel_angle_rad=self.steering_model.bicycle_to_inner(
                 max(-steering_limit, min(steering_limit, steer_rad))),
             steering_mapping=self.steering_model.mapping,
-            tracking_reference="pdm_rear_axle" if self.rear_axle_actor_xyz_m is not None else "carla_actor_origin",
+            tracking_reference=("mpc_rear_axle" if self.vehicle_model_source == "carla_mpc_vehicle" else "pdm_rear_axle")
+                if self.rear_axle_actor_xyz_m is not None else "carla_actor_origin",
             tracking_position_xy_m=[tracking_x, tracking_y],
             wheelbase_m=self.pp.L,
             vehicle_model_source=self.vehicle_model_source,

@@ -1,19 +1,19 @@
 """CARLA 闭环主驱动
 ==================
-同步 tick + PDM 数值重规划（默认 10Hz tick / 0.2s 重规划）：
+同步 tick + 独立数值重规划（默认 MPC，保留 PDM 对照；10Hz tick / 0.2s 重规划）：
 
 选择性模式每 0.5s 检查是否需要认知，只在事件、规划困难或经验提示时咨询。
-建议经对象与条件核对后限时生效；模型不可用时沿用当前 PDM 数值规划。
+建议经对象与条件核对后限时生效；模型不可用时沿用当前数值规划。
 always 模式保留以下周期认知链路，用于对照：
 
     每个 replan 周期（默认 3s sim）：
       [1 捕获] tick -> 6 相机 mosaic + ego 状态 + GT 感知 + nav
-      [2 认知] loop_runner.step(kf) -> 语义决策 -> PDM轨迹（sim 冻结）
-      [3 控制] 10Hz × N tick：Pure Pursuit + PID 跟踪轨迹回控 CARLA
+      [2 认知] loop_runner.step(kf) -> 语义决策 -> 数值轨迹（sim 冻结）
+      [3 控制] 10Hz × N tick：MPC优化转向 / PDM LQR + 速度曲线PID回控 CARLA
                其中每周期 5 次 raw 捕获（≈1.67Hz；mosaic+ego+感知，不跑 VLM）
                push 进短期记忆，使队列在控制阶段也保持最新；完整 VLM 仍 3s 一次。
-               PDM 默认每 0.2s 根据最新 world 状态重规划，保持最近合法语义。
-              model_inference=false 时跳过认知和六路相机，按同一 PDM/控制节奏直接运行。
+               数值后端每 0.2s 根据最新 world 状态重规划，保持最近合法语义。
+              model_inference=false 时跳过认知和六路相机，按同一数值/控制节奏直接运行。
       [4 记录] 逐 tick 指标采集（碰撞/违规/路线/舒适度）+ 卡死检测
       [视频]  每个 CARLA 推进 tick 取一帧写视频（跳过 VLM 冻结期），
               视频时长 = 仿真实际驾驶时间；中断 flush 保存。
@@ -75,7 +75,7 @@ class ClosedLoop:
         self.ccfg = ccfg
         self.planning_cfg = dict(ccfg.get("planning") or {})
         self.planner_backend = self.planning_cfg.get("backend", "vlm_trajectory")
-        if self.planner_backend not in ("pdm_closed", "vlm_trajectory"):
+        if self.planner_backend not in ("mpc", "pdm_closed", "vlm_trajectory"):
             raise ValueError("Unknown CARLA planning.backend")
         self.semantic_influence = self.planning_cfg.get("semantic_influence", True)
         if type(self.semantic_influence) is not bool:
@@ -89,7 +89,7 @@ class ClosedLoop:
         self.planning_memory_mode = self.planning_cfg.get("planning_memory", "off")
         if self.planning_memory_mode not in ("off", "gate", "full"):
             raise ValueError("planning_memory must be off, gate or full")
-        self._selective_execution = (self.planner_backend == "pdm_closed" and self.model_inference
+        self._selective_execution = (self.planner_backend in ("pdm_closed", "mpc") and self.model_inference
                                     and self.semantic_influence and self.semantic_policy != "always")
         self.experience_memory = None
         self.execution_planner_version = None
@@ -122,10 +122,21 @@ class ClosedLoop:
         self._cycle_ticks = max(1, round(self.replan_interval_s / self.fixed_delta))
         self._execution_horizon = self._cycle_ticks * self.fixed_delta
         self._pdm_interval = float(self.planning_cfg.get("replan_interval_s", 0.2))
-        if self.planner_backend == "pdm_closed" and (
+        if self.planner_backend in ("pdm_closed", "mpc") and (
                 not math.isfinite(self._pdm_interval) or self._pdm_interval < self.fixed_delta
                 or self._pdm_interval > self._execution_horizon):
-            raise ValueError("PDM replan interval must be between physics tick and semantic interval")
+            raise ValueError("Numerical replan interval must be between physics tick and semantic interval")
+        if self.planner_backend == "mpc":
+            from .planning.mpc_planner import effective_mpc_config
+            mpc = effective_mpc_config(self.planning_cfg)
+            if self._pdm_interval > .3 + 1e-9:
+                raise ValueError("MPC replan_interval_s must be <= 0.3 for fresh optimized controls")
+            for name, interval in (("optimization dt", mpc.dt), ("replan interval", self._pdm_interval)):
+                ratio = interval / self.fixed_delta
+                if ratio < 1.-1e-9 or abs(ratio-round(ratio)) > 1e-8:
+                    raise ValueError("MPC " + name + " must be an integer multiple of the physics tick")
+            if mpc.dt * mpc.horizon_steps + 1e-8 < self._execution_horizon:
+                raise ValueError("MPC optimization horizon must cover the semantic execution interval")
         if (self.planner_backend == "pdm_closed"
                 and self.planning_cfg.get("lateral_control", "pure_pursuit") == "native_lqr"):
             from .planning.native_tracking import MAX_PROFILE_LIFETIME_S, SAMPLE_INTERVAL_S
@@ -200,6 +211,9 @@ class ClosedLoop:
         if self.planner_backend == "pdm_closed":
             from carla_bridge.planning.pdm_planner import validate_dependencies
             validate_dependencies()
+        elif self.planner_backend == "mpc":
+            from carla_bridge.planning.mpc_planner import validate_dependencies
+            validate_dependencies()
         # 1. CARLA 连接
         self.carla_client = CarlaClient(
             host=self.ccfg.get("host", "127.0.0.1"),
@@ -261,19 +275,32 @@ class ClosedLoop:
                 history_seconds=float(self.config.get("history_seconds", 5.0))
             )
         self.tracker = TrajectoryTracker(self.controller_cfg, control_dt_s=self.fixed_delta)
-        if self.planner_backend == "pdm_closed":
-            from carla_bridge.planning.pdm_planner import CarlaPDMPlanner
+        if self.planner_backend in ("pdm_closed", "mpc"):
             planner_cfg = dict(self.planning_cfg)
             planner_cfg["horizon_s"] = max(float(planner_cfg.get("horizon_s", 4.0)), self._execution_horizon)
-            self.pdm_planner = CarlaPDMPlanner(world, ego, self.scenario.route, planner_cfg)
+            if self.planner_backend == "mpc":
+                from carla_bridge.planning.mpc_planner import CarlaMPCPlanner
+                self.pdm_planner = CarlaMPCPlanner(world, ego, self.scenario.route, planner_cfg)
+            else:
+                from carla_bridge.planning.pdm_planner import CarlaPDMPlanner
+                self.pdm_planner = CarlaPDMPlanner(world, ego, self.scenario.route, planner_cfg)
             visual_cfg = ((self.ccfg.get("visualization") or {}).get("trajectories") or {})
             self.pdm_planner.configure_trajectory_visualization(visual_cfg)
             if visual_cfg.get("enabled", False):
                 from carla_bridge.visualization.trajectory_renderer import CarlaTrajectoryRenderer
                 self.trajectory_renderer = CarlaTrajectoryRenderer(world, visual_cfg)
-            self._bind_pdm_controller(ego)
+            if self.planner_backend == "mpc":
+                self._bind_mpc_controller(ego)
+            else:
+                self._bind_pdm_controller(ego)
             from carla_bridge.planning.experience_memory import ExecutionExperienceMemory, execution_planner_version
-            self.execution_planner_version = execution_planner_version(planner_cfg, self.controller_cfg)
+            if self.planner_backend == "mpc":
+                planner = self.pdm_planner
+                vehicle_model = planner.execution_vehicle_signature()
+                self.execution_planner_version = execution_planner_version(
+                    planner_cfg, self.controller_cfg, vehicle_model=vehicle_model)
+            else:
+                self.execution_planner_version = execution_planner_version(planner_cfg, self.controller_cfg)
             if self.planning_memory_mode != "off" and self.mode != "memory_off":
                 access = self.config.get("memory_access", {}) or {}
                 self.experience_memory = ExecutionExperienceMemory(self.config.get("memory_db_dir"),
@@ -303,12 +330,12 @@ class ClosedLoop:
             self.loop = LoopRunner(
                 self.config, mode=self.mode, output_jsonl_path=out_path, resume=False,
                 decision_validator=self._validate_decision,
-                decision_processor=self._plan_semantic_decision if self.planner_backend == "pdm_closed" else None,
+                decision_processor=self._plan_semantic_decision if self.planner_backend in ("pdm_closed", "mpc") else None,
             )
             self.loop.setup()
         else:
-            logger.info("[纯PDM] 模型调用已关闭：跳过场景VLM、决策VLM、DINOv2、文本/视觉记忆和六路认知相机；数值经验启用=%s；保留事件、指标及可选视频",
-                        self.experience_memory is not None)
+            logger.info("[%s] 模型调用已关闭：跳过场景VLM、决策VLM、DINOv2、文本/视觉记忆和六路认知相机；数值经验启用=%s；保留事件、指标及可选视频",
+                        self.planner_backend, self.experience_memory is not None)
 
         # 7. Traffic Manager 起步：空转几帧
         for _ in range(10):
@@ -409,6 +436,7 @@ class ClosedLoop:
 
     def _apply_control(self, ego, control, *, source="tracker") -> None:
         native_tracking = None
+        mpc_tracking = None
         diagnostics = getattr(self, "_last_plan_diagnostics", {}) or {}
         if (source == "tracker" and getattr(self, "planner_backend", None) == "pdm_closed"
                 and diagnostics.get("native_tracking", {}).get("active") is True):
@@ -417,8 +445,22 @@ class ClosedLoop:
             control, native_tracking = override_native_tracking(control, diagnostics,
                 now_s=self._elapsed, speed_mps=math.hypot(velocity.x, velocity.y),
                 steering_model=self.pdm_planner.steering_model)
+        if source == "tracker" and getattr(self, "planner_backend", None) == "mpc":
+            from .planning.mpc_tracking import override_mpc_tracking
+            velocity = ego.get_velocity()
+            control, mpc_tracking = override_mpc_tracking(control, diagnostics,
+                now_s=self._elapsed, speed_mps=math.hypot(velocity.x, velocity.y),
+                steering_model=self.pdm_planner.steering_model)
         # Apply before bookkeeping: diagnostics must never delay an emergency.
         ego.apply_control(control)
+        if getattr(self, "planner_backend", None) == "mpc":
+            # The optimizer's first jerk bound uses the previously dispatched
+            # desired input, not noisy CARLA acceleration telemetry or a plan
+            # that was selected but never sent to the vehicle.
+            feedback = getattr(self.pdm_planner, "record_control_execution", None)
+            if callable(feedback):
+                feedback(diagnostics, mpc_tracking, now_s=self._elapsed, source=source,
+                         tracker_diagnostics=getattr(self.tracker, "last_control_diagnostics", None))
         tracking = getattr(self.tracker, "last_control_diagnostics", None)
         self._last_control_command = {
             "sim_time_s": self._elapsed, "source": source,
@@ -427,6 +469,7 @@ class ClosedLoop:
             **self._control_audit_values(control),
             "tracking": deepcopy(tracking) if source == "tracker" and isinstance(tracking, dict) else None,
             "native_tracking": native_tracking,
+            "mpc_tracking": mpc_tracking,
         }
 
     @staticmethod
@@ -483,6 +526,18 @@ class ClosedLoop:
         logger.info("PDM控制参数已绑定：轴距 %.4fm，前轮距 %.4fm，等效中心转角上限 %.4frad，后轴参考点跟踪",
                     self.tracker.pp.L, self.tracker.steering_model.front_track_m, self.tracker.max_steer_rad)
 
+    def _bind_mpc_controller(self, ego) -> None:
+        """Execute optimized MPC steering with its measured vehicle geometry."""
+        planner = self.pdm_planner
+        self.tracker.bind_vehicle_model(planner.vehicle_parameters.wheel_base,
+            steering_model=planner.steering_model,
+            rear_axle_actor_xyz_m=planner.rear_axle_actor_xyz_m)
+        self.tracker.vehicle_model_source = "carla_mpc_vehicle"
+        self.ego_provider.max_steer_rad = planner.max_steer
+        self.ego_provider.steering_model = planner.steering_model
+        logger.info("MPC控制参数已绑定：轴距 %.4fm；执行优化转向和速度曲线PID；不使用PDM/LQR",
+                    self.tracker.pp.L)
+
     def _write_control_context(self, world, ego) -> None:
         """Snapshot physics metadata once; these observations never change physics settings."""
         errors = {}
@@ -518,7 +573,8 @@ class ClosedLoop:
                 "front_track_m": tracker.steering_model.front_track_m,
                 "steering_curve_kmh_scale": tracker.steering_model.curve,
                 "mapping": tracker.steering_model.mapping,
-                "tracking_reference": "pdm_rear_axle" if tracker.rear_axle_actor_xyz_m is not None else "carla_actor_origin",
+                "tracking_reference": ("mpc_rear_axle" if self.planner_backend == "mpc" else "pdm_rear_axle")
+                    if tracker.rear_axle_actor_xyz_m is not None else "carla_actor_origin",
                 "rear_axle_actor_xyz_m": tracker.rear_axle_actor_xyz_m,
                 "input_latency_modeled": False,
             }
@@ -534,17 +590,17 @@ class ClosedLoop:
         if decision.get("fallback_used"):
             return {"accepted": False, "reasons": ["rule_fallback_not_executable"], "details": {}}
         diagnostics = decision.get("planner_diagnostics") or {}
-        if self.planner_backend == "pdm_closed" and diagnostics.get("emergency_brake") is True:
-            return {"accepted": False, "reasons": ["pdm_emergency_brake"],
+        if self.planner_backend in ("pdm_closed", "mpc") and diagnostics.get("emergency_brake") is True:
+            return {"accepted": False, "reasons": ["mpc_emergency_brake" if self.planner_backend == "mpc" else "pdm_emergency_brake"],
                     "details": {"failure_reason": diagnostics.get("failure_reason")}}
         return self.trajectory_validator.validate(
             decision.get("trajectory"), decision.get("target_speed"),
             (kf.get("ego_state") or {}).get("speed", 0.0), self._execution_horizon,
-            use_speed_profile=self.planner_backend == "pdm_closed",
+            use_speed_profile=self.planner_backend in ("pdm_closed", "mpc"),
         ).to_dict()
 
     def _is_planned_stop(self, decision: dict) -> bool:
-        if self.planner_backend != "pdm_closed":
+        if self.planner_backend not in ("pdm_closed", "mpc"):
             return float(decision.get("target_speed", 0.0)) <= self._stuck_speed_thresh
         # Terminal speed alone may be zero even when this control interval must
         # accelerate towards a distant stop line. Inspect the near-term profile.
@@ -557,7 +613,7 @@ class ClosedLoop:
         """Plan and audit before the memory layer can admit this frame."""
         self._active_semantics = None
         if decision.get("parser_status") != "success" or decision.get("decision_mode") != "semantic":
-            raise ValueError("A valid semantic decision is required for PDM planning")
+            raise ValueError("A valid semantic decision is required for numerical planning")
         semantic = {key: deepcopy(decision[key]) for key in (
             "lateral_decision", "longitudinal_decision", "behavior_reason", "risk_level", "safety_notes")}
         if "intervention" in decision:
@@ -582,7 +638,7 @@ class ClosedLoop:
 
     def _merge_plan(self, decision: dict, semantic: Optional[dict], plan: dict) -> dict:
         if not isinstance(plan, dict) or not isinstance(plan.get("planner_diagnostics"), dict):
-            raise ValueError("PDM returned no auditable plan")
+            raise ValueError("Numerical planner returned no auditable plan")
         diagnostics = plan["planner_diagnostics"]
         target = float(plan["target_speed"])
         lateral = plan.get("selected_lateral", diagnostics.get("selected_lateral", "FOLLOW_ROUTE"))
@@ -594,7 +650,7 @@ class ClosedLoop:
         else:
             selected_behavior = {"FOLLOW": "FOLLOW", "DECELERATE": "SLOW_DOWN",
                                  "YIELD": "YIELD", "STOP": "STOP"}.get(longitudinal, "KEEP_LANE")
-        context = {"backend": "pdm_closed", "semantic_influence": self.semantic_influence,
+        context = {"backend": self.planner_backend, "semantic_influence": self.semantic_influence,
                    "selected_id": diagnostics.get("selected_id"),
                    "executed_behavior": selected_behavior,
                    "selected_lateral": lateral, "selected_longitudinal": longitudinal,
@@ -602,11 +658,11 @@ class ClosedLoop:
         if getattr(self, "semantic_policy", "always") != "always":
             context.update(baseline_selected_id=diagnostics.get("baseline_selected_id"),
                            semantic_policy=self.semantic_policy, governor=deepcopy(diagnostics.get("governor")))
-        return {**decision, **plan, "trajectory_source": "pdm_closed",
+        return {**decision, **plan, "trajectory_source": self.planner_backend,
                 "semantic_decision": deepcopy(semantic), "planning_context": context,
                 "behavior": selected_behavior,
-                "behavior_reason": "PDM selected candidate %s; semantic influence=%s. Execution outcome is not yet known."
-                                   % (context["selected_id"], self.semantic_influence)}
+                "behavior_reason": "%s selected candidate %s; semantic influence=%s. Execution outcome is not yet known."
+                                   % (self.planner_backend, context["selected_id"], self.semantic_influence)}
 
     def _audit_pdm_plan(self, decision: dict, validation: dict, source: str) -> None:
         self._pdm_plan_count += 1
@@ -717,14 +773,14 @@ class ClosedLoop:
             self._audit_pdm_plan(
                 {"semantic_decision": deepcopy(semantic),
                  "planner_diagnostics": getattr(exc, "diagnostics", None)},
-                {"accepted": False, "reasons": ["pdm_planning_error"],
+                {"accepted": False, "reasons": ["mpc_planning_error" if self.planner_backend == "mpc" else "pdm_planning_error"],
                  "details": {"error_type": type(exc).__name__, "error": str(exc)}}, source)
         except Exception:
-            logger.error("PDM error audit could not be written; vehicle already braking", exc_info=True)
+            logger.error("Numerical error audit could not be written; vehicle already braking", exc_info=True)
 
     def _refresh_pdm_control(self, tf, yaw: float, speed: float) -> None:
         """Replan against current actors between expensive semantic VLM calls."""
-        if (self.planner_backend != "pdm_closed" or (self.model_inference and self._active_semantics is None
+        if (self.planner_backend not in ("pdm_closed", "mpc") or (self.model_inference and self._active_semantics is None
                 and not getattr(self, "_selective_execution", False))
                 or self._elapsed + 1e-8 < self._next_pdm_replan_at):
             return
@@ -735,7 +791,7 @@ class ClosedLoop:
             validation = self._validate_decision(result, {"ego_state": {"speed": speed}})
             self._audit_pdm_plan(result, validation, "control_update")
             if not validation["accepted"]:
-                raise ValueError("PDM trajectory rejected: %s" % validation["reasons"])
+                raise ValueError("%s trajectory rejected: %s" % (self.planner_backend, validation["reasons"]))
             self.tracker.set_trajectory(result["trajectory"], tf.location.x, tf.location.y, yaw,
                                         result["target_speed"], follow_speed_profile=True)
             self._planned_stop = self._is_planned_stop(result)
@@ -749,7 +805,7 @@ class ClosedLoop:
             self._trajectory_rejections += 1
             self._consecutive_trajectory_rejections += 1
             self._audit_pdm_error(exc, self._active_semantics, "control_error")
-            logger.error("PDM control update failed; braking: %s", exc)
+            logger.error("%s control update failed; braking: %s", self.planner_backend, exc)
             if self._consecutive_trajectory_rejections >= int(self.ccfg.get("max_trajectory_rejections", 3)):
                 self._early_terminated = True
                 self._termination_reason = "invalid_trajectory"
@@ -764,13 +820,18 @@ class ClosedLoop:
                 "duration_s": round(self._elapsed, 3),
                 "trajectory_rejections": self._trajectory_rejections,
                 "planner_backend": self.planner_backend, "semantic_influence": self.semantic_influence,
-                "pdm_lateral_control": getattr(self, "planning_cfg", {}).get("lateral_control", "pure_pursuit"),
-                "pdm_lateral_preview": getattr(self, "planning_cfg", {}).get("lqr_lateral_preview", "fixed"),
+                "pdm_lateral_control": (getattr(self, "planning_cfg", {}).get("lateral_control", "pure_pursuit")
+                                        if self.planner_backend == "pdm_closed" else None),
+                "pdm_lateral_preview": (getattr(self, "planning_cfg", {}).get("lqr_lateral_preview", "fixed")
+                                        if self.planner_backend == "pdm_closed" else None),
+                "numerical_lateral_control": ("optimized_mpc_inputs" if self.planner_backend == "mpc" else
+                    getattr(self, "planning_cfg", {}).get("lateral_control", "pure_pursuit")),
                 "execution_planner_version": getattr(self, "execution_planner_version", None),
                 "lane_quality_enabled": (getattr(self, "planning_cfg", {}).get("lane_quality") or {}).get("enabled", True),
                 "lane_maneuver_enabled": (getattr(self, "planning_cfg", {}).get("lane_maneuver") or {}).get("enabled", True),
                 "model_inference": self.model_inference,
                 "pdm_plan_count": self._pdm_plan_count,
+                "numerical_plan_count": self._pdm_plan_count,
                 "semantic_policy": getattr(self, "semantic_policy", "always"),
                 "planning_memory": getattr(self, "planning_memory_mode", "off"),
                 "cognition_scheduling": ("disabled" if not self.model_inference else
@@ -843,7 +904,7 @@ class ClosedLoop:
     # ------------------------------------------------------------------
 
     def _advisory_tick(self) -> None:
-        """PDM runs every tick; expensive cognition is an optional consultation.
+        """Numerical planning runs independently; cognition is an optional consultation.
 
         CARLA synchronous time remains frozen during a consultation. Model
         failure never replaces the already validated numerical plan with STOP.
@@ -867,7 +928,7 @@ class ClosedLoop:
         try:
             kf = self._advisory_keyframe(ego)
             self.advisory_stats["model_queries"] += 1
-            logger.info("[选择性认知] t=%.1fs reason=%s；同步仿真暂停，PDM控制方案保留",
+            logger.info("[选择性认知] t=%.1fs reason=%s；同步仿真暂停，数值控制方案保留",
                         self._elapsed, query.get("reason"))
             record = self._run_cognition(kf, query) or {}
             self._last_scene_result = record.get("current_scene") or self._last_scene_result
@@ -885,7 +946,7 @@ class ClosedLoop:
             self._audit_advisory("result", query, decision.get("planner_diagnostics", {}).get("governor"))
         except Exception as exc:
             self.advisory_stats["model_failures"] += 1
-            logger.warning("[选择性认知] 建议不可用，继续当前真值下的PDM规划: %s", exc, exc_info=True)
+            logger.warning("[选择性认知] 建议不可用，继续当前真值下的数值规划: %s", exc, exc_info=True)
             self._active_semantics = None
             self.pdm_planner.governor.submit(None, self.pdm_planner.last_context, self._elapsed)
             self._next_pdm_replan_at = 0.0
@@ -994,7 +1055,7 @@ class ClosedLoop:
         if self._elapsed + 1e-8 >= getattr(self, "_next_pdm_progress_log_at", 0.0):
             self._check_stuck(speed)
             logger.info("[%s] t=%.1fs 路线完成度=%.1f%% speed=%.2fm/s 碰撞=%d",
-                        "选择性PDM" if getattr(self, "_selective_execution", False) else "纯PDM",
+                        ("选择性" if getattr(self, "_selective_execution", False) else "纯") + self.planner_backend.upper(),
                         self._elapsed, self.route_completion * 100.0, speed, self._collision_count)
             self._next_pdm_progress_log_at = self._elapsed + 3.0
 
@@ -1043,13 +1104,13 @@ class ClosedLoop:
         kf["carla_frame_id"] = frame_id
         kf["sim_time_s"] = self._elapsed
         kf["planning_constraints"] = {
-            "decision_mode": "semantic" if self.planner_backend == "pdm_closed" else "trajectory",
+            "decision_mode": "semantic" if self.planner_backend in ("pdm_closed", "mpc") else "trajectory",
             "required_horizon_s": self._execution_horizon,
             **{key: getattr(self.trajectory_validator, key) for key in (
                 "max_speed_mps", "max_acceleration_mps2", "max_deceleration_mps2",
                 "max_lateral_acceleration_mps2")},
         }
-        if self.planner_backend == "pdm_closed":
+        if self.planner_backend in ("pdm_closed", "mpc"):
             from carla_bridge.planning.navigation_context import build_navigation_context
             kf["planning_constraints"]["navigation_context"] = build_navigation_context(
                 self.scenario.route, ego, self._elapsed)
@@ -1089,7 +1150,7 @@ class ClosedLoop:
                     self._termination_reason = "invalid_trajectory"
             self.tracker.set_trajectory(
                 traj, tf.location.x, tf.location.y, ego_yaw, target_speed,
-                **({"follow_speed_profile": True} if self.planner_backend == "pdm_closed" and accepted else {})
+                **({"follow_speed_profile": True} if self.planner_backend in ("pdm_closed", "mpc") and accepted else {})
             )
         except Exception as e:
             self.advisory_stats["model_failures"] += 1
@@ -1441,6 +1502,7 @@ class ClosedLoop:
             "query_check_interval_s": (self._query_check_interval
                                        if getattr(self, "_selective_execution", False) else None),
             "pdm_replan_interval_s": self._pdm_interval if self.planner_backend == "pdm_closed" else None,
+            "numerical_replan_interval_s": self._pdm_interval if self.planner_backend in ("pdm_closed", "mpc") else None,
             "collision_raw_events": self._collision_raw,
             "collision_unique_actors": len(
                 {a for a in self._collision_actors if a is not None}

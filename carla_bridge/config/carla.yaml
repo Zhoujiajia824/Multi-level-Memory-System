@@ -58,17 +58,23 @@ carla:
   capture_timeout_s: 2.0       # 六路相机共享的等待截止时间，不推进仿真
   max_capture_failures: 3      # 连续采集失败时结束本轮，失败期间全刹
   # ---- 闭环节奏 ----
-  replan_interval_s: 3.0         # always/语义off认知周期；selective/shadow语义on改为条件查询，PDM独立高频规划
+  replan_interval_s: 3.0         # always/语义off认知周期；selective/shadow条件查询，数值后端独立高频规划
   planning:
-    backend: "pdm_closed"       # pdm_closed | vlm_trajectory（旧版轨迹模式）
-    lateral_control: "native_lqr"  # 与原生PDM评分预测使用同一LQR转向；纵向仍PID；pure_pursuit用于旧控制对照
-    semantic_influence: true    # false禁止语义影响；selective另需当前证据授权，shadow总执行基础PDM
+    backend: "mpc"              # mpc（默认约束滚动优化）| pdm_closed（保留对照）| vlm_trajectory
+    mpc:
+      dt: 0.2                   # 优化离散步长；控制仍按0.1s，优化转向按区间保持
+      horizon_steps: 20          # 4s预测，首段执行后重新求解
+      max_iterations: 55
+      collision_margin: 0.2      # 覆盖车体与当前GT匀速预测障碍的净空膨胀
+      multi_start: true          # 热启动、参考跟踪及制动初值；每个均重新受约束优化
+    lateral_control: "native_lqr"  # 仅PDM：原生LQR转向；MPC直接执行优化转向，纵向均用速度曲线PID
+    semantic_influence: true    # false禁止语义影响；selective另需当前证据授权，shadow执行数值基线
     semantic_policy: "selective"  # selective条件介入 | always旧版无条件加分 | shadow只记录would-selection
     planning_memory: "full"     # off | gate仅辅助介入判断 | full另提供数值规划先验；memory_off仍禁读写
     model_inference: true      # false不初始化双VLM/DINO/文本记忆/认知相机；语义必须off，可选memory_on+planning_memory=full
-    replan_interval_s: 0.2      # PDM更新周期；selective建议每次重验，过期/释放即丢弃
+    replan_interval_s: 0.2      # 数值更新周期；MPC<=0.3s；selective建议每次重验，过期/释放即丢弃
     horizon_s: 4.0              # 数值轨迹时域；不等于语义建议租期，后者最多6s
-    sample_interval_s: 0.1      # 固定版本官方 TTC 实现使用 10Hz 索引
+    sample_interval_s: 0.1      # PDM固定版本官方 TTC 使用10Hz索引；MPC步长另见mpc.dt
     lqr_lateral_preview: "speed_scaled"  # 实测速度/轴距确定预瞄；fixed用于固定预瞄对照；旧缺键仍fixed
     lqr_lateral_horizon_s: 2.0  # 横向上限/固定值；纵向保留原生1s制动预测；整数采样且<=规划时域
     lqr_lateral_min_horizon_s: 1.0  # speed_scaled下限；低速使用2s，车速上升后缩短至1s
@@ -86,7 +92,7 @@ carla:
     lane_maneuver:             # 持续慢障碍的合法变道绕行，固定地图锚点，越过后择机返回
       enabled: true
       observation_s: 1.0
-      minimum_gap_m: 6.0
+      minimum_gap_m: 1.0        # 仅中心距离初筛；实际车体间隙、曲率及整段碰撞仍单独核验
       maximum_blocker_distance_m: 45.0
       slow_speed_fraction: 0.6
       maximum_pass_speed_mps: 5.0  # 仅新增固定机动的专属策略，普通候选速度保持不变
@@ -106,7 +112,7 @@ carla:
       recovery_min_observations: 3
       recovery_release_healthy_duration_s: 2.0
       recovery_release_progress_m: 2.0
-    recovery:                 # 仅selective/shadow且语义on，经模型明确请求后扩展；纯PDM始终不触发
+    recovery:                 # 仅selective/shadow且语义on，经模型明确请求后扩展；纯数值不触发
       enabled: true
       max_paths: 15
       transition_lengths_m: [2.0, 3.0, 4.0]

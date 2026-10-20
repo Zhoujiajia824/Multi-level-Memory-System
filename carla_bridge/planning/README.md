@@ -1,11 +1,130 @@
-# PDM-Closed 的 CARLA 适配层
+# CARLA 轨迹规划：默认 MPC，保留 PDM 对照
+
+当前默认 `--planner mpc`；显式 `--planner pdm_closed` 运行原PDM对照。
+二者共享场景、语义建议格式、记忆权限、回放和轨迹绘制入口，但数值算法与执行版本独立。
+服务器完整命令见[CARLA README 第14节](../README.md#14-mpc-滚动轨迹规划当前默认后端)。
+
+## MPC 独立数值核心
+
+`mpc_solver.py` 只依赖NumPy/SciPy，不导入CARLA、PDM、nuPlan或tuplan。
+`mpc_planner.py` 负责CARLA道路、合法慢障碍绕行、后轴/车身坐标与匀速目标预测；
+`mpc_tracking.py` 负责优化转向输入执行，不把旧Pure Pursuit轨迹改名成MPC。
+
+算法是有限时域非线性直接打靶：状态为后轴 `x,y,yaw,v`，每段优化加速度和等效前轮转角。
+自行车中点积分提供解析状态敏感度，SLSQP同时使用目标梯度与不等式Jacobian。
+默认20步、每步0.2s，预测4s；从每次实测状态重新积分，首段执行后滚动求解。
+热启动仅保存移位控制序列作为下一次初值，不把假设候选的状态当作新的实测状态。
+
+每个合法走廊独立求解CRUISE/SLOW/STOP等速度意图，启用full数值经验时还可加入
+支持充分的目标速度意图。保持车道的慢行人跟随速度不被预先套用到邻道候选。
+基础选择比较实际优化进展与软成本，再叠加经过门控的可选语义偏好；
+模型无需先识别“PDM故障”才能使合法绕行几何进入MPC基础候选池。
+
+### 依赖与检查
+
+复用现有Python 3.9的 `mulmem_carla`，在仓库根目录执行：
+
+```bash
+conda activate mulmem_carla
+python -m pip install -r carla_bridge/planning/requirements-mpc.txt \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 120 --retries 5
+python -m carla_bridge.planning.mpc_planner --check
+python -m pytest carla_bridge/tests/test_mpc_solver.py carla_bridge/tests/test_mpc_runtime.py -q
+```
+
+清单为 `numpy>=1.24,<2`、`scipy>=1.10,<1.14`、`Shapely==2.0.7`；Shapely供CARLA
+绕行几何、扫掠车体与间隙检查使用，纯求解器本身仍只导入NumPy/SciPy。不需要Git安装、CasADi、OSQP、
+商业求解器、MPC权重或nuPlan数据。完整新环境仍按[环境搭建](../README.md#5-环境搭建)
+安装CARLA、配置和模型基础依赖；数值清单不冒充完整应用环境。
+仅纯MPC模型off时跳过API/DINOv2，模型on仍使用原模型环境。
+已安装PDM的环境无需卸载上游包，只有运行其对照时才核验固定来源。
+
+### 核心接口与坐标
+
+- `MPCConfig`：优化步长/时域、车辆参数、约束和目标权重。
+- `MPCInitialState(x,y,yaw,speed,steering,acceleration)`：后轴世界坐标；CARLA右正yaw/转角。
+  acceleration是上一实际下发的期望加速度输入，供首步jerk约束使用，并非CARLA实测加速度；
+  静止保持、直接制动或控制中断后明确重置该输入，原始接触/制动加速度另存审计。
+- `MPCReference(name,points,half_width,speed_limit,metadata)`：`points` 为N+1行 `[x,y,yaw,目标速度]`；
+  `half_width` 已扣去车身半宽和适配余量，求解时额外计入转向后的前后角扫掠。
+- `MPCObstacle(id,centers,radii,yaws)`：N+1时刻世界中心；圆半径或N+1×2椭圆半轴。
+  适配器传本体包络，核心负责自车车体与净空膨胀，不能重复膨胀。
+- `MPCProblem(initial,reference,obstacles)` 传入 `MPCSolver(config).solve(problem)`。
+- `MPCResult`：实际自行车rollout、N×2优化控制、可行性、收敛状态、目标值和详细审计。
+
+CARLA车辆模型取真实轮坐标（世界厘米转换）、轴距、后轴位置与包围盒尺寸。
+世界后轴状态先优化，再刚性变换为捕获时刻actor原点的前/左坐标；
+`optional_heading_rad` 是车身相对朝向，不能拿轨迹切线替代。
+执行侧使用同一Ackermann/速度转向曲线映射。MPC转向零阶保持：索引0作用于
+`[issued_at,issued_at+dt)`，与PDM的未来转向状态索引含义不同。
+纵向仍由PID跟踪优化速度曲线，实际加速度输入响应不等同于理想优化变量。
+只有控制实际下发才更新上一期望输入；被拒绝的轨迹、shadow与假设候选不会改写它。
+
+### 约束、目标和诚实失败
+
+约束包含速度、加速度、等效转角、jerk、转角变化率、预测横向加速度、车身角点走廊、
+预测车体碰撞，以及适用红灯/黄灯的停止线和制动距离余量。
+`metadata.stop_line={point:[x,y],normal:[nx,ny]}` 中的point是已经扣前悬与停车余量的
+后轴最远位置，normal指向路线前方。
+
+圆形行人采用圆与完整有向车身矩形的精确距离。其它椭圆障碍使用包含真实矩形的包络，
+再与自车三个覆盖圆作保守Minkowski外包；这种保守性在狭窄间隙可能影响效率。
+碰撞同时检查dt端点与dt/2自行车中点，障碍是当前GT的匀速预测代理；
+不是真实未来，也不是连续时间碰撞证明。
+
+`MPCConfig` 的纯核心默认输入界为加速度-4到2m/s²、转角变化率0.6rad/s、
+jerk 8m/s³、横加速度3m/s²、碰撞余量0.2m；实机车辆尺寸/轴距/转角由适配器测量和
+速度转向曲线收紧，不以假设车参数覆盖CARLA实车。
+目标默认权重：横向误差8、纵向误差0.25、航向2、速度2、加速度0.05、转角0.1、
+jerk 0.05、转角变化率0.6、终端权重2。完整字段以 `MPCConfig` 与
+`carla_bridge/config/carla.yaml` 的 `carla.planning.mpc` 为准。
+
+每个初值最多55次SLSQP迭代，`ftol=1e-5`；解的约束和边界独立核验，容差为2e-3，
+其单位取决于约束，不是对道路统一放宽2mm。`converged` 只表示优化器成功且满足检查；
+`feasible_not_converged` 明确保留未收敛事实，`infeasible` 绝不作为可执行替代轨迹。
+无可行候选时上层明确制动，不静默更换规划器。SLSQP是局部优化，不能声称全局最优。
+
+日志中的每个候选 `solver` 保留尝试初值、优化器状态、迭代数、数值警告、墙钟耗时、
+各约束最小余量、最大违反量与 `initial_corridor` 初始车身净空。
+初始车体已越界时，首步走廊可能无解；应结合实测位姿和道路参考定位，不把这种状态隐藏成正常跟车。
+0.2仿真秒的重规划不等于0.2墙钟秒的求解保证，障碍/候选增加会提高计算开销。
+
+### 记忆、消融与验证边界
+
+MPC当前数值经验前缀为 `carla_mpc_execution_v1:<配置哈希>`，PDM对照为
+`carla_pdm_execution_v5:<配置哈希>`；旧PDM-v4及其它版本均不会跨到MPC提供数值执行先验。
+MPC运行时哈希还包含实测二维车辆模型：轴距、车身、后轴位置、前轮距和转向曲线。
+长度按1mm量化以消除世界坐标浮点测量噪声；悬挂高度和出生点不属于二维模型签名，
+避免同一车辆跨场景误分库。不同有效车辆模型的数值经验分别检索。
+原库不迁移、不删除；full暂只提取有足够执行支持的目标速度候选重新优化，旧IDM字段名
+只是存储兼容键。文本/视觉库选择另由bank控制，建议新建MPC专用训练库。
+只读、只积累、场景库、短期消融、eval只读与回放/录像/轨迹绘制开关均继续适用。
+
+`--pdm-lateral-control`、`--pdm-lateral-preview`、`--lane-quality` 的PDM软成本消融
+不会替换MPC自身约束/优化转向。`--planner-recovery` 同时支持MPC：selective/shadow、
+语义on、当前退化证据及明确模型请求均满足时，可在合法CRUISE参考管道内尝试
+±0.25/±0.45m的有界偏移，受max_paths/max_offset_m和可用宽度收紧，随后重新约束优化。
+原管道相应缩窄，不放宽碰撞或道路约束；shadow只记录，恢复原基础池执行。
+transition_lengths_m/side_clearance_m仍为PDM专用。MPC另通过 `--lane-maneuver`
+控制普通合法慢障碍绕行几何，该基础机制不等待模型许可。
+旧PDM“基础分+语义加分、无额外硬筛”仍只描述其对照；新MPC自身有求解约束。
+
+核心测试覆盖梯度核对、近距慢行人旁侧绕行、弯道中心、完整车身、停止线、
+中点横穿、不可行状态和热启动。下方PDM章节已有闭环成功证据属于其原后端，
+不能转记作MPC完成率。真实轮胎/执行器响应、所有Town/路线的效率、零压线、
+原始加速度/jerk及100%路线完成仍需服务器逐场景验收。
+
+## PDM-Closed 保留对照
+
+以下保留PDM专有安装、原生模块适配、语义机制和历史故障验证。
+其中“默认LQR”等措辞指选择 `--planner pdm_closed` 之后的PDM配置，不改变默认MPC入口。
 
 这里直接调用官方 `PDMGenerator`、`PDMSimulator`（LQR + bicycle）、
 `PDMScorer` 和 `PDMObservation`，没有将简化规则重命名为 PDM。
 地图、目标、车辆状态及轨迹坐标由本项目适配，属于 **PDM-Closed core + CARLA adapter**，
 不能称为原版 nuPlan benchmark，也不能直接比较其原版排行榜分数。
 
-常规驾驶入口支持 `--semantic-influence off --model-inference off --mode memory_off`
+常规驾驶入口支持 `--planner pdm_closed --semantic-influence off --model-inference off --mode memory_off`
 运行纯 PDM：跳过场景/决策 VLM、DINOv2、记忆及六路认知相机，保留同一 PDM、控制、
 事件、指标和可选视频；不需要模型 API Key 或视觉特征缓存。默认模型调用开启，单独使用
 `--semantic-influence off` 仍保留原来的模型对照行为。完整命令和组合规则见
@@ -309,11 +428,12 @@ manifest、单轮报告和CSV记录 `pdm_lateral_preview`；逐帧记录配置�
 真正“介入优于基线”的经验需要独立、条件匹配、记录真实执行结果的配对数据。
 单次无事故、模型反思、shadow、常速预测或同一回放上的两组候选评分都不构成因果收益。
 结果库保留这种证据区别；没有充分配对证据时 `causal_advantage` 为未知。
-当前数值经验版本为 `carla_pdm_execution_v4:<配置哈希>`，包含实际规划、控制以及规范化后的
+当前PDM数值经验版本为 `carla_pdm_execution_v5:<配置哈希>`，包含实际规划、控制以及规范化后的
 `lane_quality` / `lane_maneuver` 配置。切换Pure Pursuit/LQR、预瞄、PID或两个数值模块的
 开关/参数会隔离旧结果；语义、模型、记忆和恢复开关不改变该数值版本，便于条件一致的消融。
-旧v1/v2/v3经验保留但不跨版本检索；v4将执行空间轨迹改为实际评分rollout，
-不继续沿用v3的执行结果先验。原库不迁移、不删除；只读库保持原字节不变。
+旧v1/v2/v3/v4经验保留但不跨版本检索；历史v4将执行空间轨迹改为实际评分rollout，
+当前v5再隔离本轮慢障碍机动策略变化。MPC使用独立前缀，不复用这些PDM执行结果先验。
+原库不迁移、不删除；只读库保持原字节不变。
 当前运行的实际版本见 `manifest.json` 的 `outcome.execution_planner_version`。
 场景级检索保持收益未知；严格配对支持的特定动作只提示值得咨询，采纳时另外核对模型请求的
 具体动作，不能把其它动作的收益变成停车权限。库检查与实际配对证据导入命令见

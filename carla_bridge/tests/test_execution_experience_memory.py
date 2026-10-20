@@ -81,7 +81,7 @@ def test_execution_version_defaults_match_explicit_numerical_settings_without_mu
     before = copy.deepcopy((explicit, controller))
     version = execution_planner_version(explicit, controller)
     assert version == execution_planner_version({})
-    assert version.startswith("carla_pdm_execution_v4:")
+    assert version.startswith("carla_pdm_execution_v5:")
     assert len(version.rsplit(":", 1)[1]) == 64
     assert (explicit, controller) == before
     # YAML/map insertion ordering and int/float spelling do not split banks.
@@ -110,6 +110,100 @@ def test_semantic_memory_and_recovery_ablation_switches_share_the_numerical_vers
         "semantic_governor": {"enabled": False}, "memory_access": {"retrieve": False, "write": False},
         "memory_mode": "memory_off", "lateral_semantic_weight": .1, "longitudinal_semantic_weight": 0.}
     assert execution_planner_version(dict(base, **switches)) == execution_planner_version(base)
+
+
+def test_mpc_experience_is_independent_and_defaults_are_canonical():
+    from dataclasses import asdict
+    from carla_bridge.planning.mpc_planner import effective_mpc_config
+    base = {"backend": "mpc"}
+    before = copy.deepcopy(base)
+    version = execution_planner_version(base)
+    assert version.startswith("carla_mpc_execution_v1:")
+    assert version != execution_planner_version({"backend": "pdm_closed"})
+    assert version == execution_planner_version({**base, "mpc": asdict(effective_mpc_config(base))})
+    assert base == before
+    for settings in ({"mpc": {"dt": .1}}, {"mpc": {"lateral_weight": 9.}},
+                     {"max_speed_mps": 6.}, {"replan_interval_s": .1}):
+        assert version != execution_planner_version({**base, **settings})
+    assert version == execution_planner_version({**base, "semantic_policy": "shadow",
+        "semantic_influence": False, "model_inference": False, "planning_memory": "off"})
+
+
+def measured_vehicle(**changes):
+    value = {"wheelbase_m": 2.9, "length_m": 4.7, "width_m": 1.9,
+        "rear_axle_to_center_m": 1.45, "rear_axle_actor_xyz_m": (-1.4, 0., -.3),
+        "front_track_m": 1.6, "physical_max_steer_rad": .6,
+        "steering_curve": ((0., 1.), (50., .7), (100., .5)),
+        "steering_mapping": "carla_ackermann_inner_wheel", "blueprint": "vehicle.tesla.model3"}
+    value.update(changes)
+    return value
+
+
+@pytest.mark.parametrize("changes", [
+    {"wheelbase_m": 3.1}, {"length_m": 5.}, {"width_m": 2.1},
+    {"rear_axle_to_center_m": 1.6}, {"rear_axle_actor_xyz_m": (-1.5, 0., -.3)},
+    {"front_track_m": 1.7}, {"physical_max_steer_rad": .55},
+    {"steering_curve": ((0., 1.), (50., .6), (100., .5))},
+    {"steering_mapping": "carla_linear"}, {"blueprint": "vehicle.audi.a2"},
+])
+def test_mpc_execution_version_isolates_measured_vehicle_physics(changes):
+    planning, vehicle = {"backend": "mpc"}, measured_vehicle()
+    before = copy.deepcopy((planning, vehicle))
+    version = execution_planner_version(planning, vehicle_model=vehicle)
+    assert version != execution_planner_version(planning, vehicle_model=measured_vehicle(**changes))
+    assert version != execution_planner_version(planning)
+    assert (planning, vehicle) == before
+
+
+def test_measured_vehicle_signature_is_canonical_and_does_not_change_pdm_versions():
+    vehicle = measured_vehicle()
+    reordered = dict(reversed(list(vehicle.items())))
+    reordered.update(steering_curve=[[0, 1], [50, .7], [100, .5]],
+        rear_axle_actor_xyz_m=[-1.4, 0, -.3])
+    assert execution_planner_version({"backend": "mpc"}, vehicle_model=vehicle) == \
+        execution_planner_version({"backend": "mpc"}, vehicle_model=reordered)
+    assert execution_planner_version({"backend": "pdm_closed"}, vehicle_model=vehicle) == \
+        execution_planner_version({"backend": "pdm_closed"})
+    with pytest.raises(ValueError, match="finite numerical settings"):
+        execution_planner_version({"backend": "mpc"},
+            vehicle_model=measured_vehicle(wheelbase_m=float("nan")))
+
+
+@pytest.mark.parametrize("changes", [
+    {"wheelbase_m": 3.1}, {"steering_curve": ((0., 1.), (50., .6), (100., .5))},
+])
+def test_read_only_mpc_bank_excludes_other_vehicles_without_rewriting(tmp_path, changes):
+    planning = {"backend": "mpc"}
+    trained_version = execution_planner_version(planning, vehicle_model=measured_vehicle())
+    versioned_support(tmp_path, trained_version)
+    path = tmp_path / EXPERIENCE_FILENAME
+    before, modified = path.read_bytes(), path.stat().st_mtime_ns
+    compatible = ExecutionExperienceMemory(tmp_path, planner_version=trained_version,
+        memory_mode="read_only", run_id="compatible")
+    assert compatible.retrieve(context())["status"] == "supported"
+    changed = ExecutionExperienceMemory(tmp_path,
+        planner_version=execution_planner_version(planning, vehicle_model=measured_vehicle(**changes)),
+        memory_mode="read_only", run_id="different_vehicle", observation_horizon_s=1.)
+    result = changed.retrieve(context())
+    assert result["status"] == "unknown" and result["support_count"] == 0
+    assert result["parameter_priors"] == [] and result["bank_health"]["incompatible_records"] > 0
+    changed.begin(context(), {}, telemetry())
+    changed.observe(telemetry(1.))
+    changed.finish("route_complete")
+    assert changed.summarize()["persisted_updates"] == 0
+    assert path.read_bytes() == before and path.stat().st_mtime_ns == modified
+
+
+def test_pdm_experiences_are_not_loaded_as_mpc_evidence(tmp_path):
+    bank = tmp_path / "bank"
+    versioned_support(bank, execution_planner_version({"backend": "pdm_closed"}))
+    path = bank / EXPERIENCE_FILENAME
+    before = path.read_bytes()
+    reader = ExecutionExperienceMemory(bank, planner_version=execution_planner_version({"backend": "mpc"}),
+        memory_mode="read_only", observation_horizon_s=1.)
+    result = reader.retrieve(context())
+    assert result["support_count"] == 0 and result["parameter_priors"] == []
+    assert path.read_bytes() == before
 
 
 def test_old_v1_records_are_excluded_without_modifying_a_read_only_bank(tmp_path):

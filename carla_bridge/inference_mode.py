@@ -11,8 +11,8 @@ def model_inference_enabled(planning: dict, mode: str) -> bool:
     if type(enabled) is not bool:
         raise ValueError("planning.model_inference must be a boolean")
     if not enabled:
-        if planning.get("backend", "vlm_trajectory") != "pdm_closed":
-            raise ValueError("--model-inference off requires --planner pdm_closed")
+        if planning.get("backend", "vlm_trajectory") not in ("pdm_closed", "mpc"):
+            raise ValueError("--model-inference off requires --planner pdm_closed or mpc")
         if planning.get("semantic_influence", True) is not False:
             raise ValueError("--model-inference off requires --semantic-influence off")
         if mode != "memory_off" and planning.get("planning_memory") != "full":

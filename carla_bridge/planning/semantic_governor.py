@@ -33,6 +33,9 @@ DEFAULT_CONFIG = {
     "recovery_min_observations": 3,
     "recovery_release_healthy_duration_s": 2.0,
     "recovery_release_progress_m": 2.0,
+    "efficiency_degraded_duration_s": 4.0,
+    "efficiency_min_observations": 3,
+    "efficiency_speed_fraction": .35,
 }
 _LATERAL = {"FOLLOW_ROUTE", "KEEP_LANE", "CHANGE_LANE_LEFT", "CHANGE_LANE_RIGHT"}
 _LONGITUDINAL = {"MAINTAIN", "ACCELERATE", "DECELERATE", "FOLLOW", "YIELD", "STOP"}
@@ -83,11 +86,16 @@ def _configuration(config):
                  "moving_option_progress_m", "stop_distance_m", "stop_time_window_s",
                  "max_target_distance_m", "conflict_ttc_s", "max_context_age_s",
                  "wait_review_interval_s", "recovery_degraded_duration_s",
-                 "recovery_release_healthy_duration_s", "recovery_release_progress_m"):
+                 "recovery_release_healthy_duration_s", "recovery_release_progress_m",
+                 "efficiency_degraded_duration_s"):
         if result[name] <= 0:
             raise ValueError("semantic governor %s must be positive" % name)
     if type(result["recovery_min_observations"]) is not int or result["recovery_min_observations"] < 2:
         raise ValueError("semantic governor recovery_min_observations must be an integer >= 2")
+    if type(result["efficiency_min_observations"]) is not int or result["efficiency_min_observations"] < 2:
+        raise ValueError("semantic governor efficiency_min_observations must be an integer >= 2")
+    if not 0 < result["efficiency_speed_fraction"] < 1:
+        raise ValueError("semantic governor efficiency_speed_fraction must be between zero and one")
     if result["max_target_distance_m"] < result["stop_distance_m"]:
         raise ValueError("max_target_distance_m must cover stop_distance_m")
     return result
@@ -205,6 +213,11 @@ class SelectiveSemanticGovernor:
         self._recovery_observations = 0
         self._recovery_state = {"degraded": False, "sustained": False,
                                 "reason": "planner_health_unavailable"}
+        self._efficiency_anchor = None
+        self._efficiency_last_sample_s = None
+        self._efficiency_observations = 0
+        self._efficiency_state = {"degraded": False, "sustained": False,
+                                  "reason": "no_measured_efficiency_constraint"}
 
     def _observe(self, context, now_s):
         if not _number(now_s) or now_s < 0:
@@ -216,11 +229,14 @@ class SelectiveSemanticGovernor:
             self._progress_anchor = None
             self._wait_started_s = None
             self._reset_recovery()
+            self._reset_efficiency()
         self._last_observed_s = float(now_s)
         error = _context_error(context, now_s, self.config["max_context_age_s"])
         if error:
             self._reset_recovery()
+            self._reset_efficiency()
             return error
+        self._observe_efficiency(context)
         self._observe_recovery(context, now_s)
         if context["baseline_stop_expected"] and context["ego_speed_mps"] <= 0.5:
             if self._wait_started_s is None:
@@ -234,6 +250,59 @@ class SelectiveSemanticGovernor:
             self._progress_anchor = (float(now_s), progress)
         return None
 
+    def _reset_efficiency(self):
+        self._efficiency_anchor = None
+        self._efficiency_last_sample_s = None
+        self._efficiency_observations = 0
+        self._efficiency_state = {"degraded": False, "sustained": False,
+                                  "reason": "no_measured_efficiency_constraint"}
+
+    def _observe_efficiency(self, context):
+        """A positive-scoring crawl can be unhealthy despite making progress.
+
+        This invites semantic consultation only. A legal/currently clear target
+        lane, sustained measured low speed and a specific slow route obstacle
+        are all required. It never authorizes that lane change or a stop.
+        """
+        slow = context.get("slow_obstacle")
+        good = (isinstance(slow, dict) and type(slow.get("actor_id")) is int
+            and isinstance(slow.get("legal_clear_sides"), list)
+            and bool(slow["legal_clear_sides"])
+            and all(s in ("left", "right") for s in slow["legal_clear_sides"])
+            and _number(slow.get("along_speed_mps")) and -.3 <= slow["along_speed_mps"]
+            and _number(slow.get("clearance_m")) and slow["clearance_m"] > .5
+            and any(a["id"] == slow["actor_id"] for a in context["actors"])
+            and not context["baseline_stop_expected"] and not context["in_junction"])
+        if good:
+            threshold = max(1.2, self.config["efficiency_speed_fraction"]*context["speed_limit_mps"])
+            good = (context["ego_speed_mps"] <= threshold
+                    and context["ego_speed_mps"] <= slow["along_speed_mps"]+.8
+                    and slow["along_speed_mps"] < threshold)
+        if not good:
+            self._reset_efficiency()
+            return
+        signature = (context["topology_signature"], context["lane_key"], slow["actor_id"],
+                     tuple(sorted(slow["legal_clear_sides"])))
+        sample = context["sim_time_s"]
+        if (self._efficiency_anchor is None or self._efficiency_anchor[1] != signature
+                or self._efficiency_last_sample_s is None
+                or sample-self._efficiency_last_sample_s > self.config["max_context_age_s"]):
+            self._efficiency_anchor = (sample, signature)
+            self._efficiency_observations = 0
+            self._efficiency_last_sample_s = None
+        if self._efficiency_last_sample_s is None or sample > self._efficiency_last_sample_s+1e-9:
+            self._efficiency_observations += 1
+            self._efficiency_last_sample_s = sample
+        elapsed = max(0., sample-self._efficiency_anchor[0])
+        sustained = (elapsed+1e-9 >= self.config["efficiency_degraded_duration_s"]
+                     and self._efficiency_observations >= self.config["efficiency_min_observations"])
+        self._efficiency_state = {"degraded": True, "sustained": bool(sustained),
+            "reason": "sustained_low_efficiency_following" if sustained else "observing_low_efficiency_following",
+            "actor_id": slow["actor_id"], "duration_s": elapsed,
+            "observation_count": self._efficiency_observations,
+            "legal_clear_sides": list(slow["legal_clear_sides"]),
+            "execution_authorized": False}
+
     def _reset_recovery(self):
         self._recovery_anchor = None
         self._recovery_last_sample_s = None
@@ -245,15 +314,19 @@ class SelectiveSemanticGovernor:
         """Current evidence that forbids treating a stop as free-road failure."""
         if context["baseline_stop_expected"]:
             return "expected_signal_or_queue_wait"
-        if context.get("routine_following") is True:
+        efficiency_id = (self._efficiency_state.get("actor_id")
+                         if self._efficiency_state["sustained"] else None)
+        if context.get("routine_following") is True and efficiency_id is None:
             return "ordinary_same_lane_following"
         stop_range = max(12.0, context["ego_speed_mps"] * self.config["stop_time_window_s"])
         if any(s["applicable"] and s["state"].upper() in ("RED", "YELLOW")
                and 0 <= s["stop_line_distance_m"] <= stop_range for s in context["signals"]):
             return "current_stop_signal"
-        if context["blocked"] or any(self._path_blocking(a) for a in context["actors"]):
+        blockers = [a for a in context["actors"] if self._path_blocking(a)]
+        if ((context["blocked"] and efficiency_id is None)
+                or any(a["id"] != efficiency_id for a in blockers)):
             return "current_path_blockage"
-        if any(a["conflict"] and a["ttc_s"] is not None
+        if any(a["id"] != efficiency_id and a["conflict"] and a["ttc_s"] is not None
                and a["ttc_s"] <= self.config["conflict_ttc_s"] for a in context["actors"]):
             return "current_interaction_conflict"
         return None
@@ -264,7 +337,8 @@ class SelectiveSemanticGovernor:
         counts = ("candidate_count", "finite_candidate_count", "moving_candidate_count",
                   "positive_progressing_count", "drivable_area_failure_count",
                   "no_collision_failure_count")
-        valid = (isinstance(health, dict) and health.get("source") == "native_pdm_baseline"
+        valid = (isinstance(health, dict) and health.get("source") in (
+                    "native_pdm_baseline", "nonlinear_mpc_baseline")
                  and all(type(health.get(k)) is int and health[k] >= 0 for k in counts)
                  and type(health.get("baseline_stop")) is bool
                  and type(health.get("no_positive_progressing_candidate")) is bool
@@ -276,9 +350,10 @@ class SelectiveSemanticGovernor:
             self._reset_recovery()
             return
         obstruction = self._recovery_obstruction(context)
-        degraded = (health["positive_progressing_count"] == 0
+        efficiency_degraded = self._efficiency_state["sustained"]
+        degraded = (efficiency_degraded or (health["positive_progressing_count"] == 0
                     and (health["baseline_stop"] or health["finite_candidate_count"] == 0
-                         or context["ego_speed_mps"] <= 0.5))
+                         or context["ego_speed_mps"] <= 0.5)))
         if obstruction or not degraded:
             self._reset_recovery()
             self._recovery_state.update(reason=obstruction or "native_progressing_candidates_available",
@@ -299,13 +374,17 @@ class SelectiveSemanticGovernor:
             self._recovery_observations += 1
             self._recovery_last_sample_s = float(sample_s)
         elapsed = max(0.0, float(sample_s)-self._recovery_anchor[0])
-        sustained = (elapsed + 1e-9 >= self.config["recovery_degraded_duration_s"]
-                     and self._recovery_observations >= self.config["recovery_min_observations"])
+        sustained = (efficiency_degraded or (elapsed + 1e-9 >= self.config["recovery_degraded_duration_s"]
+                     and self._recovery_observations >= self.config["recovery_min_observations"]))
         self._recovery_state = {"degraded": True, "sustained": bool(sustained),
-                                "reason": "sustained_native_planner_degradation" if sustained
-                                          else "observing_native_planner_degradation",
-                                "duration_s": elapsed,
-                                "observation_count": self._recovery_observations,
+                                "reason": ("sustained_low_efficiency_following" if efficiency_degraded else
+                                    "sustained_native_planner_degradation" if sustained
+                                    else "observing_native_planner_degradation"),
+                                "duration_s": max(elapsed, self._efficiency_state.get("duration_s", 0.)),
+                                "observation_count": max(self._recovery_observations,
+                                    self._efficiency_state.get("observation_count", 0)),
+                                "inefficient_following": bool(efficiency_degraded),
+                                "efficiency": deepcopy(self._efficiency_state),
                                 "native_health": deepcopy(health)}
 
     def observe_planner_health(self, context, now_s):
@@ -497,6 +576,8 @@ class SelectiveSemanticGovernor:
             reason = "path_blocked"
         elif legitimate_wait:
             reason = "expected_signal_or_queue_wait"
+        elif self._efficiency_state["sustained"]:
+            reason = "sustained_low_efficiency_following"
         elif routine_following and not urgent_crossing and not context["blocked"]:
             reason = "ordinary_same_lane_following"
         elif self._recovery_state["sustained"]:
@@ -540,6 +621,7 @@ class SelectiveSemanticGovernor:
                       moving_proposal_count=len(moving),
                       candidate_pool_sha256=audit["candidate_pool_sha256"],
                       planner_recovery=deepcopy(self._recovery_state),
+                      planner_efficiency=deepcopy(self._efficiency_state),
                       unexpected_stall=bool(stalled and not legitimate_wait))
         if eligible:
             if self._last_query_s is None or now_s + 1e-9 >= result["next_query_time_s"]:
@@ -696,7 +778,8 @@ class SelectiveSemanticGovernor:
             if not isinstance(health, dict):
                 return "planner_health_unavailable", evidence
             native_healthy = (health["positive_progressing_count"] > 0
-                              and health["baseline_stop"] is False)
+                              and health["baseline_stop"] is False
+                              and not self._efficiency_state["degraded"])
             sample_s = context["sim_time_s"]
             if native_healthy:
                 last = recovery["last_healthy_sample_s"]
@@ -723,7 +806,9 @@ class SelectiveSemanticGovernor:
             if not relevant or not any(conflicts(actor) for actor in relevant):
                 return "no_current_interaction_conflict", evidence
         elif reason == "path_blocked":
-            if not context["blocked"] or not any(self._path_blocking(actor) for actor in targets):
+            slow_target = (self._efficiency_state["sustained"] and any(
+                actor["id"] == self._efficiency_state.get("actor_id") for actor in targets))
+            if not slow_target and (not context["blocked"] or not any(self._path_blocking(actor) for actor in targets)):
                 return "path_blockage_not_grounded", evidence
         elif reason == "traffic_signal":
             if signal is None or signal["state"].upper() not in ("RED", "YELLOW"):

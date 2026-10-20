@@ -78,7 +78,7 @@ def test_readonly_numeric_only_bank_is_accepted_locked_and_unchanged(tmp_path):
         assert manifest["semantic_policy"] == "selective"
         assert manifest["planning_memory"] == manifest["planning_memory_effective"] == "full"
         assert manifest["semantic_schema_version"] == 2
-        assert manifest["semantic_prompt_version"] == 7
+        assert manifest["semantic_prompt_version"] == 8
         assert not (bank / "assets").exists()
     finally:
         session.close()
@@ -295,7 +295,7 @@ def test_report_labels_shadow_and_stop_attribution_as_a_proxy(tmp_path):
         "lane_quality_enabled": True, "lane_maneuver_enabled": False}
     md, report = write_report({"route_completion": 1.0}, info, str(tmp_path))
     text = Path(md).read_text(encoding="utf-8")
-    assert "实际执行基础 PDM" in text and "不是已执行结果" in text
+    assert "实际执行基础数值规划" in text and "不是已执行结果" in text
     assert "额外停车归因代理: 0.40 s" in text
     assert "不是无必要停车真值" in text
     assert "模型同步查询期间仿真冻结" in text

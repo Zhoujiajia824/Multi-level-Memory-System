@@ -165,6 +165,89 @@ def _traffic_wait(result, ego_half_length):
                             for a in result["actors"])
 
 
+def _overtaking_context(result, current, local, ego, carla_map, ego_route_aligned):
+    """Expose measured efficiency constraints, separate from free-road failure.
+
+    Availability is a current target-lane gap proxy, not permission to execute a
+    lane change. The numerical planner must still verify the entire transition,
+    return corridor, reachable steering and future occupied vehicle envelopes.
+    A slow actor is not an exceptional case solely because it is visible.
+    """
+    result["overtaking_opportunities"] = []
+    result["slow_obstacle"] = None
+    if not ego_route_aligned or current is None or result["in_junction"]:
+        return
+    from .lane_maneuver import lane_change_permitted, _crosswalk_near
+    if not hasattr(current, "lane_type") or not hasattr(current, "lane_change"):
+        return  # Older context providers cannot invent map permission.
+    actors = result["actors"]
+    speed = result["ego_speed_mps"]
+    for side in ("left", "right"):
+        target = getattr(current, "get_" + side + "_lane")()
+        if not lane_change_permitted(current, target, side):
+            continue
+        target_points = []
+        for wp in local:
+            adjacent = getattr(wp, "get_" + side + "_lane")()
+            if adjacent is None or not lane_change_permitted(wp, adjacent, side):
+                break
+            p = adjacent.transform.location
+            target_points.append((float(p.x), float(p.y)))
+        if len(target_points) < 2:
+            continue
+        conflicts = []
+        probe_speed = max(speed, min(5.0, result["speed_limit_mps"]))
+        target_keys = {lane_key(getattr(wp, "get_"+side+"_lane")()) for wp in local}
+        for actor in actors:
+            position = actor.get("position_xy_m")
+            if not isinstance(position, list) or len(position) != 2:
+                continue
+            projected = project_polyline(*position, target_points)
+            # Projection clamps at the route window's first waypoint. A rear
+            # car must still occupy its map lane when outside that window.
+            on_target_map_lane = actor["lane_key"] in target_keys
+            if (not on_target_map_lane and
+                    projected[1] > float(ego.bounding_box.extent.y)+actor["width_m"]/2+.35):
+                continue
+            distance = (actor["relative_s_m"] if actor["relative_s_m"] < 0
+                        and actor["route_distance_m"] >= 0 else actor["route_distance_m"])
+            free_gap = abs(distance)-float(ego.bounding_box.extent.x)-actor["length_m"]/2
+            along = actor["along_speed_mps"]
+            required = (max(8., 3*max(0., along-speed)+5.) if distance < 0 else
+                        max(6., probe_speed*1.5, 3*max(0., probe_speed-along)))
+            if free_gap < required:
+                conflicts.append({"actor_id": actor["id"], "gap_m": free_gap,
+                                  "required_m": required, "kind": "rear" if distance < 0 else "front"})
+        result["overtaking_opportunities"].append({"side": side,
+            "target_lane_key": lane_key(target), "current_gap_clear": not conflicts,
+            "conflicts": conflicts, "source": "current_map_permission_and_gap_proxy",
+            "execution_authorized": False})
+    if result["baseline_stop_expected"]:
+        return
+    limit = min(8., result["speed_limit_mps"])
+    possible = [a for a in actors if a["type"].startswith(("vehicle.", "walker."))
+        and 1 < a["route_distance_m"] < 45
+        and a["route_lateral_distance_m"] < min(float(current.lane_width)/2-.1,
+            float(ego.bounding_box.extent.y)+a["width_m"]/2+.15)
+        and -.3 <= a["along_speed_mps"] < .6*limit
+        and abs(a["cross_speed_mps"]) < .35
+        and (a["route_heading_aligned"] or a["speed_mps"] < .3)
+        and a["route_distance_m"]-float(ego.bounding_box.extent.x)-a["length_m"]/2 > .5]
+    if not possible:
+        return
+    blocker = min(possible, key=lambda a: a["route_distance_m"])
+    if blocker["type"].startswith("walker.") and _crosswalk_near(
+            carla_map, (blocker["position_xy_m"][0], -blocker["position_xy_m"][1])):
+        return
+    sides = [item["side"] for item in result["overtaking_opportunities"] if item["current_gap_clear"]]
+    result["slow_obstacle"] = {"actor_id": blocker["id"], "type": blocker["type"],
+        "route_distance_m": blocker["route_distance_m"],
+        "clearance_m": blocker["route_distance_m"]-float(ego.bounding_box.extent.x)-blocker["length_m"]/2,
+        "along_speed_mps": blocker["along_speed_mps"], "legal_clear_sides": sides,
+        "source": "measured_slow_route_obstacle_with_current_gap_proxy",
+        "execution_authorized": False}
+
+
 def build_scene_context(world, ego, route, sim_time_s, *, reference=None, special_situations=()):
     tf, velocity = ego.get_transform(), ego.get_velocity()
     location = tf.location
@@ -251,6 +334,8 @@ def build_scene_context(world, ego, route, sim_time_s, *, reference=None, specia
                         (p.x, p.y), (v.x, v.y),
                         ego_radius=float(ego.bounding_box.extent.y), actor_radius=float(extent.y))
         stationary = math.hypot(v.x, v.y) < .5
+        along_speed = v.x*math.cos(projection[2])+v.y*math.sin(projection[2])
+        cross_speed = -v.x*math.sin(projection[2])+v.y*math.cos(projection[2])
         path_block = stationary and 1 < along < 30 and projection[1] < 1.1+float(extent.y)
         occupied_conflict, occupied_ttc = occupied_body_conflict(
             ego_body_xy, (velocity.x, velocity.y), ego_body_yaw,
@@ -265,11 +350,15 @@ def build_scene_context(world, ego, route, sim_time_s, *, reference=None, specia
             "route_distance_m": along, "lane_key": lane_key(other_wp),
             "route_aligned": bool(route_aligned), "route_lateral_distance_m": projection[1],
             "length_m": float(extent.x)*2, "width_m": float(extent.y)*2,
+            "position_xy_m": [float(p.x), float(p.y)],
+            "along_speed_mps": float(along_speed), "cross_speed_mps": float(cross_speed),
+            "route_heading_aligned": bool(math.cos(actor_yaw-projection[2]) > .8),
             "occupied_ego_conflict": bool(occupied_conflict),
             "occupied_ego_conflict_ttc_s": occupied_ttc})
     result["actors"].sort(key=lambda a: (not a["conflict"], not a["path_blocked"], a["distance_m"]))
     result["signals"].sort(key=lambda a: a["stop_line_distance_m"])
     _traffic_wait(result, float(ego.bounding_box.extent.x))
+    _overtaking_context(result, current, local, ego, carla_map, ego_route_aligned)
     # No map/actor identity in the similarity key: topology and navigation generalize.
     signature = (str(getattr(carla_map, "name", "unknown")), result["navigation"],
                  result["in_junction"], round(float(local[0].lane_width), 1),

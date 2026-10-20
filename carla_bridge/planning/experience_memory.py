@@ -55,7 +55,7 @@ def _digest(value):
                                     separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
-def execution_planner_version(planning, controller=None):
+def execution_planner_version(planning, controller=None, *, vehicle_model=None):
     """Identify numerical execution settings without splitting semantic arms.
 
     Older outcomes predate scored-rollout execution geometry, native-LQR
@@ -63,6 +63,9 @@ def execution_planner_version(planning, controller=None):
     constructing this identifier never reads, migrates or modifies a bank.
     Defaults match CarlaPDMPlanner and TrajectoryTracker, rather than the YAML
     preset, so omitted and explicitly supplied equivalent settings agree.
+    MPC additionally identifies the measured vehicle model supplied by runtime
+    setup. An unspecified model is distinct from measured physics, so earlier
+    unqualified evidence cannot be mixed into a vehicle-specific bank.
     """
     planning, controller = dict(planning or {}), copy.deepcopy(dict(controller or {}))
     numeric = {key: float(planning.get(key, default)) for key, default in (
@@ -93,7 +96,18 @@ def execution_planner_version(planning, controller=None):
             return [canonical(item) for item in value]
         return value
 
-    return "carla_pdm_execution_v4:" + _digest(canonical({"planning": numeric,
+    if planning.get("backend") == "mpc":
+        from dataclasses import asdict
+        from .mpc_planner import effective_mpc_config
+        numerical = {"backend": "mpc", "mpc": asdict(effective_mpc_config(planning)),
+            "replan_interval_s": float(planning.get("replan_interval_s", .2)),
+            "max_speed_mps": float(planning.get("max_speed_mps", 8.)),
+            "lane_quality": numeric["lane_quality"], "lane_maneuver": numeric["lane_maneuver"]}
+        return "carla_mpc_execution_v1:" + _digest(canonical({
+            "planning": numerical, "controller": effective_controller,
+            "vehicle_model": vehicle_model}))
+
+    return "carla_pdm_execution_v5:" + _digest(canonical({"planning": numeric,
                                                          "controller": effective_controller}))
 
 
