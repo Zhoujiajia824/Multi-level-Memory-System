@@ -58,8 +58,8 @@ def _digest(value):
 def execution_planner_version(planning, controller=None):
     """Identify numerical execution settings without splitting semantic arms.
 
-    Older outcomes predate native-LQR execution, lane costs and persistent
-    maneuvers and cannot support the current controller. Versioned loading excludes them;
+    Older outcomes predate scored-rollout execution geometry, native-LQR
+    execution, lane costs or persistent maneuvers. Versioned loading excludes them;
     constructing this identifier never reads, migrates or modifies a bank.
     Defaults match CarlaPDMPlanner and TrajectoryTracker, rather than the YAML
     preset, so omitted and explicitly supplied equivalent settings agree.
@@ -93,7 +93,7 @@ def execution_planner_version(planning, controller=None):
             return [canonical(item) for item in value]
         return value
 
-    return "carla_pdm_execution_v3:" + _digest(canonical({"planning": numeric,
+    return "carla_pdm_execution_v4:" + _digest(canonical({"planning": numeric,
                                                          "controller": effective_controller}))
 
 

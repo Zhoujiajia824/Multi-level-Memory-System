@@ -260,7 +260,7 @@ def test_route_return_offsets_respect_a_narrower_future_reference_lane(monkeypat
     planner.route._route_waypoints = [narrow_exit(location) for location in planner.route._route]
     # Isolate the width contract of a complete return proposal. Its current
     # adjacent lane remains 3.5 m; only its future route target narrows to 2.8 m.
-    monkeypatch.setattr(module, "_route_compatible_lane_points", lambda reference, *args:
+    monkeypatch.setattr(module, "_route_compatible_lane_points", lambda reference, *args, **kwargs:
         (module._lane_path_points(reference), {"method": "synthetic_complete_route_return"}))
     diagnostics = planner.plan(semantic("MAINTAIN"))["planner_diagnostics"]
     left = diagnostics["geometry"]["lateral_paths"]["left"]

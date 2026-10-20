@@ -68,7 +68,17 @@ def test_yield_can_start_and_stably_creep_at_a_low_speed_limit():
     assert speeds[-1] == pytest.approx(0.3, abs=1e-4)
     assert speeds.min() >= 0 and speeds.max() <= 0.3 + 1e-6
     assert np.ptp(speeds[-10:]) < 1e-4
-    assert plan["trajectory"][-1]["x"] > 1.0
+    d = plan["planner_diagnostics"]
+    index = next(c["index"] for c in d["candidates"] if c["id"] == d["selected_id"])
+    # The IDM reference still advances >1 m. Execution geometry now includes
+    # native LQR/plant launch lag (about 0.87 m), instead of pretending that the
+    # ideal generator reference was the scored vehicle motion.
+    progress = planner.generator._state_idm_array[index, :, 0]
+    assert progress[-1] - progress[0] > 1.0
+    actual = planner.scorer._states[index, :, planner.api.StateIndex.X]
+    assert plan["trajectory"][-1]["x"] == pytest.approx(actual[-1] - actual[0], abs=2e-6)
+    assert np.diff(actual).min() >= -1e-8
+    assert actual[-1] > actual[0]
 
 
 def test_normal_stop_uses_comfort_deceleration_when_the_road_is_clear():

@@ -240,7 +240,7 @@ def _lane_offset_points(points, offset, api):
 
 
 def _route_compatible_lane_points(reference, closest, side, progress, cut, transition_m,
-                                  current_side):
+                                  current_side, minimum_return_m=None):
     """Build an adjacent-lane excursion with its legal return to the route.
 
     Relative left/right lanes are not a route through a junction: in Town05,
@@ -270,8 +270,45 @@ def _route_compatible_lane_points(reference, closest, side, progress, cut, trans
         start -= 1
     # Complete the whole vehicle's transition before the connection diverges.
     merge_end = float(progress[end - 1] - 4.0)
-    merge_start = merge_end - transition_m
     ahead = float(progress[closest])
+    if side == current_side and merge_end - ahead < 4.0:
+        return None, {"reason": "route_exit_return_is_too_late", "distance_to_exit_m": float(progress[end] - ahead)}
+    direction = "right" if side == "left" else "left"
+    # A fixed 30 m interval can overlap an earlier straight junction even
+    # though the final approach has a shorter legal broken-line corridor.
+    # Find actual contiguous permission intervals, latest first. Never bridge
+    # a forbidden junction/solid marking to manufacture the requested length.
+    blocks, block = [], []
+    for i in range(start, end):
+        if lane_change_permitted(_adjacent(reference[i], side), reference[i], direction):
+            block.append(i)
+        elif block:
+            blocks.append(block)
+            block = []
+    if block:
+        blocks.append(block)
+    minimum = transition_m if minimum_return_m is None else min(transition_m, minimum_return_m)
+    nominal_stations = [i for i, station in enumerate(progress)
+                        if merge_end - transition_m - 2 <= station <= merge_end + 2]
+    # Preserve an already legal fixed return exactly, including a replan whose
+    # local map window begins partway through that ongoing spatial transition.
+    selected_block = nominal_stations if nominal_stations and all(
+        lane_change_permitted(_adjacent(reference[i], side), reference[i], direction)
+        for i in nominal_stations) else None
+    if selected_block is not None:
+        return_length, merge_start = transition_m, merge_end - transition_m
+    for block in reversed(blocks) if selected_block is None else ():
+        # Preserve the existing 2 m permission check around both endpoints.
+        finish = min(merge_end, float(progress[block[-1]]) - 2.0)
+        available = finish - (float(progress[block[0]]) + 2.0)
+        if available + 1e-6 >= minimum and finish - ahead >= 4.0:
+            return_length = min(transition_m, available)
+            merge_end, merge_start = finish, finish - return_length
+            selected_block = block
+            break
+    if selected_block is None:
+        return None, {"reason": "route_exit_has_no_legal_return",
+                      "minimum_return_length_m": float(minimum)}
     if merge_start < progress[start] and side != current_side:
         return None, {"reason": "route_exit_return_cannot_fit", "distance_to_exit_m": float(progress[end] - ahead)}
     if side != current_side and merge_start - ahead < transition_m + 4.0:
@@ -279,12 +316,9 @@ def _route_compatible_lane_points(reference, closest, side, progress, cut, trans
                       "distance_to_exit_m": float(progress[end] - ahead)}
     # A replan within an already developing return must retain its fixed map
     # endpoint, rather than demanding another fresh 30 metres every 0.2 s.
-    if side == current_side and merge_end - ahead < 4.0:
-        return None, {"reason": "route_exit_return_is_too_late", "distance_to_exit_m": float(progress[end] - ahead)}
     if end - start < 2:
         return None, {"reason": "route_exit_has_insufficient_connected_samples",
                       "distance_to_exit_m": float(progress[end] - ahead)}
-    direction = "right" if side == "left" else "left"
     stations = [i for i, station in enumerate(progress) if merge_start - 2 <= station <= merge_end + 2]
     for i in stations:
         source = _adjacent(reference[i], side)
@@ -307,13 +341,18 @@ def _route_compatible_lane_points(reference, closest, side, progress, cut, trans
     side_curve = CubicHermiteSpline(progress[start:end][side_keep], left_points[side_keep], left_tangents[side_keep], axis=0)
     samples = np.unique(np.r_[progress[start:], np.arange(progress[start], progress[-1], .25),
                               max(merge_start, progress[start]), merge_end])
-    u = np.clip((samples - merge_start) / transition_m, 0.0, 1.0)
+    u = np.clip((samples - merge_start) / return_length, 0.0, 1.0)
     blend = 1 - 10 * u ** 3 + 15 * u ** 4 - 6 * u ** 5
     # Avoid extrapolating an absent lane after it has already been left.
     side_samples = side_curve(np.minimum(samples, merge_end))
     points = center_curve(samples) + blend[:, None] * (side_samples - center_curve(samples))
     return points, {"method": "legal_return_in_spatial_proposal", "merge_start_ahead_m": merge_start - ahead,
-                    "merge_end_ahead_m": merge_end - ahead, "return_length_m": transition_m,
+                    "merge_end_ahead_m": merge_end - ahead, "return_length_m": float(return_length),
+                    "requested_return_length_m": float(transition_m),
+                    "minimum_return_length_m": float(minimum),
+                    "legal_return_lane_keys": list(dict.fromkeys(
+                        _lane_key(_adjacent(reference[i], side)) for i in selected_block
+                        if merge_start <= progress[i] <= merge_end)),
                     "exit_reference_index": end, "selection_gate_applied": False}
 
 
@@ -457,8 +496,9 @@ class CarlaPDMPlanner:
             self.api, self.vehicle_parameters, self.dt,
             longitudinal_tracking_horizon_samples=10,
             lateral_tracking_horizon_samples=self.lqr_lateral_horizon_samples)
-        self.simulator._motion_model = self.api.BatchKinematicBicycleModel(
-            vehicle=self.vehicle_parameters, max_steering_angle=self.max_steer)
+        from .forward_motion import build_forward_motion_model
+        self.simulator._motion_model = build_forward_motion_model(
+            self.api, self.vehicle_parameters, self.max_steer)
         self.provenance = dict(self.api.provenance)
 
     def _bind_lateral_preview(self, speed_mps):
@@ -781,7 +821,10 @@ class CarlaPDMPlanner:
                 excluded[side] = reason
                 continue
             route_points, route_connection = _route_compatible_lane_points(
-                reference, closest, side, progress, cut, self.transition_m, current_side)
+                reference, closest, side, progress, cut, self.transition_m, current_side,
+                minimum_return_m=max(2 * self.vehicle_parameters.wheel_base,
+                                     3 * float(corridor[0].lane_width),
+                                     2 * ego_state.dynamic_car_state.speed))
             if route_connection is not None:
                 details["route_connection"] = route_connection
                 if route_points is None:
@@ -1509,25 +1552,11 @@ class CarlaPDMPlanner:
                 "bicycle_angles_rad": self.scorer._states[
                     index, :4, self.api.StateIndex.STEERING_ANGLE].tolist(),
             }
-        generated = self.generator.generate_trajectory(index)
-        states = generated.get_sampled_trajectory()
-        from carla_bridge.state.coords import global_to_ego
-        yaw = math.radians(tf.rotation.yaw)
-        box_offset = np.array([self.ego.bounding_box.location.x, -self.ego.bounding_box.location.y])
-        trajectory = []
-        idm_velocity = self.generator._state_idm_array[index, :, 1]
-        for i, point in enumerate(states):
-            center = point.center
-            c, s = math.cos(center.heading), math.sin(center.heading)
-            # Convert footprint center back to CARLA actor origin, then reflect
-            # world y and apply the project's ego-centric (forward,left) frame.
-            origin = np.array([center.x, center.y]) - np.array([c * box_offset[0] - s * box_offset[1],
-                                                                             s * box_offset[0] + c * box_offset[1]])
-            x, y = global_to_ego(origin[0], -origin[1], tf.location.x, tf.location.y, yaw)
-            trajectory.append({"t": round(i * self.dt, 8), "x": float(x), "y": float(y),
-                               "optional_heading_rad": math.atan2(math.sin(center.heading + yaw),
-                                                                  math.cos(center.heading + yaw)),
-                               "optional_v": float(max(0, idm_velocity[i]))})
+        from .execution_trajectory import build_scored_execution_trajectory
+        diagnostics["rollout_motion_model"] = "forward_gear_native_bicycle_zero_crossing_stop"
+        trajectory, diagnostics["execution_trajectory"] = build_scored_execution_trajectory(
+            self.scorer._states[index], self.generator._state_array[index],
+            self.generator._state_idm_array[index, :, 1], state, tf, self.api.StateIndex, self.dt)
         diagnostics.update(emergency_brake=False, selected_lateral=selected["lateral"],
                            selected_longitudinal=selected["longitudinal"])
         return {"trajectory": trajectory, "target_speed": trajectory[-1]["optional_v"],

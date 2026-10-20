@@ -7,7 +7,7 @@
 ## 查看已有经验库
 
 在仓库根目录、已有 `mulmem_carla` 环境中运行。将示例银行目录换成实际使用的 `--memory-bank`。
-当前闭环版本为 `carla_pdm_execution_v3:<配置哈希>`，完整值来自已结束运行的
+当前闭环版本为 `carla_pdm_execution_v4:<配置哈希>`，完整值来自已结束运行的
 `manifest.json.outcome.execution_planner_version`。不同控制器、预瞄、PID及规范化后的
 `lane_quality` / `lane_maneuver` 开关和参数会产生不同版本；语义、模型、记忆和恢复开关
 本身不改变数值版本。下面先从实际运行读取版本，再检查该版本的库：
@@ -21,8 +21,8 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as f:
     manifest = json.load(f)
 version = manifest.get("outcome", {}).get("execution_planner_version")
-if not isinstance(version, str) or not version.startswith("carla_pdm_execution_v3:"):
-    raise SystemExit("该运行未记录当前v3数值版本，请核对运行目录和代码版本")
+if not isinstance(version, str) or not version.startswith("carla_pdm_execution_v4:"):
+    raise SystemExit("该运行未记录当前v4数值版本，请核对运行目录和代码版本")
 print(version)
 PY
 )

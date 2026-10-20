@@ -81,7 +81,7 @@ def test_execution_version_defaults_match_explicit_numerical_settings_without_mu
     before = copy.deepcopy((explicit, controller))
     version = execution_planner_version(explicit, controller)
     assert version == execution_planner_version({})
-    assert version.startswith("carla_pdm_execution_v3:")
+    assert version.startswith("carla_pdm_execution_v4:")
     assert len(version.rsplit(":", 1)[1]) == 64
     assert (explicit, controller) == before
     # YAML/map insertion ordering and int/float spelling do not split banks.
