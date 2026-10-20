@@ -8,6 +8,8 @@
 首次配置按顺序阅读：[第 5 节：新环境或已有环境安装](#5-环境搭建) →
 [第 12.0 节：生成与运行新场景](#120-从服务器开始生成场景再运行场景) →
 [第 13.6 节：策略与记忆完整命令](#136-选择性语义顾问与数值规划记忆完整命令)。
+运行后的模型调用、图像、输入输出与视频定位见[第 13.11 节](#1311-模型调用审核视频定位与仿真轨迹绘制)。
+全部入口开关、当前默认值与记忆组合速查见[第 13.12 节](#1312-运行开关总表与记忆使用形式)。
 
 > ⚠️ 研究用离线/仿真 Demo，**不可用于实车**。
 
@@ -1746,3 +1748,267 @@ IDM速度目标、纵向PID、PDM基础评分公式、候选选择和原生转�
 这是本地Windows CARLA 0.9.15的纯PDM工程回归，语义影响关闭，无VLM、DINO或记忆访问。
 它确认本轮退出与路线停滞缺陷的修复，不能替代服务器选择性语义模式的复测，也不代表所有
 场景、车道边界合规、交通规则及舒适性指标已经全部验收。
+
+### 13.11 模型调用审核、视频定位与仿真轨迹绘制
+
+本轮运行可自动生成一个离线审核页面，用于回答“哪一帧、什么位置、为什么调用模型、
+看到了什么、模型输出了什么，以及建议是否改变了轨迹选择”。页面将调用列表、触发类型统计、
+自车位置轨迹、原始输入图片、逐阶段请求详情和驾驶视频放在一起；点击调用记录可定位视频。
+不调用模型的纯PDM运行也能生成页面，并在审计完整时显示0次调用。
+
+在已有 `mulmem_carla` 环境、仓库根目录运行：
+
+```bash
+conda activate mulmem_carla
+python -m carla_bridge.run_carla_demo \
+  --scenario outputs/paper_v1_spawncheck/eval/R05_multilane_eval_s101.yaml \
+  --planner pdm_closed \
+  --semantic-policy selective \
+  --semantic-influence on \
+  --model-inference on \
+  --planning-memory off \
+  --mode memory_off \
+  --replay-audit on \
+  --record-video on \
+  --trajectory-visualization off
+```
+
+| 开关 | 用途与当前默认值 |
+| --- | --- |
+| `--replay-audit on/off` | 模型调用证据归档和审核页面；默认on |
+| `--record-video on/off` | 驾驶视频和逐帧索引；当前 `carla_bridge/config/carla.yaml` 为on |
+| `--trajectory-visualization on/off` | 在CARLA世界绘制候选及执行计划；默认off，使用PDM后端时生效 |
+
+命令行优先于YAML。上面示例用于记录模型运行；需要观察世界轨迹时，将最后一项改为
+`--trajectory-visualization on`。观测开关不修改数值规划、候选评分或语义选择规则；
+但世界线会进入RGB相机，模型输入可能随之变化，因此正式模型对照实验保持世界绘制off，
+只在可视化诊断时开启。归档、视频和绘制有I/O、编码及渲染开销，比较运行耗时时应保持观测配置一致。
+
+#### 找到并打开本轮审核页面
+
+启动后控制台打印 `[carla_bridge] 本轮输出目录: ...`。以下 `<RUN_DIR>` 指该完整目录，
+例如 `outputs/carla_runs/20261020_...__R05_multilane_eval_s101__...`，不是整个 `outputs/`。
+正常退出或由程序处理的中断进入清理阶段时，会生成：
+
+```text
+<RUN_DIR>/
+  replay/
+    index.html                   # 离线审核入口
+    data.json                    # 页面使用的完整审核数据
+    summary.json                 # 调用比例、阶段次数、触发类型与完整性提示
+  model_calls.jsonl              # 一次咨询的开始、完成或失败事件（有咨询时生成）
+  model_requests.jsonl           # 实际SDK dispatch及结果、失败与重试（有请求时生成）
+  model_call_assets/             # 实际模型输入图片的运行内归档，含用到的历史记忆图片
+  carla_videos/
+    drive_....mp4
+    drive_....frames.jsonl        # 视频帧号与实际CARLA帧、仿真时间对应关系
+    drive_....events.jsonl        # 缺帧、过期或编码失败原因
+    drive_....summary.json        # 视频帧数、缺失及最终补写统计
+  control.jsonl
+  planner.jsonl
+```
+
+建议将**整个本轮目录**下载到本机，再直接打开 `replay/index.html`。
+页面内嵌审核数据，不需要CDN或在线服务；图片和视频通过相对路径加载，
+只复制 `index.html` 会丢失这些素材。被实际送入模型的历史图片已归档到本轮目录，
+无需额外复制原记忆库。
+
+若浏览器限制本地文件或视频加载，在该目录所在机器启动静态服务：
+
+```bash
+python -m http.server 8765 --bind 127.0.0.1 --directory "<RUN_DIR>"
+```
+
+在同一台机器浏览器打开 `http://127.0.0.1:8765/replay/`。若素材保留在服务器，
+在服务器执行上面命令，再在本机新终端建立隧道：
+
+```bash
+ssh -N -L 8765:127.0.0.1:8765 zjj@<服务器地址>
+```
+
+本机浏览器访问相同地址即可。若MP4编码不被浏览器支持，可以用本机视频播放器查看原视频，
+同时根据页面帧号和 `*.frames.jsonl` 对照；不要丢弃帧索引。
+
+旧运行日志可在仓库中手动补建或重建页面：
+
+```bash
+python -m carla_bridge.replay.review "<RUN_DIR>"
+```
+
+补建不会调用模型，也不会改写驾驶日志。旧日志没有归档的完整prompt、输入图片、原始响应、
+实际SDK请求和重试次数无法从结果反推；页面会显示未知或数据缺失，不能当作新审计的同等证据。
+未经过清理的进程强制终止、磁盘写入失败等情况，也应查看完整性提示后再使用统计。
+
+#### 人工观测与统计口径
+
+先在页面上查看总调用帧占比与触发类型，再通过表格筛选、上一次/下一次调用按钮或时间线定位。
+每次咨询详情显示仿真时间、真实CARLA帧、自车位置与速度、触发原因及实际使用的图片；
+逐阶段展开可查看scene/decision的system prompt、完整用户prompt、发送给SDK的messages、
+原始响应、请求参数、失败原因和各次重试。图片可能同时包括本帧视角图、拼接图与检索到的历史图，
+应按“本次请求实际使用的全部图片”核对输入，而不只看前视图。
+
+**实际调用帧占比**的分子是发生实际SDK dispatch的唯一CARLA帧数，分母是
+`control.jsonl` 中 `world_snapshot.frame` 去重后的真实推进帧数。
+同一帧的scene、decision及应用层重试只增加请求次数，不重复增加调用帧数。
+例如1000个推进帧中有10个帧发生请求，比例为1%，即使这10帧合计发出了25次SDK请求。
+请求计数覆盖应用可观察的SDK dispatch，不宣称覆盖SDK内部自动HTTP重试。
+审计缺失或帧无法对齐时，页面显示未知及原因，不用0填充缺失值。
+
+“咨询”“实际调用”“语义被采纳”是不同事件：顾问检查可能跳过；进入咨询后也可能在请求前失败；
+模型有响应也可能未改变PDM的候选选择。页面分别统计SDK尝试、语义改变选择的规划次数和
+可归因控制帧占比。语义改变选择以同一候选池的无语义基线及扩展候选审计为依据，
+控制帧通过 `command.planner_sequence` 关联已接受计划；这不等于证明实际驾驶效果得到改善。
+
+视频按仿真推进录制，不包含模型思考期间CARLA冻结的墙钟等待。
+GPU相机回调可以迟到，录制器使用有界待匹配队列保留原帧时间与HUD，
+按实际CARLA帧补写，不用相邻旧图冒充。最终缺帧会压缩视频时长，
+因此**不能用“仿真时间×fps”直接推算视频帧**，应使用 `*.frames.jsonl`。
+页面在调用帧存在时精确定位；图像缺失只能定位最近可用帧时，会提示近似映射。
+视频HUD显示的是该帧采样时最近已开始的咨询；调用可能在采样后才开始，HUD会在后续tick更新，
+精确触发瞬间以HTML审核中的实际请求帧及索引映射为准。
+
+#### 在仿真环境观察候选和执行计划
+
+启用 `--trajectory-visualization on` 后，按每次重规划绘制：
+
+| 颜色 | 含义 |
+| --- | --- |
+| 蓝色 | 参与评分的候选轨迹 |
+| 橙色 | 本次获选候选 |
+| 绿色 | 通过轨迹校验、下发给控制器的执行计划 |
+| 红色 | 被轨迹校验拒绝的计划 |
+
+绿色线表示未来执行计划，不表示车辆已经实际走过的轨迹。
+候选线、获选线和执行线可能重叠，最后绘制的线会遮住前面的部分。
+世界线使用CARLA debug绘制。本机CARLA 0.9.15验证中已在RGB录像里看到世界线，
+因此同时开启认知相机时，模型也可能看到这些标记。其他渲染模式的可见性仍需实际核对；
+回放以保存的实际输入图片、视频和规划日志为依据。
+
+配置位于 `carla_bridge/config/carla.yaml` 的 `carla.visualization.trajectories`：
+
+```yaml
+carla:
+  visualization:
+    trajectories:
+      enabled: false
+      max_candidates: 0      # 0画全部；正整数限制显示数量，不影响候选计算或选择
+      point_stride: 3        # 绘制点抽样间隔
+      lifetime_s: 0.25       # 短暂保留，随重规划刷新
+      thickness: 0.06
+      z_offset: 0.15         # 米；抬高以减少与路面重叠
+```
+
+全部候选绘制有性能成本；观察时可先开启，正式批量实验按需要关闭或限制显示数量。
+
+本轮验证记录（`outputs/replay_validation/`，本地生成、不随Git分发）：
+
+| 验证 | 结果与范围 |
+| --- | --- |
+| 相关回归 | 259项通过，覆盖调用归档、重试与中断、统计完整性、视频索引、规划及控制回归；`final_all.xml` |
+| 页面交互逻辑 | 上述测试中调用Node脚本，14项用例通过，覆盖播放跟随、跳转、缺帧提示和无视频情况；不等于浏览器人工视觉验收 |
+| 实际CARLA短程验证 | 本地0.9.15、Town05、60辆背景车与20名行人，最终样式运行4秒、40个推进帧、20次PDM规划，轨迹拒绝0次；已检查录像中的轨迹绘制和HUD |
+| 视频缺帧验证 | 该短程最终编码24帧、缺失16帧、编码错误0；缺失显式记录，页面按真实帧索引定位；输入图归档独立于录像 |
+| 零调用统计与清理 | 纯PDM显示0/40调用帧；结束后车辆、行人、行人控制器、传感器均无残留，同步设置恢复，独立测试服务已关闭 |
+
+短程原始证据在 `outputs/replay_validation/carla_final_style_probe/`，清理独立观测为
+`cleanup_observation.json`。在线模型输入输出通过模拟SDK的集成测试核对，
+本轮没有在本地发起远程VLM请求，也没有重新跑完整路线验收；不沿用13.10节完整路线的通过结果。
+本轮改动不会自动commit或推送，需明确授权后提交。
+
+### 13.12 运行开关总表与记忆使用形式
+
+以下覆盖 `python -m carla_bridge.run_carla_demo` 的全部命令行参数。
+默认值按当前仓库的 `carla_bridge/config/carla.yaml` 与入口参数定义列出；
+`--help` 中部分默认值为None，表示继承YAML，不表示关闭。显式CLI覆盖配置，
+随后受后端兼容、记忆权限及论文train/eval约束限制。
+
+#### 三个观测开关的区别
+
+| 参数 | 开启后的行为 | 关闭后的行为 | 当前默认 |
+| --- | --- | --- | --- |
+| `--replay-audit on/off` | 归档实际模型输入图片、完整提示词、响应、触发原因、时间/帧/位置；运行结束生成 `replay/index.html`，联动视频并统计使用比例 | 不启用新增调用证据归档和自动审核页面；原有驾驶/规划日志仍保留 | on |
+| `--record-video on/off` | 增加录像相机，输出驾驶MP4、逐帧索引、缺帧事件与HUD | 不初始化录像相机或录制MP4；调用审核仍可查看图片和文本 | on |
+| `--trajectory-visualization on/off` | 用CARLA世界debug线绘制实际评分候选、获选候选、通过验证的执行计划或被拒绝计划 | 不绘制世界线；仍正常规划与保存规划日志 | off |
+
+三个开关独立：审计不等于录像，录像不等于世界轨迹绘制，关闭审计也不等于关闭模型。
+模型是否调用由 `--model-inference` 等规划开关决定。调用帧占比为“实际SDK请求的唯一CARLA帧数 / 全场景真实推进的唯一CARLA帧数”，
+同一帧的场景理解、决策和重试不重复增加分子。视频缺帧按索引明确提示，输入图片独立保存。
+世界线可能进入模型RGB输入，正式VLM对照实验推荐 `on / on / off`，人工观察候选轨迹时再把第三项设为on。
+
+#### 场景、模型与规划开关
+
+| 参数 | 可选值 / 当前默认 | 含义 |
+| --- | --- | --- |
+| `--scenario` | 场景名或YAML路径；默认 `straight_traffic` | 选择运行场景；论文场景须已完成准备/出生检查 |
+| `--planner` | `pdm_closed`（默认）、`vlm_trajectory` | 数值PDM规划，或旧模型直接输出路点后端 |
+| `--model-inference` | `on`（默认）、`off` | 是否初始化并调用场景理解/决策模型；off跳过认知相机、DINO和文本/视觉记忆 |
+| `--semantic-influence` | `on`（默认）、`off` | 模型横纵向语义是否允许影响PDM选择；off本身不会关闭模型调用 |
+| `--semantic-policy` | `selective`（默认）、`always`、`shadow` | 条件查询和介入；旧版周期查询/无条件语义加分；按需查询并记录假设选择但不实际采纳 |
+| `--planner-recovery` | `on`（默认）、`off` | selective/shadow且语义on时，是否允许模型明确请求扩展脱困候选；shadow仅观察，不执行假设扩展 |
+| `--pdm-lateral-control` | `native_lqr`（默认）、`pure_pursuit` | PDM横向执行控制；纵向均为PID |
+| `--pdm-lateral-preview` | `speed_scaled`（默认）、`fixed` | LQR预瞄随实测速度调度，或固定预瞄对照；pure_pursuit不使用该LQR预瞄 |
+| `--lane-quality` | `on`（默认）、`off` | 车道居中和车身边界的数值软成本，不是额外硬筛规则 |
+| `--lane-maneuver` | `on`（默认）、`off` | 为持续慢障碍构造合法绕行/变道及返回候选，不保证一定选择绕行 |
+
+`--model-inference off` 只允许PDM后端且语义off。此时使用 `memory_off`，或使用
+`memory_on + planning-memory full` 的独立数值记忆；不能使用无模型的gate/text-only组合。
+selective/shadow只有语义on时走条件咨询；语义off但模型on仍保留周期认知。
+shadow只关闭语义采纳，不自动关闭full数值记忆。严格无模型、无记忆PDM基线：
+
+```bash
+python -m carla_bridge.run_carla_demo \
+  --scenario outputs/paper_v1_spawncheck/eval/R05_multilane_eval_s101.yaml \
+  --planner pdm_closed --semantic-influence off --model-inference off \
+  --planning-memory off --mode memory_off \
+  --replay-audit on --record-video on --trajectory-visualization off
+```
+
+#### 记忆开关及使用形式
+
+| 参数 | 可选值 / 当前默认 | 含义 |
+| --- | --- | --- |
+| `--mode` | `memory_on`（默认）、`memory_off` | 总记忆开关；off关闭所有记忆读写和短期记忆，不关闭模型 |
+| `--memory-bank` | 路径；默认未指定 | 指定可跨运行复用的库；省略则使用本轮目录下独立库，不会自动跨轮积累 |
+| `--memory-access` | `read_write`（默认）、`read_only` | 允许积累或只读；只读必须指定已有、完整的bank |
+| `--memory-seed` | 已有库路径；默认未指定 | 将已有库复制到尚不存在的新目标库后运行；源库不变，仅支持可写目标 |
+| `--no-memory-retrieval` | 布尔旗标，默认不传 | 禁止持久文本及数值经验检索，但不禁止写入；不自动关闭本轮短期记忆 |
+| `--no-short-term` | 布尔旗标，默认不传 | 禁止本轮短期上下文记忆；不关闭持久库检索/积累 |
+| `--planning-memory` | `full`（当前YAML默认）、`gate`、`off` | full在辅助介入判断之外提供数值候选参数先验；gate仅提供介入/语义折扣证据；off关闭数值规划经验，仍可保留模型文本/视觉记忆 |
+
+以下均为追加到同一运行命令的参数组合；需要模型记忆时保留 `--model-inference on`。
+
+| 使用目的 | 记忆参数组合 |
+| --- | --- |
+| 完全无记忆 | `--mode memory_off --planning-memory off`，不要传bank/seed |
+| 每轮独立积累 | `--mode memory_on --memory-access read_write`，不传bank |
+| 持续积累共享库 | `--mode memory_on --memory-bank outputs/memory_banks/shared --memory-access read_write`；各轮复用同一路径 |
+| 按场景独立积累 | 同上，将bank改为 `outputs/memory_banks/R05` 等不同路径；目录名只用于隔离，不自动筛选场景 |
+| 指定库只检索、不增加记忆 | `--mode memory_on --memory-bank outputs/memory_banks/R05 --memory-access read_only` |
+| 只积累、不检索持久记忆 | 可写bank组合追加 `--no-memory-retrieval`；连短期也不使用时再加 `--no-short-term` |
+| 仅短期记忆 | `--mode memory_on --memory-access read_only --memory-bank <已有库> --no-memory-retrieval --planning-memory off` |
+| 仅持久库、无短期 | 只读或可写bank组合追加 `--no-short-term` |
+| 从已有库复制后独立改进 | `--mode memory_on --memory-seed <已有源库> --memory-bank <尚不存在的新库> --memory-access read_write` |
+| 仅模型文本/视觉记忆 | 模型on、memory_on及bank权限组合，显式 `--planning-memory off` |
+| 无模型、仅数值经验 | `--planner pdm_closed --semantic-influence off --model-inference off --planning-memory full --mode memory_on`，再选择bank和读写权限 |
+
+`read_only` 禁止向持久库新增/修改记忆，但允许本轮短期上下文演化和运行审计落盘；
+需要把短期也关闭时加 `--no-short-term`。论文 `paper_v1` 的eval场景在memory_on时强制read_only，
+积累必须选择train场景。只读必须先有对应格式的训练库；无模型数值库不能用于初始化完整文本/视觉库。
+完整的train/eval与多种记忆命令示例见13.6节。
+
+#### 模型文件与帮助参数
+
+| 参数 | 当前默认 | 含义 |
+| --- | --- | --- |
+| `--dinov2-model-dir` | 未指定 | 指定本地DINOv2模型或Hugging Face snapshot目录 |
+| `--dinov2-cache-dir` | `.cache/huggingface` | 指定Hugging Face缓存根目录 |
+| `--allow-model-download` | 默认不传，仅本地加载 | 显式允许DINOv2联网查找/下载；不控制远程VLM API调用 |
+| `-h` / `--help` | 查看后退出 | 打印当前入口支持的全部命令行参数，不运行场景 |
+
+连接地址/端口、仿真步长、规划频率/速度、视频视角/尺寸、轨迹绘制数量等数值项在
+`carla_bridge/config/carla.yaml` 中配置，没有对应CLI参数。
+该文件中的额外功能布尔项包括 `carla.synchronous`（同步推进）、
+`carla.stuck_detection.enabled`（停滞检查）、`carla.route_injection.enabled`（导航参考注入）、
+`perception.oracle_objects`（GT对象输入）、`perception.mosaic.label_subimages`（拼图视角标签）、
+`carla.video.hud`（录像HUD）和 `fallback.allow_rule_fallback_for_format_error`（格式错误规则回退）。
+它们属于实验配置，修改后应保留配置快照；上述CLI总表不意味着这些配置项可直接写成命令行参数。

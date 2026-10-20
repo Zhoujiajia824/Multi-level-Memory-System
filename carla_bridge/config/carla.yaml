@@ -172,14 +172,26 @@ carla:
       deadband_mps: 0.15     # 死区：小误差滑行，防油门/刹车抖动
     control_dt_s: 0.1        # 控制周期 = fixed_delta_seconds（scripted NPC PID 用）
     steer_sign: -1               # 项目 steer_rad 左正 ↔ CARLA VehicleControl.steer 右正（+yaw=右转，实测），故取反
-  # ---- 驾驶视频录制（独立小功能，默认关）----
-  # 仅在 CARLA 推进 tick 取帧（跳过 VLM 冻结期），视频时长 = 仿真实际驾驶时间
+  # ---- 驾驶视频录制（当前默认开，可用 --record-video off 关闭）----
+  # 仅在CARLA推进tick登记帧（跳过VLM冻结期）；缺帧会缩短视频，时间对应以帧索引为准
   video:
     enabled: true
     fps: 10                      # = 1/fixed_delta（=0.1s），视频按 sim 实时速度播放
     width: 1280                   # Town05 大图降视频相机分辨率（1280×720→640×360）防 UE4 崩溃
     height: 720
     view: "chase"                # chase（后上方第三人称）| front（前视角）
+    frame_timeout_s: 0.0         # 非阻塞；GPU图像延迟到达后按原CARLA帧补写
+    hud: true                   # 视频叠加时间、CARLA帧、最近模型调用和轨迹选择
+  replay:
+    enabled: true               # 自动生成 replay/index.html；归档实际模型输入，含历史记忆图片
+  visualization:
+    trajectories:
+      enabled: false            # --trajectory-visualization on 开启世界内轨迹绘制
+      max_candidates: 0         # 0表示全部候选；可设较小上限降低debug绘制开销
+      point_stride: 3
+      lifetime_s: 0.25           # 随0.2s重规划刷新；短暂重叠后自动消失
+      thickness: 0.06
+      z_offset: 0.15
   # ---- 场景 ----
   scenario_dir: "carla_bridge/config/scenarios"
   default_scenario: "straight_traffic"

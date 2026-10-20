@@ -60,6 +60,17 @@ def _render_md(run_info: dict, s: dict) -> str:
     ]
     if run_info.get("semantic_policy") == "shadow":
         lines.append("- Shadow: 实际执行基础 PDM；would-selection 仅为同快照候选比较，不是已执行结果")
+    usage = run_info.get("model_usage")
+    if isinstance(usage, dict):
+        ratio = usage.get("model_call_frame_ratio")
+        ratio_text = f"{100*ratio:.2f}%" if isinstance(ratio, (int, float)) else "未知（日志不完整或缺少帧号）"
+        lines += ["- [模型调用回放审核](replay/index.html)",
+                  f"- 实际模型调用帧占比: {ratio_text}"
+                  f"（{usage.get('actual_model_call_frame_count')} / {usage.get('total_tick_frame_count')} 个唯一CARLA帧）",
+                  f"- 认知咨询 / 逻辑模型请求 / SDK调用尝试: {usage.get('consultation_count')} / "
+                  f"{usage.get('logical_model_request_count')} / {usage.get('sdk_attempt_count')}"]
+    if run_info.get("replay_error"):
+        lines.append("- 模型回放报告未生成: "+str(run_info["replay_error"]))
     if run_info.get("early_terminated"):
         lines.append(
             f"- ⚠️ **提前终止**（原因: {run_info.get('early_terminated_reason', '?')}）"

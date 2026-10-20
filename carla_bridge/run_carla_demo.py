@@ -99,6 +99,12 @@ def main() -> None:
                     help="选择性语义策略下是否允许模型请求扩展脱困候选；off仅保留普通语义加分")
     ap.add_argument("--model-inference", choices=["on", "off"], default=None,
                     help="模型调用开关；off 要求 pdm_closed、语义off，以及memory_off或显式planning-memory full的数值记忆模式")
+    ap.add_argument("--replay-audit", choices=["on", "off"], default=None,
+                    help="模型调用证据与离线回放报告，默认on；保存实际模型输入图片、提示词和输出")
+    ap.add_argument("--record-video", choices=["on", "off"], default=None,
+                    help="录制驾驶视频及CARLA帧索引，配合模型调用回放")
+    ap.add_argument("--trajectory-visualization", choices=["on", "off"], default=None,
+                    help="在CARLA世界绘制PDM评分候选和通过验证的执行轨迹，默认off")
     ap.add_argument("--dinov2-model-dir", help="本地 DINOv2 模型目录或缓存 snapshot 目录")
     ap.add_argument("--dinov2-cache-dir", help="Hugging Face 缓存目录（默认项目 .cache/huggingface）")
     ap.add_argument("--allow-model-download", action="store_true", help="显式允许 DINOv2 联网下载；默认仅使用本地文件")
@@ -117,6 +123,13 @@ def main() -> None:
     with open(carla_yaml, "r", encoding="utf-8") as f:
         carla_cfg = yaml.safe_load(f)
     planning = carla_cfg.setdefault("carla", {}).setdefault("planning", {})
+    runtime = carla_cfg["carla"]
+    if args.replay_audit is not None:
+        runtime.setdefault("replay", {})["enabled"] = args.replay_audit == "on"
+    if args.record_video is not None:
+        runtime.setdefault("video", {})["enabled"] = args.record_video == "on"
+    if args.trajectory_visualization is not None:
+        runtime.setdefault("visualization", {}).setdefault("trajectories", {})["enabled"] = args.trajectory_visualization == "on"
     if args.planner is not None:
         planning["backend"] = args.planner
     if args.pdm_lateral_control is not None:

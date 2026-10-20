@@ -19,6 +19,7 @@ from typing import List, Optional
 
 from src.vla_memory.perception.vlm_client import VLMClient
 from src.vla_memory.common.logging_utils import get_logger
+from src.vla_memory.common.model_call_audit import describe_model_request, emit_model_request
 
 logger = get_logger("openai_compatible_client")
 
@@ -159,6 +160,10 @@ class OpenAICompatibleVLMClient(VLMClient):
 
         last_error = None
         for attempt in range(1, self.retry_times + 1):
+            started = time.perf_counter()
+            emit_model_request("request_start", attempt=attempt, dispatched=True,
+                               model=self.model_name, provider=self.provider,
+                               max_tokens=self.max_tokens, temperature=self.temperature)
             try:
                 response = self._client.chat.completions.create(
                     model=self.model_name,
@@ -167,13 +172,23 @@ class OpenAICompatibleVLMClient(VLMClient):
                     temperature=self.temperature,
                 )
                 result = response.choices[0].message.content
+                emit_model_request("request_end", attempt=attempt, dispatched=True,
+                                   status="success", response=result,
+                                   wall_duration_s=time.perf_counter()-started)
                 logger.debug(f"VLM 调用成功 (尝试 {attempt}/{self.retry_times})")
                 return result
 
             except Exception as e:
-                last_error = e
+                error = str(e)
+                secret = os.environ.get(self.api_key_env, "")
+                if secret:
+                    error = error.replace(secret, "[REDACTED]")
+                emit_model_request("request_end", attempt=attempt, dispatched=True,
+                                   status="failed", error_type=type(e).__name__, error=error,
+                                   wall_duration_s=time.perf_counter()-started)
+                last_error = error
                 logger.warning(
-                    f"VLM 调用失败 (第 {attempt}/{self.retry_times} 次): {e}"
+                    f"VLM 调用失败 (第 {attempt}/{self.retry_times} 次): {error}"
                 )
                 if attempt < self.retry_times:
                     logger.info(f"等待 {self.retry_interval}s 后重试...")
@@ -225,7 +240,8 @@ class OpenAICompatibleVLMClient(VLMClient):
 
         messages.append({"role": "user", "content": user_content})
 
-        return self._call_with_retry(messages)
+        with describe_model_request("scene", messages, [image_path]):
+            return self._call_with_retry(messages)
 
     def decide(
         self,
@@ -286,4 +302,5 @@ class OpenAICompatibleVLMClient(VLMClient):
         else:
             messages.append({"role": "user", "content": prompt})
 
-        return self._call_with_retry(messages)
+        with describe_model_request("decision", messages, image_paths):
+            return self._call_with_retry(messages)

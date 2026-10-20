@@ -435,6 +435,9 @@ class CarlaPDMPlanner:
         self.last_context = None
         self.last_candidates = []
         self.last_query_decision = None
+        self.last_visualization_snapshot = None
+        self._trajectory_visualization_config = {"enabled": False}
+        self._trajectory_visualization_warned = False
         self._memory_policy_metadata = {}
         if self.semantic_policy != "always":
             from .semantic_governor import SelectiveSemanticGovernor
@@ -500,6 +503,27 @@ class CarlaPDMPlanner:
         self.simulator._motion_model = build_forward_motion_model(
             self.api, self.vehicle_parameters, self.max_steer)
         self.provenance = dict(self.api.provenance)
+
+    def configure_trajectory_visualization(self, config=None):
+        """Enable optional copies of the final scored pool, never scoring changes."""
+        from carla_bridge.visualization.trajectory_renderer import validate_trajectory_visualization_config
+        self._trajectory_visualization_config = validate_trajectory_visualization_config(config)
+        self.last_visualization_snapshot = None
+
+    def _capture_trajectory_visualization(self, candidates, selected, state, transform, timestamp_us):
+        if not self._trajectory_visualization_config["enabled"]:
+            return
+        try:
+            from carla_bridge.visualization.trajectory_renderer import build_trajectory_visualization_snapshot
+            self.last_visualization_snapshot = build_trajectory_visualization_snapshot(
+                self.scorer._states, candidates, None if selected is None else selected["index"],
+                state, transform, self.api.StateIndex, self._reference_for_height, timestamp_us)
+        except Exception as exc:
+            # Visualization cannot turn a valid trajectory into a failed plan.
+            self.last_visualization_snapshot = None
+            if not self._trajectory_visualization_warned:
+                logger.warning("PDM trajectory visualization snapshot failed; planning continues: %s", exc)
+                self._trajectory_visualization_warned = True
 
     def _bind_lateral_preview(self, speed_mps):
         """Bind one preview to the entire snapshot, including shadow replays.
@@ -1250,6 +1274,7 @@ class CarlaPDMPlanner:
     def plan(self, semantic_decision, semantic_enabled=True, *, semantic_update=False,
              sim_time_s=None, special_situations=()):
         from shapely.geometry import Point
+        self.last_visualization_snapshot = None
         timestamp = int(round(self.world.get_snapshot().timestamp.elapsed_seconds * 1e6))
         now = timestamp/1e6 if sim_time_s is None else float(sim_time_s)
         state, tf = self._ego_state(timestamp)
@@ -1519,6 +1544,7 @@ class CarlaPDMPlanner:
                                     "rear_axle_to_center_m": self.vehicle_parameters.rear_axle_to_center})
         diagnostics["vehicle"].update(self._vehicle_geometry_source)
         diagnostics["selected_zero_base_score"] = selected is not None and selected["base_score"] == 0.0
+        self._capture_trajectory_visualization(diagnostics["candidates"], selected, state, tf, timestamp)
         # Selection is score-only. No separate collision/TTC detector replaces
         # the winner; only numerically invalid candidates cannot be executed.
         if selected is None:

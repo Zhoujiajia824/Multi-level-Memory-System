@@ -155,6 +155,10 @@ class ClosedLoop:
         self.loop: Optional[LoopRunner] = None
         self.metrics: Optional[MetricsCollector] = None
         self.recorder = None  # 可选 VideoRecorder
+        self._model_call_audit = None
+        self._replay_summary = None
+        self._replay_error = None
+        self.trajectory_renderer = None
         self.event_scheduler = None  # 可选 EventScheduler（长尾事件）
 
         # 碰撞
@@ -213,6 +217,9 @@ class ClosedLoop:
         self.scenario.setup()
         world = self.scenario.world
         ego = self.scenario.ego_vehicle
+        if (self.ccfg.get("replay") or {}).get("enabled", True):
+            from carla_bridge.model_call_audit import ModelCallAudit
+            self._model_call_audit = ModelCallAudit(self.config.get("output_dir") or "outputs")
         if (self.scenario.cfg.get("experiment") or {}).get("suite") == "paper_v1":
             from carla_bridge.env.paper_events import PaperEventScheduler
             # Preserve the partial scheduler for cleanup if actor setup fails.
@@ -259,6 +266,11 @@ class ClosedLoop:
             planner_cfg = dict(self.planning_cfg)
             planner_cfg["horizon_s"] = max(float(planner_cfg.get("horizon_s", 4.0)), self._execution_horizon)
             self.pdm_planner = CarlaPDMPlanner(world, ego, self.scenario.route, planner_cfg)
+            visual_cfg = ((self.ccfg.get("visualization") or {}).get("trajectories") or {})
+            self.pdm_planner.configure_trajectory_visualization(visual_cfg)
+            if visual_cfg.get("enabled", False):
+                from carla_bridge.visualization.trajectory_renderer import CarlaTrajectoryRenderer
+                self.trajectory_renderer = CarlaTrajectoryRenderer(world, visual_cfg)
             self._bind_pdm_controller(ego)
             from carla_bridge.planning.experience_memory import ExecutionExperienceMemory, execution_planner_version
             self.execution_planner_version = execution_planner_version(planner_cfg, self.controller_cfg)
@@ -311,10 +323,14 @@ class ClosedLoop:
             vpath = vout / f"drive_{self.scenario.scenario_name()}_{self.mode}.mp4"
             self.recorder = VideoRecorder(
                 world, ego, str(vpath),
-                fps=int(video_cfg.get("fps", 20)),
+                fps=float(video_cfg.get("fps", 1.0/self.fixed_delta)),
                 width=int(video_cfg.get("width", 1280)),
                 height=int(video_cfg.get("height", 720)),
                 view=video_cfg.get("view", "chase"),
+                frame_timeout_s=float(video_cfg.get("frame_timeout_s", 0.0)),
+                hud=bool(video_cfg.get("hud", True)),
+                max_pending_frames=int(video_cfg.get("max_pending_frames", 32)),
+                flush_timeout_s=float(video_cfg.get("flush_timeout_s", .25)),
             )
             self.recorder.start()
 
@@ -607,6 +623,14 @@ class ClosedLoop:
             stream.write(json.dumps(audit, ensure_ascii=False, allow_nan=False) + "\n")
         diagnostics = decision.get("planner_diagnostics") or {}
         self._last_plan_diagnostics = diagnostics
+        renderer = getattr(self, "trajectory_renderer", None)
+        if renderer is not None:
+            try:
+                renderer.draw(getattr(self.pdm_planner, "last_visualization_snapshot", None),
+                              decision, self.scenario.ego_vehicle.get_transform(),
+                              accepted=validation.get("accepted") is True)
+            except Exception as exc:
+                logger.warning("轨迹可视化不可用，继续执行原规划: %s", exc)
         stats = getattr(self, "advisory_stats", None)
         if stats is not None:
             baseline_id = diagnostics.get("original_baseline_selected_id", diagnostics.get("baseline_selected_id"))
@@ -752,6 +776,8 @@ class ClosedLoop:
                 "cognition_scheduling": ("disabled" if not self.model_inference else
                                          "event_triggered" if getattr(self, "_selective_execution", False) else "periodic"),
                 "advisory": deepcopy(getattr(self, "advisory_stats", {})),
+                "model_usage": deepcopy(getattr(self, "_replay_summary", None)),
+                "replay_error": getattr(self, "_replay_error", None),
                 "wall_time_s": round(time.perf_counter()-getattr(self, "_wall_started", time.perf_counter()), 3),
                 "cleanup_errors": list(self._cleanup_errors), "experiment_events": event_result}
 
@@ -803,6 +829,7 @@ class ClosedLoop:
             self._cleanup_errors.append("world_restore_skipped_for_live_actors")
         if self._cleanup_errors and self.run_status != "memory_save_failed":
             self.run_status = "cleanup_failed"
+        self._finalize_replay()
         if self._final_summary is not None:
             try:
                 self._write_report()
@@ -842,7 +869,7 @@ class ClosedLoop:
             self.advisory_stats["model_queries"] += 1
             logger.info("[选择性认知] t=%.1fs reason=%s；同步仿真暂停，PDM控制方案保留",
                         self._elapsed, query.get("reason"))
-            record = self.loop.step(kf) or {}
+            record = self._run_cognition(kf, query) or {}
             self._last_scene_result = record.get("current_scene") or self._last_scene_result
             self._last_nav = kf["nav_instruction"]
             validation = record.get("decision_validation") or {}
@@ -878,6 +905,46 @@ class ClosedLoop:
                  "context": self.pdm_planner.last_context}
         with path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(audit, ensure_ascii=False, allow_nan=False)+"\n")
+
+    def _run_cognition(self, kf, query):
+        audit = getattr(self, "_model_call_audit", None)
+        if audit is None:
+            return self.loop.step(kf)
+        ego = self.scenario.ego_vehicle
+        try:
+            transform, velocity = ego.get_transform(), ego.get_velocity()
+            pose = {"x": float(transform.location.x), "y": float(transform.location.y),
+                    "z": float(transform.location.z), "yaw_deg": float(transform.rotation.yaw),
+                    "speed_mps": math.hypot(velocity.x, velocity.y)}
+        except Exception as exc:
+            pose = {"error": type(exc).__name__+": "+str(exc)}
+        with audit.consultation(kf, query, pose) as evidence:
+            record = self.loop.step(kf)
+            evidence["record"] = record
+            validation = (record or {}).get("decision_validation") or {}
+            evidence["status"] = "accepted" if validation.get("accepted") is True else "unavailable"
+            return record
+
+    def _finalize_replay(self):
+        if not (getattr(self, "ccfg", {}).get("replay") or {}).get("enabled", True):
+            return
+        try:
+            output = Path(self.config.get("output_dir") or "outputs")
+            output.mkdir(parents=True, exist_ok=True)
+            metadata = {"schema_version": 1, "model_inference": self.model_inference,
+                        "semantic_influence": self.semantic_influence,
+                        "semantic_policy": self.semantic_policy,
+                        "duration_s": self._elapsed, "run_status": self.run_status,
+                        "audit_enabled": self._model_call_audit is not None,
+                        "audit_errors": list(self._model_call_audit.errors) if self._model_call_audit else []}
+            (output / "replay_metadata.json").write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2)+"\n", encoding="utf-8")
+            from carla_bridge.replay.review import build_review
+            self._replay_summary = build_review(output)
+            logger.info("模型调用回放已生成: %s", output / "replay" / "index.html")
+        except Exception as exc:
+            self._replay_error = type(exc).__name__+": "+str(exc)
+            logger.warning("模型回放报告生成失败，可在运行后重新生成: %s", exc, exc_info=True)
 
     def _advisory_keyframe(self, ego):
         frame_id = self.carla_client.get_world().get_snapshot().frame
@@ -998,7 +1065,7 @@ class ClosedLoop:
         inference_started = time.perf_counter()
         self.advisory_stats["model_queries"] += 1
         try:
-            record = self.loop.step(kf)
+            record = self._run_cognition(kf, {"query": True, "reason": "periodic_cognition"})
             # 记录上次 VLM 场景结果 + nav，供控制阶段 raw 捕获沿用
             self._last_scene_result = (record or {}).get("current_scene") or self._last_scene_result
             self._last_nav = nav
@@ -1133,7 +1200,14 @@ class ClosedLoop:
         self._drain_collisions()
         self.carla_client.set_spectator_follow(ego)
         if self.recorder is not None:
-            self.recorder.on_tick()
+            audit = getattr(self, "_model_call_audit", None)
+            latest = audit.latest if audit is not None else None
+            self.recorder.on_tick(
+                frame_id=(world_clock or {}).get("frame"), sim_time_s=self._elapsed,
+                overlay={"model_call_count": audit.consultation_count if audit else 0,
+                         "latest_call_id": latest.get("call_id") if latest else None,
+                         "latest_trigger": (latest.get("query") or {}).get("reason") if latest else None,
+                         "selected_id": (getattr(self, "_last_plan_diagnostics", {}) or {}).get("selected_id")})
         if self.metrics is not None or self._control_audit_path is not None:
             v, a, tf = ego.get_velocity(), ego.get_acceleration(), ego.get_transform()
             yaw = math.radians(tf.rotation.yaw)  # Native CARLA axes for acceleration projections.
