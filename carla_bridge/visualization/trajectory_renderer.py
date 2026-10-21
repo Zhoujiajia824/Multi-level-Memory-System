@@ -28,10 +28,11 @@ DEFAULTS = {
 COLORS = {
     # CARLA 0.9.15 shipping multiplies linear debug color by 1000. Full 255
     # channels cause overlapping proposals to bloom into a white light sheet.
-    "candidate": (0, 1, 2),
-    "selected": (2, 1, 0),
-    "execution": (0, 2, 1),
-    "rejected": (2, 0, 0),
+    # Low-intensity approximations of the user's reference-image palette.
+    "candidate": (0, 1, 2),  # Blue: #0070C0.
+    "selected": (3, 2, 0),   # Golden yellow: #FFC000.
+    "execution": (0, 1, 0),  # Green: #3B7D23.
+    "rejected": (2, 1, 2),   # Pink-purple: #D86ECC.
 }
 
 LINE_WIDTH_SCALE = {"candidate": 1., "selected": 1.6,
@@ -166,7 +167,7 @@ class CarlaTrajectoryRenderer:
         return count
 
     def draw(self, snapshot, decision, capture_transform, accepted, *, frame_id=None):
-        """Call after trajectory validation; rejected commands never appear teal.
+        """Call after trajectory validation; rejected commands never appear green.
 
         ``decision`` is the actual control decision containing ``trajectory`` in
         captured forward/left coordinates. ``accepted`` must be the validator's
