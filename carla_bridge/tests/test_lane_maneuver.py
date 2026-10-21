@@ -187,7 +187,9 @@ def test_lane_return_waits_until_actual_blocker_is_behind_then_anchors_once():
     repeat = engine.update(world, ego, reference, 1.6, current_side="left")
     np.testing.assert_array_equal(repeat["points"], returning["points"])
     ego.x, ego.y = 72., 0.
-    finished = engine.update(world, ego, reference, 1.8)
+    for now in (1.8, 2.):
+        assert engine.update(world, ego, reference, now)["active"]
+    finished = engine.update(world, ego, reference, 2.2)
     assert not finished["active"] and finished["diagnostics"]["reason"] == "completed"
 
 
@@ -368,7 +370,9 @@ def test_return_cannot_complete_in_either_adjacent_lane_even_after_transition_en
     still_adjacent = engine.update(world, ego, reference, 1.4, current_side=side)
     assert still_adjacent["active"] and still_adjacent["phase"] == "returning"
     ego.y = 0.
-    centered = engine.update(world, ego, reference, 1.6)
+    for now in (1.6, 1.8):
+        assert engine.update(world, ego, reference, now)["active"]
+    centered = engine.update(world, ego, reference, 2.)
     assert not centered["active"] and centered["diagnostics"]["reason"] == "completed"
 
 
@@ -408,6 +412,60 @@ def test_prediction_never_pretends_measured_ten_mps_ego_immediately_slows_to_can
     clear, conflict = engine._gap_clear([crossing_actor(45.)], points, samples, 0., ego, 5.,
                                         candidate_speed_mps=8.)
     assert not clear and conflict["ego_probe_speed_mps"] == 10.
+
+
+def test_decelerating_maneuver_retains_its_later_capped_arrival_not_only_measured_speed():
+    engine, _, ego, _ = fixture()
+    ego.speed = 10.
+    samples = np.arange(0., 101.)
+    points = np.c_[samples, np.zeros(len(samples))]
+    # The crossing pedestrian is gone when the current 10 m/s proxy arrives,
+    # but conflicts with the later 5 m/s capped arrival. Both must be checked.
+    clear, conflict = engine._gap_clear([crossing_actor(24.)], points, samples, 0., ego, 5.,
+                                        candidate_speed_mps=5.)
+    assert not clear and conflict["ego_probe_speed_mps"] == 5.
+
+
+def test_new_pass_checks_its_real_cap_and_prefers_a_smooth_legal_curve(monkeypatch):
+    engine, world, ego, reference = fixture([Obstacle(actor_id=7, x=28)])
+    actual = engine._gap_clear
+    probes = []
+
+    def observed_gap(actors, points, samples, station, vehicle, cap, **kwargs):
+        probes.append((cap, kwargs["candidate_speed_mps"]))
+        return actual(actors, points, samples, station, vehicle, cap, **kwargs)
+
+    monkeypatch.setattr(engine, "_gap_clear", observed_gap)
+    result = observed(engine, world, ego, reference, candidate_speed_mps=8.)
+    assert result["active"]
+    assert result["diagnostics"]["transition_length_m"] == 24.
+    assert result["diagnostics"]["passing_checks"]["speed_search_round"] == "maximum"
+    assert probes and all(cap == numerical_probe for cap, numerical_probe in probes)
+
+
+def test_station_coalescing_preserves_exact_transition_anchors_and_not_map_roundoff():
+    from carla_bridge.planning.lane_maneuver import _merge_station_samples
+    start, end = 10.000000013, 16.000000027
+    grid = np.arange(8., 19., .25)
+    knots = np.arange(8., 19., 2.) + 2.44e-8
+    samples = _merge_station_samples(np.r_[grid, knots], [start, end, grid[-1], grid[0]])
+    assert start in samples and end in samples
+    assert np.min(np.diff(samples)) >= .001
+    assert not np.any(samples == 10.)
+    assert not np.any(samples == 10.0000000244)
+
+
+def test_station_coalescing_does_not_smooth_or_cap_a_real_tight_turn():
+    from carla_bridge.planning.lane_maneuver import _merge_station_samples, _curvature
+    # A genuine 2 m radius turn exceeds the conservative mock vehicle bound.
+    # Removing coincident sampling stations must not make it appear driveable.
+    grid = np.arange(0., 4., .025)
+    samples = _merge_station_samples(np.r_[grid, grid[::8] + 2.44e-8], [0., grid[-1]])
+    radius = 2.
+    points = np.c_[radius * np.cos(samples/radius), radius * np.sin(samples/radius)]
+    curvature = _curvature(points)
+    assert np.max(curvature) == pytest.approx(1/radius, abs=.001)
+    assert np.min(curvature[2:-2]) > .49
 
 
 def test_target_front_gap_covers_faster_ordinary_policy_without_relaxing_rear_gap():

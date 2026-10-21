@@ -16,9 +16,11 @@ from types import SimpleNamespace
 import numpy as np
 from scipy.interpolate import CubicHermiteSpline
 
+from .actor_motion import ActorMotionHistory, MOTION_MODEL_VERSION, predict_actor_motion
 from .lane_maneuver import LaneManeuver
 from .mpc_solver import (MPCConfig, MPCInitialState, MPCObstacle, MPCProblem,
-                         MPCReference, MPCSolver, bicycle_step)
+                         MPCReference, MPCSolver, bicycle_step, MPC_COLLISION_GEOMETRY_VERSION,
+                         MPC_SOLVE_POLICY_VERSION)
 from .scene_context import (build_scene_context, candidate_summary, lane_key,
                             planner_health, project_polyline)
 from .selection import choose_candidate
@@ -98,6 +100,14 @@ class MPCPlanningError(ValueError):
         self.diagnostics = diagnostics
 
 
+MPC_BRAKING_RECOVERY_HORIZON_S = 1.2
+MPC_BRAKING_RECOVERY_HORIZON_LEVELS_S = (1.2, .8, .6)
+MPC_BRAKING_RECOVERY_MAX_CONTINUOUS_S = 8.0
+MPC_BRAKING_RECOVERY_POLICY_VERSION = "jerk_compatible_no_added_positive_demand_v1"
+MPC_MINIMUM_RISK_HOLD_POLICY_VERSION = "finite_infeasibility_full_brake_reobserve_v1"
+MPC_MINIMUM_RISK_HOLD_LIFETIME_S = .3
+
+
 class CarlaMPCPlanner:
     """Optimize each legal lane intent, then apply optional semantic preference."""
 
@@ -118,12 +128,14 @@ class CarlaMPCPlanner:
         self._vehicle_model()
         numerical = effective_mpc_config(self.config, wheelbase=self.vehicle_parameters.wheel_base,
             rear_axle_to_center=self.rear_axle_to_center,
+            ego_body_center_lateral=self.ego_body_center_lateral, ego_body_yaw=self.ego_body_yaw,
             ego_length=self.vehicle_parameters.length, ego_width=self.vehicle_parameters.width,
             steer_max=min(self.max_steer, float((self.config.get("mpc") or {}).get("steer_max", self.max_steer))))
         self.numerical_config, self.solver = numerical, MPCSolver(numerical)
         self._configured_steer_max = numerical.steer_max
         self.dt, self.samples = numerical.dt, numerical.horizon_steps
         self.horizon = self.dt * self.samples
+        self.actor_motion = ActorMotionHistory(self.config.get("actor_motion"))
         self.lane_maneuver = LaneManeuver(self.config.get("lane_maneuver"))
         from .recovery import validate_recovery_config
         self.recovery_config = validate_recovery_config(self.config.get("recovery"))
@@ -141,7 +153,16 @@ class CarlaMPCPlanner:
         self.provenance = {"backend": "mpc", "optimizer": "scipy.optimize.SLSQP",
             "dynamics": "rear_axle_kinematic_bicycle_midpoint",
             "constraints": "speed_acceleration_steering_rate_jerk_lateral_corridor_predicted_footprint_stop_line",
-            "prediction_kind": "constant_velocity_proxy_not_future_GT",
+            "prediction_kind": "connected_lane_observed_turn_rate_and_following_response_not_future_GT",
+            "actor_motion_version": MOTION_MODEL_VERSION,
+            "actor_motion_config": dict(self.actor_motion.config),
+            "collision_geometry_version": MPC_COLLISION_GEOMETRY_VERSION,
+            "solve_policy_version": MPC_SOLVE_POLICY_VERSION,
+            "braking_recovery_horizon_s": MPC_BRAKING_RECOVERY_HORIZON_S,
+            "braking_recovery_horizon_levels_s": list(MPC_BRAKING_RECOVERY_HORIZON_LEVELS_S),
+            "braking_recovery_max_continuous_s": MPC_BRAKING_RECOVERY_MAX_CONTINUOUS_S,
+            "braking_recovery_policy_version": MPC_BRAKING_RECOVERY_POLICY_VERSION,
+            "minimum_risk_hold_version": MPC_MINIMUM_RISK_HOLD_POLICY_VERSION,
             "upstream_pdm_used": False, "numerical_config": asdict(numerical)}
 
     def _vehicle_model(self):
@@ -159,6 +180,8 @@ class CarlaMPCPlanner:
         track = abs(float(local[0][1] - local[1][1]))
         self.rear_axle_actor_xyz_m = tuple(float(value) for value in rear[:3])
         self.rear_axle_to_center = float(box.location.x - rear[0])
+        self.ego_body_center_lateral = float(getattr(box.location, "y", 0.)-rear[1])
+        self.ego_body_yaw = math.radians(float(getattr(getattr(box, "rotation", None), "yaw", 0.)))
         if not 0 < self.rear_axle_to_center < 2*float(box.extent.x):
             raise ValueError("CARLA physical rear axle lies outside the supported body geometry")
         self.physical_max_steer = math.radians(max(float(w.max_steer_angle) for w in wheels[:2]))
@@ -168,7 +191,8 @@ class CarlaMPCPlanner:
         self.max_steer, self.front_track_m = self.steering_model.max_steer_rad, track
         self.vehicle_parameters = SimpleNamespace(wheel_base=wheelbase,
             width=2*float(box.extent.y), length=2*float(box.extent.x),
-            rear_axle_to_center=self.rear_axle_to_center)
+            rear_axle_to_center=self.rear_axle_to_center,
+            body_center_lateral=self.ego_body_center_lateral, body_yaw=self.ego_body_yaw)
 
     def configure_trajectory_visualization(self, config=None):
         from carla_bridge.visualization.trajectory_renderer import validate_trajectory_visualization_config
@@ -199,6 +223,8 @@ class CarlaMPCPlanner:
             "length_m": quantized(params.length, 3), "width_m": quantized(params.width, 3),
             "front_track_m": quantized(self.front_track_m, 3),
             "rear_axle_to_center_m": quantized(self.rear_axle_to_center, 3),
+            "body_center_lateral_m": quantized(self.ego_body_center_lateral, 3),
+            "body_yaw_rad": quantized(self.ego_body_yaw, 6),
             "rear_axle_actor_xy_m": [quantized(v, 3) for v in self.rear_axle_actor_xyz_m[:2]],
             "physical_inner_max_steer_rad": quantized(self.physical_max_steer, 6),
             "steering_curve_kmh_scale": [[quantized(speed, 6), quantized(scale, 6)]
@@ -239,9 +265,15 @@ class CarlaMPCPlanner:
         tracker = tracker_diagnostics or {}
         if source == "direct_brake":
             reason = "direct_brake_reset_desired_input"
-        elif tracker.get("reason") == "stationary_hold":
-            reason = "stationary_hold_zero_desired_acceleration"
+        elif source == "mpc_minimum_risk_hold":
+            # This is direct full-brake actuation without an accepted MPC
+            # acceleration profile, even if an older profile remains in audit.
+            reason = "minimum_risk_hold_reset_desired_input"
         elif source == "tracker" and audit.get("applied") is True:
+            # PID stationary_hold describes actual zero-speed brake actuation,
+            # not a replacement acceleration demand. Preserve an accepted MPC
+            # input through the unilateral stop so its next jerk bound uses
+            # the actual published command history, even while speed is zero.
             profile = (diagnostics or {}).get("mpc_tracking") or {}
             index = audit.get("profile_sample_index")
             values = profile.get("accelerations_mps2")
@@ -253,10 +285,13 @@ class CarlaMPCPlanner:
                 reason, sample_index = "dispatched_optimized_desired_acceleration", index
             else:
                 reason = "invalid_dispatched_profile_reset_desired_input"
+        elif tracker.get("reason") == "stationary_hold":
+            reason = "stationary_hold_zero_desired_acceleration"
         elif source == "tracker":
             reason = "mpc_control_override_rejected_reset_desired_input"
         self._pending_desired_acceleration = {"value_mps2": value, "sim_time_s": float(now_s),
             "source": reason, "profile_sample_index": sample_index,
+            "tracker_reason": tracker.get("reason"),
             "physical_acceleration_measurement": False,
             "longitudinal_actuation": "desired_speed_profile_tracked_by_PID_not_exact_acceleration"}
 
@@ -343,11 +378,59 @@ class CarlaMPCPlanner:
                             "from_lane": lane_key(first), "to_lane": lane_key(current),
                             "reason": "coincident_junction_exit_connected_to_next_reference",
                             "evaluation_route_modified": False})
+            # Evaluation checkpoints describe the actor origin, while MPC
+            # integrates its measured rear axle. At a spawn checkpoint the
+            # physical rear axle can precede station zero by ~1.4m. Without a
+            # connected physical prefix even STOP is attracted forward to the
+            # first checkpoint instead of holding its actual road position.
+            # Keep this prefix private; route progress/checkpoints/indexing are
+            # unchanged. A merge/ambiguous predecessor is never guessed.
+            self._route_start_predecessors = []
+            self._reference_start_extension = {"method": "verified_explicit_predecessors",
+                "point_count": 0, "length_m": 0., "evaluation_route_modified": False}
+            if self._resolved_route_waypoints:
+                cursor = self._resolved_route_waypoints[0]
+                required = max(8., self.vehicle_parameters.length+2.)
+                length = 0.
+                while length < required:
+                    previous_getter = getattr(cursor, "previous", None)
+                    if not callable(previous_getter):
+                        self._reference_start_extension["stop_reason"] = "predecessor_api_unavailable"
+                        break
+                    predecessors = list(previous_getter(2.))
+                    if len(predecessors) != 1:
+                        self._reference_start_extension["stop_reason"] = ("ambiguous_predecessors"
+                            if predecessors else "no_predecessor")
+                        break
+                    candidate = predecessors[0]
+                    cp, current = candidate.transform, cursor.transform
+                    distance = math.hypot(cp.location.x-current.location.x,
+                                          cp.location.y-current.location.y)
+                    driving = str(getattr(candidate, "lane_type", "Driving")).split(".")[-1] == "Driving"
+                    linked = (driving and .25 < distance < 2.2
+                        and abs(cp.location.z-current.location.z) < .5
+                        and abs(_angle(math.radians(cp.rotation.yaw-current.rotation.yaw))) < math.radians(25.)
+                        and any(lane_key(successor) == lane_key(cursor)
+                            and math.hypot(successor.transform.location.x-current.location.x,
+                                           successor.transform.location.y-current.location.y) < .08
+                            and abs(successor.transform.location.z-current.location.z) < .1
+                            and abs(_angle(math.radians(successor.transform.rotation.yaw-current.rotation.yaw)))
+                                < math.radians(3.) for successor in candidate.next(2.)))
+                    if not linked:
+                        self._reference_start_extension["stop_reason"] = "predecessor_not_verified_connected"
+                        break
+                    self._route_start_predecessors.insert(0, candidate)
+                    length += distance
+                    cursor = candidate
+                self._reference_start_extension.update(point_count=len(self._route_start_predecessors),
+                    length_m=float(length))
         full = self._resolved_route_waypoints
         index = min(len(full)-1, max(0, int(self.route._nearest_index(self.ego.get_location()))))
         local = list(full[max(0, index-6):min(len(full), index+61)])
         if len(local) < 2:
             local = list(full[-2:])
+        if local and full and local[0] is full[0]:
+            local = list(self._route_start_predecessors)+local
         # Evaluation endpoints never become physical stopped leaders. Continue
         # actual successors only; ordered evaluation checkpoints remain unchanged.
         length = sum(np.linalg.norm(_points([a, b])[1]-_points([a, b])[0]) for a, b in zip(local, local[1:]))
@@ -389,31 +472,45 @@ class CarlaMPCPlanner:
     def _obstacles(self, initial, tf):
         predictions, audit = [], []
         times = np.arange(self.samples+1)*self.dt
-        for actor in self.world.get_actors():
+        # plan() updates this shared snapshot before scene/maneuver generation.
+        # Direct adapter probes can still initialize it without accumulating a
+        # second history sample at the same frozen simulator frame.
+        if self.actor_motion.last_time_s is None:
+            self.actor_motion.update(self.world)
+        current_actors = tuple(self.world.get_actors())
+        for actor in current_actors:
             if actor.id == self.ego.id or not actor.type_id.startswith(("vehicle.", "walker.pedestrian", "static.prop.")):
                 continue
             pose = actor.get_transform()
             p = pose.location
             if abs(p.z-tf.location.z) > 2.5 or math.hypot(p.x-tf.location.x, p.y-tf.location.y) > 70:
                 continue
-            velocity, box = actor.get_velocity(), actor.bounding_box
-            yaw = math.radians(pose.rotation.yaw)
-            offset = getattr(box, "location", SimpleNamespace(x=0., y=0.))
-            center = np.array([p.x+offset.x*math.cos(yaw)-offset.y*math.sin(yaw),
-                               p.y+offset.x*math.sin(yaw)+offset.y*math.cos(yaw)])
-            centers = center + times[:, None]*np.array([velocity.x, velocity.y])
-            body_yaw = yaw + math.radians(getattr(getattr(box, "rotation", None), "yaw", 0.))
+            motion, box = self.actor_motion.motion_for(actor), actor.bounding_box
+            centers, body_yaws, prediction = predict_actor_motion(
+                actor, motion, times, self.map, self.actor_motion.config,
+                history=self.actor_motion, leader_actors=current_actors)
+            uncertainty = np.asarray(prediction["uncertainty_margin_m"])
             # Pedestrian circles use the exact ego rectangle/circle solver
             # constraint; a tall longitudinal vehicle envelope is unnecessary.
+            rectangle = None
             if actor.type_id.startswith("walker."):
-                radii = max(.1, math.hypot(box.extent.x, box.extent.y))
+                radii = max(.1, math.hypot(box.extent.x, box.extent.y)) + uncertainty
             else:
-                # Circumscribed ellipse contains the CARLA rectangular body.
-                radii = np.tile(np.sqrt(2.)*np.array([max(.1, box.extent.x), max(.1, box.extent.y)]), (self.samples+1, 1))
-            predictions.append(MPCObstacle(str(actor.id), centers, radii, body_yaw))
-            audit.append({"id": int(actor.id), "type": actor.type_id, "x": float(center[0]),
-                "y": float(center[1]), "heading": body_yaw, "vx": float(velocity.x),
-                "vy": float(velocity.y), "length": 2*float(box.extent.x), "width": 2*float(box.extent.y)})
+                # True physical bbox, with uncertainty kept as an independent
+                # Euclidean clearance rather than baked into an outer ellipse.
+                rectangle = np.array([float(box.extent.x), float(box.extent.y)])
+                radii = np.tile(rectangle, (self.samples+1, 1))
+            predictions.append(MPCObstacle(str(actor.id), centers, radii, body_yaws,
+                rectangle_half_extents=rectangle,
+                uncertainty_m=uncertainty if rectangle is not None else 0.))
+            audit.append({"id": int(actor.id), "type": actor.type_id, "x": float(centers[0, 0]),
+                "y": float(centers[0, 1]), "heading": float(body_yaws[0]), "vx": motion.vx,
+                "vy": motion.vy, "length": 2*float(box.extent.x), "width": 2*float(box.extent.y),
+                "motion": motion.audit, "prediction": prediction,
+                "collision_shape": "physical_rectangle" if rectangle is not None else "pedestrian_circle",
+                "rectangle_half_extents_m": rectangle.tolist() if rectangle is not None else None,
+                "collision_margin_m": self.numerical_config.collision_margin,
+                "uncertainty_margin_m": uncertainty.tolist()})
         return predictions, audit
 
     def _reference(self, identity, points, initial, desired, width, metadata, *, headings=None, stop_line=None):
@@ -451,6 +548,14 @@ class CarlaMPCPlanner:
             remaining = np.maximum(0., (np.asarray(stop_line["point"])-xy) @ normal)
             speed_profile = np.minimum(speed_profile, np.sqrt(2*abs(self.numerical_config.accel_min)*remaining))
         refmeta = dict(metadata)
+        if (str(identity).upper().split(":")[-1].split("@")[0] == "STOP"
+                and desired == 0. and initial.speed <= .03):
+            # An already stopped vehicle holds its measured physical pose.
+            # The solver uses this for the objective only; the connected map
+            # reference below still defines every road/stop-line constraint.
+            # This also supports old providers without previous() waypoints,
+            # where station zero must never become a forward motion request.
+            refmeta["stationary_hold_pose"] = [float(initial.x),float(initial.y),float(initial.yaw)]
         if stop_line is not None:
             refmeta["stop_line"] = stop_line
         road_width = np.interp(targets, stations, widths[kept])
@@ -514,10 +619,40 @@ class CarlaMPCPlanner:
             "parameter_model": "nonlinear_mpc_not_IDM", "idm_headway_s": 1.5,
             "idm_min_gap_m": 1.5, "idm_accel_max_mps2": self.numerical_config.accel_max,
             "idm_decel_max_mps2": abs(self.numerical_config.accel_min),
-            "safety": {"finite": usable, "no_collision": float(result.feasible),
+            "safety": {"finite": finite, "no_collision": float(result.feasible),
                 "drivable_area": float(result.feasible), "driving_direction": 1.,
                 "ttc": float(result.feasible), "traffic_light": bool(result.feasible)},
             "feasibility_reason": "constrained_solution" if usable else "nonlinear_mpc_infeasible"}
+
+    def _maneuver_path_limit(self, points, meta, cap, maneuver, initial, signal_stop):
+        """Keep ordinary continuations inside the verified merge-speed/window.
+
+        The reservation belongs to the passing lane; a real return trajectory
+        must remain free to leave that lane and join the route.
+        """
+        if not maneuver.get("active") or not maneuver["diagnostics"].get("committed"):
+            return cap, signal_stop
+        side = meta.get("physical_lane_side", "center")
+        passing_side = maneuver["diagnostics"]["side"]
+        target_side = maneuver["metadata"]["physical_lane_side"]
+        if side in (passing_side, target_side):
+            cap = min(cap, float(maneuver["speed_cap_mps"]))
+        stop_xy = maneuver["metadata"].get("return_wait_world_xy",
+                    maneuver["metadata"].get("maneuver_stop_world_xy"))
+        if side != passing_side or stop_xy is None:
+            return cap, signal_stop
+        pts, stations, spline = _curve(points)
+        point = np.asarray(stop_xy)*[1., -1.]
+        station = project_polyline(*point, pts)[0]
+        normal = spline(station, 1)
+        normal /= max(float(np.linalg.norm(normal)), 1e-8)
+        reservation = {"point": spline(station).tolist(), "normal": normal.tolist(),
+                       "id": "preserve_legal_return_window"}
+        if signal_stop is not None:
+            signal_station = project_polyline(*signal_stop["point"], pts)[0]
+            if signal_station <= station:
+                return cap, signal_stop
+        return cap, reservation
 
     def _expanded_references(self, baseline):
         """A model may invite more optimization, never relax physical limits.
@@ -555,13 +690,20 @@ class CarlaMPCPlanner:
     def _execution(self, result, tf):
         from carla_bridge.state.coords import global_to_ego
         states = result.states
+        samples = len(result.controls)
+        if len(states) != samples + 1:
+            raise ValueError("MPC execution needs one more state than optimized inputs")
+        horizon = samples * self.dt
         output_dt = min(.1, self.dt)
-        ts = np.arange(0., self.horizon+output_dt/2, output_dt)
+        # A short verification horizon need not be a multiple of output_dt.
+        # Include its exact endpoint and never label the final state with a
+        # later, unverified timestamp by rounding the sample count upward.
+        ts = np.r_[np.arange(0., horizon-1e-9, output_dt), horizon]
         rows = []
         for time in ts:
-            index = min(self.samples, int(math.floor((time+1e-10)/self.dt)))
+            index = min(samples, int(math.floor((time+1e-10)/self.dt)))
             fraction = float(time-index*self.dt)
-            if index == self.samples or fraction <= 1e-9:
+            if index == samples or fraction <= 1e-9:
                 rows.append(states[index].copy())
             else:
                 rows.append(bicycle_step(states[index], result.controls[index], fraction,
@@ -581,6 +723,224 @@ class CarlaMPCPlanner:
             trajectory.append({"t": round(float(t), 8), "x": float(forward), "y": float(left),
                 "optional_heading_rad": _angle(yaw-float(heading)), "optional_v": max(0., float(speed))})
         return trajectory
+
+    @staticmethod
+    def _recovery_slice(value, count):
+        """Preserve scalar limits and truncate sampled limits without padding."""
+        if value is None:
+            return None
+        values = np.asarray(value)
+        return float(values) if values.ndim == 0 else values[:count].copy()
+
+    def _finite_solver_result(self, result, steps):
+        """Validate complete numeric solver evidence, including its tolerance."""
+        try:
+            states, controls = np.asarray(result.states), np.asarray(result.controls)
+            minima = result.diagnostics["constraint_minimums"]
+            violation = result.diagnostics["max_constraint_violation"]
+            tolerance = result.diagnostics["constraint_tolerance"]
+            return bool(states.shape == (steps+1, 4) and controls.shape == (steps, 2)
+                and np.isfinite(states).all() and np.isfinite(controls).all()
+                and math.isfinite(result.cost) and isinstance(minima, dict) and minima
+                and all(math.isfinite(value) for value in minima.values())
+                and math.isfinite(violation) and math.isfinite(tolerance)
+                and tolerance == self.numerical_config.constraint_tolerance)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return False
+
+    def _finite_infeasible_result(self, result, steps):
+        """Classify real finite optimizer failure without hiding numeric faults."""
+        return bool(self._finite_solver_result(result, steps) and not result.feasible
+            and result.status == "infeasible" and result.diagnostics["max_constraint_violation"]
+            > result.diagnostics["constraint_tolerance"])
+
+    def _recovery_braking_plan(self, references, obstacles, initial, tf, now, timestamp, diagnostics,
+                               *, full_results):
+        """Try a newly verified short STOP, with an explicit bounded lifetime.
+
+        No normal full-horizon solution reaches this method. Its references,
+        footprint, obstacle predictions, stop lines and actuator constraints
+        are the exact same current-snapshot data; only the verified prediction
+        horizon is shorter. There is no padded stationary tail or claim that a
+        short solution validates the nominal four-second horizon.
+        """
+        episode = getattr(self, "_braking_recovery_episode", None)
+        if episode is None or now < episode["started_at_s"]:
+            episode = {"started_at_s": float(now),
+                "deadline_s": float(now + MPC_BRAKING_RECOVERY_MAX_CONTINUOUS_S)}
+            self._braking_recovery_episode = episode
+        audit = {"active": False, "mode": "verified_short_horizon_stop",
+            "issued_at_s": float(now), "nominal_horizon_s": float(self.horizon),
+            "episode_started_s": episode["started_at_s"], "episode_deadline_s": episode["deadline_s"],
+            "elapsed_s": max(0., float(now-episode["started_at_s"])),
+            "max_continuous_s": MPC_BRAKING_RECOVERY_MAX_CONTINUOUS_S,
+            "acceleration_policy_version": MPC_BRAKING_RECOVERY_POLICY_VERSION,
+            "requested_horizon_levels_s": list(MPC_BRAKING_RECOVERY_HORIZON_LEVELS_S),
+            "attempted_horizon_levels_s": [],
+            "constraints_relaxed": False, "fresh_snapshot": True,
+            "semantic_influence": False, "attempts": [], "optimization_feasible": False}
+        diagnostics["degraded_braking"] = audit
+        diagnostics["provenance"] = dict(diagnostics["provenance"],
+            braking_recovery_horizon_s=MPC_BRAKING_RECOVERY_HORIZON_S,
+            braking_recovery_horizon_levels_s=list(MPC_BRAKING_RECOVERY_HORIZON_LEVELS_S),
+            braking_recovery_max_continuous_s=MPC_BRAKING_RECOVERY_MAX_CONTINUOUS_S,
+            braking_recovery_policy_version=MPC_BRAKING_RECOVERY_POLICY_VERSION,
+            minimum_risk_hold_version=MPC_MINIMUM_RISK_HOLD_POLICY_VERSION)
+
+        finite_full_infeasible = bool(full_results and len(full_results) == len(references)
+            and all(self._finite_infeasible_result(result, self.samples) for result in full_results))
+        finite_short_infeasible = True
+        expected_short_attempts = 0
+
+        def failed(reason):
+            audit["reason"] = reason
+            diagnostics.update(emergency_brake=True, failure_reason=reason)
+            if (reason == "no_feasible_mpc_solution" and finite_full_infeasible
+                    and finite_short_infeasible and expected_short_attempts > 0
+                    and len(audit["attempts"]) == expected_short_attempts):
+                # No safe trajectory is being accepted. The separate actuator
+                # contract requests full braking and a new measured snapshot;
+                # it shares the existing eight-second recovery deadline.
+                diagnostics["minimum_risk_hold"] = {
+                    "active": True, "contract_version": MPC_MINIMUM_RISK_HOLD_POLICY_VERSION,
+                    "reason": "all_finite_full_and_short_horizon_solutions_infeasible",
+                    "actuation": "full_brake_reobserve", "issued_at_s": float(now),
+                    "execution_expires_at_s": min(episode["deadline_s"], now+min(MPC_MINIMUM_RISK_HOLD_LIFETIME_S,
+                        float(self.config.get("replan_interval_s", .2))+.1)),
+                    "episode_started_s": episode["started_at_s"],
+                    "episode_deadline_s": episode["deadline_s"],
+                    "max_continuous_s": MPC_BRAKING_RECOVERY_MAX_CONTINUOUS_S,
+                    "nominal_horizon_s": float(self.horizon), "verified_horizon_s": 0.,
+                    "optimization_feasible": False, "trajectory_accepted": False,
+                    "constraints_relaxed": False, "fresh_snapshot": True,
+                    "full_horizon_candidate_count": len(full_results),
+                    "short_horizon_attempt_count": len(audit["attempts"]),
+                    "attempted_horizon_levels_s": list(audit["attempted_horizon_levels_s"])}
+            return {"trajectory": [], "target_speed": 0., "selected_lateral": "KEEP_LANE",
+                    "selected_longitudinal": "STOP", "planner_diagnostics": diagnostics}
+
+        if now >= episode["deadline_s"]-1e-9:
+            return failed("planner_recovery_timeout")
+        if not math.isfinite(initial.speed) or initial.speed < 0.:
+            return failed("invalid_mpc_initial_speed")
+        if not finite_full_infeasible:
+            return failed("invalid_mpc_solver_result" if not any(result.feasible for result in full_results)
+                          else "mpc_feasible_candidate_selection_failed")
+        audit["terminal_speed_upper_bound_mps"] = float(initial.speed)
+        step_levels = []
+        for requested in MPC_BRAKING_RECOVERY_HORIZON_LEVELS_S:
+            steps = int(math.floor(min(requested, MPC_BRAKING_RECOVERY_HORIZON_S)/self.dt+1e-9))
+            if (2 <= steps < self.samples and steps not in step_levels
+                    and steps*self.dt < self.horizon-1e-9):
+                step_levels.append(steps)
+        audit["available_horizon_levels_s"] = [steps*self.dt for steps in step_levels]
+        expected_short_attempts = len(step_levels)*sum(
+            original.metadata.get("longitudinal") == "STOP" for original in references)
+        if not step_levels:
+            return failed("no_feasible_mpc_solution")
+        solvers = getattr(self, "_braking_recovery_solvers", {})
+        self._braking_recovery_solvers = solvers
+        verified = []
+        for steps in step_levels:
+            config = replace(self.numerical_config, horizon_steps=steps)
+            acceleration_upper = np.maximum(0., initial.acceleration -
+                np.arange(1, steps+1)*config.jerk_max*config.dt)
+            solver = solvers.get(steps)
+            if solver is None or solver.config != config:
+                solver = solvers[steps] = MPCSolver(config)
+            audit["attempted_horizon_levels_s"].append(steps*self.dt)
+            count = steps+1
+            short_obstacles = tuple(MPCObstacle(obstacle.id, np.asarray(obstacle.centers)[:count].copy(),
+                self._recovery_slice(obstacle.radii, count), self._recovery_slice(obstacle.yaws, count),
+                rectangle_half_extents=(np.asarray(obstacle.rectangle_half_extents).copy()
+                    if np.asarray(obstacle.rectangle_half_extents).shape == (2,) else
+                    self._recovery_slice(obstacle.rectangle_half_extents, count)),
+                uncertainty_m=self._recovery_slice(obstacle.uncertainty_m, count))
+                for obstacle in obstacles)
+            for original in references:
+                if original.metadata.get("longitudinal") != "STOP":
+                    continue
+                points = np.asarray(original.points)[:count].copy()
+                speed_limit = self._recovery_slice(original.speed_limit, count)
+                if speed_limit is None:
+                    speed_limit = np.maximum(initial.speed, np.maximum(1., points[:, 3]))
+                elif np.asarray(speed_limit).ndim == 0:
+                    speed_limit = np.full(count, speed_limit, dtype=float)
+                # A STOP recovery must finish no faster than its observation.
+                # This is an optimizer constraint as well as an output guard;
+                # the objective alone could otherwise coast on an unavoidable
+                # positive input inherited from the previous jerk boundary.
+                speed_limit[-1] = min(speed_limit[-1], initial.speed)
+                reference = MPCReference(original.name+"@verified_braking",
+                    points, self._recovery_slice(original.half_width, count), speed_limit,
+                    dict(original.metadata, recovery=True, degraded_braking=True,
+                         desired_speed_mps=0., longitudinal="STOP"))
+                result = solver.solve(MPCProblem(initial, reference, short_obstacles),
+                                      acceleration_upper_bounds=acceleration_upper)
+                finite_short_infeasible = (finite_short_infeasible and
+                    self._finite_infeasible_result(result, steps))
+                finite = bool(np.isfinite(result.states).all() and np.isfinite(result.controls).all())
+                feasible = (finite and result.feasible and
+                    float(result.diagnostics["max_constraint_violation"]) <= config.constraint_tolerance)
+                # Terminal speed alone cannot rule out accelerating and braking
+                # back to a stop. The optimizer and this output check both
+                # enforce the jerk-compatible no-added-positive-demand policy.
+                acceleration_policy = bool(finite and np.all(
+                    result.controls[:, 0] <= acceleration_upper+config.constraint_tolerance))
+                braking = (finite and result.states[-1, 3] <= initial.speed+config.constraint_tolerance)
+                audit["attempts"].append({"reference_id": reference.name, "optimization_feasible": feasible,
+                    "finite_result": self._finite_solver_result(result, steps),
+                    "braking_or_hold": bool(braking), "acceleration_policy_passed": acceleration_policy,
+                    "verified_horizon_s": steps*self.dt,
+                    "solver": deepcopy(result.diagnostics), "optimizer_status": result.status})
+                if feasible and braking and acceleration_policy:
+                    verified.append((float(result.states[-1, 3]), result.cost, reference, result))
+            if verified:
+                # Preserve the longest verified horizon. Shorter levels are
+                # considered only after every STOP at this level has failed.
+                break
+        if not verified:
+            return failed("no_feasible_mpc_solution")
+        audit["acceleration_upper_bounds_mps2"] = acceleration_upper.tolist()
+        _, _, reference, result = min(verified, key=lambda item: item[:2])
+        candidate = self._candidate(reference, result, len(diagnostics["candidates"]), initial, self._speed_limit)
+        candidate.update(degraded_braking=True, verified_horizon_s=steps*self.dt)
+        selected, selection_audit = choose_candidate([*diagnostics["candidates"], candidate], {}, False)
+        if selected is None:
+            return failed("no_feasible_mpc_solution")
+        diagnostics["full_horizon_selection"] = {key: deepcopy(diagnostics.get(key)) for key in
+            ("selected_id", "baseline_selected_id", "candidate_pool_sha256")}
+        for key in ("selected_id", "baseline_selected_id", "candidate_pool_sha256", "candidates"):
+            diagnostics[key] = selection_audit[key]
+        verified_horizon = steps*self.dt
+        expiry = min(now+min(.3, float(self.config.get("replan_interval_s", .2))+.1), episode["deadline_s"])
+        audit.update(active=True, reason="full_horizon_infeasible_verified_braking_available",
+            acceleration_policy_passed=True,
+            verified_horizon_s=verified_horizon,
+            verified_constraint_tolerance=config.constraint_tolerance, optimization_feasible=True,
+            execution_expires_at_s=float(expiry), selected_id=selected["id"],
+            verified_constraint_max_violation=float(result.diagnostics["max_constraint_violation"]))
+        trajectory = self._execution(result, tf)
+        diagnostics.update(emergency_brake=False, failure_reason=None,
+            selection_rule="full_horizon_infeasible_then_verified_short_horizon_stop",
+            nominal_horizon_s=self.horizon, horizon_s=verified_horizon,
+            selected_lateral=selected["lateral"], selected_longitudinal="STOP",
+            execution_trajectory={"geometry_source": "nonlinear_mpc_optimized_rear_axle_rollout",
+                "speed_profile_source": "nonlinear_mpc_optimized_velocity",
+                "frame": "capture_time_carla_actor_forward_left", "sample_interval_s": min(.1, self.dt),
+                "sample_count": len(trajectory), "verified_horizon_s": verified_horizon,
+                "execution_origin_distance_m": math.hypot(trajectory[0]["x"], trajectory[0]["y"]),
+                "selected_states_sha256": hashlib.sha256(result.states.tobytes()).hexdigest()},
+            mpc_tracking={"active": True, "source": "nonlinear_mpc_optimized_controls",
+                "issued_at_s": now, "expires_at_s": expiry, "sample_interval_s": self.dt,
+                "bicycle_angles_rad": result.controls[:, 1].tolist(),
+                "accelerations_mps2": result.controls[:, 0].tolist(), "speeds_mps": result.states[:-1, 3].tolist()})
+        # The old snapshot has no selected full-horizon candidate. Never show
+        # one of those infeasible rollouts as the executed braking solution.
+        self.last_visualization_snapshot = None
+        return {"trajectory": trajectory, "target_speed": trajectory[-1]["optional_v"],
+                "selected_lateral": selected["lateral"], "selected_longitudinal": "STOP",
+                "planner_diagnostics": diagnostics}
 
     def _visualization(self, references, results, candidates, selected, tf, timestamp):
         if not self._trajectory_visualization_config["enabled"]:
@@ -615,11 +975,13 @@ class CarlaMPCPlanner:
         self.last_visualization_snapshot = None
         timestamp = int(round(self.world.get_snapshot().timestamp.elapsed_seconds*1e6))
         now = timestamp/1e6 if sim_time_s is None else float(sim_time_s)
+        self.actor_motion.update(self.world, sim_time_s=now)
         initial, tf = self._initial_state(now)
         try:
             local, index = self._resolve_reference()
             context = build_scene_context(self.world, self.ego, self.route, now,
-                reference=self._resolved_route_waypoints, special_situations=special_situations)
+                reference=self._resolved_route_waypoints, special_situations=special_situations,
+                motion_history=self.actor_motion)
         except Exception as exc:
             raise MPCPlanningError(str(exc), {"backend": "mpc", "failure_reason": "road_geometry_error",
                 "timestamp_us": timestamp, "error_type": type(exc).__name__}) from exc
@@ -630,7 +992,8 @@ class CarlaMPCPlanner:
         self._bind_dynamic_steering_limit(initial.speed, limit)
         evidence = self.experience_memory.retrieve(context) if self.experience_memory else None
         maneuver = self.lane_maneuver.update(self.world, self.ego, self._resolved_route_waypoints, now,
-            context=context, current_side=self._side(local), route_index=index, candidate_speed_mps=limit)
+            context=context, current_side=self._side(local), route_index=index, candidate_speed_mps=limit,
+            motion_history=self.actor_motion)
         stop_line = self._stop_line(local, initial, context)
         obstacles, actor_audit = self._obstacles(initial, tf)
         lane_width = np.array([float(wp.lane_width) for wp in local])
@@ -648,11 +1011,12 @@ class CarlaMPCPlanner:
         priors = (evidence or {}).get("parameter_priors", []) if self.planning_memory_mode == "full" else []
         references = []
         for identity, points, width, meta, cap, headings in paths:
+            cap, path_stop_line = self._maneuver_path_limit(points, meta, cap, maneuver, initial, stop_line)
             for suffix, desired, label in (("CRUISE", cap, "ACCELERATE"),
                                            ("SLOW", cap*.55, "FOLLOW"), ("STOP", 0., "STOP")):
                 metadata = dict(meta, desired_speed_mps=desired, longitudinal=label)
                 references.append(self._reference(identity+":"+suffix, points, initial, desired, width,
-                    metadata, headings=headings, stop_line=stop_line))
+                    metadata, headings=headings, stop_line=path_stop_line))
             for number, prior in enumerate(priors[:2]):
                 if prior.get("status") != "execution_supported" or prior.get("support_count", 0) < 3:
                     continue
@@ -663,10 +1027,11 @@ class CarlaMPCPlanner:
                 meta_memory = dict(meta, desired_speed_mps=desired, longitudinal="MAINTAIN",
                                    memory_support=prior.get("record_ids", []))
                 references.append(self._reference(identity+":MEMORY%d" % number, points, initial,
-                    desired, width, meta_memory, headings=headings, stop_line=stop_line))
+                    desired, width, meta_memory, headings=headings, stop_line=path_stop_line))
         results = [self.solver.solve(MPCProblem(initial, reference, tuple(obstacles))) for reference in references]
         candidates = [self._candidate(ref, result, i, initial, limit)
                       for i, (ref, result) in enumerate(zip(references, results))]
+        baseline_references, baseline_results = list(references), list(results)
         baseline_candidates = list(candidates)
         baseline, base_audit = choose_candidate(candidates, {}, False)
         context["candidates_summary"] = candidate_summary(candidates, base_audit["baseline_selected_id"])
@@ -711,6 +1076,10 @@ class CarlaMPCPlanner:
                 diagnostics["governor"]["would_adopt"] = diagnostics["governor"]["adopted"]
                 diagnostics["governor"]["adopted"] = False
                 recovery["selected"] = False
+                # Shadow proposals are observation-only. Restore the whole
+                # execution pool, including the evidence used for short STOP
+                # recovery and minimum-risk hold, not just ranked diagnostics.
+                references, results = baseline_references, baseline_results
         self.last_context, self.last_candidates = context, baseline_candidates
         diagnostics.update(backend="mpc", provenance=self.provenance, semantic_policy=self.semantic_policy,
             selection_rule="constrained_mpc_progress_minus_soft_cost_plus_optional_semantic",
@@ -725,19 +1094,21 @@ class CarlaMPCPlanner:
             steering_state=self._steering_state_diagnostics, traffic_stop_line=stop_line,
             speed_dependent_steering=self._dynamic_steer_diagnostics,
             geometry={"reference_resolution": self._route_resolution, "current_side": self._side(local),
-                "initial_topology_corrections": deepcopy(self._reference_topology_corrections)},
+                "initial_topology_corrections": deepcopy(self._reference_topology_corrections),
+                "physical_start_extension": deepcopy(self._reference_start_extension)},
             recovery=recovery,
             vehicle={"wheelbase_m": self.vehicle_parameters.wheel_base, "width_m": self.vehicle_parameters.width,
                 "length_m": self.vehicle_parameters.length, "rear_axle_to_center_m": self.rear_axle_to_center,
+                "body_center_lateral_m": self.ego_body_center_lateral, "body_yaw_rad": self.ego_body_yaw,
                 "rear_axle_actor_xyz_m": list(self.rear_axle_actor_xyz_m), "max_steer_rad": self.max_steer})
         try:
             self._visualization(references, results, diagnostics["candidates"], selected, tf, timestamp)
         except Exception:
             self.last_visualization_snapshot = None
         if selected is None:
-            diagnostics.update(emergency_brake=True, failure_reason="no_feasible_mpc_solution")
-            return {"trajectory": [], "target_speed": 0., "selected_lateral": "KEEP_LANE",
-                    "selected_longitudinal": "STOP", "planner_diagnostics": diagnostics}
+            return self._recovery_braking_plan(references, obstacles, initial, tf, now, timestamp,
+                                               diagnostics, full_results=results)
+        self._braking_recovery_episode = None
         selected_index = selected["index"]
         result, reference = results[selected_index], references[selected_index]
         committed = self.lane_maneuver.commit_selected(selected["id"], now,

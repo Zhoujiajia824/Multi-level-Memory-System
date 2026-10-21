@@ -64,6 +64,11 @@ def _render_md(run_info: dict, s: dict) -> str:
     ]
     if run_info.get("semantic_policy") == "shadow":
         lines.append("- Shadow: 实际执行基础数值规划；would-selection 仅为同快照候选比较，不是已执行结果")
+    advisory = run_info.get("advisory") or {}
+    if run_info.get("planner_backend") == "mpc":
+        lines.append(f"- 最小风险制动并重观测: {advisory.get('minimum_risk_hold_plans', 0)} 次规划 / "
+                     f"{advisory.get('minimum_risk_hold_ticks', 0)} 个物理帧 / "
+                     f"{advisory.get('minimum_risk_hold_s', 0.):.2f} s（无可行轨迹，非安全性通过）")
     usage = run_info.get("model_usage")
     if isinstance(usage, dict):
         ratio = usage.get("model_call_frame_ratio")

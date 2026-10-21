@@ -71,6 +71,10 @@ def choose_candidate(candidates, semantic, enabled, lateral_weight=0.8, longitud
         cost_valid = (type(cost) in (int, float) and math.isfinite(cost)
                       and 0.0 <= cost <= MAX_NUMERICAL_COST + 1e-12)
         numerically_valid = safety.get("finite") is True and score_valid and cost_valid
+        # MPC supplies a separate optimizer feasibility contract. PDM has no
+        # such field and retains its score-only selection rule.
+        optimization_gate = "optimization_feasible" in candidate
+        optimization_valid = not optimization_gate or candidate["optimization_feasible"] is True
         # Retain the former safety assessment for comparison with older logs.
         # It is deliberately independent from eligibility in this version.
         safe = (all(type(v) in (int, float) and math.isfinite(v) and 1.0 - 1e-8 <= v <= 1 for v in metrics)
@@ -98,7 +102,10 @@ def choose_candidate(candidates, semantic, enabled, lateral_weight=0.8, longitud
                     planning_score=planning_score,
                     final_score=float(planning_score + bonus) if numerically_valid else None,
                     # Compatibility fields: no route or safety gate is applied.
-                    route_eligible=True, eligible=numerically_valid)
+                    route_eligible=True, eligible=numerically_valid and optimization_valid,
+                    solver_feasibility_gate_applied=optimization_gate,
+                    ineligible_reason=("optimization_infeasible" if not optimization_valid else
+                                       "invalid_numerics" if not numerically_valid else None))
         audited.append(item)
     eligible = [item for item in audited if item["eligible"]]
     selected = max(eligible, key=lambda item: item["final_score"]) if eligible else None

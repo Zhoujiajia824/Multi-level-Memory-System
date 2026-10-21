@@ -1,9 +1,10 @@
-"""Stateful, map-anchored numerical overtaking proposals for PDM.
+"""Stateful, map-anchored numerical overtaking proposals for PDM and MPC.
 
-The current snapshot grants a proposal, never a right of way.  The upstream
-generator, rollout and scorer still evaluate this path with every ordinary
-longitudinal policy.  Neither a model call nor a semantic CHANGE_LANE bonus is
-needed.  A fixed spatial transition avoids restarting a lane change at 5 Hz.
+The current snapshot grants a proposal, never a right of way.  The numerical
+backend evaluates its actual rollout and current traffic.  Neither a model call
+nor a semantic CHANGE_LANE bonus is needed.  Fixed spatial transitions avoid
+restarting lane changes at 5 Hz; a shared return reservation preserves room to
+complete the entire excursion while traffic blocks the return.
 """
 from __future__ import annotations
 
@@ -15,6 +16,9 @@ from numbers import Real
 import numpy as np
 
 from .scene_context import lane_key, project_polyline
+
+
+MANEUVER_GEOMETRY_VERSION = "fixed_phase_reference_stable_stations_v3"
 
 
 DEFAULTS = {"enabled": True, "observation_s": 1.0, "minimum_gap_m": 1.0,
@@ -94,6 +98,32 @@ def _quintic(value):
     return 10 * value ** 3 - 15 * value ** 4 + 6 * value ** 5
 
 
+def _merge_station_samples(samples, required, minimum_separation_m=1e-3):
+    """Coalesce redundant sampling locations, preserving transition anchors.
+
+    CARLA float map knots can differ from a regular sample by nanometres.
+    Keeping both makes a second numerical derivative ill-conditioned even on
+    an exactly straight Hermite spline. This changes only the sampling set,
+    never the map interpolant, curve shape or curvature/steering bound.
+    Required anchors are retained in the supplied priority order; a redundant
+    support endpoint within a millimetre cannot displace a transition anchor.
+    """
+    anchors = []
+    for value in required:
+        if all(abs(value - previous) >= minimum_separation_m for previous in anchors):
+            anchors.append(float(value))
+    anchors = np.asarray(anchors)
+    samples = np.unique(np.asarray(samples, dtype=float))
+    if len(anchors):
+        samples = samples[np.min(abs(samples[:, None] - anchors[None, :]), axis=1)
+                          >= minimum_separation_m]
+    kept = []
+    for value in samples:
+        if not kept or value - kept[-1] >= minimum_separation_m:
+            kept.append(float(value))
+    return np.sort(np.r_[anchors, kept])
+
+
 def _curvature(points):
     arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))]
     first = np.gradient(points, arc, axis=0)
@@ -133,8 +163,10 @@ def _curvature_limit(ego, speed_mps=0., *, physics=None):
     return .9*math.tan(model.limit_at(speed_mps))/wheelbase
 
 
-def _actor_data(actor, reference_points, ego_z):
-    p, velocity = actor.get_location(), actor.get_velocity()
+def _actor_data(actor, reference_points, ego_z, motion_observation=None):
+    p = actor.get_location()
+    velocity = (actor.get_velocity() if motion_observation is None
+                else motion_observation.velocity)
     if abs(p.z - ego_z) > 2.5:
         return None
     projection = project_polyline(p.x, -p.y, reference_points)
@@ -150,7 +182,8 @@ def _actor_data(actor, reference_points, ego_z):
             "cross_speed": float(velocity_xy @ np.array([-math.sin(tangent), math.cos(tangent)])),
             "aligned": math.cos(yaw - tangent) > .8,
             "half_length": float(extent.x), "half_width": float(extent.y),
-            "speed": float(np.linalg.norm(velocity_xy))}
+            "speed": float(np.linalg.norm(velocity_xy)),
+            "motion_source": getattr(motion_observation, "source", "actor_api_velocity")}
 
 
 def _crosswalk_near(carla_map, xy):
@@ -285,8 +318,12 @@ class LaneManeuver:
             return None
         center = self._samples(subset, "center", knots)
         adjacent = self._samples(subset, side, knots)
-        sample_s = np.unique(np.r_[knots, np.arange(knots[0], min(end, knots[-1]), .25), start, start + length])
-        sample_s = sample_s[(sample_s >= knots[0]) & (sample_s <= min(end, knots[-1]))]
+        last_sample = min(end, knots[-1])
+        sample_s = np.r_[knots, np.arange(knots[0], last_sample, .25)]
+        sample_s = sample_s[(sample_s >= knots[0]) & (sample_s <= last_sample)]
+        required = [value for value in (start, start + length, last_sample, knots[0])
+                    if knots[0] <= value <= last_sample]
+        sample_s = _merge_station_samples(sample_s, required)
         blend = _quintic((sample_s - start) / length)
         if returning:
             blend = 1 - blend
@@ -305,10 +342,10 @@ class LaneManeuver:
         """
         measured = math.hypot(ego.get_velocity().x, ego.get_velocity().y)
         upper = max(cap, measured, candidate_speed_mps)
-        return tuple(sorted({max(cap, measured), upper})), min(cap, measured)
+        return tuple(sorted({cap, max(cap, measured), upper})), min(cap, measured)
 
     def _gap_clear(self, actors, points, samples, ego_station, ego, cap, *, blocker_id=None,
-                   candidate_speed_mps=None):
+                   candidate_speed_mps=None, returning=False):
         """Current front/rear envelopes and same-time constant-velocity occupancy."""
         half_l, half_w = float(ego.bounding_box.extent.x), float(ego.bounding_box.extent.y)
         direction = np.gradient(points, axis=0)
@@ -318,6 +355,11 @@ class LaneManeuver:
         if candidate_speed_mps is None:
             candidate_speed_mps = min(8., float(ego.get_speed_limit()) / 3.6)
         speeds, rear_speed = self._prediction_speeds(ego, cap, candidate_speed_mps)
+        if returning:
+            measured = math.hypot(ego.get_velocity().x, ego.get_velocity().y)
+            # Cover the bounded ordinary slow policy and a measured crawl as
+            # well as cruise.  A slower arrival must not hide crossing traffic.
+            speeds = tuple(sorted(set(speeds) | {measured, cap * .55}))
         for actor in actors:
             initial = project_polyline(*actor["xy"], points)
             if initial is not None and initial[1] < half_w + actor["half_width"] + .35:
@@ -326,7 +368,10 @@ class LaneManeuver:
                     gap = actor["station"] - ego_station
                     if actor["id"] != blocker_id and gap < 0:
                         rear_gap = -gap - half_l - actor["half_length"]
-                        required = max(8., 3 * max(0., actor["along_speed"] - rear_speed) + 5.)
+                        pedestrian = actor.get("type", "").startswith("walker.")
+                        minimum = 2. if returning and pedestrian else 8.
+                        reserve = 2. if returning and pedestrian else 5.
+                        required = max(minimum, 3 * max(0., actor["along_speed"] - rear_speed) + reserve)
                         if rear_gap < required:
                             return False, {"reason": "target_rear_gap", "actor_id": actor["id"],
                                            "gap_m": rear_gap, "required_m": required}
@@ -346,7 +391,8 @@ class LaneManeuver:
         return True, None
 
     @staticmethod
-    def _target_gap_clear(actors, reference, stations, station, ego, side, cap, *, candidate_speed_mps=None):
+    def _target_gap_clear(actors, reference, stations, station, ego, side, cap, *,
+                          candidate_speed_mps=None, returning=False):
         """Check the target lane itself, including behind the initial curve.
 
         Testing only the curved ego path misses a rapidly closing rear vehicle:
@@ -369,7 +415,10 @@ class LaneManeuver:
             gap = actor["station"] - station
             free_gap = abs(gap) - ego.bounding_box.extent.x - actor["half_length"]
             if gap < 0:
-                required = max(8., 3 * max(0., actor["along_speed"] - rear_speed) + 5.)
+                pedestrian = actor.get("type", "").startswith("walker.")
+                minimum = 2. if returning and pedestrian else 8.
+                reserve = 2. if returning and pedestrian else 5.
+                required = max(minimum, 3 * max(0., actor["along_speed"] - rear_speed) + reserve)
                 kind = "target_rear_gap"
             else:
                 required = max(6., 1.5 * front_speed, 3 * max(0., front_speed - actor["along_speed"]))
@@ -378,6 +427,140 @@ class LaneManeuver:
                 return False, {"reason": kind, "actor_id": actor["id"],
                                "gap_m": float(free_gap), "required_m": float(required)}
         return True, None
+
+    def _return_reservation(self, plan, reference, stations, station, ego):
+        """A longitudinal limit before the last *legal* return transition.
+
+        The final adjacent-lane endpoint is too late to wait: a full spatial
+        merge still has to fit before it.  Publish a world point so every
+        adapter can apply this same limit to ordinary and maneuver proposals.
+        The reserve includes ego's front overhang and two metres of map slack.
+        """
+        last_start = plan["corridor_end"] - plan["length"] - max(4., ego.bounding_box.extent.x + 2.)
+        for start in np.arange(last_start, max(plan["anchor"], last_start - 40.) - .01, -1.):
+            legal, _ = self._corridor(reference, stations, float(start),
+                                      float(start) + plan["length"], plan["side"], returning=True)
+            if legal:
+                last_start = float(start)
+                break
+        stop = min(last_start, plan.get("return_wait_station", last_start))
+        plan["return_wait_station"] = stop  # once reserved, never creep it forward
+        stop_xy = [float(np.interp(stop, plan["sample_s"], plan["points"][:, axis]))
+                   for axis in (0, 1)]
+        return {"return_required": True, "return_deadline_route_station_m": last_start,
+            "maneuver_stop_route_station_m": stop, "maneuver_stop_world_xy": stop_xy,
+            "maneuver_stop_reason": "preserve_legal_return_window",
+            "return_wait_route_station_m": stop, "return_wait_world_xy": stop_xy,
+            "return_window_remaining_m": last_start - station,
+            "return_stop_already_passed": bool(station > stop + .5)}
+
+    def _return_candidate(self, plan, actors, reference, stations, station, ego):
+        """Search bounded merge speeds; a fast ordinary policy is not evidence
+        that this capped candidate would travel at that unrelated speed.
+
+        Current measured speed is retained in the envelope, and the downstream
+        planner still checks its actual dynamic rollout.  A candidate grants no
+        right of way and never bypasses topology or a closing rear vehicle.
+        """
+        pending = plan.get("return_proposal")
+        lengths = ([pending["length"]] if pending is not None else
+                   list(dict.fromkeys([plan["length"], 24., 20., 16., 12., 10., 9., 8., 7., 6.])))
+        attempts = []
+        physics = ego.get_physics_control() if callable(getattr(ego, "get_physics_control", None)) else None
+        for length in lengths:
+            anchor = pending["anchor"] if pending is not None else station
+            legal, reason = self._corridor(reference, stations, anchor, anchor + length,
+                                          plan["side"], returning=True)
+            if not legal or anchor + length + 4. > plan["corridor_end"]:
+                attempts.append({"length_m": length, "reason": reason or "no_complete_legal_return_corridor"})
+                continue
+            built = ((pending["points"], pending["sample_s"], pending["widths"]) if pending is not None else
+                     self._build(reference, stations, anchor, length, plan["side"],
+                                 min(stations[-1], anchor + 90.), returning=True))
+            if built is None:
+                attempts.append({"length_m": length, "reason": "path_construction_failed"})
+                continue
+            kmax = max(float(np.max(_curvature(built[0]))), .001)
+            cap = min(plan["speed_cap"], math.sqrt(self.config["lateral_acceleration_mps2"] / kmax))
+            caps = sorted({float(cap), min(float(cap), 3.), min(float(cap), 2.),
+                           min(float(cap), 1.)}, reverse=True)
+            for cap in caps:
+                if cap < .5 or kmax > _curvature_limit(ego, cap, physics=physics):
+                    attempts.append({"length_m": length, "speed_cap_mps": cap,
+                                     "reason": "steering_curvature_unreachable"})
+                    continue
+                clear, conflict = self._target_gap_clear(actors, reference, stations, station,
+                    ego, "center", cap, candidate_speed_mps=cap, returning=True)
+                if clear:
+                    clear, conflict = self._gap_clear(actors, built[0], built[1], station, ego, cap,
+                                                      candidate_speed_mps=cap, returning=True)
+                if clear:
+                    updated = dict(plan, points=built[0], nominal_points=built[0].copy(),
+                        sample_s=built[1], widths=built[2], anchor=anchor, length=float(length),
+                        phase="returning", speed_cap=cap)
+                    updated.pop("return_proposal", None)
+                    for name in ("maneuver_stop_route_station_m", "maneuver_stop_world_xy", "maneuver_stop_reason"):
+                        updated.pop(name, None)
+                    updated["return_checks"] = {"allowed": True, "attempts": attempts,
+                        "speed_envelope": "candidate_cap_and_measured_speed", "speed_cap_mps": cap}
+                    return updated, None
+                attempts.append(dict(conflict, length_m=length, speed_cap_mps=cap))
+        return None, {"reason": "return_currently_blocked", "attempts": attempts,
+                      "speed_envelope": "candidate_cap_and_measured_speed"}
+
+    @staticmethod
+    def _observe_return_completion(plan, ego, reference, reference_points, stations,
+                                   station, projection, now, current_side):
+        """Release a return only after the measured complete body is stable.
+
+        A center position can cross the route while the bonnet still crosses a
+        boundary. Check the actual CARLA bbox, including its local offset and
+        rotation, against the original connected lane surface. This is only a
+        completion observation: it neither moves the executed anchor nor grants
+        a new trajectory permission. Duplicate queries cannot add samples.
+        """
+        from shapely.geometry import MultiPoint, Polygon
+        from shapely.ops import unary_union
+
+        tf = ego.get_transform()
+        aligned = math.cos(-math.radians(tf.rotation.yaw) - projection[2]) > .985
+        end_reached = plan["phase"] != "returning" or station >= plan["anchor"] + plan["length"]
+        first = max(0, int(np.searchsorted(stations, station - 6.)) - 1)
+        last = min(len(reference), int(np.searchsorted(stations, station + 6.)) + 2)
+        headings = -np.radians([wp.transform.rotation.yaw for wp in reference[first:last]])
+        normals = np.c_[-np.sin(headings), np.cos(headings)]
+        half_widths = np.array([wp.lane_width for wp in reference[first:last]]) / 2
+        centers = reference_points[first:last]
+        left, right = centers + half_widths[:, None] * normals, centers - half_widths[:, None] * normals
+        surface = unary_union([Polygon([left[i], left[i+1], right[i+1], right[i]])
+                               for i in range(len(centers)-1)])
+        body = MultiPoint([(v.x, -v.y) for v in ego.bounding_box.get_world_vertices(tf)]).convex_hull
+        body_inside = bool(not surface.is_empty and surface.is_valid and surface.covers(body))
+        clearance = float(surface.boundary.distance(body)) if body_inside else 0.
+        pose = {"current_side": current_side, "lateral_error_m": float(projection[1]),
+                "heading_aligned": bool(aligned), "transition_end_reached": bool(end_reached),
+                "complete_body_inside_original_lane": body_inside,
+                "minimum_body_boundary_clearance_m": clearance,
+                "required_body_boundary_clearance_m": .05}
+        plan["return_completion_pose"] = pose
+        entered = plan["phase"] == "returning" or plan.get("observed_passing_lane_at_s") is not None
+        centered = (entered and end_reached and current_side == "center" and projection[1] < .35
+                    and aligned and body_inside and clearance >= .05)
+        if not centered:
+            plan.pop("measured_return_observation", None)
+            return None
+        observed = plan.get("measured_return_observation")
+        if observed is None or now - observed["last_time_s"] > .4 + 1e-8:
+            observed = {"since_s": float(now), "samples": 0,
+                "source": "measured_complete_body_in_original_lane_after_excursion"}
+        distinct = now > observed.get("last_time_s", -math.inf) + 1e-8
+        observed.update(last_time_s=float(now), samples=observed["samples"] + int(distinct), **pose)
+        plan["measured_return_observation"] = observed
+        if observed["samples"] >= 3 and now - observed["since_s"] >= .4 - 1e-8:
+            return dict(observed, elapsed_s=float(now-observed["since_s"]),
+                observed_passing_lane_at_s=plan.get("observed_passing_lane_at_s"),
+                completion_phase=plan["phase"], dedicated_return_selection_claimed=False)
+        return None
 
     def _result(self, plan, phase, *, committed, conflict=None):
         points = plan["points"]
@@ -394,10 +577,19 @@ class LaneManeuver:
             "maneuver_blocker_id": plan["blocker_id"], "maneuver_preferred": True,
             "lane_quality_reference_points": nominal.tolist(), "lane_quality_widths": plan["widths"].tolist(),
             "lane_quality_transition": True}
+        return_audit = {key: deepcopy(plan[key]) for key in (
+            "return_required", "return_deadline_route_station_m", "maneuver_stop_route_station_m",
+            "maneuver_stop_world_xy", "maneuver_stop_reason", "return_window_remaining_m",
+            "return_wait_route_station_m", "return_wait_world_xy", "return_stop_already_passed",
+            "maneuver_overdue", "return_trigger", "return_checks", "passing_checks", "pending_return_invalidation",
+            "pending_return_invalidation_count", "measured_return_observation",
+            "return_completion_pose") if key in plan}
+        metadata.update(return_audit)
         self._pending = plan
         return {"active": True, "phase": phase, "target_side": target, "current_target_side": target,
                 "points": points, "nominal_points": nominal, "metadata": metadata, "speed_cap_mps": plan["speed_cap"],
                 "diagnostics": {"reason": "committed_maneuver" if committed else "persistent_slow_obstacle",
+                    "geometry_version": MANEUVER_GEOMETRY_VERSION,
                     "committed": committed, "maneuver_id": plan["serial"], "blocker_id": plan["blocker_id"],
                     "side": plan["side"], "target_side": target, "phase": phase,
                     "executed_phase": self._active["phase"] if self._active is not None else None,
@@ -407,7 +599,8 @@ class LaneManeuver:
                     "actual_selected_id": plan.get("actual_selected_id"),
                     "actual_selected_path_label": plan.get("actual_selected_path_label"),
                     "executed_geometry_sha256": plan.get("executed_geometry_sha256"),
-                    "prediction_kind": "constant_velocity_proxy_not_future_GT", "conflict": conflict}}
+                    "prediction_kind": "observed_velocity_proxy_not_future_GT", "conflict": conflict,
+                    **return_audit}}
 
     def commit_selected(self, selected_id, now, *, selected_path_points=None, selected_metadata=None):
         """Commit only an executed proposal, including shadow's actual baseline."""
@@ -552,7 +745,7 @@ class LaneManeuver:
         return True
 
     def update(self, world, ego, reference, now, *, context=None, current_side="center", route_index=None,
-               candidate_speed_mps=None):
+               candidate_speed_mps=None, motion_history=None):
         if not self.config["enabled"]:
             return self._inactive("disabled")
         if not math.isfinite(float(now)):
@@ -594,7 +787,8 @@ class LaneManeuver:
         actors = []
         for actor in world.get_actors():
             if actor.id != ego.id and actor.type_id.startswith(("vehicle.", "walker.pedestrian.")):
-                value = _actor_data(actor, actor_points, location.z)
+                observation = motion_history.motion_for(actor) if motion_history is not None else None
+                value = _actor_data(actor, actor_points, location.z, observation)
                 if value is not None:
                     value["station"] += stations[actor_first]
                 if value is not None and abs(value["station"] - station) < 100:
@@ -605,61 +799,90 @@ class LaneManeuver:
         waiting = bool((context or {}).get("traffic_wait", {}).get("active"))
         if self._active is not None:
             plan = self._active
-            if now - plan["committed_at"] > self.config["maximum_maneuver_s"]:
-                self._active = None
-                return self._inactive("maneuver_expired_hold_lane")
-            # A large displacement is a new scene, not a continuation licence.
-            if abs(station - plan["anchor"]) > 150:
-                self._active = None
-                return self._inactive("route_discontinuity")
+            # A clock deadline cannot cancel the physical obligation to return.
+            # Keep the verified lane and stopping reservation while waiting for
+            # traffic, rather than forgetting the excursion after 45 seconds.
+            plan["maneuver_overdue"] = bool(now - plan["committed_at"] > self.config["maximum_maneuver_s"])
+            # Detect an actual observation jump, not accumulated progress since
+            # the original anchor. A long, continuously observed excursion
+            # still owes its return, including after the maneuver time budget.
+            previous_station = plan.get("last_observed_route_station_m", plan["anchor"])
+            previous_time = plan.get("last_observed_time_s", plan["committed_at"])
+            if now > previous_time + 1e-8:
+                if abs(station - previous_station) > 150:
+                    self._active = self._observed = None
+                    return self._inactive("route_discontinuity_single_observation_station_jump",
+                        previous_route_station_m=float(previous_station), current_route_station_m=float(station),
+                        observation_station_jump_m=float(station-previous_station),
+                        original_anchor_station_m=float(plan["anchor"]))
+                plan.update(last_observed_route_station_m=float(station), last_observed_time_s=float(now))
+            if plan["phase"] == "passing":
+                # A native ordinary center path may return successfully while
+                # the dedicated proposal lost or its conservative precheck was
+                # blocked. Observe that physical completion without inventing
+                # a dedicated-return selection. Initial center-lane launch is
+                # not completion: first require the whole body in the side lane.
+                if (current_side == plan["side"] and projection[1] >=
+                        float(reference[nearest].lane_width) / 2 + ego.bounding_box.extent.y + .1):
+                    plan.setdefault("observed_passing_lane_at_s", float(now))
+            completion = self._observe_return_completion(plan, ego, reference, reference_points,
+                stations, station, projection, now, current_side)
+            if completion is not None:
+                self._active = self._observed = None
+                return self._inactive("completed", measured_return_completion=completion)
             if plan["phase"] == "returning":
-                if station >= plan["anchor"] + plan["length"] and projection[1] < .45:
-                    self._active = None
-                    self._observed = None
-                    return self._inactive("completed")
                 return self._result(plan, "returning", committed=True)
-            if plan.get("return_proposal") is not None:
-                # Reserving a spatial proposal is not an execution commitment.
-                # Keep its fixed endpoint while it competes; moving that anchor
-                # forward at every unselected frame recreates the original
-                # receding lane-change failure. Current occupancy is rechecked.
-                pending = plan["return_proposal"]
-                clear, conflict = self._target_gap_clear(actors, reference, stations, station,
-                                                          ego, "center", plan["speed_cap"],
-                                                          candidate_speed_mps=candidate_speed_mps)
-                if clear:
-                    clear, conflict = self._gap_clear(actors, pending["points"], pending["sample_s"],
-                                                      station, ego, plan["speed_cap"],
-                                                      candidate_speed_mps=candidate_speed_mps)
-                if clear:
-                    return self._result(pending, "returning", committed=True)
-                return self._result(plan, "passing", committed=True, conflict=conflict)
+            plan.update(self._return_reservation(plan, reference, stations, station, ego))
+            pending = plan.get("return_proposal")
+            if pending is not None and current_side == plan["side"]:
+                nominal_xy = np.array([np.interp(station, pending["sample_s"], pending["points"][:, axis])
+                                       for axis in (0, 1)])
+                normal = np.array([-math.sin(projection[2]), math.cos(projection[2])])
+                mismatch = abs(float((np.array([location.x, -location.y]) - nominal_xy) @ normal))
+                if station > pending["anchor"] + .5 and mismatch > .45:
+                    # This proposal never executed. Reusing its old mid-merge
+                    # geometry would now start metres away from the real ego.
+                    # Rebuild at current evidence, inside the SAME stop limit;
+                    # a committed return above never enters this branch.
+                    plan["pending_return_invalidation_count"] = plan.get("pending_return_invalidation_count", 0) + 1
+                    plan["pending_return_invalidation"] = {
+                        "reason": "unexecuted_return_geometry_no_longer_matches_ego",
+                        "time_s": float(now), "old_anchor_station_m": pending["anchor"],
+                        "old_transition_end_station_m": pending["anchor"] + pending["length"],
+                        "current_route_station_m": float(station), "nominal_lateral_mismatch_m": mismatch,
+                        "fixed_return_wait_station_m": plan["return_wait_route_station_m"],
+                        "new_anchor_station_m": None, "executed_return_reanchored": False}
+                    plan.pop("return_proposal", None)
             blocker = next((actor for actor in actors if actor["id"] == plan["blocker_id"]), None)
             blocker_station = blocker["station"] if blocker else plan["blocker_station"]
             passed = station - blocker_station > plan["blocker_half_length"] + ego.bounding_box.extent.x + self.config["return_clearance_m"]
-            force_return = station + plan["length"] + 5 > plan["corridor_end"]
-            if passed or force_return:
-                allowed, reason = self._corridor(reference, stations, station, station + plan["length"], plan["side"], returning=True)
-                built = self._build(reference, stations, station, plan["length"], plan["side"],
-                                    min(stations[-1], station + 90), returning=True) if allowed else None
-                if built is not None:
-                    clear, conflict = self._target_gap_clear(actors, reference, stations, station,
-                                                              ego, "center", plan["speed_cap"],
-                                                              candidate_speed_mps=candidate_speed_mps)
-                    if clear:
-                        clear, conflict = self._gap_clear(actors, built[0], built[1], station, ego, plan["speed_cap"],
-                                                          candidate_speed_mps=candidate_speed_mps)
-                    if clear and passed:
-                        updated = dict(plan, points=built[0], nominal_points=built[0].copy(),
-                                       sample_s=built[1], widths=built[2],
-                                       anchor=station, phase="returning")
-                        # Cache on the already committed passing state; no
-                        # change to actual phase until this return is executed.
-                        plan["return_proposal"] = updated
-                        return self._result(updated, "returning", committed=True)
+            conflict = None
+            measured_speed = math.hypot(ego.get_velocity().x, ego.get_velocity().y)
+            deadline_near = (plan["return_wait_route_station_m"] - station <=
+                             max(3., measured_speed * 2. + measured_speed ** 2 / 4.))
+            # If traffic prevents completing the pass, giving up the pass and
+            # returning *behind* the blocker can be the safe legal solution.
+            # The same complete gap/sweep checks apply; the deadline is never
+            # permission to cut in front of a pedestrian or closing rear car.
+            if passed or plan.get("return_proposal") is not None or deadline_near or plan["maneuver_overdue"]:
+                plan["return_trigger"] = ("passed_original_blocker" if passed else
+                    "overdue_safe_return" if plan["maneuver_overdue"] else "abort_pass_before_deadline")
+                updated, conflict = self._return_candidate(plan, actors, reference, stations, station, ego)
+                if updated is not None:
+                    # Reserve the same spatial endpoint until its actual
+                    # selection, while checking current occupancy every frame.
+                    plan["return_proposal"] = updated
+                    if "pending_return_invalidation" in plan:
+                        plan["pending_return_invalidation"]["new_anchor_station_m"] = updated["anchor"]
+                        updated["pending_return_invalidation"] = deepcopy(plan["pending_return_invalidation"])
+                    return self._result(updated, "returning", committed=True)
+                plan["return_checks"] = deepcopy(conflict)
+            else:
+                plan["return_checks"] = {"reason": "original_blocker_not_yet_cleared",
+                    "blocker_id": plan["blocker_id"], "blocker_station_m": blocker_station}
             # Keep the target lane until the measured obstacle is fully behind;
             # PDM sees new actors/signals and can stop on this finite real lane.
-            return self._result(plan, "passing", committed=True)
+            return self._result(plan, "passing", committed=True, conflict=conflict)
         if waiting or (signal and signal["distance_m"] < 35):
             self._observed = None
             return self._inactive("traffic_signal_or_queue", signal=signal)
@@ -692,13 +915,19 @@ class LaneManeuver:
         # laterally while the transition is still in progress. Search geometry
         # and verify actual envelopes instead of imposing a fixed 9 m vacancy.
         preferred = min(24., max(6., clearance))
-        lengths = [preferred] + [n for n in (24., 20., 16., 12., 10., 9., 8., 7., 6.)
-                                  if abs(n-preferred) > 1e-6]
+        # A close blocker does not make the shortest S curve the best initial
+        # proposal. First try smoother legal curves at their reachable speed;
+        # retain short curves when traffic/topology actually requires them.
+        lengths = sorted({preferred, 24., 20., 16., 12., 10., 9., 8., 7., 6.}, reverse=True)
         getter = getattr(ego, "get_physics_control", None)
         physics = getter() if callable(getter) else None
         maximum_curvature = _curvature_limit(ego, physics=physics)
         failures = {}
-        for side in ("left", "right"):
+        # Search lower speeds only after the normal-speed alternatives have
+        # all failed. Otherwise a long 1.5 m/s curve could hide a smooth 16 m
+        # curve that is safe at 4 m/s in the very same observed traffic.
+        for reduced_speed, side in ((reduced, side) for reduced in (False, True)
+                                     for side in ("left", "right")):
             allowed, reason = self._corridor(reference, stations, station, station + 6., side)
             if not allowed:
                 failures[side] = reason
@@ -713,7 +942,8 @@ class LaneManeuver:
                         or (i > nearest and not _connected(_adjacent(reference[i - 1], side), adjacent))):
                     break
                 end = float(stations[i])
-            attempts = []
+            previous = failures.get(side)
+            attempts = list(previous.get("attempts", ())) if isinstance(previous, dict) else []
             for length in lengths:
                 allowed, reason = self._corridor(reference, stations, station, station + length, side)
                 if not allowed:
@@ -744,24 +974,35 @@ class LaneManeuver:
                 if not feasible_caps:
                     attempts.append({"length_m": length, "reason": "no_speed_with_reachable_steering_advantage"})
                     continue
-                cap = feasible_caps[0]
-                if cap < minimum_advantage:
-                    attempts.append({"length_m": length, "reason": "insufficient_numerical_passing_advantage"})
-                    continue
-                clear, conflict = self._target_gap_clear(actors, reference, stations, station, ego, side, cap,
-                                                       candidate_speed_mps=candidate_speed_mps)
-                if clear:
-                    clear, conflict = self._gap_clear(actors, built[0], built[1], station, ego, cap,
-                        blocker_id=blocker["id"], candidate_speed_mps=candidate_speed_mps)
-                if not clear:
-                    attempts.append(dict(conflict, length_m=length))
-                    continue
-                self._counter += 1
-                plan = {"serial": self._counter, "side": side, "phase": "passing", "anchor": station,
-                    "length": length, "points": built[0], "sample_s": built[1], "widths": built[2],
-                    "speed_cap": cap, "blocker_id": blocker["id"], "blocker_station": blocker["station"],
-                    "blocker_half_length": blocker["half_length"], "corridor_end": end}
-                return self._result(plan, "passing", committed=False)
+                maximum_cap = feasible_caps[0]
+                caps = ([maximum_cap] if not reduced_speed else
+                        sorted({min(maximum_cap, 3.), min(maximum_cap, 2.), minimum_advantage}, reverse=True))
+                for cap in caps:
+                    if (cap < minimum_advantage or cap > maximum_cap
+                            or (reduced_speed and cap >= maximum_cap - 1e-6)
+                            or kmax > _curvature_limit(ego, cap, physics=physics)):
+                        continue
+                    # These proposals really execute with this cap. The
+                    # measured speed is retained by _prediction_speeds; an
+                    # unrelated ordinary 8 m/s policy is not their forecast.
+                    clear, conflict = self._target_gap_clear(actors, reference, stations, station, ego, side, cap,
+                                                           candidate_speed_mps=cap)
+                    if clear:
+                        clear, conflict = self._gap_clear(actors, built[0], built[1], station, ego, cap,
+                            blocker_id=blocker["id"], candidate_speed_mps=cap)
+                    if not clear:
+                        attempts.append(dict(conflict, length_m=length, speed_cap_mps=cap,
+                                             speed_search_round="reduced" if reduced_speed else "maximum"))
+                        continue
+                    self._counter += 1
+                    plan = {"serial": self._counter, "side": side, "phase": "passing", "anchor": station,
+                        "length": length, "points": built[0], "sample_s": built[1], "widths": built[2],
+                        "speed_cap": cap, "blocker_id": blocker["id"], "blocker_station": blocker["station"],
+                        "blocker_half_length": blocker["half_length"], "corridor_end": end,
+                        "passing_checks": {"attempts": attempts,
+                            "speed_search_round": "reduced" if reduced_speed else "maximum",
+                            "speed_envelope": "candidate_cap_and_measured_speed"}}
+                    return self._result(plan, "passing", committed=False)
             failures[side] = {"reason": "no_feasible_transition", "attempts": attempts}
         return self._inactive("no_safe_legal_overtaking_corridor", excluded=failures, actor_id=blocker["id"])
 
@@ -835,7 +1076,8 @@ def maneuver_proposal_manager(api, paths, lateral, policies, labels, targets):
     caps = []
     path_caps = []
     for metadata in lateral:
-        cap = metadata.get("maneuver_speed_cap_mps") if metadata.get("maneuver") else None
+        cap = (metadata.get("maneuver_speed_cap_mps")
+               if metadata.get("maneuver") or metadata.get("maneuver_execution_limit") is True else None)
         if cap is not None:
             if type(cap) not in (int, float) or not math.isfinite(cap) or not .1 <= cap <= 20:
                 raise ValueError("maneuver speed cap must be finite and within [0.1, 20]")
@@ -845,12 +1087,21 @@ def maneuver_proposal_manager(api, paths, lateral, policies, labels, targets):
         path_caps.append(cap)
     size = len(labels)
     if not caps:
-        return api.PDMProposalManager(paths, policies), list(labels), list(targets), list(range(size))
+        manager = api.PDMProposalManager(paths, policies)
+        if any(metadata.get("maneuver_wait_hold") for metadata in lateral):
+            manager._proposals = [proposal for proposal in manager._proposals
+                if not lateral[proposal.lateral_idx].get("maneuver_wait_hold")
+                or labels[proposal.longitudinal_idx] in ("STOP", "STOP_HARD")]
+            for index, proposal in enumerate(manager._proposals):
+                proposal.proposal_idx = index
+        return manager, list(labels), list(targets), list(range(size))
     grouped = _GroupedVelocityPolicies(policies, caps)
     manager = api.PDMProposalManager(paths, grouped)
     group_for_path = [0 if cap is None else 1 + caps.index(cap) for cap in path_caps]
     manager._proposals = [proposal for proposal in manager._proposals
-        if proposal.longitudinal_idx // size == group_for_path[proposal.lateral_idx]]
+        if proposal.longitudinal_idx // size == group_for_path[proposal.lateral_idx]
+        and (not lateral[proposal.lateral_idx].get("maneuver_wait_hold")
+             or labels[proposal.longitudinal_idx % size] in ("STOP", "STOP_HARD"))]
     for index, proposal in enumerate(manager._proposals):
         proposal.proposal_idx = index
     expanded_labels = list(labels) * (1 + len(caps))

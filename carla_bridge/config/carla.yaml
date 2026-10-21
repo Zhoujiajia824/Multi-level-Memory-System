@@ -65,7 +65,7 @@ carla:
       dt: 0.2                   # 优化离散步长；控制仍按0.1s，优化转向按区间保持
       horizon_steps: 20          # 4s预测，首段执行后重新求解
       max_iterations: 55
-      collision_margin: 0.2      # 覆盖车体与当前GT匀速预测障碍的净空膨胀
+      collision_margin: 0.2      # 车体与实测运动/连续车道预测障碍的额外净空
       multi_start: true          # 热启动、参考跟踪及制动初值；每个均重新受约束优化
     lateral_control: "native_lqr"  # 仅PDM：原生LQR转向；MPC直接执行优化转向，纵向均用速度曲线PID
     semantic_influence: true    # false禁止语义影响；selective另需当前证据授权，shadow执行数值基线
@@ -81,6 +81,10 @@ carla:
     max_speed_mps: 8.0          # 适配首轮保守上限，同时服从当前道路限速
     map_radius_m: 100.0
     lane_change_length_m: 30.0
+    actor_motion:               # 仅当前/过去观测与真实道路连接，不读取未来仿真状态
+      history_window_s: 0.6     # 修正CARLA行人移动但速度API为0；车辆API经位移核验一致则保留瞬时速度
+      map_guidance: true        # 对齐道路的车辆沿next()预测；分叉不明确/正在变道时回退实测运动
+      map_max_lateral_speed_mps: 0.35
     lane_quality:              # 对实际预测车身计算数值软成本；纯PDM/语义模式一致，无额外轨迹硬筛
       enabled: true
       center_weight: 0.04
@@ -95,7 +99,7 @@ carla:
       minimum_gap_m: 1.0        # 仅中心距离初筛；实际车体间隙、曲率及整段碰撞仍单独核验
       maximum_blocker_distance_m: 45.0
       slow_speed_fraction: 0.6
-      maximum_pass_speed_mps: 5.0  # 仅新增固定机动的专属策略，普通候选速度保持不变
+      maximum_pass_speed_mps: 5.0  # 提交机动后，同目标普通/offset候选也绑定已核验的机动速度上限
       lateral_acceleration_mps2: 1.4
       return_clearance_m: 8.0
       maximum_maneuver_s: 45.0

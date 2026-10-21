@@ -81,7 +81,7 @@ def test_execution_version_defaults_match_explicit_numerical_settings_without_mu
     before = copy.deepcopy((explicit, controller))
     version = execution_planner_version(explicit, controller)
     assert version == execution_planner_version({})
-    assert version.startswith("carla_pdm_execution_v5:")
+    assert version.startswith("carla_pdm_execution_v6:")
     assert len(version.rsplit(":", 1)[1]) == 64
     assert (explicit, controller) == before
     # YAML/map insertion ordering and int/float spelling do not split banks.
@@ -118,7 +118,7 @@ def test_mpc_experience_is_independent_and_defaults_are_canonical():
     base = {"backend": "mpc"}
     before = copy.deepcopy(base)
     version = execution_planner_version(base)
-    assert version.startswith("carla_mpc_execution_v1:")
+    assert version.startswith("carla_mpc_execution_v2:")
     assert version != execution_planner_version({"backend": "pdm_closed"})
     assert version == execution_planner_version({**base, "mpc": asdict(effective_mpc_config(base))})
     assert base == before
@@ -127,6 +127,30 @@ def test_mpc_experience_is_independent_and_defaults_are_canonical():
         assert version != execution_planner_version({**base, **settings})
     assert version == execution_planner_version({**base, "semantic_policy": "shadow",
         "semantic_influence": False, "model_inference": False, "planning_memory": "off"})
+
+
+@pytest.mark.parametrize("constant,new_value", [
+    ("MPC_BRAKING_RECOVERY_HORIZON_S", 1.),
+    ("MPC_BRAKING_RECOVERY_MAX_CONTINUOUS_S", 6.),
+    ("MPC_BRAKING_RECOVERY_HORIZON_LEVELS_S", (1.2, .6)),
+    ("MPC_BRAKING_RECOVERY_POLICY_VERSION", "changed_policy"),
+])
+def test_mpc_short_braking_policy_constants_partition_execution_evidence(monkeypatch, constant, new_value):
+    from carla_bridge.planning import mpc_planner
+    mpc_version = execution_planner_version({"backend": "mpc"})
+    pdm_version = execution_planner_version({"backend": "pdm_closed"})
+    monkeypatch.setattr(mpc_planner, constant, new_value)
+    assert execution_planner_version({"backend": "mpc"}) != mpc_version
+    assert execution_planner_version({"backend": "pdm_closed"}) == pdm_version
+
+
+@pytest.mark.parametrize("backend", ["mpc", "pdm_closed"])
+def test_fixed_maneuver_geometry_change_partitions_both_execution_banks(monkeypatch, backend):
+    from carla_bridge.planning import lane_maneuver
+    planning = {"backend": backend}
+    previous = execution_planner_version(planning)
+    monkeypatch.setattr(lane_maneuver, "MANEUVER_GEOMETRY_VERSION", "different_fixed_path_contract")
+    assert execution_planner_version(planning) != previous
 
 
 def measured_vehicle(**changes):
@@ -769,3 +793,13 @@ def test_invalid_configuration_is_rejected(tmp_path, kwargs):
     options = {"planner_version": VERSION, **kwargs}
     with pytest.raises(ValueError):
         ExecutionExperienceMemory(tmp_path, **options)
+
+
+def test_solver_restart_policy_versions_mpc_evidence_without_changing_pdm(monkeypatch):
+    from carla_bridge.planning import mpc_solver
+    from carla_bridge.planning.experience_memory import execution_planner_version
+    old_mpc = execution_planner_version({"backend": "mpc"})
+    old_pdm = execution_planner_version({"backend": "pdm_closed"})
+    monkeypatch.setattr(mpc_solver, "MPC_SOLVE_POLICY_VERSION", "future_verified_restart_policy")
+    assert execution_planner_version({"backend": "mpc"}) != old_mpc
+    assert execution_planner_version({"backend": "pdm_closed"}) == old_pdm

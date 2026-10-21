@@ -429,6 +429,8 @@ class CarlaPDMPlanner:
         from .lane_quality import validate_lane_quality_config
         self.lane_quality_config = validate_lane_quality_config(self.config.get("lane_quality"))
         from .lane_maneuver import LaneManeuver
+        from .actor_motion import ActorMotionHistory
+        self.actor_motion = ActorMotionHistory(self.config.get("actor_motion"))
         self.lane_maneuver = LaneManeuver(self.config.get("lane_maneuver"))
         self._ordinary_lane_intent = None
         self.experience_memory = None
@@ -967,7 +969,7 @@ class CarlaPDMPlanner:
             local_z = closest_road.transform.location.z
             if center.z + bbox.extent.z < local_z + bottom or center.z - bbox.extent.z > local_z + top:
                 continue  # Separate bridge decks must not become 2D obstacles.
-            velocity = actor.get_velocity()
+            velocity = self.actor_motion.motion_for(actor).velocity
             kind = (self.api.TrackedObjectType.PEDESTRIAN if actor.type_id.startswith("walker.")
                     else self.api.TrackedObjectType.VEHICLE)
             oriented_box = self.api.OrientedBox(self.api.StateSE2(center.x, -center.y,
@@ -1158,6 +1160,10 @@ class CarlaPDMPlanner:
                                "maneuver_phase": lat.get("maneuver_phase"),
                                "maneuver_blocker_id": lat.get("maneuver_blocker_id"),
                                "maneuver_speed_cap_mps": lat.get("maneuver_speed_cap_mps"),
+                               "maneuver_execution_limit": bool(lat.get("maneuver_execution_limit", False)),
+                               "maneuver_wait_hold": bool(lat.get("maneuver_wait_hold", False)),
+                               "maneuver_wait_remaining_m": lat.get("maneuver_wait_remaining_m"),
+                               "maneuver_stop_world_xy": lat.get("maneuver_stop_world_xy"),
                                "maneuver_continuation": bool(lat.get("maneuver_continuation", False)),
                                "maneuver_geometry_source": lat.get("maneuver_geometry_source"),
                                "maneuver_executed_geometry_sha256": lat.get("maneuver_executed_geometry_sha256"),
@@ -1271,12 +1277,62 @@ class CarlaPDMPlanner:
             last_origin=np.array([self.ego.get_location().x, -self.ego.get_location().y]))
         return True
 
+    def _apply_maneuver_limits(self, paths, lateral, maneuver):
+        """Bind return checks to every proposal that continues the same lane.
+
+        A fast ordinary policy must not bypass the speed used to verify the
+        merge, or pass the last legal return start while waiting for a gap.
+        The endpoint is supplied to native IDM as a finite path end. Near that
+        endpoint, only the existing exact-stop native policies are constructed
+        for the waiting lane, so a 0.05 m/s asymptotic crawl cannot consume the
+        remaining legal merge window. A safe center-return path stays available.
+        """
+        from shapely.geometry import Point
+        if not maneuver.get("active") or not maneuver["diagnostics"].get("committed"):
+            return
+        target = maneuver["metadata"]["physical_lane_side"]
+        passing_side = maneuver["diagnostics"]["side"]
+        stop = maneuver["metadata"].get("return_wait_world_xy",
+                                         maneuver["metadata"].get("maneuver_stop_world_xy"))
+        tf, offset = self.ego.get_transform(), self.rear_axle_actor_xyz_m
+        heading = math.radians(tf.rotation.yaw)
+        rear = Point(tf.location.x + offset[0] * math.cos(heading) - offset[1] * math.sin(heading),
+                     -(tf.location.y + offset[0] * math.sin(heading) + offset[1] * math.cos(heading)))
+        velocity = self.ego.get_velocity()
+        measured_speed = math.hypot(velocity.x, velocity.y)
+        for index, entry in enumerate(lateral):
+            side = entry.get("physical_lane_side")
+            # An executed pass also permits an ordinary abort toward the
+            # original route. That option is part of the same bounded action;
+            # it cannot suddenly accelerate to the unrelated 8 m/s policy.
+            if side not in (target, passing_side, "center"):
+                continue
+            entry.update(maneuver_execution_limit=True,
+                         maneuver_speed_cap_mps=float(maneuver["speed_cap_mps"]))
+            # While a return competes (or is partially executed), an ordinary
+            # path that stays in the passing lane still owes the same return.
+            # Its faster nominal policy cannot drive past the reserved point.
+            if stop is None or side != passing_side:
+                continue
+            path = paths[index]
+            end = max(.1, min(float(path.length), float(path.project(Point(*stop)))))
+            remaining = end - float(path.project(rear))
+            if end < path.length - 1e-6:
+                distances = np.r_[np.arange(0., end, .5), end]
+                paths[index] = self.api.PDMPath(path.interpolate(distances))
+            entry.update(maneuver_stop_world_xy=list(stop),
+                         maneuver_stop_reason="preserve_legal_return_window",
+                         maneuver_limited_path_length_m=float(paths[index].length),
+                         maneuver_wait_hold=bool(remaining <= .75 and measured_speed <= .6),
+                         maneuver_wait_remaining_m=float(remaining))
+
     def plan(self, semantic_decision, semantic_enabled=True, *, semantic_update=False,
              sim_time_s=None, special_situations=()):
         from shapely.geometry import Point
         self.last_visualization_snapshot = None
         timestamp = int(round(self.world.get_snapshot().timestamp.elapsed_seconds * 1e6))
         now = timestamp/1e6 if sim_time_s is None else float(sim_time_s)
+        self.actor_motion.update(self.world, sim_time_s=now)
         state, tf = self._ego_state(timestamp)
         self._bind_lateral_preview(state.dynamic_car_state.speed)
         self._geometry_diagnostics = {"ego_location": {"x": tf.location.x, "y": tf.location.y,
@@ -1309,7 +1365,8 @@ class CarlaPDMPlanner:
                 or self.lane_maneuver.config["enabled"]):
             from .scene_context import build_scene_context
             context = build_scene_context(self.world, self.ego, self.route, now,
-                        reference=self._resolved_route_waypoints, special_situations=special_situations)
+                        reference=self._resolved_route_waypoints, special_situations=special_situations,
+                        motion_history=self.actor_motion)
             if self.experience_memory is not None:
                 memory_evidence = self.experience_memory.retrieve(context)
         # Numerical overtaking is part of the common PDM baseline, including
@@ -1318,7 +1375,8 @@ class CarlaPDMPlanner:
         maneuver = self.lane_maneuver.update(self.world, self.ego,
             self._resolved_route_waypoints, now, context=context,
             current_side=self._geometry_diagnostics["current_side"],
-            route_index=self.route._nearest_index(self.ego.get_location()), candidate_speed_mps=limit)
+            route_index=self.route._nearest_index(self.ego.get_location()), candidate_speed_mps=limit,
+            motion_history=self.actor_motion)
         ordinary_intent = self._continue_ordinary_lane_intent(paths, lateral, state, now, maneuver)
         if maneuver["active"]:
             points = maneuver["points"]
@@ -1342,7 +1400,18 @@ class CarlaPDMPlanner:
                 ("center", maneuver["diagnostics"]["side"]))
             paths.append(fixed_path)
             lateral.append(meta)
-            if maneuver["diagnostics"].get("committed") and not maneuver["diagnostics"].get("conflict"):
+            if maneuver["diagnostics"].get("committed"):
+                if maneuver["phase"] == "passing":
+                    # A candidate that aborts a committed pass must keep the
+                    # original route reference. Rebuilding a 30 m curve from
+                    # the current left-pointing heading can continue moving
+                    # left while its semantic label already says CHANGE_RIGHT.
+                    source_points = np.array([_xy(wp) for wp in self.lane_maneuver._last_reference])
+                    for path_index, entry in enumerate(lateral[:-1]):
+                        if entry["physical_lane_side"] == "center":
+                            source = _lane_offset_points(source_points, float(entry["lane_offset_m"]), self.api)
+                            paths[path_index] = self.api.PDMPath(_path_states(source, self.api))
+                            entry.update(maneuver_geometry_source="fixed_original_route_abort_reference")
                 pending_return = (maneuver["phase"] == "returning"
                                   and maneuver["diagnostics"].get("executed_phase") == "passing")
                 if (pending_return or
@@ -1376,7 +1445,7 @@ class CarlaPDMPlanner:
                         lane_quality_continuing_maneuver=(
                             entry["physical_lane_side"] == meta["physical_lane_side"]
                             and entry["label"] == meta["label"]))
-                if maneuver["phase"] == "returning":
+                if maneuver["phase"] in ("passing", "returning"):
                     # A real curved-road body sweep may need a few decimetres
                     # of compensation inside the target lane. Generate native
                     # alternatives from the same fixed nominal path, rather
@@ -1395,7 +1464,8 @@ class CarlaPDMPlanner:
                             shifted_meta = dict(target, id=identity, lane_offset_m=offset,
                                 transition_length_m=float(maneuver["diagnostics"]["transition_length_m"]),
                                 maneuver_continuation_adjustment=True, maneuver_adjustment_limit_m=room,
-                                maneuver_geometry_source="fixed_nominal_return_lane_offset")
+                                maneuver_geometry_source=("fixed_nominal_return_lane_offset" if
+                                    maneuver["phase"] == "returning" else "fixed_nominal_pass_lane_offset"))
                             if identity in known:
                                 index = known[identity]
                                 paths[index], lateral[index] = shifted_path, shifted_meta
@@ -1403,6 +1473,7 @@ class CarlaPDMPlanner:
                                 known[identity] = len(paths)
                                 paths.append(shifted_path)
                                 lateral.append(shifted_meta)
+        self._apply_maneuver_limits(paths, lateral, maneuver)
         priors = ((memory_evidence or {}).get("parameter_priors", [])
                   if getattr(self, "planning_memory_mode", "off") == "full" else [])
         policies, longitudinal, targets = self._policies(state.dynamic_car_state.speed, limit, priors)

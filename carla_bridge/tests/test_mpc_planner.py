@@ -273,7 +273,7 @@ def test_only_actual_optimized_control_dispatch_updates_previous_desired_input()
 
 @pytest.mark.parametrize("source,audit,tracker,reason", [
     ("direct_brake", {"applied": True, "profile_sample_index": 0}, {}, "direct_brake_reset_desired_input"),
-    ("tracker", {"applied": True, "profile_sample_index": 0}, {"reason": "stationary_hold"},
+    ("tracker", {"applied": False}, {"reason": "stationary_hold"},
         "stationary_hold_zero_desired_acceleration"),
     ("tracker", {"applied": False}, {}, "mpc_control_override_rejected_reset_desired_input"),
     ("tracker", {"applied": True, "profile_sample_index": 8}, {},
@@ -291,6 +291,45 @@ def test_hold_and_interruption_reset_previous_desired_input(source, audit, track
                                      tracker_diagnostics=tracker)
     assert planner._initial_state(1.2)[0].acceleration == 0.
     assert planner._executed_desired_acceleration["source"] == reason
+
+
+@pytest.mark.parametrize("demand", [-2.76863, -1.6, 0., .4])
+def test_valid_optimized_demand_survives_pid_stationary_hold(demand):
+    planner = fixture()
+    diagnostics = {"mpc_tracking": {"accelerations_mps2": [demand]}}
+    planner.record_control_execution(diagnostics, {"applied": True, "profile_sample_index": 0},
+        now_s=1., source="tracker", tracker_diagnostics={"reason": "stationary_hold"})
+    # A same-frame solve cannot consume this dispatch; the following physical
+    # tick must retain it even though actual speed and acceleration are zero.
+    assert planner._initial_state(1.)[0].acceleration == 0.
+    assert planner._initial_state(1.1)[0].acceleration == pytest.approx(demand)
+    previous = planner._steering_state_diagnostics["previous_desired_acceleration"]
+    assert previous["source"] == "dispatched_optimized_desired_acceleration"
+    assert previous["tracker_reason"] == "stationary_hold"
+
+
+def test_r10_brake_history_survives_stop_hold_then_releases_under_the_same_jerk_limit():
+    from carla_bridge.planning.mpc_solver import MPCInitialState, MPCProblem
+    planner = fixture(speed=.15367)
+    previous = -2.76863
+    planner.record_control_execution({"mpc_tracking": {"accelerations_mps2": [previous]}},
+        {"applied": True, "profile_sample_index": 0}, now_s=1., source="tracker",
+        tracker_diagnostics={"reason": "stationary_hold"})
+    initial, _ = planner._initial_state(1.1)
+    assert initial.acceleration == previous
+    # The exact-stop model can continue releasing that negative input after
+    # the vehicle reaches zero. It need not clear the history to become feasible.
+    stopped = MPCInitialState(initial.x, initial.y, initial.yaw, 0., initial.steering, initial.acceleration)
+    planner._speed_limit = planner.max_speed
+    reference = planner._reference("center:STOP", np.array([[-10., 0.], [40., 0.]]), stopped,
+        0., 3.5, {"label": "KEEP_LANE", "semantics": ["KEEP_LANE"],
+                   "longitudinal": "STOP", "desired_speed_mps": 0.})
+    result = planner.solver.solve(MPCProblem(stopped, reference))
+    assert result.feasible, result.diagnostics
+    changes = np.diff(np.r_[previous, result.controls[:, 0]])
+    assert np.max(np.abs(changes)) <= planner.numerical_config.jerk_max*planner.dt+.003
+    assert result.controls[0, 0] <= -1.16863+.003
+    np.testing.assert_allclose(result.states[:, 3], 0., atol=.002)
 
 
 def test_lane_identity_brackets_a_connected_road_seam_without_assuming_an_adjacent_lane():

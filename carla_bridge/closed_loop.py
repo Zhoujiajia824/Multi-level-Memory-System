@@ -437,7 +437,27 @@ class ClosedLoop:
     def _apply_control(self, ego, control, *, source="tracker") -> None:
         native_tracking = None
         mpc_tracking = None
+        minimum_risk_audit = None
         diagnostics = getattr(self, "_last_plan_diagnostics", {}) or {}
+        hold = getattr(self, "_mpc_minimum_risk_hold", None)
+        if source == "tracker" and getattr(self, "planner_backend", None) == "mpc" and hold:
+            # No trajectory is authorized during an explicitly reported
+            # infeasibility. Never execute an older steering/throttle profile,
+            # including on the physics tick between two fresh observations.
+            control = carla.VehicleControl(throttle=0., steer=0., brake=1.)
+            source = "mpc_minimum_risk_hold"
+            if self._elapsed >= hold["episode_deadline_s"]-1e-9:
+                self._early_terminated = True
+                self._termination_reason = "planner_recovery_timeout"
+        if source == "mpc_minimum_risk_hold" and hold:
+            fresh = hold["issued_at_s"] <= self._elapsed < hold["execution_expires_at_s"]-1e-9
+            if not fresh:
+                self._next_pdm_replan_at = 0.
+            minimum_risk_audit = {"contract_version": hold["contract_version"],
+                "observation_lease_fresh": fresh, "issued_at_s": hold["issued_at_s"],
+                "execution_expires_at_s": hold["execution_expires_at_s"],
+                "episode_deadline_s": hold["episode_deadline_s"],
+                "trajectory_validated": False, "optimization_feasible": False}
         if (source == "tracker" and getattr(self, "planner_backend", None) == "pdm_closed"
                 and diagnostics.get("native_tracking", {}).get("active") is True):
             from .planning.native_tracking import override_native_tracking
@@ -470,6 +490,7 @@ class ClosedLoop:
             "tracking": deepcopy(tracking) if source == "tracker" and isinstance(tracking, dict) else None,
             "native_tracking": native_tracking,
             "mpc_tracking": mpc_tracking,
+            "minimum_risk_hold": minimum_risk_audit,
         }
 
     @staticmethod
@@ -590,14 +611,186 @@ class ClosedLoop:
         if decision.get("fallback_used"):
             return {"accepted": False, "reasons": ["rule_fallback_not_executable"], "details": {}}
         diagnostics = decision.get("planner_diagnostics") or {}
+        if (diagnostics.get("minimum_risk_hold") or {}).get("active"):
+            valid = self._valid_mpc_minimum_risk_hold(decision)
+            return {"accepted": False,
+                    "reasons": ["mpc_minimum_risk_hold" if valid else "invalid_mpc_minimum_risk_hold_contract"],
+                    "details": {"minimum_risk_contract_valid": valid,
+                                "execution_mode": "full_brake_reobserve" if valid else None,
+                                "nominal_horizon_validated": False,
+                                "trajectory_validated": False}}
         if self.planner_backend in ("pdm_closed", "mpc") and diagnostics.get("emergency_brake") is True:
             return {"accepted": False, "reasons": ["mpc_emergency_brake" if self.planner_backend == "mpc" else "pdm_emergency_brake"],
                     "details": {"failure_reason": diagnostics.get("failure_reason")}}
-        return self.trajectory_validator.validate(
+        required_horizon = self._execution_horizon
+        degraded = diagnostics.get("degraded_braking") or {}
+        if degraded.get("active"):
+            # Only this explicit, freshly optimized MPC STOP can use a shorter
+            # verified horizon. Ordinary short, stale or unconstrained output
+            # remains a rejected trajectory.
+            from carla_bridge.planning.mpc_planner import (MPC_BRAKING_RECOVERY_MAX_CONTINUOUS_S,
+                                                          MPC_BRAKING_RECOVERY_HORIZON_S,
+                                                          MPC_BRAKING_RECOVERY_POLICY_VERSION)
+            now = getattr(self, "_elapsed", float("nan"))
+            tracking = diagnostics.get("mpc_tracking") or {}
+            chosen = next((c for c in diagnostics.get("candidates", [])
+                           if c.get("id") == diagnostics.get("selected_id")), {})
+            numeric_keys = ("verified_horizon_s", "issued_at_s", "episode_started_s", "episode_deadline_s",
+                            "execution_expires_at_s", "verified_constraint_tolerance",
+                            "verified_constraint_max_violation")
+            finite = all(type(degraded.get(k)) in (int, float) and math.isfinite(degraded[k])
+                         for k in numeric_keys)
+            valid = (finite and self.planner_backend == "mpc" and math.isfinite(now)
+                     and degraded.get("optimization_feasible") is True
+                     and degraded.get("acceleration_policy_passed") is True
+                     and degraded.get("acceleration_policy_version") == MPC_BRAKING_RECOVERY_POLICY_VERSION
+                     and degraded.get("constraints_relaxed") is False
+                     and degraded.get("fresh_snapshot") is True
+                     and decision.get("selected_longitudinal") == "STOP"
+                     and chosen.get("optimization_feasible") is True
+                     and chosen.get("degraded_braking") is True
+                     and chosen.get("safety", {}).get("finite") is True
+                     and tracking.get("active") is True)
+            if valid:
+                valid = (abs(degraded["issued_at_s"]-now) <= 1e-6
+                         and degraded["episode_started_s"] <= now < degraded["episode_deadline_s"]
+                         and degraded["episode_deadline_s"]-degraded["episode_started_s"]
+                             <= MPC_BRAKING_RECOVERY_MAX_CONTINUOUS_S+1e-8
+                         and now+self.fixed_delta <= degraded["execution_expires_at_s"]+1e-8
+                         and tracking.get("issued_at_s") == degraded["issued_at_s"]
+                         and tracking.get("expires_at_s") == degraded["execution_expires_at_s"]
+                         and self._pdm_interval+self.fixed_delta <= degraded["verified_horizon_s"]
+                             <= MPC_BRAKING_RECOVERY_HORIZON_S+1e-8
+                         and chosen.get("verified_horizon_s") == degraded["verified_horizon_s"]
+                         and diagnostics.get("horizon_s") == degraded["verified_horizon_s"]
+                         and abs((chosen.get("solver", {}).get("dt_s", 0)
+                                  *chosen.get("solver", {}).get("horizon_steps", 0))
+                                 -degraded["verified_horizon_s"]) <= 1e-8
+                         and 0 < degraded["verified_constraint_tolerance"] <= .05
+                         and 0 <= degraded["verified_constraint_max_violation"]
+                             <= degraded["verified_constraint_tolerance"])
+            if valid:
+                bounds = degraded.get("acceleration_upper_bounds_mps2")
+                commands = tracking.get("accelerations_mps2")
+                solver_bounds = chosen.get("solver", {}).get("acceleration_upper_bounds_mps2")
+                valid = (isinstance(bounds, list) and isinstance(commands, list)
+                         and isinstance(solver_bounds, list) and len(bounds) == len(commands) > 0
+                         and len(bounds) == len(solver_bounds)
+                         and all(type(v) in (int, float) and math.isfinite(v)
+                                 for values in (bounds, commands, solver_bounds) for v in values))
+                if valid:
+                    tolerance = degraded["verified_constraint_tolerance"]
+                    valid = all(abs(bound-solver_bound) <= 1e-8 and command <= bound+tolerance
+                                for bound, command, solver_bound in zip(bounds, commands, solver_bounds))
+            if not valid:
+                return {"accepted": False, "reasons": ["invalid_mpc_braking_recovery_contract"], "details": {}}
+            required_horizon = degraded["verified_horizon_s"]
+        result = self.trajectory_validator.validate(
             decision.get("trajectory"), decision.get("target_speed"),
-            (kf.get("ego_state") or {}).get("speed", 0.0), self._execution_horizon,
+            (kf.get("ego_state") or {}).get("speed", 0.0), required_horizon,
             use_speed_profile=self.planner_backend in ("pdm_closed", "mpc"),
         ).to_dict()
+        if degraded.get("active"):
+            result["details"]["execution_mode"] = "verified_short_horizon_braking"
+            result["details"]["nominal_horizon_validated"] = False
+        return result
+
+    def _valid_mpc_minimum_risk_hold(self, decision):
+        """Recognize a bounded control state, never a collision-free trajectory."""
+        from .planning.mpc_planner import (MPC_MINIMUM_RISK_HOLD_POLICY_VERSION,
+            MPC_MINIMUM_RISK_HOLD_LIFETIME_S, MPC_BRAKING_RECOVERY_MAX_CONTINUOUS_S,
+            MPC_BRAKING_RECOVERY_HORIZON_LEVELS_S, MPC_BRAKING_RECOVERY_HORIZON_S)
+        d = decision.get("planner_diagnostics") or {}
+        h, recovery = d.get("minimum_risk_hold") or {}, d.get("degraded_braking") or {}
+        now = getattr(self, "_elapsed", float("nan"))
+        numeric = ("issued_at_s", "execution_expires_at_s", "episode_started_s",
+                   "episode_deadline_s", "max_continuous_s", "nominal_horizon_s", "verified_horizon_s")
+        if not (self.planner_backend == "mpc" and math.isfinite(now)
+                and h.get("active") is True
+                and h.get("contract_version") == MPC_MINIMUM_RISK_HOLD_POLICY_VERSION
+                and h.get("reason") == "all_finite_full_and_short_horizon_solutions_infeasible"
+                and h.get("actuation") == "full_brake_reobserve"
+                and h.get("optimization_feasible") is False and h.get("trajectory_accepted") is False
+                and h.get("constraints_relaxed") is False and h.get("fresh_snapshot") is True
+                and d.get("emergency_brake") is True and d.get("failure_reason") == "no_feasible_mpc_solution"
+                and decision.get("trajectory") == [] and decision.get("target_speed") == 0.
+                and recovery.get("active") is False
+                and all(type(h.get(k)) in (int, float) and math.isfinite(h[k]) for k in numeric)):
+            return False
+        if not (abs(h["issued_at_s"]-now) <= 1e-6
+                and h["episode_started_s"] <= now < h["execution_expires_at_s"] <= h["episode_deadline_s"]
+                and now+self.fixed_delta <= h["execution_expires_at_s"]+1e-8
+                and h["execution_expires_at_s"]-now <= MPC_MINIMUM_RISK_HOLD_LIFETIME_S+1e-8
+                and h["episode_deadline_s"]-h["episode_started_s"] <= MPC_BRAKING_RECOVERY_MAX_CONTINUOUS_S+1e-8
+                and h["max_continuous_s"] == MPC_BRAKING_RECOVERY_MAX_CONTINUOUS_S
+                and h["verified_horizon_s"] == 0.
+                and h["nominal_horizon_s"] == d.get("horizon_s")
+                and all(h[k] == recovery.get(k) for k in
+                        ("issued_at_s", "episode_started_s", "episode_deadline_s"))):
+            return False
+        candidates, attempts = d.get("candidates") or [], recovery.get("attempts") or []
+        levels = recovery.get("available_horizon_levels_s") or []
+        if not (isinstance(candidates, list) and isinstance(attempts, list) and isinstance(levels, list)
+                and candidates and attempts and levels
+                and all(isinstance(c, dict) for c in candidates+attempts)
+                and all(type(n) in (int, float) and math.isfinite(n) for n in levels)
+                and all(isinstance(a.get("reference_id"), str)
+                        and type(a.get("verified_horizon_s")) in (int, float)
+                        and math.isfinite(a["verified_horizon_s"]) for a in attempts)
+                and h.get("full_horizon_candidate_count") == len(candidates)
+                and h.get("short_horizon_attempt_count") == len(attempts)
+                and h.get("attempted_horizon_levels_s") == recovery.get("attempted_horizon_levels_s") == levels
+                and set(levels) == {a.get("verified_horizon_s") for a in attempts}):
+            return False
+        provenance = d.get("provenance") or {}
+        config = provenance.get("numerical_config") if isinstance(provenance, dict) else None
+        if not isinstance(config, dict):
+            return False
+        dt, samples = config.get("dt"), config.get("horizon_steps")
+        if not (type(dt) in (int, float) and math.isfinite(dt) and 0 < dt <= .5
+                and type(samples) is int and samples >= 2):
+            return False
+        step_levels = []
+        for requested in MPC_BRAKING_RECOVERY_HORIZON_LEVELS_S:
+            steps = int(math.floor(min(requested, MPC_BRAKING_RECOVERY_HORIZON_S)/dt+1e-9))
+            if 2 <= steps < samples and steps not in step_levels and steps*dt < h["nominal_horizon_s"]-1e-9:
+                step_levels.append(steps)
+        if levels != [steps*dt for steps in step_levels]:
+            return False
+        def finite_infeasible(item):
+            solver = item.get("solver") or {}
+            if not isinstance(solver, dict):
+                return False
+            v, tolerance = solver.get("max_constraint_violation"), solver.get("constraint_tolerance")
+            return (item.get("optimization_feasible") is False
+                and all(type(n) in (int, float) and math.isfinite(n) for n in (v, tolerance))
+                and 0 < tolerance <= .05 and v > tolerance)
+        from collections import Counter
+        stops = [c.get("id") for c in candidates if c.get("longitudinal") == "STOP"]
+        if not stops or any(not isinstance(name, str) for name in stops):
+            return False
+        expected = Counter((name+"@verified_braking", level) for name in stops for level in levels)
+        actual = Counter((a.get("reference_id"), a.get("verified_horizon_s")) for a in attempts)
+        return (expected == actual
+                and all(isinstance(c.get("safety"), dict)
+                        and c["safety"].get("finite") is True and finite_infeasible(c) for c in candidates)
+                and all(a.get("finite_result") is True and finite_infeasible(a) for a in attempts))
+
+    def _execute_mpc_minimum_risk_hold(self, decision, validation, tf, yaw):
+        if (validation.get("details") or {}).get("minimum_risk_contract_valid") is not True:
+            return False
+        self._mpc_minimum_risk_hold = deepcopy(decision["planner_diagnostics"]["minimum_risk_hold"])
+        self.tracker.set_trajectory([], tf.location.x, tf.location.y, yaw, 0.)
+        self._planned_stop = True
+        self._apply_control(self.scenario.ego_vehicle,
+            carla.VehicleControl(throttle=0., steer=0., brake=1.), source="mpc_minimum_risk_hold")
+        memory = getattr(self, "experience_memory", None)
+        if memory is not None:
+            memory.finish("planner_minimum_risk_hold")
+            self._experience_signature = None
+        logger.warning("MPC 暂无约束可行轨迹，最小风险制动并重新观测（非可行轨迹，恢复预算剩余 %.1fs）",
+                       self._mpc_minimum_risk_hold["episode_deadline_s"]-self._elapsed)
+        return True
 
     def _is_planned_stop(self, decision: dict) -> bool:
         if self.planner_backend not in ("pdm_closed", "mpc"):
@@ -631,7 +824,7 @@ class ClosedLoop:
         result = self._merge_plan(decision, semantic, plan)
         validation = self._validate_decision(result, kf)
         self._audit_pdm_plan(result, validation, "semantic_update")
-        if validation["accepted"]:
+        if validation["accepted"] or (validation.get("details") or {}).get("minimum_risk_contract_valid"):
             self._active_semantics = semantic
             self._next_pdm_replan_at = self._elapsed + self._pdm_interval
         return result
@@ -691,7 +884,13 @@ class ClosedLoop:
         if stats is not None:
             baseline_id = diagnostics.get("original_baseline_selected_id", diagnostics.get("baseline_selected_id"))
             changed = diagnostics.get("selected_id") != baseline_id
-            if changed and self.semantic_influence:
+            degraded_braking = bool((diagnostics.get("degraded_braking") or {}).get("active"))
+            minimum_risk_hold = bool((validation.get("details") or {}).get("minimum_risk_contract_valid"))
+            if minimum_risk_hold:
+                stats["minimum_risk_hold_plans"] = stats.get("minimum_risk_hold_plans", 0) + 1
+            if degraded_braking:
+                stats["degraded_braking_plans"] = stats.get("degraded_braking_plans", 0) + 1
+            if changed and self.semantic_influence and not degraded_braking and not minimum_risk_hold:
                 stats["semantic_changed_plans"] += 1
             if diagnostics.get("shadow_selected_id") != diagnostics.get("baseline_selected_id") and diagnostics.get("shadow_only"):
                 stats["shadow_changed_plans"] += 1
@@ -738,6 +937,10 @@ class ClosedLoop:
         if memory is None:
             return
         d = decision.get("planner_diagnostics") or {}
+        if (d.get("degraded_braking") or {}).get("active"):
+            memory.finish("planner_degraded_braking")
+            self._experience_signature = None
+            return
         context = d.get("planner_context")
         candidate = next((c for c in d.get("candidates", []) if c["id"] == d.get("selected_id")), None)
         if not context or not candidate:
@@ -780,8 +983,12 @@ class ClosedLoop:
 
     def _refresh_pdm_control(self, tf, yaw: float, speed: float) -> None:
         """Replan against current actors between expensive semantic VLM calls."""
+        hold = getattr(self, "_mpc_minimum_risk_hold", None)
+        if hold and self._elapsed >= hold["execution_expires_at_s"]-1e-9:
+            self._next_pdm_replan_at = 0.
         if (self.planner_backend not in ("pdm_closed", "mpc") or (self.model_inference and self._active_semantics is None
-                and not getattr(self, "_selective_execution", False))
+                and not getattr(self, "_selective_execution", False)
+                and not getattr(self, "_mpc_minimum_risk_hold", None))
                 or self._elapsed + 1e-8 < self._next_pdm_replan_at):
             return
         self._next_pdm_replan_at = self._elapsed + self._pdm_interval
@@ -790,13 +997,20 @@ class ClosedLoop:
             result = self._merge_plan({}, self._active_semantics, plan)
             validation = self._validate_decision(result, {"ego_state": {"speed": speed}})
             self._audit_pdm_plan(result, validation, "control_update")
+            if self._execute_mpc_minimum_risk_hold(result, validation, tf, yaw):
+                return
             if not validation["accepted"]:
+                if (result.get("planner_diagnostics") or {}).get("failure_reason") == "planner_recovery_timeout":
+                    self._early_terminated = True
+                    self._termination_reason = "planner_recovery_timeout"
                 raise ValueError("%s trajectory rejected: %s" % (self.planner_backend, validation["reasons"]))
+            self._mpc_minimum_risk_hold = None
             self.tracker.set_trajectory(result["trajectory"], tf.location.x, tf.location.y, yaw,
                                         result["target_speed"], follow_speed_profile=True)
             self._planned_stop = self._is_planned_stop(result)
             self._consecutive_trajectory_rejections = 0
         except Exception as exc:
+            self._mpc_minimum_risk_hold = None
             # Apply the brake before attempting further logging: a full disk or
             # broken audit path must never leave the previous throttle applied.
             self._apply_brake()
@@ -806,7 +1020,8 @@ class ClosedLoop:
             self._consecutive_trajectory_rejections += 1
             self._audit_pdm_error(exc, self._active_semantics, "control_error")
             logger.error("%s control update failed; braking: %s", self.planner_backend, exc)
-            if self._consecutive_trajectory_rejections >= int(self.ccfg.get("max_trajectory_rejections", 3)):
+            if (self._consecutive_trajectory_rejections >= int(self.ccfg.get("max_trajectory_rejections", 3))
+                    and not self._early_terminated):
                 self._early_terminated = True
                 self._termination_reason = "invalid_trajectory"
 
@@ -935,8 +1150,14 @@ class ClosedLoop:
             self._last_nav = kf["nav_instruction"]
             validation = record.get("decision_validation") or {}
             decision = record.get("decision_output") or {}
+            tf = ego.get_transform()
+            yaw = coords.carla_yaw_deg_to_rad(tf.rotation.yaw)
+            if self._execute_mpc_minimum_risk_hold(decision, validation, tf, yaw):
+                self._audit_advisory("minimum_risk_hold", query)
+                return
             if validation.get("accepted") is not True:
                 raise ValueError("advisory rejected: %s" % validation.get("reasons", ["missing_validation"]))
+            self._mpc_minimum_risk_hold = None
             tf, v = ego.get_transform(), ego.get_velocity()
             yaw = coords.carla_yaw_deg_to_rad(tf.rotation.yaw)
             self.tracker.set_trajectory(decision["trajectory"], tf.location.x, tf.location.y, yaw,
@@ -1133,19 +1354,29 @@ class ClosedLoop:
             decision = (record or {}).get("decision_output") or {}
             validation = (record or {}).get("decision_validation") or {}
             accepted = validation.get("accepted") is True
-            if accepted:
+            minimum_risk = self._execute_mpc_minimum_risk_hold(decision, validation, tf, ego_yaw)
+            if minimum_risk:
+                traj, target_speed = [], 0.
+            elif accepted:
+                self._mpc_minimum_risk_hold = None
                 self._consecutive_trajectory_rejections = 0
                 traj = decision.get("trajectory") or []
                 target_speed = float(decision.get("target_speed", 0.0) or 0.0)
                 self._planned_stop = self._is_planned_stop(decision)
             else:
+                self._mpc_minimum_risk_hold = None
+                recovery_timeout = (decision.get("planner_diagnostics") or {}).get("failure_reason") == "planner_recovery_timeout"
+                if recovery_timeout:
+                    self._early_terminated = True
+                    self._termination_reason = "planner_recovery_timeout"
                 self.advisory_stats["model_failures"] += 1
                 traj, target_speed = [], 0.0
                 self._planned_stop = True
                 self._trajectory_rejections += 1
                 self._consecutive_trajectory_rejections += 1
                 logger.error("轨迹被拒绝，本周期全刹: %s", validation.get("reasons", ["missing_validation"]))
-                if self._consecutive_trajectory_rejections >= int(self.ccfg.get("max_trajectory_rejections", 3)):
+                if (self._consecutive_trajectory_rejections >= int(self.ccfg.get("max_trajectory_rejections", 3))
+                        and not self._early_terminated):
                     self._early_terminated = True
                     self._termination_reason = "invalid_trajectory"
             self.tracker.set_trajectory(
@@ -1283,6 +1514,13 @@ class ClosedLoop:
             self._experience_jerk = (math.hypot(a.x-previous[1], a.y-previous[2])/(self._elapsed-previous[0])
                                     if previous and self._elapsed > previous[0] else None)
             self._experience_kinematics = (self._elapsed, a.x, a.y)
+            previous_command = getattr(self, "_last_control_command", {}) or {}
+            if (previous_command.get("source") == "mpc_minimum_risk_hold"
+                    and getattr(self, "_minimum_risk_measured_at_s", None) != self._elapsed):
+                self._minimum_risk_measured_at_s = self._elapsed
+                stats = self.advisory_stats
+                stats["minimum_risk_hold_ticks"] = stats.get("minimum_risk_hold_ticks", 0) + 1
+                stats["minimum_risk_hold_s"] = stats.get("minimum_risk_hold_s", 0.) + self.fixed_delta
             if self.metrics is not None:
                 self.metrics.on_tick(ego, self._elapsed, state)
             memory = getattr(self, "experience_memory", None)

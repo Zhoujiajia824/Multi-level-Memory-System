@@ -1,0 +1,111 @@
+{
+  "source": "physical_001847:3.3s, isolated Town05 slow walker, no other traffic, green signals",
+  "timestamp_s": 3.3,
+  "map_sha256": "7edc53b0be840e177598da7a4ed9571146d7b2595ce280d154c90f92e8a48851",
+  "pose": {
+    "x": -131.67445373535156,
+    "y": -74.43431854248047,
+    "z": 0.001,
+    "yaw_rad": 1.5758886902732916
+  },
+  "vehicle": {
+    "wheelbase_m": 3.0046436441953355,
+    "max_steer_rad": 1.0005280815533433,
+    "physical_inner_max_steer_rad": 1.2217303432379762,
+    "front_track_m": 1.6668361754700811,
+    "steering_mapping": "physx_perfect_ackermann",
+    "width_m": 2.163450002670288,
+    "length_m": 4.791779518127441,
+    "bounding_box_offset_xyz": [
+      0.02921946719288826,
+      4.391670245240675e-06,
+      0.7358605265617371
+    ],
+    "rear_axle_to_center_m": 1.415635748435926,
+    "rear_axle_to_center_source": "carla_world_wheel_positions",
+    "measured_rear_axle_to_center_m": 1.415635748435926,
+    "rear_axle_actor_xyz_m": [
+      -1.3864162812430378,
+      -8.119362462366553e-07,
+      0.37574903475120663
+    ],
+    "planning_rear_axle_actor_xyz_m": [
+      -1.3864162812430378,
+      4.391670245240675e-06,
+      0.37574903475120663
+    ]
+  },
+  "measured": {
+    "speed": 1.5868097773158292,
+    "velocity_x": -0.00916843768209219,
+    "velocity_y": 1.5867832899093628,
+    "speed_longitudinal_mps": 1.5868094044055614,
+    "acceleration": 0.12729383662637583,
+    "acceleration_x": -0.0018931273370981216,
+    "acceleration_y": 0.12727975845336914,
+    "yaw_rad": 1.5758886902732916,
+    "x": -131.67445373535156,
+    "y": -74.43431854248047,
+    "acceleration_longitudinal_mps2": 0.12728774858788114,
+    "acceleration_lateral_mps2": 0.0012449507985576019
+  },
+  "steering_state": {
+    "source": "carla_measured_front_wheels",
+    "front_left_deg": 0.07071957737207413,
+    "front_right_deg": 0.07076803594827652,
+    "command_estimate_bicycle_rad": -0.0012345786294089033,
+    "bicycle_angle_rad": -0.0012347122067805178,
+    "normalized_command": 0.0010405844077467918,
+    "input_latency_modeled": false
+  },
+  "applied_control": {
+    "throttle": 0.17311237752437592,
+    "brake": 0.0,
+    "steer": 0.0010405844077467918,
+    "gear": 1,
+    "reverse": false,
+    "hand_brake": false
+  },
+  "steering_curve_kmh_scale": [
+    [
+      0.0,
+      1.0
+    ],
+    [
+      20.0,
+      0.8999999761581421
+    ],
+    [
+      60.0,
+      0.800000011920929
+    ],
+    [
+      120.0,
+      0.699999988079071
+    ]
+  ],
+  "blocker": {
+    "id": "390",
+    "x": -131.72900390625,
+    "y": 66.89124298095703,
+    "heading": -1.577664619246211,
+    "vx": -0.004882812500795801,
+    "vy": -0.699997860192829,
+    "length": 0.3753577768802643,
+    "width": 0.3753577768802643
+  },
+  "route_xy": [
+    [
+      -131.65994262695312,
+      -76.91111755371094
+    ],
+    [
+      -132.06150817871094,
+      -12.847732543945312
+    ]
+  ],
+  "route_progress": {
+    "index": 0,
+    "fraction": 0.04
+  }
+}

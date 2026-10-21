@@ -130,3 +130,25 @@ def test_maneuver_velocity_group_keeps_ordinary_native_profiles_exact_and_stop_i
     assert [manager[i].proposal_idx for i in range(len(manager))] == list(range(len(manager)))
     assert all(manager[i].longitudinal_idx < 8 for i in range(size))
     assert all(manager[i].longitudinal_idx >= 8 for i in range(size, len(manager)))
+
+
+def test_committed_ordinary_continuation_obeys_explicit_execution_cap_without_forging_identity():
+    import numpy as np
+    planner = make_planner(speed=1., length=160)
+    state, tf = planner._ego_state(2_000_000)
+    planner._geometry_diagnostics = {}
+    paths, lateral, centerline, area, lanes, excluded = planner._road_geometry(state)
+    policies, labels, targets = planner._policies(1., 8.)
+    observation = planner.api.PDMObservation(planner.sampling, planner.sampling, planner.map_radius)
+    observation.update(state, planner._observed_actors(2_000_000, tf), {}, lanes)
+    bounded = dict(lateral[0], id="ordinary_committed_return", maneuver=False,
+        maneuver_execution_limit=True, maneuver_speed_cap_mps=1.4154)
+    manager, new_labels, new_targets, sources = maneuver_proposal_manager(planner.api,
+        paths + [paths[0]], lateral + [bounded], policies, labels, targets)
+    result = planner.generator.generate_proposals(state, observation, manager)
+    count = len(paths) * len(labels)
+    assert len(result) == count + len(labels)
+    assert np.max(planner.generator._state_idm_array[count:, :, 1]) <= 1.4154 + 1e-6
+    assert max(new_targets[len(labels):]) <= 1.4154
+    assert not bounded["maneuver"]
+    assert all(manager[i].longitudinal_idx >= len(labels) for i in range(count, len(manager)))

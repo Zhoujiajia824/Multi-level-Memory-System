@@ -75,9 +75,13 @@ def execution_planner_version(planning, controller=None, *, vehicle_model=None):
     numeric.update(lateral_control=planning.get("lateral_control", "pure_pursuit"),
                    lqr_lateral_preview=planning.get("lqr_lateral_preview", "fixed"))
     from .lane_quality import validate_lane_quality_config
-    from .lane_maneuver import validate_maneuver_config
+    from .lane_maneuver import validate_maneuver_config, MANEUVER_GEOMETRY_VERSION
+    from .actor_motion import validate_motion_config, MOTION_MODEL_VERSION
     numeric["lane_quality"] = validate_lane_quality_config(planning.get("lane_quality"))
     numeric["lane_maneuver"] = validate_maneuver_config(planning.get("lane_maneuver"))
+    numeric["maneuver_geometry_version"] = MANEUVER_GEOMETRY_VERSION
+    numeric["actor_motion"] = validate_motion_config(planning.get("actor_motion"))
+    numeric["motion_model_version"] = MOTION_MODEL_VERSION
     effective_controller = {"wheelbase_m": 2.8, "max_steer_rad": .6,
         "lookahead_min_m": 3.0, "lookahead_max_m": 12.0, "lookahead_k": .5, "steer_sign": -1,
         **{key: value for key, value in controller.items() if key != "pid"}}
@@ -98,16 +102,35 @@ def execution_planner_version(planning, controller=None, *, vehicle_model=None):
 
     if planning.get("backend") == "mpc":
         from dataclasses import asdict
-        from .mpc_planner import effective_mpc_config
+        from .mpc_solver import MPC_COLLISION_GEOMETRY_VERSION, MPC_SOLVE_POLICY_VERSION
+        from .mpc_planner import (effective_mpc_config, MPC_BRAKING_RECOVERY_HORIZON_S,
+                                  MPC_BRAKING_RECOVERY_MAX_CONTINUOUS_S, MPC_BRAKING_RECOVERY_POLICY_VERSION,
+                                  MPC_BRAKING_RECOVERY_HORIZON_LEVELS_S,
+                                  MPC_MINIMUM_RISK_HOLD_POLICY_VERSION, MPC_MINIMUM_RISK_HOLD_LIFETIME_S)
         numerical = {"backend": "mpc", "mpc": asdict(effective_mpc_config(planning)),
             "replan_interval_s": float(planning.get("replan_interval_s", .2)),
             "max_speed_mps": float(planning.get("max_speed_mps", 8.)),
-            "lane_quality": numeric["lane_quality"], "lane_maneuver": numeric["lane_maneuver"]}
-        return "carla_mpc_execution_v1:" + _digest(canonical({
+            "lane_quality": numeric["lane_quality"], "lane_maneuver": numeric["lane_maneuver"],
+            "maneuver_geometry_version": MANEUVER_GEOMETRY_VERSION,
+            "actor_motion": numeric["actor_motion"], "motion_model_version": MOTION_MODEL_VERSION,
+            "longitudinal_dynamics_version": "forward_only_exact_within_step_braking_stop_v1",
+            "stationary_hold_objective_version": "measured_rear_pose_road_constraints_v1",
+            "collision_geometry_version": MPC_COLLISION_GEOMETRY_VERSION,
+            "solve_policy_version": MPC_SOLVE_POLICY_VERSION,
+            "braking_recovery": {"verified_horizon_s": MPC_BRAKING_RECOVERY_HORIZON_S,
+                "horizon_levels_s": list(MPC_BRAKING_RECOVERY_HORIZON_LEVELS_S),
+                "max_continuous_s": MPC_BRAKING_RECOVERY_MAX_CONTINUOUS_S,
+                "acceleration_policy_version": MPC_BRAKING_RECOVERY_POLICY_VERSION},
+            "minimum_risk_hold": {"contract_version": MPC_MINIMUM_RISK_HOLD_POLICY_VERSION,
+                "lifetime_s": MPC_MINIMUM_RISK_HOLD_LIFETIME_S,
+                "max_continuous_s": MPC_BRAKING_RECOVERY_MAX_CONTINUOUS_S,
+                "shares_verified_braking_episode": True, "trajectory_accepted": False,
+                "actuation": "full_brake_reobserve"}}
+        return "carla_mpc_execution_v2:" + _digest(canonical({
             "planning": numerical, "controller": effective_controller,
             "vehicle_model": vehicle_model}))
 
-    return "carla_pdm_execution_v5:" + _digest(canonical({"planning": numeric,
+    return "carla_pdm_execution_v6:" + _digest(canonical({"planning": numeric,
                                                          "controller": effective_controller}))
 
 

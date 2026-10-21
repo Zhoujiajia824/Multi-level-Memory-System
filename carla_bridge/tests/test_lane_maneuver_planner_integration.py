@@ -54,8 +54,8 @@ def test_executed_pdm_without_model_commits_the_actual_selected_bypass_geometry(
         return np.array([[p.x, p.y] for p in
             planner._evaluated_lateral_paths[candidate["lateral_path_index"]].discrete_path])
     np.testing.assert_array_equal(coordinates(canonical), coordinates(fixed))
-    assert canonical["desired_speed_mps"] == 8.  # Ordinary policy was not capped.
-    # Per-path cap is explicit evidence; ordinary targets are untouched.
+    assert canonical["desired_speed_mps"] <= repeat["lane_maneuver"]["speed_cap_mps"]
+    # Before any execution commitment the unrelated ordinary pool is intact.
     ordinary = [item for item in diagnostics["candidates"] if not item["maneuver"]]
     assert max(item["desired_speed_mps"] for item in ordinary) == 8.
     fixed = [item for item in diagnostics["candidates"] if item["maneuver"]]
@@ -104,8 +104,11 @@ def test_executed_geometry_continues_independently_of_fixed_or_generic_provenanc
     canonical = next(c for c in diagnostics["candidates"] if c["id"] == "left:ACCELERATE")
     fixed = next(c for c in diagnostics["candidates"] if c["maneuver"])
     assert canonical["maneuver_geometry_source"] == "actual_selected_map_anchor"
-    assert planner._evaluated_lateral_paths[canonical["lateral_path_index"]] is (
-        planner._evaluated_lateral_paths[fixed["lateral_path_index"]])
+    canonical_path = planner._evaluated_lateral_paths[canonical["lateral_path_index"]]
+    fixed_path = planner._evaluated_lateral_paths[fixed["lateral_path_index"]]
+    np.testing.assert_array_equal(
+        [[p.x, p.y] for p in canonical_path.discrete_path],
+        [[p.x, p.y] for p in fixed_path.discrete_path])
     np.testing.assert_array_equal(planner.lane_maneuver._active["points"], anchored)
 
 
@@ -123,7 +126,7 @@ def test_verified_pending_return_canonical_geometry_competes_before_execution_co
     a = planner._evaluated_lateral_paths[canonical["lateral_path_index"]]
     b = planner._evaluated_lateral_paths[fixed["lateral_path_index"]]
     assert a is b
-    assert canonical["desired_speed_mps"] == 8.
+    assert canonical["desired_speed_mps"] <= diagnostics["lane_maneuver"]["speed_cap_mps"]
     assert diagnostics["lane_maneuver"]["executed_phase"] == "passing"
     # A fresh proposal is never labelled as executed before actual selection.
     selected = next(c for c in diagnostics["candidates"] if c["id"] == diagnostics["selected_id"])

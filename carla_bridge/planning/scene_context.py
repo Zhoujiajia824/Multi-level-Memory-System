@@ -1,13 +1,14 @@
 """Current, route-relative evidence for advisory planning (never a safety oracle).
 
-Only CARLA's current state and an ordered map route are used. Constant-velocity
-conflicts are explicit proxies; they are not ground-truth future trajectories.
+Only CARLA's current/past state and an ordered map route are used. Connected-road
+and observed-motion forecasts are proxies, never ground-truth future trajectories.
 The context authorizes semantic advice, and does not veto native PDM proposals.
 """
 from __future__ import annotations
 
 import hashlib
 import math
+from bisect import bisect_right
 
 
 def lane_key(wp):
@@ -42,8 +43,31 @@ def point_at(station, points):
     return points[-1]
 
 
+def _predicted_body_at(actor_prediction, time_s, actor_xy, actor_velocity, actor_yaw=0.):
+    """Interpolate one explicit shared prediction, or preserve legacy CV calls."""
+    if actor_prediction is None:
+        return (actor_xy[0]+actor_velocity[0]*time_s,
+                actor_xy[1]+actor_velocity[1]*time_s, actor_yaw, 0.)
+    times = actor_prediction["times_s"]
+    centers = actor_prediction["centers_world_xy_m"]
+    yaws = actor_prediction["body_yaws_rad"]
+    margins = actor_prediction.get("uncertainty_margin_m", [0.]*len(times))
+    if not times or not (len(times) == len(centers) == len(yaws) == len(margins)):
+        raise ValueError("actor_prediction samples must have matching times/centers/headings")
+    right = min(len(times)-1, bisect_right(times, time_s))
+    left = max(0, right-1)
+    span = float(times[right]-times[left])
+    fraction = max(0., min(1., (time_s-times[left])/span)) if span > 0 else 0.
+    yaw_step = math.atan2(math.sin(yaws[right]-yaws[left]), math.cos(yaws[right]-yaws[left]))
+    return (centers[left][0]+fraction*(centers[right][0]-centers[left][0]),
+            centers[left][1]+fraction*(centers[right][1]-centers[left][1]),
+            yaws[left]+fraction*yaw_step,
+            margins[left]+fraction*(margins[right]-margins[left]))
+
+
 def constant_velocity_conflict(ego_station, speed, points, actor_xy, actor_velocity,
-                               ego_radius=1.2, actor_radius=1.2, horizon_s=4.0):
+                               ego_radius=1.2, actor_radius=1.2, horizon_s=4.0,
+                               *, actor_prediction=None):
     """Whether occupied envelopes meet at the SAME sampled future time.
 
     Longitudinal extents are deliberately not collapsed into bounding circles:
@@ -57,18 +81,19 @@ def constant_velocity_conflict(ego_station, speed, points, actor_xy, actor_veloc
         station = ego_station+travel_speed*t
         ex, ey = point_at(station, points)
         tangent = project_polyline(ex, ey, points)[2]
-        ax, ay = actor_xy[0]+actor_velocity[0]*t, actor_xy[1]+actor_velocity[1]*t
+        ax, ay, _, uncertainty = _predicted_body_at(actor_prediction, t, actor_xy, actor_velocity)
         dx, dy = ax-ex, ay-ey
         longitudinal = abs(dx*math.cos(tangent)+dy*math.sin(tangent))
         lateral = abs(-dx*math.sin(tangent)+dy*math.cos(tangent))
-        if longitudinal < 4.5 and lateral < ego_radius+actor_radius+.15:
+        if longitudinal < 4.5+uncertainty and lateral < ego_radius+actor_radius+.15+uncertainty:
             return True, t
     return False, None
 
 
 def occupied_body_conflict(ego_xy, ego_velocity, ego_yaw, ego_extent,
-                          actor_xy, actor_velocity, actor_yaw, actor_extent):
-    """Two-second constant-heading body overlap using measured ego velocity.
+                          actor_xy, actor_velocity, actor_yaw, actor_extent,
+                          *, actor_prediction=None):
+    """Two-second body overlap using the same actor forecast as the planner.
 
     The route forecast above deliberately asks what could happen IF a stopped
     car proceeded. That is useful before entering a junction, but it must not
@@ -77,16 +102,18 @@ def occupied_body_conflict(ego_xy, ego_velocity, ego_yaw, ego_extent,
     It is neither a safety veto nor privileged knowledge of future motion.
     """
     ex, ey = math.cos(ego_yaw), math.sin(ego_yaw)
-    ax, ay = math.cos(actor_yaw), math.sin(actor_yaw)
-    axes = ((ex, ey), (-ey, ex), (ax, ay), (-ay, ax))
     for step in range(9):
         t = step * .25
-        dx = actor_xy[0] + actor_velocity[0]*t - ego_xy[0] - ego_velocity[0]*t
-        dy = actor_xy[1] + actor_velocity[1]*t - ego_xy[1] - ego_velocity[1]*t
+        px, py, predicted_yaw, uncertainty = _predicted_body_at(
+            actor_prediction, t, actor_xy, actor_velocity, actor_yaw)
+        ax, ay = math.cos(predicted_yaw), math.sin(predicted_yaw)
+        axes = ((ex, ey), (-ey, ex), (ax, ay), (-ay, ax))
+        dx = px - ego_xy[0] - ego_velocity[0]*t
+        dy = py - ego_xy[1] - ego_velocity[1]*t
         if all(abs(dx*ux+dy*uy) <= (
                 ego_extent[0]*abs(ex*ux+ey*uy) + ego_extent[1]*abs(-ey*ux+ex*uy)
                 + actor_extent[0]*abs(ax*ux+ay*uy) + actor_extent[1]*abs(-ay*ux+ax*uy)
-                + .15) for ux, uy in axes):
+                + .15 + uncertainty) for ux, uy in axes):
             return True, t
     return False, None
 
@@ -248,7 +275,8 @@ def _overtaking_context(result, current, local, ego, carla_map, ego_route_aligne
         "execution_authorized": False}
 
 
-def build_scene_context(world, ego, route, sim_time_s, *, reference=None, special_situations=()):
+def build_scene_context(world, ego, route, sim_time_s, *, reference=None, special_situations=(),
+                        motion_history=None):
     tf, velocity = ego.get_transform(), ego.get_velocity()
     location = tf.location
     speed = math.hypot(velocity.x, velocity.y)
@@ -276,7 +304,10 @@ def build_scene_context(world, ego, route, sim_time_s, *, reference=None, specia
                          and math.cos(heading-ego_projection[2]) > .8)
     route_keys = {lane_key(wp) for wp in local}
     road_limit = float(ego.get_speed_limit())/3.6
-    result = {"schema_version": 1, "source": "CARLA_GT_route_constant_velocity_proxy",
+    prediction_kind = ("connected_lane_observed_turn_rate_and_following_response_not_future_GT" if motion_history is not None
+                       else "constant_velocity_proxy_not_future_GT")
+    result = {"schema_version": 1, "source": "CARLA_GT_route_observed_motion_proxy" if motion_history is not None
+              else "CARLA_GT_route_constant_velocity_proxy",
               "sim_time_s": float(sim_time_s), "ego_speed_mps": speed,
               "route_progress_m": float(route.distance_completed_m()),
               "in_junction": bool(current and current.is_junction),
@@ -284,11 +315,12 @@ def build_scene_context(world, ego, route, sim_time_s, *, reference=None, specia
               "speed_limit_mps": road_limit, "signals": [], "actors": [],
               "special_situations": sorted(set(special_situations)),
               "blocked": False, "baseline_stop_expected": False,
-              "prediction_kind": "constant_velocity_proxy_not_future_GT"}
+              "prediction_kind": prediction_kind}
     weather = world.get_weather()
     if float(weather.fog_density) >= 40:
         result["special_situations"] = sorted(set(result["special_situations"]+["limited_visibility_fog"]))
-    for actor in world.get_actors():
+    current_actors = tuple(world.get_actors())
+    for actor in current_actors:
         if actor.id == ego.id:
             continue
         kind = actor.type_id
@@ -314,7 +346,8 @@ def build_scene_context(world, ego, route, sim_time_s, *, reference=None, specia
         distance = math.hypot(p.x-location.x, p.y-location.y)
         if distance > 65 or abs(p.z-location.z) > 2.5:
             continue
-        v = actor.get_velocity()
+        motion = motion_history.motion_for(actor) if motion_history is not None else None
+        v = motion.velocity if motion is not None else actor.get_velocity()
         dx, dy = p.x-location.x, p.y-location.y
         relative_s = dx*math.cos(heading)+dy*math.sin(heading)
         relative_l = dx*math.sin(heading)-dy*math.cos(heading)
@@ -325,6 +358,12 @@ def build_scene_context(world, ego, route, sim_time_s, *, reference=None, specia
         actor_tf = actor.get_transform()
         actor_yaw = math.radians(actor_tf.rotation.yaw)
         actor_body_xy, actor_body_yaw = _body_pose(actor, actor_tf)
+        actor_prediction = None
+        if motion is not None:
+            from .actor_motion import predict_actor_motion
+            _, _, actor_prediction = predict_actor_motion(actor, motion,
+                [index*.25 for index in range(17)], carla_map, motion_history.config,
+                history=motion_history, leader_actors=current_actors)
         projected_keys, projected_width = _route_lane_at(projection[0], local)
         route_aligned = (other_wp is not None and lane_key(other_wp) in projected_keys
                          and projection[1] <= projected_width/2
@@ -332,7 +371,8 @@ def build_scene_context(world, ego, route, sim_time_s, *, reference=None, specia
         same_lane = route_aligned and ego_route_aligned
         conflict, ttc = constant_velocity_conflict(ego_station, speed, points,
                         (p.x, p.y), (v.x, v.y),
-                        ego_radius=float(ego.bounding_box.extent.y), actor_radius=float(extent.y))
+                        ego_radius=float(ego.bounding_box.extent.y), actor_radius=float(extent.y),
+                        actor_prediction=actor_prediction)
         stationary = math.hypot(v.x, v.y) < .5
         along_speed = v.x*math.cos(projection[2])+v.y*math.sin(projection[2])
         cross_speed = -v.x*math.sin(projection[2])+v.y*math.cos(projection[2])
@@ -340,7 +380,8 @@ def build_scene_context(world, ego, route, sim_time_s, *, reference=None, specia
         occupied_conflict, occupied_ttc = occupied_body_conflict(
             ego_body_xy, (velocity.x, velocity.y), ego_body_yaw,
             (float(ego.bounding_box.extent.x), float(ego.bounding_box.extent.y)),
-            actor_body_xy, (v.x, v.y), actor_body_yaw, (float(extent.x), float(extent.y)))
+            actor_body_xy, (v.x, v.y), actor_body_yaw, (float(extent.x), float(extent.y)),
+            actor_prediction=actor_prediction)
         result["blocked"] |= bool(path_block)
         result["actors"].append({"id": int(actor.id), "type": kind,
             "distance_m": distance, "relative_s_m": relative_s, "relative_l_m": relative_l,
@@ -354,7 +395,13 @@ def build_scene_context(world, ego, route, sim_time_s, *, reference=None, specia
             "along_speed_mps": float(along_speed), "cross_speed_mps": float(cross_speed),
             "route_heading_aligned": bool(math.cos(actor_yaw-projection[2]) > .8),
             "occupied_ego_conflict": bool(occupied_conflict),
-            "occupied_ego_conflict_ttc_s": occupied_ttc})
+            "occupied_ego_conflict_ttc_s": occupied_ttc,
+            "motion_source": motion.source if motion is not None else "carla_velocity_api",
+            "motion_quality": motion.quality if motion is not None else "unverified_api",
+            "prediction_mode": actor_prediction["mode"] if actor_prediction is not None else "constant_velocity",
+            "prediction_map_status": actor_prediction.get("map_status") if actor_prediction is not None else None,
+            "following_response": actor_prediction.get("following_response") if actor_prediction is not None else None,
+            "yaw_rate_rad_s": motion.yaw_rate_rad_s if motion is not None else None})
     result["actors"].sort(key=lambda a: (not a["conflict"], not a["path_blocked"], a["distance_m"]))
     result["signals"].sort(key=lambda a: a["stop_line_distance_m"])
     _traffic_wait(result, float(ego.bounding_box.extent.x))
