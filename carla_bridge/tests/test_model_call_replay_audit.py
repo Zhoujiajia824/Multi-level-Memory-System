@@ -130,5 +130,165 @@ def test_visualization_transform_failure_cannot_reject_valid_plan(tmp_path):
     loop.scenario.ego_vehicle.get_transform.side_effect = RuntimeError("visual telemetry failed")
     loop._audit_pdm_plan({"planner_diagnostics": {}}, {"accepted": True}, "control_update")
     assert rows(tmp_path / "planner.jsonl")[-1]["validation"]["accepted"] is True
+    audit = rows(tmp_path / "planner.jsonl")[-1]["trajectory_visualization"]
+    assert audit["enabled"] and audit["error"]["type"] == "RuntimeError"
+    loop.recorder = Mock()
+    loop._record_tick(loop.scenario.ego_vehicle)
+    assert loop.recorder.on_tick.call_args.kwargs["overlay"]["trajectory_visualization"] == audit
     loop.scenario.ego_vehicle.apply_control.assert_not_called()
     loop.trajectory_renderer.draw.assert_not_called()
+
+
+@pytest.mark.parametrize("accepted", [True, False])
+def test_visualization_audit_is_saved_with_the_same_planner_sequence(tmp_path, accepted):
+    from copy import deepcopy
+    from carla_bridge.tests.test_route_acceptance import fake_loop
+    loop = fake_loop()
+    loop.config.data["output_dir"] = tmp_path
+    display = {"enabled": True, "style_version": "fixture", "drawn_candidates": 6,
+               "candidate_pool_count": 40, "execution_drawn": accepted,
+               "rejected_drawn": not accepted, "groups": [{"id": "left", "count": 12}]}
+    loop.trajectory_renderer = Mock()
+    loop.trajectory_renderer.draw.return_value = display
+    snapshot = {"source": "fixture", "candidates": []}
+    loop.pdm_planner = NS(last_visualization_snapshot=snapshot)
+    decision = {"trajectory": [{"x": 0., "y": 0.}, {"x": 3., "y": 0.}],
+                "planner_diagnostics": {"selected_id": "center:CRUISE"}}
+    before = deepcopy(decision)
+    validation = {"accepted": accepted}
+    loop._audit_pdm_plan(decision, validation, "control_update")
+    journal = rows(tmp_path / "planner.jsonl")
+    assert len(journal) == 1
+    assert journal[0]["sequence"] == 1
+    assert journal[0]["trajectory_visualization"] == display
+    assert loop._last_trajectory_visualization_audit == display
+    assert journal[0]["validation"] == validation
+    assert journal[0]["trajectory"] == decision["trajectory"]
+    assert decision == before
+    call = loop.trajectory_renderer.draw.call_args
+    assert call.args[0] is snapshot and call.args[1] is decision
+    assert call.kwargs["accepted"] is accepted
+    loop.scenario.ego_vehicle.apply_control.assert_not_called()
+    loop.carla_client.tick.assert_not_called()
+
+
+def test_latest_trajectory_legend_overlay_is_a_detached_planner_display_audit(tmp_path):
+    from carla_bridge.tests.test_route_acceptance import fake_loop
+    loop = fake_loop()
+    loop.config.data["output_dir"] = tmp_path
+    display = {"enabled": True, "style": "paper", "drawn_candidates": 8,
+               "candidate_pool_count": 40, "merged_candidates": 20, "hidden_candidates": 12}
+    loop.trajectory_renderer = Mock()
+    loop.trajectory_renderer.draw.return_value = display
+    loop._audit_pdm_plan({"planner_diagnostics": {"selected_id": "left:CRUISE"}},
+                         {"accepted": True}, "control_update")
+    original = dict(display)
+    display["drawn_candidates"] = 999
+    loop.recorder = Mock()
+    loop._record_tick(loop.scenario.ego_vehicle)
+    overlay = loop.recorder.on_tick.call_args.kwargs["overlay"]
+    assert overlay["selected_id"] == "left:CRUISE"
+    assert overlay["trajectory_visualization"] == original
+    overlay["trajectory_visualization"]["hidden_candidates"] = 999
+    assert loop._last_trajectory_visualization_audit == original
+    assert rows(tmp_path / "planner.jsonl")[-1]["trajectory_visualization"] == original
+    loop.scenario.ego_vehicle.apply_control.assert_not_called()
+    loop.carla_client.tick.assert_not_called()
+
+
+def test_video_projection_snapshot_and_ego_mask_are_detached_from_planning(tmp_path):
+    from copy import deepcopy
+    from carla_bridge.tests.test_route_acceptance import fake_loop
+    loop = fake_loop()
+    loop.config.data["output_dir"] = tmp_path
+    paths = {"style": "paper", "paths": [{"kind": "selected", "rgb": [245, 195, 0],
+             "points_world": [[2., 3., .156], [5., 3., .156]], "width_m": .24}]}
+    original = deepcopy(paths)
+    loop.trajectory_renderer = NS(last_display_snapshot=paths)
+    loop._last_trajectory_visualization_audit = {"enabled": True, "style": "paper"}
+    loop.recorder = Mock()
+    ego = loop.scenario.ego_vehicle
+    transform = ego.get_transform.return_value
+    ego.bounding_box.get_world_vertices.return_value = [NS(x=1., y=2., z=3.), NS(x=4., y=5., z=6.)]
+    loop._record_tick(ego)
+    overlay = loop.recorder.on_tick.call_args.kwargs["overlay"]
+    assert overlay["trajectory_display"] == {**original, "ego_box_world": [[1., 2., 3.], [4., 5., 6.]]}
+    ego.bounding_box.get_world_vertices.assert_called_once_with(transform)
+    overlay["trajectory_display"]["paths"][0]["points_world"][0][0] = 999.
+    assert paths == original
+    assert "trajectory_display" not in loop._last_trajectory_visualization_audit
+    assert not (tmp_path / "planner.jsonl").exists()
+    ego.apply_control.assert_not_called()
+    loop.carla_client.tick.assert_not_called()
+
+
+@pytest.mark.parametrize("snapshot", [None, {}])
+def test_missing_or_unmaskable_video_snapshot_keeps_recording(tmp_path, snapshot):
+    from carla_bridge.tests.test_route_acceptance import fake_loop
+    loop = fake_loop()
+    loop.trajectory_renderer = NS(last_display_snapshot=snapshot)
+    loop._last_trajectory_visualization_audit = {"enabled": True, "style": "paper"}
+    loop.recorder = Mock()
+    ego = loop.scenario.ego_vehicle
+    ego.bounding_box.get_world_vertices.side_effect = RuntimeError("bbox unavailable")
+    loop._record_tick(ego)
+    overlay = loop.recorder.on_tick.call_args.kwargs["overlay"]
+    if snapshot is None:
+        assert "trajectory_display" not in overlay
+        ego.get_transform.assert_not_called()
+    else:
+        assert overlay["trajectory_display"] == {}
+    ego.apply_control.assert_not_called()
+
+
+def test_noncopyable_optional_projection_snapshot_cannot_stop_control_tick(tmp_path):
+    from carla_bridge.tests.test_route_acceptance import fake_loop
+
+    class InvalidDisplay(dict):
+        def __deepcopy__(self, memo):
+            raise RuntimeError("invalid optional display")
+
+    loop = fake_loop()
+    loop.trajectory_renderer = NS(last_display_snapshot=InvalidDisplay(paths=[]))
+    loop._last_trajectory_visualization_audit = {"enabled": True, "style": "paper"}
+    loop.recorder = Mock()
+    loop._record_tick(loop.scenario.ego_vehicle)
+    assert "trajectory_display" not in loop.recorder.on_tick.call_args.kwargs["overlay"]
+    loop.scenario.ego_vehicle.apply_control.assert_not_called()
+
+
+@pytest.mark.parametrize("latest_audit", [{"enabled": False},
+    {"enabled": True, "error": {"type": "RuntimeError", "message": "new plan transform unavailable"}}])
+def test_failed_or_disabled_latest_drawing_cannot_project_a_stale_previous_plan(tmp_path, latest_audit):
+    from carla_bridge.tests.test_route_acceptance import fake_loop
+    loop = fake_loop()
+    loop.trajectory_renderer = NS(last_display_snapshot={"style": "paper", "paths": [{"old": "plan"}]})
+    loop._last_trajectory_visualization_audit = latest_audit
+    loop.recorder = Mock()
+    loop._record_tick(loop.scenario.ego_vehicle)
+    assert "trajectory_display" not in loop.recorder.on_tick.call_args.kwargs["overlay"]
+    loop.scenario.ego_vehicle.get_transform.assert_not_called()
+    loop.scenario.ego_vehicle.apply_control.assert_not_called()
+
+
+@pytest.mark.parametrize("bad_display", [None, {"drawn_segments": float("nan")}, {"object": object()}])
+def test_malformed_optional_visualization_audit_does_not_reject_a_plan(tmp_path, bad_display):
+    from carla_bridge.tests.test_route_acceptance import fake_loop
+    loop = fake_loop()
+    loop.config.data["output_dir"] = tmp_path
+    loop.trajectory_renderer = Mock()
+    loop.trajectory_renderer.draw.return_value = bad_display
+    loop._audit_pdm_plan({"planner_diagnostics": {}}, {"accepted": True}, "control_update")
+    audit = rows(tmp_path / "planner.jsonl")[-1]
+    assert audit["validation"]["accepted"] is True
+    assert audit["trajectory_visualization"]["error"]["type"] in ("TypeError", "ValueError")
+    loop.scenario.ego_vehicle.apply_control.assert_not_called()
+
+
+def test_disabled_visualization_is_explicit_in_planner_journal(tmp_path):
+    from carla_bridge.tests.test_route_acceptance import fake_loop
+    loop = fake_loop()
+    loop.config.data["output_dir"] = tmp_path
+    loop._audit_pdm_plan({"planner_diagnostics": {}}, {"accepted": True}, "control_update")
+    assert rows(tmp_path / "planner.jsonl")[-1]["trajectory_visualization"] == {"enabled": False}
+    loop.scenario.ego_vehicle.get_transform.assert_not_called()

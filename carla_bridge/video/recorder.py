@@ -23,6 +23,13 @@ from src.vla_memory.common.logging_utils import get_logger
 
 logger = get_logger("carla_video")
 
+# RGB video is already tone mapped. These ordinary OpenCV BGR values must not
+# reuse the deliberately tiny HDR inputs used by CARLA's world debug drawer.
+TRAJECTORY_HUD_COLORS = {"candidate": (235, 145, 50), "selected": (0, 195, 245),
+                         "execution": (150, 215, 15), "rejected": (70, 65, 235)}
+CLASSIC_TRAJECTORY_HUD_COLORS = {"candidate": (235, 100, 50), "selected": (0, 135, 245),
+                                 "execution": (65, 210, 65), "rejected": (70, 65, 235)}
+
 
 class VideoRecorder:
     """Record an exact camera frame for each requested CARLA tick.
@@ -226,7 +233,10 @@ class VideoRecorder:
         that it was dropped. Expiration and final unfulfilled requests have
         explicit events. Neither registration nor close advances the world.
         Optional HUD keys: ``model_call_count``, ``latest_call_id``,
-        ``latest_trigger``, ``selected_id``, ``status``.
+        ``latest_trigger``, ``selected_id``, ``status``,
+        ``trajectory_visualization`` (the matching planner display audit).
+        ``trajectory_display`` optionally contains detached world polylines for
+        video-only projection through this image's capture transform.
         """
         if self._writer is None or self._flushed or self._closing:
             return False
@@ -273,6 +283,7 @@ class VideoRecorder:
                 frame.height, frame.width, 4)[:, :, :3].copy()
             if (frame.width, frame.height) != (self.width, self.height):
                 raise ValueError("camera frame dimensions do not match video writer")
+            bgr = self._apply_trajectory_overlay(bgr, row, overlay or {}, frame)
             if self.hud:
                 self._draw_hud(bgr, row, overlay or {})
             # cv2 normally returns None. Explicit False from a backend is failure.
@@ -295,7 +306,60 @@ class VideoRecorder:
         self._last_sim_time = elapsed
         return True
 
+    def _apply_trajectory_overlay(self, image, row, overlay, frame):
+        """Optional video annotation cannot drop an otherwise valid image.
+
+        Camera callbacks may arrive several ticks later. Only the transform
+        bundled with that exact captured image is valid for projection; querying
+        the live sensor here would shift the paths as the vehicle moves.
+        """
+        display = overlay.get("trajectory_display")
+        visual = overlay.get("trajectory_visualization")
+        if (display is None or (isinstance(visual, dict) and visual.get("enabled") is False)
+                or (isinstance(display, dict) and display.get("enabled") is False)):
+            return image
+        event_reason = None
+        try:
+            transform = getattr(frame, "transform", None)
+            if transform is None:
+                audit = {"enabled": True, "drawn_paths": 0, "drawn_segments": 0,
+                         "camera_transform_source": "captured_image", "depth_occlusion": False,
+                         "skipped_reason": "missing_capture_transform"}
+                event_reason = "trajectory_overlay_skipped"
+            else:
+                from carla_bridge.visualization.camera_overlay import draw_trajectory_overlay
+                painted = image.copy()
+                audit = draw_trajectory_overlay(painted, display, transform, fov_degrees=90.)
+                if not isinstance(audit, dict):
+                    raise TypeError("camera trajectory overlay audit must be a dictionary")
+                # Validate before replacing pixels: even a failed or malformed
+                # optional renderer cannot corrupt the base video frame.
+                audit = json.loads(json.dumps(audit, ensure_ascii=False, allow_nan=False))
+                image = painted
+                if audit.get("skipped_reason"):
+                    event_reason = "trajectory_overlay_skipped"
+        except Exception as exc:
+            audit = {"enabled": True, "drawn_paths": 0, "drawn_segments": 0,
+                     "camera_transform_source": "captured_image", "depth_occlusion": False,
+                     "skipped_reason": "overlay_error",
+                     "error": {"type": type(exc).__name__, "message": str(exc)}}
+            event_reason = "trajectory_overlay_error"
+            logger.warning("视频轨迹投影已跳过 (frame=%s): %s", row["carla_frame_id"], exc)
+        row["trajectory_overlay"] = audit
+        if event_reason is not None:
+            try:
+                self._write_event(event_reason, row["requested_frame"], row["sim_time_s"],
+                                  carla_frame_id=row["carla_frame_id"], trajectory_overlay=audit)
+            except Exception as exc:
+                logger.warning("视频轨迹投影事件写入失败: %s", exc)
+        return image
+
     def _draw_hud(self, image, row: dict, overlay: dict) -> None:
+        visual = overlay.get("trajectory_visualization")
+        if isinstance(visual, dict) and visual.get("enabled") is True:
+            self._draw_trajectory_hud(image, row, overlay, visual)
+            return
+
         def compact(value):
             # cv2 fonts are ASCII; detailed UTF-8 remains in audit artifacts.
             return str(value).encode("ascii", "replace").decode("ascii")[:150]
@@ -314,6 +378,83 @@ class VideoRecorder:
         for i, line in enumerate(lines):
             cv2.putText(image, line, (8, 20 + i * 22), cv2.FONT_HERSHEY_SIMPLEX,
                         .48, (255, 255, 255), 1, cv2.LINE_AA)
+
+    def _draw_trajectory_hud(self, image, row, overlay, visual) -> None:
+        """A bounded video legend for planned rollouts, never an actual trail.
+
+        World debug strings are spectator HUD primitives and are not a reliable
+        RGB-camera legend. Draw this into each exact frame's retained overlay.
+        """
+        height, width = image.shape[:2]
+        classic = visual.get("style") == "classic"
+        colors = CLASSIC_TRAJECTORY_HUD_COLORS if classic else TRAJECTORY_HUD_COLORS
+        wide = width >= 800
+        font = .43 if wide else max(.28, min(.43, width / 1280 * .6, height / 720 * .6))
+        step = 22 if wide else max(11, round(font * 35))
+        panel_height = min(height, 96 if wide else 6 * step + 4)
+        image[:panel_height] = (image[:panel_height].astype(float) * .28).astype(np.uint8)
+
+        def text(value, x, y, available_width):
+            value = str(value).encode("ascii", "replace").decode("ascii")[:150]
+            while value and cv2.getTextSize(value, cv2.FONT_HERSHEY_SIMPLEX, font, 1)[0][0] > available_width:
+                value = value[:-1]
+            if value:
+                cv2.putText(image, value, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                            font, (245, 245, 245), 1, cv2.LINE_AA)
+
+        def count(name):
+            value = visual.get(name)
+            return str(value) if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else "-"
+
+        def sample(kind, label, x, y, available_width):
+            line_y = y - 4
+            color = colors[kind]
+            if kind == "candidate" and not classic:
+                for start in (0, 10, 20):
+                    cv2.line(image, (x + start, line_y), (x + start + 5, line_y), color, 2, cv2.LINE_AA)
+            else:
+                cv2.line(image, (x, line_y), (x + 25, line_y), color, 3, cv2.LINE_AA)
+            text(label, x + 32, y, max(0, available_width - 32))
+
+        elapsed = row.get("sim_time_s")
+        time_label = f"{elapsed:.2f}s" if elapsed is not None else "-"
+        calls = overlay.get("model_call_count", overlay.get("call_count", 0))
+        trigger = overlay.get("latest_trigger", overlay.get("trigger", "-"))
+        selected = overlay.get("selected_id", "-")
+        summary = f"Traj {count('drawn_candidates')}/{count('candidate_pool_count')}"
+        summary += f" | Merged {count('merged_candidates')} | Hidden {count('hidden_candidates')}"
+        if visual.get("error"):
+            summary = "Trajectory draw error | " + summary
+        if wide:
+            legend_width = min(460, int(width * .44))
+            legend_x = width - legend_width
+            left_width = max(0, legend_x - 20)
+            lines = [f"CARLA frame {row.get('carla_frame_id')} | sim {time_label}",
+                     f"Model calls: {calls} | latest: {overlay.get('latest_call_id', '-')}",
+                     f"Trigger: {trigger}", f"Selected plan: {selected}"]
+            for index, line in enumerate(lines):
+                text(line, 8, 20 + index * step, left_width)
+            half = (legend_width - 16) // 2
+            text(summary, legend_x + 4, 18, legend_width - 12)
+            sample("candidate", "Candidates", legend_x + 4, 40, half)
+            sample("selected", "Selected plan", legend_x + 4 + half, 40, half)
+            sample("execution", "Accepted command", legend_x + 4, 62, half)
+            sample("rejected", "Rejected command", legend_x + 4 + half, 62, half)
+            text("Plans, not the vehicle's driven trail", legend_x + 4, 84, legend_width - 12)
+        else:
+            y0 = step
+            lines = [f"F {row.get('carla_frame_id')} | t {time_label} | calls {calls}",
+                     f"Trigger: {trigger}", f"Selected plan: {selected}",
+                     f"Plans {count('drawn_candidates')}/{count('candidate_pool_count')}"
+                     f" | M{count('merged_candidates')} H{count('hidden_candidates')}"
+                     + (" | draw error" if visual.get("error") else "")]
+            for index, line in enumerate(lines):
+                text(line, 6, y0 + index * step, max(0, width - 12))
+            half = max(1, (width - 12) // 2)
+            sample("candidate", "Candidates", 6, y0 + 4 * step, half)
+            sample("selected", "Selected plan", 6 + half, y0 + 4 * step, half)
+            sample("execution", "Accepted cmd", 6, y0 + 5 * step, half)
+            sample("rejected", "Rejected cmd", 6 + half, y0 + 5 * step, half)
 
     def summary(self) -> dict:
         """Small replay manifest; full frame correspondence remains on disk."""

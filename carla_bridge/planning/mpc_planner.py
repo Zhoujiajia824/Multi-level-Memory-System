@@ -963,7 +963,14 @@ class CarlaMPCPlanner:
             snapshots.append({"id": candidate["id"], "index": candidate["index"],
                 "points_world": np.column_stack((xy, zs)).tolist(),
                 "headings_world_rad": states[:, 2].tolist(), "base_score": candidate["base_score"],
-                "final_score": candidate.get("final_score")})
+                "final_score": candidate.get("final_score"),
+                **{key: deepcopy(candidate[key]) for key in (
+                    "lateral", "longitudinal", "physical_lane_side", "lane_offset_m",
+                    "lateral_path_index", "longitudinal_policy_id", "maneuver", "maneuver_id",
+                    "maneuver_phase", "recovery", "recovery_recipe", "recovery_transition_m",
+                    "optimization_feasible", "trajectory_finite", "numerically_valid", "eligible",
+                    "ineligible_reason", "forward_progress_m", "terminal_speed_mps",
+                    "desired_speed_mps") if key in candidate}})
         self.last_visualization_snapshot = {"source": "nonlinear_mpc_optimized_rollout",
             "frame": "carla_world_actor", "timestamp_us": timestamp,
             "selected_index": selected["index"] if selected else None,

@@ -31,6 +31,13 @@ def test_enabled_visualization_preserves_scores_and_emits_exact_execution_geomet
     assert snapshot["selected_index"] == winner["index"]
     assert snapshot["candidate_pool_count"] == len(displayed["planner_diagnostics"]["candidates"])
     selected = next(c for c in snapshot["candidates"] if c["index"] == winner["index"])
+    for key in ("lateral", "longitudinal", "physical_lane_side", "lane_offset_m",
+                "lateral_path_index", "longitudinal_policy_id", "maneuver", "recovery",
+                "numerically_valid", "eligible", "forward_progress_m", "terminal_speed_mps",
+                "desired_speed_mps"):
+        assert selected[key] == winner[key]
+    selected["lateral"] = "DISPLAY_ONLY"
+    assert winner["lateral"] != "DISPLAY_ONLY"
     tf = visual.ego.get_transform()
     for candidate, point in zip(selected["points_world"], displayed["trajectory"]):
         actual = ego_to_global(point["x"], point["y"], tf.location.x, tf.location.y,

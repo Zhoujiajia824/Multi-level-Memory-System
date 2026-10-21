@@ -867,19 +867,30 @@ class ClosedLoop:
                  "semantic_influence": self.semantic_influence,
                  "model_inference": self.model_inference,
                  "planner_diagnostics": decision.get("planner_diagnostics"),
-                 "trajectory": decision.get("trajectory"), "validation": validation}
-        with path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(audit, ensure_ascii=False, allow_nan=False) + "\n")
+                 "trajectory": decision.get("trajectory"), "validation": validation,
+                 "trajectory_visualization": {"enabled": False}}
         diagnostics = decision.get("planner_diagnostics") or {}
         self._last_plan_diagnostics = diagnostics
         renderer = getattr(self, "trajectory_renderer", None)
         if renderer is not None:
             try:
-                renderer.draw(getattr(self.pdm_planner, "last_visualization_snapshot", None),
-                              decision, self.scenario.ego_vehicle.get_transform(),
-                              accepted=validation.get("accepted") is True)
+                display_audit = renderer.draw(
+                    getattr(self.pdm_planner, "last_visualization_snapshot", None),
+                    decision, self.scenario.ego_vehicle.get_transform(),
+                    accepted=validation.get("accepted") is True)
+                if not isinstance(display_audit, dict):
+                    raise TypeError("Trajectory renderer audit must be a mapping")
+                # Optional rendering cannot make the planner journal fail because
+                # an extension returned a nonfinite/nonserializable display value.
+                audit["trajectory_visualization"] = json.loads(
+                    json.dumps(display_audit, ensure_ascii=False, allow_nan=False))
             except Exception as exc:
+                audit["trajectory_visualization"] = {"enabled": True,
+                    "error": {"type": type(exc).__name__, "message": str(exc)}}
                 logger.warning("轨迹可视化不可用，继续执行原规划: %s", exc)
+        self._last_trajectory_visualization_audit = deepcopy(audit["trajectory_visualization"])
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(audit, ensure_ascii=False, allow_nan=False) + "\n")
         stats = getattr(self, "advisory_stats", None)
         if stats is not None:
             baseline_id = diagnostics.get("original_baseline_selected_id", diagnostics.get("baseline_selected_id"))
@@ -1494,12 +1505,33 @@ class ClosedLoop:
         if self.recorder is not None:
             audit = getattr(self, "_model_call_audit", None)
             latest = audit.latest if audit is not None else None
+            overlay = {"model_call_count": audit.consultation_count if audit else 0,
+                       "latest_call_id": latest.get("call_id") if latest else None,
+                       "latest_trigger": (latest.get("query") or {}).get("reason") if latest else None,
+                       "selected_id": (getattr(self, "_last_plan_diagnostics", {}) or {}).get("selected_id"),
+                       "trajectory_visualization": deepcopy(
+                           getattr(self, "_last_trajectory_visualization_audit", {"enabled": False}))}
+            try:
+                display = getattr(getattr(self, "trajectory_renderer", None), "last_display_snapshot", None)
+                visual = overlay["trajectory_visualization"]
+                if (isinstance(display, dict) and visual.get("enabled") is True
+                        and not visual.get("error")):
+                    # Display-only copies never enter decisions, scoring or
+                    # controller inputs. Delayed images retain their own plan.
+                    overlay["trajectory_display"] = deepcopy(display)
+                    try:
+                        vertices = ego.bounding_box.get_world_vertices(ego.get_transform())
+                        overlay["trajectory_display"]["ego_box_world"] = [
+                            [float(v.x), float(v.y), float(v.z)] for v in vertices]
+                    except Exception as exc:
+                        # Self-vehicle masking is optional annotation metadata;
+                        # unsupported telemetry cannot remove the retained plan.
+                        logger.debug("视频自车遮挡轮廓不可用: %s", exc)
+            except Exception as exc:
+                logger.warning("视频轨迹快照已跳过: %s", exc)
             self.recorder.on_tick(
                 frame_id=(world_clock or {}).get("frame"), sim_time_s=self._elapsed,
-                overlay={"model_call_count": audit.consultation_count if audit else 0,
-                         "latest_call_id": latest.get("call_id") if latest else None,
-                         "latest_trigger": (latest.get("query") or {}).get("reason") if latest else None,
-                         "selected_id": (getattr(self, "_last_plan_diagnostics", {}) or {}).get("selected_id")})
+                overlay=overlay)
         if self.metrics is not None or self._control_audit_path is not None:
             v, a, tf = ego.get_velocity(), ego.get_acceleration(), ego.get_transform()
             yaw = math.radians(tf.rotation.yaw)  # Native CARLA axes for acceleration projections.
