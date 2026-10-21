@@ -1806,11 +1806,13 @@ python -m carla_bridge.run_carla_demo \
 | 开关 | 用途与当前默认值 |
 | --- | --- |
 | `--replay-audit on/off` | 模型调用证据归档和审核页面；默认on |
-| `--record-video on/off` | 驾驶视频和逐帧索引；当前 `carla_bridge/config/carla.yaml` 为on |
-| `--trajectory-visualization on/off` | 默认paper样式在录像中投影候选与计划的连续实线，不向CARLA世界发送发光图元；需同时开启录像，支持MPC/PDM后端，默认off |
+| `--record-video on/off` | 保存驾驶MP4和逐帧索引；独立于浏览器实时显示，当前YAML为on |
+| `--trajectory-visualization on/off` | 默认paper样式在独立显示相机画面中投影候选与计划的连续实线；可供浏览器实时观察及录像，支持MPC/PDM后端，默认off |
+| `--live-view on/off` | 浏览器实时观察；未显式指定时跟随轨迹绘制开关，不要求开启录像 |
+| `--live-host` / `--live-port` | 实时服务监听地址和端口，默认 `127.0.0.1:8765` |
 
-命令行优先于YAML。上面示例用于记录模型运行；需要在录像与回放中观察轨迹时，将最后一项改为
-`--trajectory-visualization on`。默认paper样式只处理独立录像画面，不修改数值规划、候选评分、
+命令行优先于YAML。上面示例用于记录模型运行；需要实时和回放观察轨迹时，将最后一项改为
+`--trajectory-visualization on`。默认paper样式只处理独立显示相机画面，不修改数值规划、候选评分、
 语义选择或认知相机原图。显式切换classic时仍绘制原生世界线，可能进入模型RGB输入。
 归档、视频和投影有I/O及编码开销，比较运行耗时时应保持观测配置一致。
 
@@ -1897,27 +1899,54 @@ GPU相机回调可以迟到，录制器使用有界待匹配队列保留原帧�
 视频HUD显示的是该帧采样时最近已开始的咨询；调用可能在采样后才开始，HUD会在后续tick更新，
 精确触发瞬间以HTML审核中的实际请求帧及索引映射为准。
 
-#### 在录像与回放中观察候选和执行计划
+#### 在浏览器实时画面、录像与回放中观察轨迹
 
-启用 `--record-video on --trajectory-visualization on` 后，默认使用 `style: paper`，
-将实际评分池中的候选及本次计划投影到录像画面。关闭录像时，paper仍可记录显示分组审计，
-但不会产生可观看的轨迹画面。查看生成的MP4或 `replay/index.html`，不需要新增命令行参数。
+启用 `--trajectory-visualization on` 后，默认使用 `style: paper`，
+将实际评分池中的候选及本次计划投影到独立显示相机的画面。浏览器实时服务默认随之开启，
+运行中打开 `http://127.0.0.1:8765`；同时开启 `--record-video on` 可保存相同合成画面的MP4，
+结束后通过录像或 `replay/index.html` 复查。浏览器和录像共用这一台显示相机，不重复创建两台相机。
 
-默认paper**完全不调用 `world.debug` 发送绘制图元**，只在捕获后的8位录像画面上画普通实线，
+例如使用无模型、无记忆的MPC观察场景：
+
+```bash
+python -m carla_bridge.run_carla_demo \
+  --scenario outputs/paper_v1_spawncheck/eval/R05_multilane_eval_s101.yaml \
+  --planner mpc --semantic-influence off --model-inference off \
+  --planning-memory off --mode memory_off \
+  --trajectory-visualization on --live-view on --record-video on
+```
+
+仅实时观察时改为 `--record-video off`；只录像时使用 `--live-view off --record-video on`。
+`--live-view on --trajectory-visualization off` 可查看没有轨迹叠加的实时相机画面。
+实时页显示实际捕获帧号、仿真时间及图像年龄；没有新图时提示等待或stale，不将旧图冒充新推进帧。
+网页的最新帧预览使用有界队列，可能跳过被新图替代的预览帧；视频是否缺帧以保存的逐帧索引为准。
+
+服务器运行时，在本地另开终端建立SSH转发，然后仍打开本地浏览器地址：
+
+```bash
+ssh -N -L 8765:127.0.0.1:8765 zjj@<服务器地址>
+```
+
+端口占用时将运行参数改为 `--live-port 8766`，并相应调整SSH转发与浏览器地址。
+`--live-host 127.0.0.1` 是默认监听地址。运行结束后实时服务随场景清理关闭，离线检查使用保存的录像和回放页面。
+实时HTTP启动失败会告警并继续实验；仅实时模式的显示相机或索引初始化失败也会清理预览并继续。
+显式开启录像时，录像初始化失败仍会报错，避免将没有录像的运行误认为已成功录制。
+
+默认paper**完全不调用 `world.debug` 发送绘制图元**，只在捕获后的8位显示画面上画普通实线，
 因此不产生原生debug轨迹的发光和HDR光晕，也不会把这些标注放入认知相机。
-CARLA 0.9.15 shipping版的原生debug图元有HDR发光放大（约乘1000），降低RGB不能可靠消除；
-默认方案因此不在UE窗口中画世界轨迹，不能承诺live UE窗口或仓库外的独立观察器也显示这些无光晕彩线。
+paper不在UE主窗口绘制轨迹；本轮提供浏览器实时画面与录像，不修改CARLA引擎。
 
-| 录像投影颜色与线型 | 含义 |
+| 实时画面与录像的颜色、线型 | 含义 |
 | --- | --- |
-| 低饱和蓝灰、紫灰、鼠尾草绿、棕灰、橄榄绿或灰玫瑰色实线 | 参与评分的候选轨迹；颜色按候选ID稳定分配，不代表分数高低，也不保证每个候选颜色唯一 |
-| 深蓝实线，RGB(54, 90, 115)，默认宽0.20米 | 本次实际获选候选 |
-| 陶土色实线，RGB(201, 107, 80)，默认宽0.09米 | 通过轨迹校验、下发给控制器的未来执行计划；与获选线重合时显示为较窄的内线 |
+| 三种冷色细实线：中间族蓝色RGB(55, 136, 190)、左侧族青绿RGB(0, 158, 150)、右侧族紫色RGB(141, 107, 188)；默认宽0.045米、alpha 0.60 | 参与评分的候选；颜色表示横向族，不表示分数高低或每个候选独有的ID |
+| 蓝色实线，RGB(25, 92, 173)，默认宽0.075米、alpha 0.85 | 本次实际获选候选 |
+| 朱红色粗实线，RGB(222, 58, 55)，默认宽0.12米、alpha 1.0 | 通过轨迹校验、下发给控制器的未来执行计划；突出实际接受的方案 |
 | 红色实线 | 被轨迹校验拒绝的计划 |
 | 灰色实线 | 坐标有限、可以绘制，但数值求解失败或被标记为不可用的候选 |
 
-陶土色线表示未来接受计划，不表示车辆已经实际走过的轨迹。表中米制线宽投影到图像后有像素可读性上下限。
+朱红色线表示未来接受计划，不表示车辆已经实际走过的轨迹。表中米制线宽投影到图像后有像素可读性上下限。
 候选、获选和接受计划可能几何重合，通过颜色和线宽区别，不添加XY偏移，不为区分候选而伪造分离路径。
+完全重合时后绘制的接受计划可能遮住获选线，不能据画面上可见的线数推断候选数量。
 每两个相邻原始轨迹点直接连续连接，保留原折点，不额外平滑或改造轨迹；默认无描边，
 也没有虚线、箭头、末端横帽或十字标记。零长度静止路径不画线或标记，记录在显示审计的 `stationary_paths`，
 不虚构向前行驶的轨迹。
@@ -1930,33 +1959,50 @@ CARLA 0.9.15 shipping版的原生debug图元有HDR发光放大（约乘1000）�
 这些限制只影响显示，不减少规划候选，不修改评分和选择。`max_candidates: 0` 显示全部几何组；
 需要逐条绘制每个可绘制候选时，同时设置 `max_candidates: 0` 和 `merge_distance_m: 0`。
 
-录像投影使用**该张实际捕获图像的 `Image.transform`** 和录像相机固定的水平FOV90°，
+实时与录像投影使用**该张实际捕获图像的 `Image.transform`** 和显示相机固定的水平FOV90°，
 对该帧关联的规划几何做投影，不查询后来时刻的sensor姿态补齐；延迟到达的图像仍使用自己的捕获位姿。
 正常两次重规划之间持续使用当前显示快照，下一次计划到来再替换，不以世界线的life timer制造间歇空帧。
 同帧保留自车包围盒，可用时将其投影区域的原始像素保留，减少轨迹压在自车车顶上的情况。
-投影是录像的几何标注：未增加深度相机，不对其他车辆、行人或建筑做深度遮挡，
+投影是显示画面的几何标注：未增加深度相机，不对其他车辆、行人或建筑做深度遮挡，
 线条可能覆盖它们，不能将标注当作物理世界中真实可见的地面线。
 这项处理不改变实际XY、规划、控制、相机后处理或曝光；不在认知相机原图中添加彩色投影。
 
 只有显式使用classic等原生世界绘制时，世界线才仍可能进入认知相机；本机CARLA 0.9.15中已看到过这种情况。
 默认paper的投影不写回CARLA世界，也不修改模型输入。回放以保存的实际输入图片、视频和规划日志为依据。
-仓库没有外部独立观察器的实现，不能据此声称其图像也已加上彩色投影。
+仓库内的浏览器观察器使用同一显示合成帧；仓库外的其他观察器不因此自动获得轨迹叠加。
+
+这套显示层次参考了作者本地收集论文中的实际图，而不是照搬模型示意图：
+
+- `D:/科研-比赛/第一篇论文/文献下载/1实验用文献/第一批/Agent-Driver：A Language Agent for Autonomous Driving.pdf`，PDF第24页附录Fig.2：真实前视图上以少量颜色对照计划与参考轨迹；放大后实际带密集采样圆点，本项目按观察需求改用无点连续实线。
+- `D:/科研-比赛/第一篇论文/文献下载/新建文件夹 (4)/GameFormer.pdf`，PDF第7页Fig.5：浅灰BEV底图区分自车计划和他车预测，正文为清晰起见仅显示最可能轨迹；支持减少显示拥挤，不意味着减少实际规划候选。
+- `D:/科研-比赛/第一篇论文/文献下载/新建文件夹 (3)/LanguageMPC.pdf`，PDF第7页Fig.7：二维道路上用淡蓝色连续曲线表达变道；借鉴平整线条和少量语义色，不把二维示意宣称为CARLA原生渲染。
+
+以上页码均为PDF物理页码，文件是本地视觉参考，不是服务器运行依赖。
 
 配置位于 `carla_bridge/config/carla.yaml` 的 `carla.visualization.trajectories`：
 
 ```yaml
 carla:
   visualization:
+    live:
+      enabled: null        # 跟随轨迹绘制开关；true/false显式独立开启/关闭
+      host: 127.0.0.1
+      port: 8765
+      jpeg_quality: 90
+      stale_after_s: 2.0   # 墙钟无新图时提示stale，不假造新帧
     trajectories:
       enabled: false
-      style: paper          # 录像连续实线投影；不发送世界debug图元
+      style: paper          # 浏览器/录像连续实线投影；不发送世界debug图元
       max_candidates: 6     # paper下限制准备投影的几何组数量；0保留全部组
       merge_distance_m: 0.12 # paper下合并接近的完整轨迹；0禁用合并
       point_stride: 2       # 仅classic抽样；paper连接全部相邻原点
       lifetime_s: 0.20      # 仅classic世界线使用；paper持续使用当前显示快照
-      thickness: 0.055      # paper候选色芯宽度，米
-      selected_thickness: 0.20
-      execution_thickness: 0.09
+      thickness: 0.045      # paper细候选线，米
+      selected_thickness: 0.075
+      execution_thickness: 0.12
+      candidate_alpha: 0.60
+      selected_alpha: 0.85
+      execution_alpha: 1.0
       outline_width: 0      # 默认无描边；显式设为正数可添加细描边
       z_offset: 0.15        # 米；轨迹投影高度偏移，不改变XY
 ```
@@ -1978,22 +2024,32 @@ classic按 `point_stride` 抽样，使用 `lifetime_s` 控制世界线寿命；p
 默认paper的 `backend` 为 `camera_overlay`，`world_drawn_segments` 为0。
 `candidate_groups` 记录每个显示组的
 `representative_id`、完整 `member_ids`/`member_indices`、横向方向、获选状态及是否具有非零投影几何的 `projectable`；
-`display_rgb` 记录录像投影的普通0–255 RGB配色，不能将颜色字段解读为已向世界发送debug线。
+`display_rgb` 记录实时/录像投影的普通0–255 RGB配色，不能将颜色字段解读为已向世界发送debug线。
+`color_encoding: lateral_family`、组内 `family`、`display_alpha` 和 `display_feasible` 分别标明横向族编码、
+该组横向族、透明度与数值可用状态；不同横向族不靠候选ID随机换色。
 这些字段便于把一条显示线对应回具体候选；分组显示不替代原始候选日志。
-同时开启录像并保留默认HUD时，视频显示候选/获选/接受/拒绝图例、获选ID和
+保留默认HUD时，实时画面与录像显示候选/获选/接受/拒绝图例、获选ID和
 `Traj 准备投影组数/原候选数`、`Merged`、`Hidden` 计数；这些计数不是被执行候选的数量。
 
-视频逐帧索引 `*.frames.jsonl` 的 `trajectory_overlay` 记录该实际图像的投影审计，
+显示相机逐帧索引 `*.frames.jsonl` 的 `trajectory_overlay` 记录该实际图像的投影审计，
 包括捕获位姿来源、实际投影绘制的 `drawn_paths`/线段数及跳过原因；这些计数发生在自车遮罩还原前，
 不等于最终画面一定可见的完整路径数。
+仅实时、不录像时仍保存显示帧索引，但 `video_frame_index` / `video_time_s` 为空，不虚构MP4定位。
 准备阶段已识别的零长静止路径见 `planner.jsonl` 的 `trajectory_visualization.stationary_paths`。
 画面外或静止的路径可能已准备好却未画出像素，不能把规划分组计数当作画面路径数。
 本次计划的显示几何构建失败时会记录 `command_error` 并仅省略该计划的标注，当前有效候选仍可投影；
 不会保留上一条已接受计划冒充本次结果。
 缺少 `Image.transform` 或投影失败时，
 跳过相应标注并记录原因，保留相机帧继续编码，不丢帧、不用当前sensor位姿代替捕获位姿。
-HUD开关仅控制文字与图例，**不控制轨迹投影**；在paper样式录像中，要关闭投影应关闭
+HUD开关仅控制文字与图例，**不控制轨迹投影**；在paper样式中，要关闭投影应关闭
 `--trajectory-visualization`。默认paper本身不绘制世界轨迹。
+
+本轮浏览器与paper样式验证记录位于本地 `outputs/trajectory_live_validation/`（不随Git分发）：
+365项主回归通过，另新增10项启动故障回归，并对含这些用例的81项闭环相关回归复验通过。
+真实CARLA短程完成40个推进帧、20次PDM规划，录像解码39帧、缺1帧且显式记录；
+核对了真实候选快照的白天/夜间、追车/俯视投影及浏览器同帧信息。
+仅实时模式另用真实相机生成373张合成帧，无MP4、无相机缺帧、无发布错误，浏览器帧号持续更新；
+该模式采用冻结车辆与真实计划核对显示，不属于驾驶性能或完整路线验收。两次验证均清理了actor并恢复同步设置。
 
 以下是此前回放审计与旧版绘制的历史验证记录（`outputs/replay_validation/`，本地生成、不随Git分发），
 不代表本次paper无发光、克制配色连续实线投影及新HUD样式的实测验收；本次样式验证另行记录：
@@ -2017,19 +2073,25 @@ HUD开关仅控制文字与图例，**不控制轨迹投影**；在paper样式�
 `--help` 中部分默认值为None，表示继承YAML，不表示关闭。显式CLI覆盖配置，
 随后受后端兼容、记忆权限及论文train/eval约束限制。
 
-#### 三个观测开关的区别
+#### 审计、录像、轨迹与实时预览的区别
 
 | 参数 | 开启后的行为 | 关闭后的行为 | 当前默认 |
 | --- | --- | --- | --- |
 | `--replay-audit on/off` | 归档实际模型输入图片、完整提示词、响应、触发原因、时间/帧/位置；运行结束生成 `replay/index.html`，联动视频并统计使用比例 | 不启用新增调用证据归档和自动审核页面；原有驾驶/规划日志仍保留 | on |
-| `--record-video on/off` | 增加录像相机，输出驾驶MP4、逐帧索引、缺帧事件与HUD；paper样式且轨迹绘制开启时还投影彩色轨迹 | 不初始化录像相机或录制MP4，也不产生录像彩色投影；调用审核仍可查看图片和文本 | on |
-| `--trajectory-visualization on/off` | 默认paper仅在录像中投影克制配色的连续实线，无光晕/箭头/虚线，不发送世界debug图元；记录分组与逐帧投影审计；classic另保留旧世界线 | 关闭轨迹显示；仍正常规划与保存规划日志 | off；开启后默认style为paper |
+| `--record-video on/off` | 将独立显示相机的合成帧保存为驾驶MP4，输出逐帧索引、缺帧事件与HUD | 不保存MP4；实时预览开启时仍创建共享显示相机和帧审计，调用审核仍可查看图片和文本 | on |
+| `--trajectory-visualization on/off` | 默认paper在浏览器实时画面及可选录像中投影候选/获选/接受计划的连续实线；记录分组与逐帧审计；classic另保留旧世界线 | 关闭轨迹叠加；仍正常规划与保存规划日志 | off；开启后默认style为paper |
+| `--live-view on/off` | 启动浏览器实时预览，使用独立显示相机的同帧合成结果；不要求保存录像 | 关闭HTTP预览；不影响已开启的录像、规划或审计 | 未指定时跟随轨迹绘制开关 |
+| `--live-host` | 指定实时预览监听地址 | 不属于on/off开关 | `127.0.0.1` |
+| `--live-port` | 指定实时预览端口，浏览器与SSH转发需使用同一端口 | 不属于on/off开关 | `8765` |
 
-三个开关分别控制审计、录像和轨迹显示；彩色录像投影需要同时开启后两项并使用paper样式。
+审计、录像、轨迹叠加和实时服务分别控制。使用paper并开启轨迹叠加后，
+浏览器实时服务默认开启；要保留录像还需 `--record-video on`。
+显式 `--live-view off` 可只录不看，`--live-view on --record-video off` 可只看不录。
+二者都关闭时，不创建独立显示相机；规划显示分组审计仍可保存。
 关闭HUD不关闭轨迹投影，关闭审计也不等于关闭模型。
 模型是否调用由 `--model-inference` 等规划开关决定。调用帧占比为“实际SDK请求的唯一CARLA帧数 / 全场景真实推进的唯一CARLA帧数”，
 同一帧的场景理解、决策和重试不重复增加分子。视频缺帧按索引明确提示，输入图片独立保存。
-默认paper可以用 `on / on / on` 在录像中检查轨迹，不向认知相机添加标注；
+默认paper的浏览器与录像都不向认知相机添加标注；
 若显式使用classic，其世界线可能进入模型RGB输入，正式VLM对照仍应关闭该世界绘制。
 
 #### 场景、模型与规划开关
@@ -2102,12 +2164,13 @@ python -m carla_bridge.run_carla_demo \
 | `--allow-model-download` | 默认不传，仅本地加载 | 显式允许DINOv2联网查找/下载；不控制远程VLM API调用 |
 | `-h` / `--help` | 查看后退出 | 打印当前入口支持的全部命令行参数，不运行场景 |
 
-连接地址/端口、仿真步长、规划频率/速度、视频视角/尺寸、轨迹绘制数量等数值项在
-`carla_bridge/config/carla.yaml` 中配置，没有对应CLI参数。
+CARLA连接地址/端口、仿真步长、规划频率/速度、显示相机视角/尺寸、轨迹绘制数量等数值项在
+`carla_bridge/config/carla.yaml` 中配置，没有对应CLI参数；实时预览地址/端口可用上表的
+`--live-host` / `--live-port` 覆盖。
 该文件中的额外功能布尔项包括 `carla.synchronous`（同步推进）、
 `carla.stuck_detection.enabled`（停滞检查）、`carla.route_injection.enabled`（导航参考注入）、
 `perception.oracle_objects`（GT对象输入）、`perception.mosaic.label_subimages`（拼图视角标签）、
-`carla.video.hud`（录像HUD）和 `fallback.allow_rule_fallback_for_format_error`（格式错误规则回退）。
+`carla.video.hud`（共享显示画面的HUD）和 `fallback.allow_rule_fallback_for_format_error`（格式错误规则回退）。
 它们属于实验配置，修改后应保留配置快照；上述CLI总表不意味着这些配置项可直接写成命令行参数。
 
 ## 14. MPC 滚动轨迹规划：当前默认后端
@@ -2235,8 +2298,11 @@ MPC数值经验使用独立 `carla_mpc_execution_v2:<配置哈希>`；旧MPC-v1�
 实际版本见 `manifest.json` 中的 `outcome.execution_planner_version`。
 
 调用审计仍打开本轮 `replay/index.html`；纯MPC模型off时实际SDK调用比例应为0。
-`--record-video on --trajectory-visualization on` 在默认paper样式录像中投影优化候选及实际下发的未来计划，
-使用13.11节的克制配色连续实线；不向世界发送发光图元，也不改认知相机输入。
+`--trajectory-visualization on` 在默认paper样式下开启浏览器实时轨迹画面；
+同时使用 `--record-video on` 可保存录像。需要显式控制时增加 `--live-view on/off`，
+默认地址为 `http://127.0.0.1:8765`，服务器SSH转发见13.11节。
+优化候选、实际获选与下发的未来计划共用13.11节的冷色细候选/蓝色获选/朱红粗接受计划层次，
+不向世界发送发光图元，也不改认知相机输入；UE主窗口不绘制paper轨迹。
 classic仍保留原生世界绘制及其RGB输入影响；下载回放时保留整个运行目录。
 
 ### 14.5 当前数值配置、约束与失败定位

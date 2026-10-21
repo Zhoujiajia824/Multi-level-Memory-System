@@ -223,6 +223,189 @@ def test_video_projection_snapshot_and_ego_mask_are_detached_from_planning(tmp_p
     loop.carla_client.tick.assert_not_called()
 
 
+def test_live_display_without_control_journal_still_uses_exact_server_frame_and_plan_metadata(tmp_path):
+    from carla_bridge.tests.test_route_acceptance import fake_loop
+    loop = fake_loop()
+    loop.config.data["run_id"] = "live-frame-fixture"
+    loop._control_audit_path = None
+    loop.metrics = None
+    loop._world_clock_audit = Mock(return_value={"frame": 4321, "elapsed_seconds": 57.2})
+    loop.recorder = Mock()
+    loop._elapsed = 5.7
+    loop._last_control_command = {"planner_sequence": 19}
+    loop._last_plan_diagnostics = {"selected_id": "left:passing"}
+    loop._last_trajectory_visualization_audit = {"enabled": False}
+    ego = loop.scenario.ego_vehicle
+    loop._record_tick(ego)
+    request = loop.recorder.on_tick.call_args.kwargs
+    assert request["frame_id"] == 4321 and request["sim_time_s"] == 5.7
+    assert request["overlay"]["run_id"] == "live-frame-fixture"
+    assert request["overlay"]["planner_sequence"] == 19
+    assert request["overlay"]["selected_id"] == "left:passing"
+    assert "trajectory_display" not in request["overlay"]
+    loop._world_clock_audit.assert_called_once()
+    ego.get_transform.assert_not_called()
+    ego.apply_control.assert_not_called()
+    loop.carla_client.tick.assert_not_called()
+
+
+def test_same_frame_overlay_keeps_model_consultation_identity_without_requerying_model(tmp_path):
+    from carla_bridge.tests.test_route_acceptance import fake_loop
+    loop = fake_loop()
+    loop._world_clock_audit = Mock(return_value={"frame": 512})
+    loop.recorder = Mock()
+    loop._model_call_audit = NS(consultation_count=3,
+        latest={"call_id": "consultation-3", "query": {"reason": "blocked_lane"}})
+    loop._record_tick(loop.scenario.ego_vehicle)
+    overlay = loop.recorder.on_tick.call_args.kwargs["overlay"]
+    assert overlay["model_call_count"] == 3
+    assert overlay["latest_call_id"] == "consultation-3"
+    assert overlay["latest_trigger"] == "blocked_lane"
+    loop.loop.step.assert_not_called()
+    loop.cameras.capture.assert_not_called()
+    loop.carla_client.tick.assert_not_called()
+
+
+def display_setup_loop(tmp_path, monkeypatch, *, live_enabled=True, record_video=False):
+    """Use real setup/cleanup flow with no simulator, inference, or HTTP service."""
+    from carla_bridge import closed_loop as closed
+    from carla_bridge.planning import pdm_planner
+    from carla_bridge.video import recorder as video
+    from carla_bridge.visualization import live_view
+    from src.vla_memory.common.config import Config
+
+    config = Config(overrides={"output_dir": str(tmp_path), "carla": {
+        "planning": {"backend": "pdm_closed", "semantic_influence": False, "model_inference": False},
+        "video": {"enabled": record_video}, "replay": {"enabled": False},
+        "visualization": {"live": {"enabled": live_enabled}, "trajectories": {"enabled": False}}}})
+    world, ego, client = Mock(), Mock(), Mock()
+    scenario = NS(world=world, ego_vehicle=ego, cfg={}, route=Mock(), setup=Mock(),
+                  destroy=Mock(return_value=True), scenario_name=lambda: "display_setup")
+    monkeypatch.setattr(closed, "CarlaClient", Mock(return_value=client))
+    monkeypatch.setattr(closed.ScenarioManager, "from_yaml", Mock(return_value=scenario))
+    monkeypatch.setattr(pdm_planner, "validate_dependencies", Mock())
+    monkeypatch.setattr(pdm_planner, "CarlaPDMPlanner", Mock(return_value=Mock()))
+    monkeypatch.setattr(closed, "TrajectoryTracker", Mock(return_value=Mock()))
+    metrics = Mock()
+    metrics.summary.return_value = {}
+    monkeypatch.setattr(closed, "MetricsCollector", Mock(return_value=metrics))
+    live, recorder = Mock(), Mock()
+    live.start.return_value = "http://127.0.0.1:8765/"
+    live_factory, camera_factory = Mock(return_value=live), Mock(return_value=recorder)
+    monkeypatch.setattr(live_view, "LiveTrajectoryView", live_factory)
+    monkeypatch.setattr(video, "VideoRecorder", camera_factory)
+    loop = closed.ClosedLoop(config, "unused", mode="memory_off")
+    loop._bind_pdm_controller = Mock()
+    loop._setup_collision_sensor = Mock()
+    loop._write_control_context = Mock()
+    loop._write_report = Mock()
+    return NS(loop=loop, live=live, recorder=recorder, live_factory=live_factory,
+              camera_factory=camera_factory, metrics=metrics, client=client, scenario=scenario)
+
+
+def fail_display_directory(monkeypatch, error):
+    from pathlib import Path
+    mkdir = Path.mkdir
+
+    def fail(path, *args, **kwargs):
+        if path.name == "carla_videos":
+            raise error
+        return mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", fail)
+
+
+def test_both_display_sinks_off_allocate_neither_http_service_nor_display_camera(tmp_path, monkeypatch):
+    state = display_setup_loop(tmp_path, monkeypatch, live_enabled=False, record_video=False)
+    try:
+        state.loop.setup()
+        assert state.loop.live_view is None and state.loop.recorder is None
+        state.live_factory.assert_not_called()
+        state.camera_factory.assert_not_called()
+        assert state.loop.metrics is state.metrics
+        assert state.client.tick.call_count == 15  # Existing traffic warmup only.
+    finally:
+        state.loop.close()
+    state.scenario.destroy.assert_called_once()
+    state.client.restore.assert_called_once()
+
+
+@pytest.mark.parametrize("phase", ["construct", "start"])
+def test_optional_live_service_failure_cannot_abort_closed_loop_setup(tmp_path, monkeypatch, phase):
+    state = display_setup_loop(tmp_path, monkeypatch)
+    error = RuntimeError("optional live service %s failed" % phase)
+    if phase == "construct":
+        state.live_factory.side_effect = error
+    else:
+        state.live.start.side_effect = error
+    try:
+        state.loop.setup()
+        assert state.loop.live_view is None and state.loop.recorder is None
+        assert state.loop.metrics is state.metrics
+        state.camera_factory.assert_not_called()
+        if phase == "start":
+            state.live.close.assert_called_once()
+        else:
+            state.live.close.assert_not_called()
+    finally:
+        state.loop.close()
+    state.client.restore.assert_called_once()
+
+
+@pytest.mark.parametrize("phase", ["mkdir", "construct", "start", "start_cleanup_error"])
+def test_live_only_display_camera_failure_cleans_optional_sinks_and_continues(tmp_path, monkeypatch, phase):
+    state = display_setup_loop(tmp_path, monkeypatch)
+    error = RuntimeError("optional display camera %s failed" % phase)
+    if phase == "mkdir":
+        fail_display_directory(monkeypatch, error)
+    elif phase == "construct":
+        state.camera_factory.side_effect = error
+    else:
+        state.recorder.start.side_effect = error
+        if phase == "start_cleanup_error":
+            state.recorder.flush.side_effect = RuntimeError("partial display cleanup failed")
+    try:
+        state.loop.setup()
+        assert state.loop.live_view is None and state.loop.recorder is None
+        assert state.loop.metrics is state.metrics
+        state.live.close.assert_called_once()
+        if phase in ("start", "start_cleanup_error"):
+            state.recorder.flush.assert_called_once()
+        else:
+            state.recorder.flush.assert_not_called()
+        if phase == "mkdir":
+            state.camera_factory.assert_not_called()
+        assert state.client.tick.call_count == 15
+        # Optional display failure did not alter setup's planner or controller.
+        assert state.loop.pdm_planner is not None and state.loop.tracker is not None
+    finally:
+        state.loop.close()
+    state.live.close.assert_called_once()
+    state.client.restore.assert_called_once()
+
+
+@pytest.mark.parametrize("phase", ["mkdir", "construct", "start"])
+def test_required_recording_failure_still_propagates_and_is_cleaned_on_close(tmp_path, monkeypatch, phase):
+    state = display_setup_loop(tmp_path, monkeypatch, record_video=True)
+    error = RuntimeError("required recording %s failed" % phase)
+    if phase == "mkdir":
+        fail_display_directory(monkeypatch, error)
+    elif phase == "construct":
+        state.camera_factory.side_effect = error
+    else:
+        state.recorder.start.side_effect = error
+    try:
+        with pytest.raises(RuntimeError, match="required recording"):
+            state.loop.setup()
+    finally:
+        state.loop.close()
+    state.live.close.assert_called_once()
+    if phase == "start":
+        state.recorder.flush.assert_called_once()
+    state.scenario.destroy.assert_called_once()
+    state.client.restore.assert_called_once()
+
+
 @pytest.mark.parametrize("snapshot", [None, {}])
 def test_missing_or_unmaskable_video_snapshot_keeps_recording(tmp_path, snapshot):
     from carla_bridge.tests.test_route_acceptance import fake_loop

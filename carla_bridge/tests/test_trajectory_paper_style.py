@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from carla_bridge.visualization.trajectory_renderer import (
-    CarlaTrajectoryRenderer, DISPLAY_COLORS, _display_groups,
+    CarlaTrajectoryRenderer, DISPLAY_COLORS, DISPLAY_FAMILY_COLORS, _display_groups,
     validate_trajectory_visualization_config,
 )
 from carla_bridge.tests.test_trajectory_renderer import world, capture
@@ -28,7 +28,9 @@ def no_world_debug(audit, target):
 
 @pytest.mark.parametrize("bad", [{"style": "unknown"}, {"endpoint_markers": "yes"},
                                   {"merge_distance_m": -1}, {"merge_distance_m": float("nan")},
-                                  {"outline_width": -1}])
+                                  {"outline_width": -1}, {"candidate_alpha": -0.1},
+                                  {"selected_alpha": 1.1}, {"execution_alpha": float("nan")},
+                                  {"candidate_alpha": True}])
 def test_paper_config_rejects_invalid_rendering_options(bad):
     with pytest.raises(ValueError, match="carla.visualization.trajectories"):
         validate_trajectory_visualization_config(bad)
@@ -37,11 +39,34 @@ def test_paper_config_rejects_invalid_rendering_options(bad):
 def test_default_paper_budget_widths_palette_and_no_outline():
     config = validate_trajectory_visualization_config()
     assert config["style"] == "paper" and config["max_candidates"] == 6
-    assert config["selected_thickness"] == .20 and config["execution_thickness"] == .09
+    assert config["thickness"] == .045
+    assert config["selected_thickness"] == .075 and config["execution_thickness"] == .12
+    assert config["candidate_alpha"] == .6 and config["selected_alpha"] == .85
+    assert config["execution_alpha"] == 1.
     assert config["outline_width"] == 0
     assert validate_trajectory_visualization_config({"outline_width": 0})["outline_width"] == 0
-    assert DISPLAY_COLORS["selected"] == (54, 90, 115)
-    assert DISPLAY_COLORS["execution"] == (201, 107, 80)
+    assert DISPLAY_COLORS["selected"] == (25, 92, 173)
+    assert DISPLAY_COLORS["execution"] == (222, 58, 55)
+    assert DISPLAY_FAMILY_COLORS == {"center": (55, 136, 190), "left": (0, 158, 150),
+                                     "right": (141, 107, 188)}
+
+
+def test_candidate_color_is_stable_for_lateral_family_despite_id_and_policy_changes():
+    # Distinct actual geometries prevent grouping from concealing a bad ID
+    # palette. Two independent plan cycles must encode the same families.
+    renderer = CarlaTrajectoryRenderer(None, {"enabled": True})
+    family_colors = {}
+    for cycle in range(2):
+        items = [candidate(i + cycle*100, [[0., i, 0.], [10., i, 0.]], side)
+                 for i, side in enumerate(("center", "left", "right", "left", "right"))]
+        renderer.draw(pool(items, selected=None), None, capture(), True)
+        for shown in renderer.last_display_snapshot["paths"]:
+            side = shown["id"].split(":")[0]
+            rgb = tuple(shown["rgb"])
+            assert rgb == DISPLAY_FAMILY_COLORS[side]
+            assert rgb == family_colors.setdefault(side, rgb)
+            assert shown["alpha"] == .6 and shown["width_m"] == .045
+    assert len(set(family_colors.values())) == 3
 
 
 def test_near_duplicate_group_preserves_winner_member_ids_and_has_no_debug_primitives():
@@ -140,7 +165,9 @@ def test_selected_and_command_keep_distinct_width_color_but_share_surface_height
     audit = renderer.draw(data, command, capture(), accepted)
     selected = next(p for p in renderer.last_display_snapshot["paths"] if p["kind"] == "selected")
     executed = next(p for p in renderer.last_display_snapshot["paths"] if p["kind"] == kind)
-    assert selected["width_m"] == .20 and executed["width_m"] == .09
+    assert selected["width_m"] == .075 and executed["width_m"] == .12
+    assert selected["width_m"] < executed["width_m"]
+    assert selected["alpha"] == .85 and executed["alpha"] == 1.
     assert tuple(selected["rgb"]) == DISPLAY_COLORS["selected"]
     assert tuple(executed["rgb"]) == DISPLAY_COLORS[kind]
     np.testing.assert_allclose(selected["points_world"], executed["points_world"], atol=1e-6)

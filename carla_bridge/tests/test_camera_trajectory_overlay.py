@@ -58,8 +58,14 @@ def changed(pixels):
 
 
 def color_mask(pixels, rgb=RGB):
-    # An exact full-intensity BGR core must exist; antialiased edges may blend.
-    return np.all(pixels == np.asarray(rgb[::-1], dtype=np.uint8), axis=-1)
+    # A fine 1px AA line does not contain a fully saturated core in OpenCV.
+    # Check that its color lies on the source-to-background blend ray, while
+    # excluding both unpainted pixels and weak subpixel fringes.
+    delta = np.asarray(rgb[::-1], dtype=float) - BACKGROUND
+    observed = pixels.astype(float) - BACKGROUND
+    strength = observed @ delta / np.dot(delta, delta)
+    residual = np.max(np.abs(observed - strength[..., None]*delta), axis=-1)
+    return (strength > .5) & (strength < 1.02) & (residual < 2.5)
 
 
 def near_pixel(mask, x, y, radius=2):
@@ -172,24 +178,65 @@ def test_nonuniform_waypoint_polyline_is_pixel_continuous_despite_legacy_dash_fl
 
 
 @pytest.mark.parametrize("reverse_input", [False, True])
-def test_muted_blue_selected_outer_and_terracotta_execution_inner_remain_visible(reverse_input):
-    pixels = image()
-    blue, terracotta = [54, 90, 115], [201, 107, 80]
+def test_wider_red_execution_covers_a_coincident_selected_line_without_blue_shell(reverse_input):
+    pixels = np.full((720, 1280, 3), BACKGROUND, dtype=np.uint8)
+    blue, red = [25, 92, 173], [222, 58, 55]
     points = [[10., 0., -1.5], [10., 0., 1.5]]
     paths = [
-        path(points, kind="selected", rgb=blue, width_m=.20),
-        path(points, kind="execution", rgb=terracotta, width_m=.09),
+        path(points, kind="selected", rgb=blue, width_m=.075, alpha=.85),
+        path(points, kind="execution", rgb=red, width_m=.12, alpha=1.),
     ]
     draw_trajectory_overlay(pixels, display(paths[::-1] if reverse_input else paths), CaptureTransform())
-    blue_x = np.where(color_mask(pixels, blue)[180])[0]
-    execution_x = np.where(color_mask(pixels, terracotta)[180])[0]
-    assert len(blue_x) and len(execution_x)
-    assert blue_x.min() < execution_x.min() <= 320 <= execution_x.max() < blue_x.max()
-    # With zero outline, AA can only mix source colors with the existing
-    # background. A black halo or glow would leave this per-channel range.
-    minimum = np.minimum(blue[::-1], terracotta[::-1])
-    assert np.all(pixels.min(axis=(0, 1)) >= minimum-1)
-    assert pixels.max() <= BACKGROUND
+    assert color_mask(pixels, red)[360, 640]
+    assert not color_mask(pixels, blue)[360].any()
+    # The visible row must be indistinguishable from the wider executed line
+    # alone. A selected-colored casing would occupy extra lateral pixels.
+    execution_only = np.full_like(pixels, BACKGROUND)
+    draw_trajectory_overlay(execution_only, display([paths[1]]), CaptureTransform())
+    np.testing.assert_array_equal(pixels[360], execution_only[360])
+
+
+def test_partial_opacity_is_composited_once_per_complete_path_not_per_join():
+    opaque, translucent = image(), image()
+    points = [[10., -4., 0.], [10., -1., 0.], [10., 2., 0.], [10., 4., 0.]]
+    source = path(points, kind="selected", width_m=.075, alpha=1.)
+    draw_trajectory_overlay(opaque, display([source]), CaptureTransform())
+    source["alpha"] = .6
+    audit = draw_trajectory_overlay(translucent, display([source]), CaptureTransform())
+    # Independent numerical compositing over every pixel also covers vertices:
+    # repeated blend per segment would make the vertex darker than this.
+    expected = np.rint(opaque.astype(float)*.6 + BACKGROUND*.4).astype(np.uint8)
+    np.testing.assert_array_equal(translucent, expected)
+    assert audit["opacity_compositing"] == "per_path"
+    assert changed(translucent)[180, 194:447].all()
+
+
+@pytest.mark.parametrize("height", [360, 720, 1440])
+def test_pixel_line_weights_scale_with_resolution_and_keep_action_above_selection(height):
+    width = round(height*16/9)
+    pixels = np.full((height, width, 3), BACKGROUND, dtype=np.uint8)
+    # Identical depth, with independent x positions in the image. Count strong
+    # color cores at mid-row, not AA borders. Metric sizes deliberately fill
+    # each kind's upper readability bound.
+    source = [path([[10., side, -1.], [10., side, 1.]], kind=kind, width_m=10.)
+              for side, kind in ((-3., "candidate"), (0., "selected"), (3., "execution"))]
+    draw_trajectory_overlay(pixels, display(source), CaptureTransform())
+    centers = [round(width/2 + width/2*side/10) for side in (-3., 0., 3.)]
+    row = color_mask(pixels)[height//2]
+    spans = [row[max(0, center-20):center+21].sum() for center in centers]
+    assert 0 < spans[0] < spans[1] < spans[2]
+    # 720p visible cores are a few pixels, not the former 7..16px casing.
+    assert spans[2] <= math.ceil(7*height/720.) + 2
+
+
+@pytest.mark.parametrize("bad_alpha", [-.01, 1.01, float("nan"), float("inf")])
+def test_invalid_opacity_isolated_before_any_pixels_are_changed(bad_alpha):
+    pixels = image()
+    before = pixels.copy()
+    audit = draw_trajectory_overlay(pixels, display([path(
+        [[10., -4., 0.], [10., 4., 0.]], alpha=bad_alpha)]), CaptureTransform())
+    np.testing.assert_array_equal(pixels, before)
+    assert len(audit["skipped_paths"]) == 1 and audit["drawn_paths"] == 0
 
 
 def test_readable_bounded_stroke_width_does_not_grow_with_camera_depth():
@@ -315,8 +362,9 @@ def test_ego_bbox_restores_original_pixels_inside_hull_but_keeps_outside_lines()
     interior = np.s_[170:191, 290:351]
     np.testing.assert_array_equal(masked[interior], original[interior])
     assert np.any(plain[interior] != original[interior])
-    assert near_pixel(color_mask(masked), 240, 180)
-    assert near_pixel(color_mask(masked), 400, 180)
+    for outside in (np.s_[176:185, 230:251], np.s_[176:185, 390:411]):
+        np.testing.assert_array_equal(masked[outside], plain[outside])
+        assert np.any(masked[outside] != original[outside])
     assert audit["ego_box_masked"] is True and audit["drawn_paths"] == 1
     assert data == before
 

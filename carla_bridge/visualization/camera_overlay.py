@@ -58,11 +58,14 @@ def draw_trajectory_overlay(image, display, camera_transform, fov_degrees=90.):
     All XY belong to actual evaluated/executed polylines. Only widths have
     pixel readability bounds. Every adjacent pair is connected as a solid line;
     legacy dash/marker flags are deliberately ignored. There is no glow layer.
+    Candidate opacity is composited once per complete path, so a real bend or
+    a different waypoint density cannot make its joins artificially darker.
     Invalid individual paths are omitted, not repaired into plausible paths.
     """
     audit = {"enabled": False, "drawn_paths": 0, "drawn_segments": 0,
              "camera_transform_source": "captured_image", "depth_occlusion": False,
-             "line_style": "solid", "endpoint_markers": False, "emissive": False}
+             "line_style": "solid", "endpoint_markers": False, "emissive": False,
+             "opacity_compositing": "per_path", "width_reference_height_px": 720}
     if not display or display.get("enabled") is False or display.get("style") != "paper":
         return audit
     audit["enabled"] = True
@@ -110,10 +113,13 @@ def draw_trajectory_overlay(image, display, camera_transform, fov_degrees=90.):
             points, _ = _polyline(path["points_world"])
             rgb = np.asarray(path["rgb"], dtype=float)
             stroke_m = float(path["width_m"])
+            alpha = float(path.get("alpha", 1.))
             if rgb.shape != (3,) or not np.isfinite(rgb).all() or np.any(rgb < 0) or np.any(rgb > 255):
                 raise ValueError("Camera display color must be RGB in [0, 255]")
             if not math.isfinite(stroke_m) or stroke_m <= 0:
                 raise ValueError("Camera display stroke must be positive and finite")
+            if not math.isfinite(alpha) or not 0. <= alpha <= 1.:
+                raise ValueError("Camera display alpha must be finite in [0, 1]")
             if len(points) - 1 > MAX_STROKE_SEGMENTS:
                 raise ValueError("Trajectory exceeds the camera display segment budget")
             if len(points) < 2:
@@ -127,16 +133,24 @@ def draw_trajectory_overlay(image, display, camera_transform, fov_degrees=90.):
             audit["skipped_paths"].append({"id": path.get("id"), "reason": str(exc)})
             continue
         kind = path.get("kind")
-        lower, upper = (7, 16) if kind == "selected" else (3, 7) if kind in ("execution", "rejected") else (2, 4)
+        # A 720p image uses a fine 1..2 px candidate, 2..3 px selection and
+        # 3..5 px executed command. The latter covers a coincident selection,
+        # instead of creating a thick selected shell with a narrow warm core.
+        bounds = (2, 3) if kind == "selected" else (3, 5) if kind in ("execution", "rejected") else (1, 2)
+        scale = height / 720.
+        lower, upper = (max(1, int(math.floor(v * scale + .5))) for v in bounds)
         bgr = tuple(int(v) for v in rgb[::-1])
+        canvas = image.copy() if alpha < 1. else image
         if outline_m > 0:
             for a, b, depth in projected:
                 core_px = int(np.clip(round(stroke_m * focal / depth), lower, upper))
-                outline_px = int(np.clip(round(outline_m * focal / depth), 1, 2))
-                cv2.line(image, tuple(a), tuple(b), (45, 53, 61), core_px + 2 * outline_px, cv2.LINE_AA)
+                outline_px = int(np.clip(round(outline_m * focal / depth), 1, max(1, round(2 * scale))))
+                cv2.line(canvas, tuple(a), tuple(b), (45, 53, 61), core_px + 2 * outline_px, cv2.LINE_AA)
         for a, b, depth in projected:
             core_px = int(np.clip(round(stroke_m * focal / depth), lower, upper))
-            cv2.line(image, tuple(a), tuple(b), bgr, core_px, cv2.LINE_AA)
+            cv2.line(canvas, tuple(a), tuple(b), bgr, core_px, cv2.LINE_AA)
+        if alpha < 1.:
+            cv2.addWeighted(canvas, alpha, image, 1. - alpha, 0., dst=image)
         audit["drawn_segments"] += len(projected)
         audit["drawn_paths"] += bool(projected)
     if ego_mask is not None:

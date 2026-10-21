@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import math
-import hashlib
 from copy import deepcopy
 from numbers import Real
 
@@ -25,9 +24,12 @@ DEFAULTS = {
     "max_candidates": 6,  # Display budget only; the actual winner is always included.
     "point_stride": 2,
     "lifetime_s": 0.2,
-    "thickness": 0.055,
-    "selected_thickness": 0.20,
-    "execution_thickness": 0.09,
+    "thickness": 0.045,
+    "selected_thickness": 0.075,
+    "execution_thickness": 0.12,
+    "candidate_alpha": 0.60,
+    "selected_alpha": 0.85,
+    "execution_alpha": 1.0,
     "outline_width": 0.0,
     "z_offset": 0.15,
     "dash_length_m": 1.2,
@@ -45,11 +47,13 @@ COLORS = {
     "rejected": (2, 0, 0),
 }
 
-# Muted ordinary RGB, applied after tone mapping. No emission, blur or halo.
-DISPLAY_COLORS = {"selected": (54, 90, 115), "execution": (201, 107, 80),
-                  "rejected": (172, 69, 80), "infeasible": (163, 168, 175)}
-DISPLAY_CANDIDATE_COLORS = ((127, 155, 179), (166, 160, 190), (114, 165, 160),
-                            (184, 156, 125), (130, 151, 123), (171, 140, 154))
+# Ordinary post-tone-map RGB. Color describes the lateral family, never an
+# arbitrary proposal ID; line weight/opacity separates alternatives and action.
+DISPLAY_COLORS = {"selected": (25, 92, 173), "execution": (222, 58, 55),
+                  "rejected": (153, 47, 47), "infeasible": (150, 155, 161)}
+# Keep the tuple interface used by the video HUD's representative legend.
+DISPLAY_CANDIDATE_COLORS = ((55, 136, 190), (0, 158, 150), (141, 107, 188))
+DISPLAY_FAMILY_COLORS = dict(zip(("center", "left", "right"), DISPLAY_CANDIDATE_COLORS))
 MAX_STROKE_SEGMENTS = 4096
 SNAPSHOT_METADATA = (
     "lateral", "longitudinal", "physical_lane_side", "lane_offset_m",
@@ -86,6 +90,12 @@ def validate_trajectory_visualization_config(config=None):
         value = values[name]
         if not isinstance(value, Real) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
             raise ValueError("carla.visualization.trajectories.%s must be finite and nonnegative" % name)
+        values[name] = float(value)
+    for name in ("candidate_alpha", "selected_alpha", "execution_alpha"):
+        value = values[name]
+        if (not isinstance(value, Real) or isinstance(value, bool)
+                or not math.isfinite(value) or not 0. <= value <= 1.):
+            raise ValueError("carla.visualization.trajectories.%s must be finite in [0, 1]" % name)
         values[name] = float(value)
     return values
 
@@ -303,14 +313,16 @@ class CarlaTrajectoryRenderer:
                      merged_candidates=sum(len(g["members"]) - 1 for g in groups),
                      hidden_candidates=len(groups) - len(chosen), invalid_candidate_ids=invalid,
                      candidate_groups=[], skipped_candidate_errors=[], stationary_paths=[],
-                     xy_geometry_displaced=False, line_style="solid", endpoint_markers=False)
+                     xy_geometry_displaced=False, line_style="solid", endpoint_markers=False,
+                     color_encoding="lateral_family")
         # Publish a complete replacement only. Between replans the same world
         # geometry is reprojected into each image; no debug lifetime can expire.
         display = {"style": "paper", "backend": "camera_overlay", "paths": [],
                    "line_style": "solid", "endpoint_markers": False,
-                   "outline_width_m": self.config["outline_width"]}
+                   "outline_width_m": self.config["outline_width"],
+                   "color_encoding": "lateral_family"}
 
-        def append_path(points, kind, rgb, width, identifier=None):
+        def append_path(points, kind, rgb, width, identifier=None, alpha=1.):
             points, _ = _polyline(points)
             if len(points) - 1 > MAX_STROKE_SEGMENTS:
                 raise ValueError("Trajectory exceeds the display segment budget")
@@ -321,21 +333,20 @@ class CarlaTrajectoryRenderer:
             points[:, 2] += self.config["z_offset"]
             display["paths"].append({"kind": kind, "id": identifier,
                 "points_world": points.tolist(), "rgb": list(rgb), "width_m": width,
-                "dashed": False, "marker": False})
+                "alpha": alpha, "dashed": False, "marker": False})
             return len(points) - 1
 
         for group in chosen:
             candidate = group["representative"]
             winner = selected_index is not None and candidate.get("index") == selected_index
-            identifier = str(candidate.get("id", candidate.get("index")))
-            digest = int.from_bytes(hashlib.blake2s(identifier.encode("utf-8"), digest_size=4).digest(), "big")
-            rgb = (DISPLAY_COLORS["selected"] if winner else
-                   DISPLAY_CANDIDATE_COLORS[digest % len(DISPLAY_CANDIDATE_COLORS)]
-                   if group["feasible"] else DISPLAY_COLORS["infeasible"])
+            rgb = (DISPLAY_COLORS["infeasible"] if not group["feasible"] else
+                   DISPLAY_COLORS["selected"] if winner else
+                   DISPLAY_FAMILY_COLORS.get(group["family"], DISPLAY_FAMILY_COLORS["center"]))
             width = self.config["selected_thickness"] if winner else self.config["thickness"]
+            alpha = self.config["selected_alpha"] if winner else self.config["candidate_alpha"]
             try:
                 count = append_path(candidate["points_world"], "selected" if winner else "candidate",
-                                    rgb, width, candidate.get("id"))
+                                    rgb, width, candidate.get("id"), alpha)
             except (ValueError, TypeError, KeyError) as exc:
                 audit["skipped_candidate_errors"].append({"id": candidate.get("id"),
                     "type": type(exc).__name__, "message": str(exc)})
@@ -346,7 +357,7 @@ class CarlaTrajectoryRenderer:
                 "member_ids": [m.get("id") for m in group["members"]],
                 "member_indices": [m.get("index") for m in group["members"]],
                 "family": group["family"], "display_rgb": list(rgb), "selected": winner,
-                "display_feasible": group["feasible"], "projectable": bool(count)})
+                "display_alpha": alpha, "display_feasible": group["feasible"], "projectable": bool(count)})
         trajectory = (decision or {}).get("trajectory") or []
         if trajectory:
             try:
@@ -356,7 +367,8 @@ class CarlaTrajectoryRenderer:
                 heights = _elevations(xy, (snapshot or {}).get("reference_surface_xyz", []), capture_transform.location.z)
                 kind = "execution" if accepted is True else "rejected"
                 count = append_path(np.column_stack((xy, heights)), kind,
-                                    DISPLAY_COLORS[kind], self.config["execution_thickness"])
+                                    DISPLAY_COLORS[kind], self.config["execution_thickness"],
+                                    alpha=self.config["execution_alpha"])
                 audit["drawn_segments"] += count
                 audit[kind + "_drawn"] = bool(count)
             except (ValueError, TypeError, KeyError) as exc:

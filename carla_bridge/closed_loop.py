@@ -166,6 +166,7 @@ class ClosedLoop:
         self.loop: Optional[LoopRunner] = None
         self.metrics: Optional[MetricsCollector] = None
         self.recorder = None  # 可选 VideoRecorder
+        self.live_view = None  # 与录像共用同帧合成结果；不使用模型相机
         self._model_call_audit = None
         self._replay_summary = None
         self._replay_error = None
@@ -341,25 +342,55 @@ class ClosedLoop:
         for _ in range(10):
             self.carla_client.tick()
 
-        # 8. 视频录制（可选，默认关）
+        # 8. Independent display camera, shared by live view and optional MP4.
         video_cfg = self.ccfg.get("video", {}) or {}
-        if video_cfg.get("enabled", False):
+        live_cfg = dict((self.ccfg.get("visualization") or {}).get("live") or {})
+        if live_cfg.get("enabled") is None:
+            live_cfg["enabled"] = bool(((self.ccfg.get("visualization") or {}).get("trajectories") or {}).get("enabled"))
+        if live_cfg.get("enabled"):
+            from carla_bridge.visualization.live_view import LiveTrajectoryView
+            try:
+                self.live_view = LiveTrajectoryView(live_cfg)
+                url = self.live_view.start()
+                logger.info("实时轨迹观察器: %s （远程服务器可使用SSH端口转发）", url)
+            except Exception as exc:
+                if self.live_view is not None:
+                    self.live_view.close()
+                self.live_view = None
+                logger.warning("实时观察器启动失败，实验继续: %s", exc)
+        if video_cfg.get("enabled", False) or self.live_view is not None:
             from carla_bridge.video.recorder import VideoRecorder
-            vout = Path(self.config.get("output_dir") or "outputs") / "carla_videos"
-            vout.mkdir(parents=True, exist_ok=True)
-            vpath = vout / f"drive_{self.scenario.scenario_name()}_{self.mode}.mp4"
-            self.recorder = VideoRecorder(
-                world, ego, str(vpath),
-                fps=float(video_cfg.get("fps", 1.0/self.fixed_delta)),
-                width=int(video_cfg.get("width", 1280)),
-                height=int(video_cfg.get("height", 720)),
-                view=video_cfg.get("view", "chase"),
-                frame_timeout_s=float(video_cfg.get("frame_timeout_s", 0.0)),
-                hud=bool(video_cfg.get("hud", True)),
-                max_pending_frames=int(video_cfg.get("max_pending_frames", 32)),
-                flush_timeout_s=float(video_cfg.get("flush_timeout_s", .25)),
-            )
-            self.recorder.start()
+            record_video = bool(video_cfg.get("enabled", False))
+            try:
+                vout = Path(self.config.get("output_dir") or "outputs") / "carla_videos"
+                vout.mkdir(parents=True, exist_ok=True)
+                vpath = vout / f"drive_{self.scenario.scenario_name()}_{self.mode}.mp4"
+                self.recorder = VideoRecorder(
+                    world, ego, str(vpath),
+                    fps=float(video_cfg.get("fps", 1.0/self.fixed_delta)),
+                    width=int(video_cfg.get("width", 1280)),
+                    height=int(video_cfg.get("height", 720)),
+                    view=video_cfg.get("view", "chase"),
+                    frame_timeout_s=float(video_cfg.get("frame_timeout_s", 0.0)),
+                    hud=bool(video_cfg.get("hud", True)),
+                    max_pending_frames=int(video_cfg.get("max_pending_frames", 32)),
+                    flush_timeout_s=float(video_cfg.get("flush_timeout_s", .25)),
+                    record_video=record_video, live_view=self.live_view,
+                )
+                self.recorder.start()
+            except Exception as exc:
+                if record_video:
+                    raise
+                # An optional preview failure must not stop driving. Clean up
+                # even when initialization only got as far as opening a file.
+                for resource, operation in ((self.recorder, "flush"), (self.live_view, "close")):
+                    if resource is not None:
+                        try:
+                            getattr(resource, operation)()
+                        except Exception as cleanup_exc:
+                            logger.warning("实时显示清理失败: %s", cleanup_exc)
+                self.recorder = self.live_view = None
+                logger.warning("实时显示相机启动失败，实验继续: %s", exc)
 
         # 9. 长尾事件调度器（若场景声明了 events）
         events_cfg = (self.scenario.cfg or {}).get("events") or []
@@ -374,9 +405,9 @@ class ClosedLoop:
             logger.info("长尾事件调度器: %d 个事件", len(events_cfg))
 
         logger.info(
-            "ClosedLoop setup 完成 (scenario=%s, mode=%s, replan=%.1fs, dt=%.3fs, video=%s, model_inference=%s)",
+            "ClosedLoop setup 完成 (scenario=%s, mode=%s, replan=%.1fs, dt=%.3fs, video=%s, live=%s, model_inference=%s)",
             self.scenario.scenario_name(), self.mode, self.replan_interval_s, self.fixed_delta,
-            self.recorder is not None, self.model_inference,
+            bool(video_cfg.get("enabled", False)), self.live_view is not None, self.model_inference,
         )
 
     def run(self) -> None:
@@ -1094,6 +1125,8 @@ class ClosedLoop:
             cleanup("execution_experience_finalize", lambda: self.experience_memory.finish(self.run_status))
         if self.recorder is not None:
             cleanup("video_flush", self.recorder.flush)
+        if getattr(self, "live_view", None) is not None:
+            cleanup("live_view_close", self.live_view.close)
         if self.event_scheduler is not None:
             cleanup("event_cleanup", self.event_scheduler.destroy)
         if self.loop:
@@ -1499,13 +1532,15 @@ class ClosedLoop:
     def _record_tick(self, ego) -> None:
         # Read the server clock before observers/metrics, in the same callback as
         # the measured response. Keep the local scheduler's sim_time_s unchanged.
-        world_clock = self._world_clock_audit() if self._control_audit_path is not None else None
+        world_clock = self._world_clock_audit() if self._control_audit_path is not None or self.recorder is not None else None
         self._drain_collisions()
         self.carla_client.set_spectator_follow(ego)
         if self.recorder is not None:
             audit = getattr(self, "_model_call_audit", None)
             latest = audit.latest if audit is not None else None
             overlay = {"model_call_count": audit.consultation_count if audit else 0,
+                       "run_id": self.config.get("run_id"),
+                       "planner_sequence": (getattr(self, "_last_control_command", {}) or {}).get("planner_sequence"),
                        "latest_call_id": latest.get("call_id") if latest else None,
                        "latest_trigger": (latest.get("query") or {}).get("reason") if latest else None,
                        "selected_id": (getattr(self, "_last_plan_diagnostics", {}) or {}).get("selected_id"),

@@ -1,4 +1,4 @@
-"""Bounded, frame-indexed CARLA driving video with optional model-call HUD.
+"""Bounded, frame-indexed CARLA display frames for live view and optional video.
 
 Tick registration is nonblocking by default; delayed GPU camera callbacks are
 matched to bounded pending metadata and written in simulation-frame order.
@@ -34,7 +34,7 @@ CLASSIC_TRAJECTORY_HUD_COLORS = {"candidate": (235, 100, 50), "selected": (0, 13
 
 
 class VideoRecorder:
-    """Record an exact camera frame for each requested CARLA tick.
+    """Compose an exact camera frame for each requested CARLA tick.
 
     ``sim_time_s`` is elapsed experiment time; the sensor's absolute timestamp is
     separate. ``video_time_s`` is actual playback time, including any frame gaps.
@@ -43,8 +43,11 @@ class VideoRecorder:
     def __init__(self, world, ego, output_path: str, fps: float = 20,
                  width: int = 1280, height: int = 720, view: str = "chase",
                  frame_timeout_s: float = 0.0, hud: bool = True,
-                 max_pending_frames: int = 32, flush_timeout_s: float = .25):
+                 max_pending_frames: int = 32, flush_timeout_s: float = .25,
+                 record_video: bool = True, live_view=None):
         self.world, self.ego = world, ego
+        self.record_video, self.live_view = bool(record_video), live_view
+        self._live_error_count = 0
         self.output_path = str(output_path)
         self.fps, self.frame_timeout_s = float(fps), float(frame_timeout_s)
         if not math.isfinite(self.fps) or self.fps <= 0:
@@ -104,17 +107,19 @@ class VideoRecorder:
             bp.set_attribute("sensor_tick", "0.0")
             self._sensor = self.world.spawn_actor(bp, self._view_transform(), attach_to=self.ego)
             self._sensor.listen(self._receive_frame)
-            self._writer = cv2.VideoWriter(self.output_path, cv2.VideoWriter_fourcc(*"mp4v"),
-                                           self.fps, (self.width, self.height))
-            if not self._writer.isOpened():
-                raise RuntimeError(f"无法打开视频输出: {self.output_path}")
+            if self.record_video:
+                self._writer = cv2.VideoWriter(self.output_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                               self.fps, (self.width, self.height))
+                if not self._writer.isOpened():
+                    raise RuntimeError(f"无法打开视频输出: {self.output_path}")
             self._started = True
         except Exception:
             self._error_count += 1
             self.flush()
             raise
-        logger.info("视频录制开始: %s (%dx%d @ %.3gfps, view=%s)",
-                    self.output_path, self.width, self.height, self.fps, self.view)
+        logger.info("独立显示相机开始: %s (%dx%d @ %.3gfps, view=%s, 录像=%s, 实时=%s)",
+                    self.output_path, self.width, self.height, self.fps, self.view,
+                    self.record_video, self.live_view is not None)
 
     def _receive_frame(self, frame) -> None:
         """Sensor thread callback: bounded storage also during failed runs."""
@@ -238,9 +243,9 @@ class VideoRecorder:
         ``latest_trigger``, ``selected_id``, ``status``,
         ``trajectory_visualization`` (the matching planner display audit).
         ``trajectory_display`` optionally contains detached world polylines for
-        video-only projection through this image's capture transform.
+        live/video projection through this image's capture transform.
         """
-        if self._writer is None or self._flushed or self._closing:
+        if not self._started or self._flushed or self._closing:
             return False
         requested = int(frame_id) if frame_id is not None else None
         self._requested_count += 1
@@ -280,6 +285,9 @@ class VideoRecorder:
                "requested_frame": requested, "sim_time_s": elapsed,
                "sensor_timestamp_s": sensor_time,
                "video_time_s": self._frame_count / self.fps, "fps": self.fps}
+        if not self.record_video:
+            row.update(video_frame_index=None, video_time_s=None,
+                       display_frame_index=self._frame_count)
         try:
             bgr = np.frombuffer(frame.raw_data, dtype=np.uint8).reshape(
                 frame.height, frame.width, 4)[:, :, :3].copy()
@@ -289,7 +297,7 @@ class VideoRecorder:
             if self.hud:
                 self._draw_hud(bgr, row, overlay or {})
             # cv2 normally returns None. Explicit False from a backend is failure.
-            if self._writer.write(bgr) is False:
+            if self._writer is not None and self._writer.write(bgr) is False:
                 raise RuntimeError("video writer rejected frame")
             if self._index_file is not None:
                 self._index_file.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
@@ -301,6 +309,19 @@ class VideoRecorder:
                               carla_frame_id=actual, error=f"{type(exc).__name__}: {exc}")
             logger.warning("视频帧写入失败 (frame=%s): %s", actual, exc)
             return False
+        # Both destinations receive the exact same composited image. JPEG and
+        # slow clients run outside this control thread; live errors cannot drop
+        # an otherwise successfully written MP4 frame.
+        if self.live_view is not None:
+            try:
+                published = self.live_view.publish(bgr, {**row,
+                    **{key: (overlay or {}).get(key) for key in
+                       ("run_id", "planner_sequence", "selected_id")}})
+                if published is False:
+                    self._live_error_count += 1
+            except Exception as exc:
+                self._live_error_count += 1
+                logger.warning("实时画面发布失败 (frame=%s): %s", actual, exc)
         self._frame_count += 1
         self._last_frame_id = actual
         if self._first_sim_time is None:
@@ -455,14 +476,26 @@ class VideoRecorder:
             sample("execution", "Accepted cmd", 6, y0 + 5 * step, half)
             sample("rejected", "Rejected cmd", 6 + half, y0 + 5 * step, half)
 
+    def _live_summary(self):
+        if self.live_view is None:
+            return None
+        try:
+            return json.loads(json.dumps(self.live_view.summary(), ensure_ascii=False, allow_nan=False))
+        except Exception as exc:
+            return {"state": "error", "error": {"type": type(exc).__name__, "message": str(exc)}}
+
     def summary(self) -> dict:
         """Small replay manifest; full frame correspondence remains on disk."""
-        return {"schema_version": 1, "video_path": self.output_path,
+        return {"schema_version": 1, "video_path": self.output_path if self.record_video else None,
                 "frames_path": str(self.index_path), "events_path": str(self.events_path),
                 "summary_path": str(self.summary_path), "fps": self.fps,
                 "width": self.width, "height": self.height, "view": self.view,
                 "hud": self.hud, "requested_frame_count": self._requested_count,
-                "encoded_frame_count": self._frame_count,
+                "record_video": self.record_video,
+                "encoded_frame_count": self._frame_count if self.record_video else 0,
+                "composited_frame_count": self._frame_count,
+                "live_publish_error_count": self._live_error_count,
+                "live_view": self._live_summary(),
                 "pending_frame_count": len(self._pending),
                 "max_pending_frames": self.max_pending_frames,
                 "frame_timeout_s": self.frame_timeout_s,
@@ -473,7 +506,7 @@ class VideoRecorder:
                 "stale_frame_count": self._stale_count,
                 "queue_overflow_count": self._overflow_count,
                 "encode_error_count": self._error_count,
-                "video_duration_s": self._frame_count / self.fps,
+                "video_duration_s": self._frame_count / self.fps if self.record_video else 0.,
                 "first_sim_time_s": self._first_sim_time, "last_sim_time_s": self._last_sim_time,
                 "closed": self._flushed,
                 "timeline_note": "Use frames_path for exact simulation-to-video correspondence; missing frames are not duplicated."}
@@ -486,7 +519,7 @@ class VideoRecorder:
         if self._flushed or self._closing:
             return
         self._closing = True
-        if self._writer is not None:
+        if self._started:
             # Leave the callback active for a small, bounded final drain. A
             # missing GPU frame cannot make close tick or wait indefinitely.
             self._service_pending(self.flush_timeout_s)
@@ -513,6 +546,11 @@ class VideoRecorder:
             except Exception as exc:
                 logger.warning("视频关闭失败: %s", exc)
             self._writer = None
+        if self.live_view is not None:
+            try:
+                self.live_view.close()
+            except Exception as exc:
+                logger.warning("实时显示关闭失败: %s", exc)
         for name in ("_index_file", "_events_file"):
             handle = getattr(self, name)
             if handle is not None:
@@ -528,6 +566,7 @@ class VideoRecorder:
             with self.summary_path.open("w", encoding="utf-8", newline="\n") as handle:
                 json.dump(self.summary(), handle, indent=2, ensure_ascii=False, allow_nan=False)
                 handle.write("\n")
-        logger.info("视频录制结束: %s (%d 帧, 播放 %.1fs, 缺帧 %d；时间以帧索引为准)",
-                    self.output_path, self._frame_count, self._frame_count / self.fps,
+        logger.info("显示相机结束: %s (%d 合成帧, 录像=%s, 播放 %.1fs, 缺帧 %d；时间以帧索引为准)",
+                    self.output_path, self._frame_count, self.record_video,
+                    self._frame_count / self.fps if self.record_video else 0.,
                     self._missing_count)

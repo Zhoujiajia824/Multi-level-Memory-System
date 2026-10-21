@@ -1,5 +1,6 @@
 """Video/simulation correspondence, bounded callbacks and real MP4 decoding."""
 import json
+from copy import deepcopy
 import threading
 import time
 from types import SimpleNamespace
@@ -32,6 +33,26 @@ def start_mock(tmp_path, monkeypatch, width=320, height=180, **kwargs):
                                     width=width, height=height, fps=10, **kwargs)
     recorder.start()
     return recorder, writer, world
+
+
+class CapturingPreview:
+    """A synchronous capture of the pixels handed to the asynchronous sink."""
+    def __init__(self, failure=None):
+        self.frames = []
+        self.failure = failure
+        self.close_count = 0
+
+    def publish(self, image, metadata):
+        self.frames.append((image.copy(), deepcopy(metadata)))
+        if self.failure == "exception":
+            raise RuntimeError("optional browser publisher failed")
+        return self.failure != "false"
+
+    def close(self):
+        self.close_count += 1
+
+    def summary(self):
+        return {"state": "closed" if self.close_count else "live", "frames": len(self.frames)}
 
 
 def test_exact_frame_waits_for_callback_without_ticking(tmp_path, monkeypatch):
@@ -548,12 +569,14 @@ def test_real_renderer_loop_and_delayed_video_projection_share_world_geometry_an
     from carla_bridge.tests.test_route_acceptance import fake_loop
     from carla_bridge.visualization.trajectory_renderer import CarlaTrajectoryRenderer, DISPLAY_COLORS
 
+    preview = CapturingPreview()
     recorder, writer, world = start_mock(tmp_path, monkeypatch, width=1280, height=720,
-                                         hud=False, flush_timeout_s=0)
+                                         hud=False, flush_timeout_s=0, live_view=preview)
     sensor = recorder._sensor
     sensor.get_transform.side_effect = AssertionError("a live camera pose is never a capture pose")
     loop = fake_loop()
     loop.config.data["output_dir"] = tmp_path
+    loop.config.data["run_id"] = "same-capture-run"
     loop._control_audit_path = tmp_path / "control.jsonl"
     loop._world_clock_audit = Mock()
     loop.recorder = recorder
@@ -569,6 +592,7 @@ def test_real_renderer_loop_and_delayed_video_projection_share_world_geometry_an
         ego.get_transform.return_value = carla.Transform(carla.Location(x=x))
         loop._world_clock_audit.return_value = {"frame": i}
         loop._elapsed = i / 10
+        loop._last_control_command = {"planner_sequence": i * 2}
         points = [[x + 8., -2., 0.], [x + 28., -2., 0.]]
         snapshot = {"selected_index": 0, "candidate_pool_count": 3,
             "reference_surface_xyz": [[x, -2., 0.], [x + 30., -2., 0.]],
@@ -607,8 +631,17 @@ def test_real_renderer_loop_and_delayed_video_projection_share_world_geometry_an
     images = [call.args[0] for call in writer.write.call_args_list]
     assert len(images) == 2
     for pixels in images:
-        for kind in ("selected", "execution"):
-            assert np.any(np.all(pixels == DISPLAY_COLORS[kind][::-1], axis=-1))
+        # A coincident accepted command is deliberately wider than the selected
+        # candidate; requiring both flat colors would demand the old blue shell.
+        assert np.any(np.all(pixels == DISPLAY_COLORS["execution"][::-1], axis=-1))
+    assert len(preview.frames) == 2 and preview.close_count == 1
+    for (live_pixels, metadata), video_pixels, index_row in zip(preview.frames, images, indexed):
+        np.testing.assert_array_equal(live_pixels, video_pixels)
+        assert all(metadata[key] == value for key, value in index_row.items())
+        assert metadata["selected_id"] == "winner"
+        assert metadata["run_id"] == "same-capture-run"
+        assert metadata["planner_sequence"] == metadata["carla_frame_id"] * 2
+        assert metadata["trajectory_overlay"]["drawn_paths"] == 2
     assert np.mean(np.abs(images[0].astype(float) - images[1])) < .1
     # No emissive native primitive may enter the raw camera image. The only
     # trajectory pixels are the muted, continuous post-capture annotation.
@@ -618,6 +651,160 @@ def test_real_renderer_loop_and_delayed_video_projection_share_world_geometry_an
     sensor.get_transform.assert_not_called()
     ego.apply_control.assert_not_called()
     loop.carla_client.tick.assert_not_called()
+    world.tick.assert_not_called()
+
+
+def test_live_only_uses_real_jpeg_sink_camera_projection_and_index_without_mp4(tmp_path, monkeypatch):
+    """MP4 is optional; the independent display camera and overlay still run."""
+    import carla
+    from carla_bridge.visualization.live_view import LiveTrajectoryView
+    from carla_bridge.visualization.trajectory_renderer import DISPLAY_COLORS, DEFAULTS
+
+    writer_factory = Mock(side_effect=AssertionError("live-only mode allocated an MP4 writer"))
+    monkeypatch.setattr(module.cv2, "VideoWriter", writer_factory)
+    live = LiveTrajectoryView({"enabled": True, "port": 0})
+    live.start()
+    world = Mock()
+    recorder = module.VideoRecorder(world, Mock(), str(tmp_path / "live-only.mp4"),
+        width=320, height=180, fps=10, record_video=False, live_view=live, hud=False, flush_timeout_s=0)
+    frame = camera_frame(41, color=160)
+    original_raw = frame.raw_data
+    frame.transform = carla.Transform(carla.Location(z=3.))
+    path = {"kind": "execution", "rgb": list(DISPLAY_COLORS["execution"]),
+            "points_world": [[8., 0., .15], [30., 0., .15]],
+            "width_m": DEFAULTS["execution_thickness"], "alpha": 1.}
+    try:
+        recorder.start()
+        sensor = recorder._sensor
+        world.spawn_actor.assert_called_once()
+        sensor.listen.assert_called_once()
+        recorder._receive_frame(frame)
+        assert recorder.on_tick(frame_id=41, sim_time_s=4.1, overlay={
+            "run_id": "live-only", "planner_sequence": 7, "selected_id": "center",
+            "trajectory_display": {"style": "paper", "paths": [path]},
+            "trajectory_visualization": {"enabled": True, "style": "paper"}})
+        with live._condition:
+            assert live._condition.wait_for(lambda: live._encoded == 1, timeout=2.)
+            jpeg = live._latest[1]
+        decoded = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        assert decoded.shape == (180, 320, 3)
+        # The actual JPEG contains a colored future plan, rather than only gray RGB.
+        assert np.max(np.ptp(decoded.astype(int), axis=2)) > 50
+        assert live.summary()["frame"]["carla_frame_id"] == 41
+        assert live.summary()["frame"]["sim_time_s"] == 4.1
+        assert live.summary()["frame"]["trajectory_overlay"]["drawn_paths"] == 1
+        assert not (tmp_path / "live-only.mp4").exists()
+        indexed = rows(recorder.index_path)
+        assert len(indexed) == 1 and indexed[0]["display_frame_index"] == 0
+        assert indexed[0]["video_frame_index"] is None and indexed[0]["video_time_s"] is None
+        assert indexed[0]["carla_frame_id"] == 41
+        state = recorder.summary()
+        assert state["video_path"] is None and state["encoded_frame_count"] == 0
+        assert state["composited_frame_count"] == 1 and state["video_duration_s"] == 0
+        assert state["missing_frame_count"] == state["encode_error_count"] == 0
+        assert frame.raw_data == original_raw  # Captured/model source bytes are untouched.
+    finally:
+        recorder.flush()
+        live.close()
+    writer_factory.assert_not_called()
+    sensor.stop.assert_called_once()
+    sensor.destroy.assert_called_once()
+    assert not live._worker.is_alive() and not live._server_thread.is_alive()
+    assert json.loads(recorder.summary_path.read_text(encoding="utf-8"))["live_view"]["state"] == "closed"
+    assert recorder._index_file is recorder._events_file is None
+    world.tick.assert_not_called()
+    world.wait_for_tick.assert_not_called()
+
+
+@pytest.mark.parametrize("record_video", [True, False])
+def test_delayed_camera_keeps_live_and_video_metadata_and_hud_on_the_same_frame(
+        tmp_path, monkeypatch, record_video):
+    preview = CapturingPreview()
+    recorder, writer, world = start_mock(tmp_path, monkeypatch, flush_timeout_s=0,
+                                         record_video=record_video, live_view=preview)
+    drawn = []
+
+    def hud(image, row, overlay):
+        marker = overlay["planner_sequence"]
+        image[80, 100] = (marker, 150, 220)
+        drawn.append((row["carla_frame_id"], marker))
+
+    monkeypatch.setattr(recorder, "_draw_hud", hud)
+    for fid in (100, 101):
+        overlay = {"run_id": "delayed-run", "planner_sequence": fid - 70,
+                   "selected_id": "plan_%d" % fid}
+        assert not recorder.on_tick(frame_id=fid, sim_time_s=(fid - 90) / 10, overlay=overlay)
+        overlay["planner_sequence"] = 999  # Pending data must already be detached.
+    for fid in (101, 100):
+        recorder._receive_frame(camera_frame(fid, color=fid))
+    recorder.flush()
+    indexed = rows(recorder.index_path)
+    assert drawn == [(100, 30), (101, 31)]
+    assert [meta["carla_frame_id"] for _, meta in preview.frames] == [100, 101]
+    assert [meta["sim_time_s"] for _, meta in preview.frames] == [1., 1.1]
+    for (image, metadata), index_row in zip(preview.frames, indexed):
+        assert all(metadata[key] == value for key, value in index_row.items())
+        assert tuple(image[80, 100]) == (metadata["planner_sequence"], 150, 220)
+        assert metadata["run_id"] == "delayed-run"
+        assert metadata["selected_id"] == "plan_%d" % metadata["carla_frame_id"]
+    if record_video:
+        assert writer.write.call_count == 2
+        for live_frame, write_call in zip(preview.frames, writer.write.call_args_list):
+            np.testing.assert_array_equal(live_frame[0], write_call.args[0])
+    else:
+        module.cv2.VideoWriter.assert_not_called()
+        assert all(row["video_frame_index"] is None for row in indexed)
+    assert preview.close_count == 1
+    assert recorder.summary()["missing_frame_count"] == 0
+    world.tick.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["exception", "false"])
+def test_optional_live_publish_failure_never_drops_an_encoded_video_frame(tmp_path, monkeypatch, failure):
+    preview = CapturingPreview(failure)
+    recorder, writer, _ = start_mock(tmp_path, monkeypatch, live_view=preview, hud=False)
+    try:
+        recorder._receive_frame(camera_frame(20))
+        assert recorder.on_tick(frame_id=20, sim_time_s=2.)
+        assert writer.write.call_count == 1
+        assert rows(recorder.index_path)[0]["carla_frame_id"] == 20
+        assert recorder.summary()["encoded_frame_count"] == 1
+        assert recorder.summary()["missing_frame_count"] == recorder.summary()["encode_error_count"] == 0
+        assert recorder.summary()["live_publish_error_count"] == 1
+    finally:
+        recorder.flush()
+    writer.release.assert_called_once()
+    assert preview.close_count == 1
+
+
+def test_default_recorder_does_not_create_a_live_server(tmp_path, monkeypatch):
+    from carla_bridge.visualization import live_view
+    live_factory = Mock(side_effect=AssertionError("off mode started browser resources"))
+    monkeypatch.setattr(live_view, "LiveTrajectoryView", live_factory)
+    recorder, writer, _ = start_mock(tmp_path, monkeypatch, hud=False)
+    recorder._receive_frame(camera_frame(20))
+    assert recorder.on_tick(frame_id=20, sim_time_s=2.)
+    recorder.flush()
+    assert recorder.summary()["live_view"] is None
+    assert writer.write.call_count == 1
+    live_factory.assert_not_called()
+
+
+def test_optional_live_summary_failure_cannot_abort_video_flush(tmp_path, monkeypatch):
+    preview = CapturingPreview()
+    preview.summary = Mock(side_effect=RuntimeError("optional browser summary failed"))
+    recorder, writer, world = start_mock(tmp_path, monkeypatch, live_view=preview, hud=False)
+    sensor = recorder._sensor
+    recorder._receive_frame(camera_frame(20))
+    assert recorder.on_tick(frame_id=20, sim_time_s=2.)
+    recorder.flush()
+    assert writer.write.call_count == 1
+    writer.release.assert_called_once()
+    sensor.destroy.assert_called_once()
+    assert recorder._index_file is recorder._events_file is None
+    summary = json.loads(recorder.summary_path.read_text(encoding="utf-8"))
+    assert summary["closed"] and summary["live_view"]["state"] == "error"
+    assert summary["live_view"]["error"]["type"] == "RuntimeError"
     world.tick.assert_not_called()
 
 
