@@ -76,8 +76,10 @@ def _render_md(run_info: dict, s: dict) -> str:
         lines += ["- [模型调用回放审核](replay/index.html)",
                   f"- 实际模型调用帧占比: {ratio_text}"
                   f"（{usage.get('actual_model_call_frame_count')} / {usage.get('total_tick_frame_count')} 个唯一CARLA帧）",
-                  f"- 认知咨询 / 逻辑模型请求 / SDK调用尝试: {usage.get('consultation_count')} / "
-                  f"{usage.get('logical_model_request_count')} / {usage.get('sdk_attempt_count')}"]
+                  f"- 认知咨询 / 逻辑模型请求 / 实际模型调用尝试: {usage.get('consultation_count')} / "
+                  f"{usage.get('logical_model_request_count')} / {usage.get('model_attempt_count', usage.get('sdk_attempt_count'))}",
+                  f"- 模型调用后端: API SDK {usage.get('sdk_attempt_count')} 次；"
+                  f"本地推理 {usage.get('local_attempt_count', '未知')} 次"]
     if run_info.get("replay_error"):
         lines.append("- 模型回放报告未生成: "+str(run_info["replay_error"]))
     if run_info.get("early_terminated"):

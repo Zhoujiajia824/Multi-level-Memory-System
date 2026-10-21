@@ -1,10 +1,22 @@
 # =============================================================================
-# VLM API 模型配置
+# VLM 模型配置：远程 API / 本进程离线 Qwen2.5-VL
 # =============================================================================
 # 第一版默认使用 OpenAI-compatible API 方式调用 VLM。
 # 推荐 Qwen-VL / Qwen 系列视觉模型。
 # 所有敏感信息（API Key）必须从环境变量读取，不允许硬编码。
 # =============================================================================
+
+# 两个阶段使用同一后端；命令行 --vlm-backend 优先于此配置。
+# 默认api保留现有运行方式；服务器使用 --vlm-backend local 启用下方目录。
+vlm:
+  backend: "api"
+  local:
+    model_path: "/data/zjj/qwen_vlm_models/Qwen2.5-VL-3B-Instruct"
+    device: "cuda:1"             # 避开常见的CARLA GPU0；按实际空闲GPU修改
+    dtype: "auto"                # CUDA优先bf16，CPU用fp32
+    attn_implementation: "sdpa"   # 不要求编译flash-attn
+    min_pixels: 200704            # 256 * 28 * 28，每张图的最小像素预算
+    max_pixels: 1003520           # 1280 * 28 * 28；调低可降低显存占用
 
 # ---- 场景理解 VLM ----
 scene_understanding:

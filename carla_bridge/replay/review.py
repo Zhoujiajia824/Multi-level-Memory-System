@@ -290,11 +290,12 @@ def _requests(root, calls, warnings):
         if event in ("request_end", "end"):
             target["completed"] = True
     for item in attempts.values():
-        # New instrumentation marks SDK dispatch explicitly. A historical row
-        # with only a response/error is an attempted SDK invocation unless the
-        # producer explicitly marked a skipped or preflight-only request.
+        # Historical API logs predate the backend marker. Local inference is
+        # counted only when the producer explicitly entered model.generate;
+        # loading weights or preparing a prompt is not a model invocation.
+        item["backend"] = str(item.get("backend") or "api").lower()
         item["dispatched"] = (item.get("dispatched") is True or (
-            item.get("dispatched") is not False and (item.get("started") is True
+            item["backend"] == "api" and item.get("dispatched") is not False and (item.get("started") is True
             or item.get("status") in ("success", "ok", "error", "failed", "completed"))))
         item.setdefault("status", "incomplete" if not item.get("completed") else "completed")
         if item["call_id"] not in calls:
@@ -418,13 +419,13 @@ def build_review(run_dir: str | Path) -> dict[str, Any]:
     call_frames = {r["carla_frame_id"] for r in dispatched if r.get("carla_frame_id") is not None}
     outside_frames = call_frames - ticks.keys()
     if outside_frames:
-        warnings.append("%d 个实际 SDK 调用帧不在 control tick 帧日志中，调用帧比例不可准确计算。" % len(outside_frames))
+        warnings.append("%d 个实际模型调用帧不在 control tick 帧日志中，调用帧比例不可准确计算。" % len(outside_frames))
     if unknown_attempt_frames:
-        warnings.append("%d 次 SDK 调用缺少真实 CARLA 帧号，不能准确计算调用帧比例。" % unknown_attempt_frames)
+        warnings.append("%d 次模型调用缺少真实 CARLA 帧号，不能准确计算调用帧比例。" % unknown_attempt_frames)
     if not ticks:
         warnings.append("没有可用 control.jsonl 真实推进帧；帧数分母与比例未知。")
     if not request_log_present:
-        warnings.append("没有 model_requests.jsonl；实际 SDK 尝试/重试计数未知，不能把认知记录数当作 API 请求数。")
+        warnings.append("没有 model_requests.jsonl；实际模型尝试/重试计数未知，不能把认知记录数当作模型调用数。")
     plan_counts, applicable, affected = _planner(root, calls, ticks, warnings)
     videos = _video_data(root, warnings)
     ordered_calls = sorted(calls.values(), key=lambda c: (
@@ -443,13 +444,23 @@ def build_review(run_dir: str | Path) -> dict[str, Any]:
         call["images"] = _image_assets(call, root)
         for request in call["requests"]:
             request["images"] = _image_assets(request, root)
-        call["actual_sdk_attempt_count"] = (sum(bool(r["dispatched"]) for r in call["requests"])
+        call["actual_model_attempt_count"] = (sum(bool(r["dispatched"]) for r in call["requests"])
+                                             if request_log_present else None)
+        call["has_actual_model_dispatch"] = (call["actual_model_attempt_count"] > 0
+                                            if request_log_present else None)
+        call["actual_sdk_attempt_count"] = (sum(r["dispatched"] and r["backend"] == "api"
+                                              for r in call["requests"])
                                              if request_log_present else None)
         call["has_actual_sdk_dispatch"] = (call["actual_sdk_attempt_count"] > 0
                                             if request_log_present else None)
-    trigger_counts = Counter(c["trigger_text"] for c in ordered_calls if c["has_actual_sdk_dispatch"] is True)
+        call["actual_local_attempt_count"] = (sum(r["dispatched"] and r["backend"] == "local"
+                                                for r in call["requests"])
+                                               if request_log_present else None)
+    trigger_counts = Counter(c["trigger_text"] for c in ordered_calls if c["has_actual_model_dispatch"] is True)
     consultation_trigger_counts = Counter(c["trigger_text"] for c in ordered_calls)
     failed = [r for r in dispatched if r.get("status") in ("error", "failed", "failure") or r.get("error")]
+    sdk_dispatched = [r for r in dispatched if r["backend"] == "api"]
+    sdk_failed = [r for r in failed if r["backend"] == "api"]
     logical = {(r["call_id"], r.get("stage"), r.get("logical_request_id", r["request_id"])) for r in dispatched}
     corrupt_request_audit = any("model_requests.jsonl" in w or "model_calls.jsonl" in w for w in warnings)
     corrupt_control_audit = any("control.jsonl" in w for w in warnings)
@@ -464,16 +475,21 @@ def build_review(run_dir: str | Path) -> dict[str, Any]:
         "planner_audit_complete": (root / "planner.jsonl").is_file() and not corrupt_planner_audit,
         "consultation_count": len(calls),
         "logical_model_request_count": len(logical) if request_log_present else None,
-        "sdk_attempt_count": len(dispatched) if request_log_present else None,
-        "sdk_failed_attempt_count": len(failed) if request_log_present else None,
-        "sdk_incomplete_attempt_count": sum(not r.get("completed") for r in dispatched) if request_log_present else None,
+        "model_attempt_count": len(dispatched) if request_log_present else None,
+        "model_failed_attempt_count": len(failed) if request_log_present else None,
+        "model_incomplete_attempt_count": sum(not r.get("completed") for r in dispatched) if request_log_present else None,
+        "local_attempt_count": sum(r["backend"] == "local" for r in dispatched) if request_log_present else None,
+        "sdk_attempt_count": len(sdk_dispatched) if request_log_present else None,
+        "sdk_failed_attempt_count": len(sdk_failed) if request_log_present else None,
+        "sdk_incomplete_attempt_count": sum(not r.get("completed") for r in sdk_dispatched) if request_log_present else None,
         "actual_model_call_frame_count": len(call_frames) if request_log_present and not unknown_attempt_frames else None,
         "actual_model_call_frames_in_tick_log": len(call_frames & ticks.keys()) if request_log_present else None,
         "total_tick_frame_count": len(ticks) if ticks else None,
         "tick_rows_without_frame": missing_tick_frames,
         "model_call_frame_ratio": len(call_frames) / len(ticks) if valid_ratio else None,
-        "model_call_frame_ratio_definition": "实际 SDK dispatch 对应的唯一 CARLA 帧 / control.jsonl 中真实推进的唯一 CARLA 帧；同帧 scene、decision、重试只计一帧。不是模型墙钟耗时占比；SDK 内部 HTTP 重试不可观察。",
-        "sdk_attempt_definition": "request_id + attempt 去重的已 dispatch SDK 调用尝试；SDK 内部自动 HTTP 重试不在此计数内。",
+        "model_call_frame_ratio_definition": "实际模型调用对应的唯一 CARLA 帧 / control.jsonl 中真实推进的唯一 CARLA 帧；包含 API dispatch 与本地 model.generate，同帧 scene、decision、重试只计一帧。不是模型墙钟耗时占比；模型加载、输入准备及 SDK 内部 HTTP 重试不计调用帧。",
+        "model_attempt_definition": "request_id + attempt 去重的实际模型调用尝试；API 按 SDK dispatch，本地按实际进入 model.generate 计数。",
+        "sdk_attempt_definition": "SDK 字段仅计 backend=api 的实际 SDK dispatch；旧日志未注明 backend 时视为 API。SDK 内部自动 HTTP 重试不在此计数内；本地推理不记为 SDK 调用。",
         "planner_plan_count": plan_counts["all"],
         "semantic_effect_plan_count": plan_counts["effect"],
         "semantic_effect_unknown_plan_count": plan_counts["unknown_effect"],

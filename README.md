@@ -26,6 +26,8 @@ nuPlan/tuplan、下载其 Git 源码或训练权重。安装、运行及限制�
 **从零安装 CARLA 环境**或直接为现有 `mulmem_carla` 补装依赖，请按
 [CARLA 环境搭建第 5 节](carla_bridge/README.md#5-环境搭建) 执行，包含基础依赖、可选 PDM 对照安装、
 DINOv2 离线缓存、API、仿真器连接及预检。下文离线 nuScenes 的 Python 3.12 安装不用于此入口。
+服务器已下载的 Qwen2.5-VL 可直接替代场景理解与决策 API，原环境安装、离线预检和完整命令见
+[本地 Qwen2.5-VL 推理](carla_bridge/README.md#56-服务器本地-qwen25-vl替代场景理解与决策-api)。
 新建的大地图常规/长尾场景需先在服务器生成，再传入场景 YAML 路径运行，完整命令见
 [新场景服务器操作步骤](carla_bridge/README.md#120-从服务器开始生成场景再运行场景)，
 包括语义 on/off、记忆库积累/只读以及顺序批量实验。

@@ -38,7 +38,7 @@ from src.vla_memory.memory.mid_term_memory import MidTermMemory
 from src.vla_memory.memory.retrieval import MemoryRetriever
 from src.vla_memory.memory.short_term_memory import ShortTermMemory
 from src.vla_memory.perception.dinov2_extractor import DINOv2Extractor
-from src.vla_memory.perception.openai_compatible_client import OpenAICompatibleVLMClient
+from src.vla_memory.perception.factory import build_vlm_clients, close_vlm_clients
 from src.vla_memory.perception.scene_understanding import SceneUnderstandingPipeline
 from src.vla_memory.schemas.memory import MidTermMemoryRecord, ShortTermMemoryItem
 
@@ -149,6 +149,7 @@ class OnlineDrivingLoop:
         self._update_enabled = False
 
         self._setup_done = False
+        self._vlm_clients = ()
 
     # ------------------------------------------------------------------
     # 初始化
@@ -180,18 +181,8 @@ class OnlineDrivingLoop:
 
         # ---- 2. 场景理解 VLM + Pipeline ----
         scene_vlm_cfg = cfg.get("scene_understanding", {}) or {}
-        scene_vlm = OpenAICompatibleVLMClient(
-            provider=scene_vlm_cfg.get("provider", "qwen"),
-            api_key_env=scene_vlm_cfg.get("api_key_env", "DASHSCOPE_API_KEY"),
-            base_url=scene_vlm_cfg.get("base_url", ""),
-            model_name=scene_vlm_cfg.get("model_name", "qwen-vl-max"),
-            timeout=scene_vlm_cfg.get("timeout", 60),
-            max_tokens=scene_vlm_cfg.get("max_tokens", 2048),
-            temperature=scene_vlm_cfg.get("temperature", 0.1),
-            retry_times=scene_vlm_cfg.get("retry_times", 3),
-            retry_interval_seconds=scene_vlm_cfg.get("retry_interval_seconds", 5),
-            system_prompt=scene_vlm_cfg.get("system_prompt", ""),
-        )
+        scene_vlm, decision_vlm = build_vlm_clients(cfg)
+        self._vlm_clients = (scene_vlm, decision_vlm)
         feature_dir = cfg.get("feature_dir") or Path("outputs/features")
         self.scene_pipeline = SceneUnderstandingPipeline(
             feature_extractor=self.feature_extractor,
@@ -258,20 +249,6 @@ class OnlineDrivingLoop:
         )
 
         # ---- 4. 决策 VLM + Client ----
-        from src.vla_memory.decision.config_access import get_decision_system_prompt
-        dec_vlm_cfg = cfg.get("decision", {}) or {}
-        decision_vlm = OpenAICompatibleVLMClient(
-            provider=dec_vlm_cfg.get("provider", "qwen"),
-            api_key_env=dec_vlm_cfg.get("api_key_env", "DASHSCOPE_API_KEY"),
-            base_url=dec_vlm_cfg.get("base_url", ""),
-            model_name=dec_vlm_cfg.get("model_name", "qwen-vl-max"),
-            timeout=dec_vlm_cfg.get("timeout", 120),
-            max_tokens=dec_vlm_cfg.get("max_tokens", 4096),
-            temperature=dec_vlm_cfg.get("temperature", 0.1),
-            retry_times=dec_vlm_cfg.get("retry_times", 3),
-            retry_interval_seconds=dec_vlm_cfg.get("retry_interval_seconds", 5),
-            system_prompt=get_decision_system_prompt(cfg),
-        )
         self.decision_client = DecisionClient(vlm_client=decision_vlm)
 
         # ---- 5. P5 图像上下文配置 ----
@@ -981,14 +958,17 @@ class OnlineDrivingLoop:
             except Exception as e:
                 flush_error = e
                 logger.warning("event_memory close-flush 异常: %s", e)
-        if self.mid_term is not None:
-            try:
-                self.mid_term.close()
-            except Exception:
-                logger.exception("mid_term.close 保存失败")
-                raise
-        if flush_error is not None:
-            raise RuntimeError("结束事件记忆入库失败") from flush_error
+        try:
+            if self.mid_term is not None:
+                try:
+                    self.mid_term.close()
+                except Exception:
+                    logger.exception("mid_term.close 保存失败")
+                    raise
+            if flush_error is not None:
+                raise RuntimeError("结束事件记忆入库失败") from flush_error
+        finally:
+            close_vlm_clients(getattr(self, "_vlm_clients", ()))
 
     # ------------------------------------------------------------------
     # 辅助

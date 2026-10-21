@@ -13,6 +13,8 @@ MPC 不依赖 nuPlan/tuplan；安装、完整命令及约束说明见[第 14 节
 未指定 planner 的命令现在使用 MPC，不能把旧 PDM 验收结果视为 MPC 验收。
 运行后的模型调用、图像、输入输出与视频定位见[第 13.11 节](#1311-模型调用审核视频定位与仿真轨迹绘制)。
 全部入口开关、当前默认值与记忆组合速查见[第 13.12 节](#1312-运行开关总表与记忆使用形式)。
+已在服务器下载 Qwen2.5-VL 时，按[第 5.6 节](#56-服务器本地-qwen25-vl替代场景理解与决策-api)
+直接使用本地模型替代场景理解与决策 API，保持原规划、语义调度和记忆模式。
 
 > ⚠️ 研究用离线/仿真 Demo，**不可用于实车**。
 
@@ -55,9 +57,10 @@ python -m pytest carla_bridge/tests/test_mpc_solver.py carla_bridge/tests/test_m
 - 按服务器原有方式启动 CARLA 0.9.15，确认场景使用的 Town04 / Town01 地图可加载。
   `carla_bridge/config/carla.yaml` 默认连接 `127.0.0.1:2000`，异机部署需修改 host。
 - 保持 `synchronous: true`。同一个 CARLA world 同时只运行一个闭环驱动客户端。
-- 检查 `config/api_models.yaml` 的服务地址、模型名、`api_key_env`，在运行终端设置对应密钥。
+- 使用默认 API 后端时，检查 `config/api_models.yaml` 的服务地址、模型名、`api_key_env`，在运行终端设置对应密钥。
   默认 `DASHSCOPE_API_KEY`：Bash 用 `export DASHSCOPE_API_KEY='你的key'`，
   PowerShell 用 `$env:DASHSCOPE_API_KEY='你的key'`。
+  选择 `--vlm-backend local` 时无需 API Key，安装和本地模型路径见第 5.6 节。
 - DINOv2 默认只读本地模型文件；`CUDA: False` 不代表导入失败，但推理性能需另行评估。
 - 当前视频默认开启；显存不足时在 `carla.video` 中关闭视频或降低分辨率。
 
@@ -86,7 +89,8 @@ python scripts/00_prepare_models.py --offline --cache-dir /path/to/huggingface
 
 CARLA 配置默认 `feature_extractor.local_files_only: true`，缺文件立即报错，不等待 Hugging Face。
 入口自动启用原生故障堆栈和及时日志输出，**无需 `HF_HUB_OFFLINE=1`、`-X faulthandler`、`-u` 前缀**。
-VLM API 调用仍需网络。覆盖模型位置或显式允许下载的方式为：
+默认 VLM API 调用仍需网络；`--vlm-backend local` 则只读本地 Qwen 文件。
+覆盖 DINOv2 模型位置或显式允许下载的方式为：
 
 ```bash
 python carla_bridge/run_carla_demo.py --scenario straight_traffic --dinov2-cache-dir /path/to/huggingface
@@ -507,7 +511,7 @@ python scripts/00_prepare_models.py --offline
 独立模型目录可用 `python scripts/00_prepare_models.py --offline --model-dir /实际路径/dinov2`；
 此后驾驶命令也要添加同一个 `--dinov2-model-dir /实际路径/dinov2`。
 
-核对 `config/api_models.yaml` 中场景理解与决策模型的服务地址、模型名和 `api_key_env`。
+使用默认 `vlm.backend: api` 时，核对 `config/api_models.yaml` 中场景理解与决策模型的服务地址、模型名和 `api_key_env`。
 默认密钥变量可以在 Bash 当前终端中隐藏输入：
 
 ```bash
@@ -517,7 +521,8 @@ export DASHSCOPE_API_KEY
 ```
 
 默认入口不会自动读取 `.env`，新终端需要重新设置或沿用你已有的环境变量管理方式。
-模型缓存离线不意味着 VLM API 也离线；模型调用仍需访问配置的服务。
+模型缓存离线不意味着 VLM API 也离线；API 后端仍需访问配置的服务。
+使用本地 Qwen 后端时改按第 5.6 节操作，无需设置此密钥。
 
 ### 5.5 连接仿真器，再进入新场景实验
 
@@ -548,6 +553,174 @@ PY
 版本一致且所需地图齐全后，继续 [12.0 的 prepare 和首轮驾驶命令](#120-从服务器开始生成场景再运行场景)，
 再选择 [12.6 的记忆库方式](#126-新场景与记忆库模式完整命令)。
 历史 `setup_env.sh` 仍是旧基础环境脚本，未包含完整 PDM 安装，不作为本节流程的替代。
+
+### 5.6 服务器本地 Qwen2.5-VL：替代场景理解与决策 API
+
+`--vlm-backend local` 在驾驶进程中通过 Transformers 读取本地 Qwen2.5-VL-3B-Instruct。
+场景理解与决策使用各自原有提示词和输出协议，共享同一份模型权重，顺序推理，避免加载两份显存副本。
+不需要启动 vLLM、HTTP 服务或设置 API Key，也不需要 `HF_HUB_OFFLINE=1` 前缀。
+模型与 processor 均强制只读指定目录；缺文件时明确报错，不联网补下载、不自动改用远程 API。
+默认后端仍为 `api`，可通过 CLI 或下面的配置选择 `local`。
+
+#### 原 mulmem_carla 环境安装和依赖检查
+
+继续使用已有环境，不重新创建。先记录依赖并检查当前 PyTorch/CUDA 配套情况：
+
+```bash
+cd /data/zjj/code/vlm_memory_system/Multi-level-Memory-System
+conda activate mulmem_carla
+mkdir -p outputs/local_vlm_setup
+python -m pip freeze > outputs/local_vlm_setup/before_install.txt
+nvidia-smi
+python - <<'PY'
+import sys
+import torch
+import torchvision
+from torchvision.ops import nms
+print("Python:", sys.version)
+print("torch:", torch.__version__, "torchvision:", torchvision.__version__)
+print("CUDA build:", torch.version.cuda, "CUDA usable:", torch.cuda.is_available())
+for i in range(torch.cuda.device_count()):
+    print(i, torch.cuda.get_device_name(i))
+print("torchvision nms:", nms(torch.tensor([[0., 0., 1., 1.]]), torch.tensor([1.]), 0.5))
+PY
+```
+
+出现 `torchvision::nms does not exist` 或导入错误时，先修复已有 torch/torchvision 的配套关系，
+按 [PyTorch 官方版本表](https://pytorch.org/get-started/previous-versions/) 选择与服务器驱动兼容的同组 wheel。
+下面的可选依赖清单不指定新的 CUDA/torch/torchvision 版本；已有可用组合保持原样。
+Transformers 4.51.3 和 Accelerate 1.6.0 支持 Python 3.9，二者元数据要求 torch 至少 2.0；
+本地默认 SDPA 建议保留已配套的 torch 2.2 或更高版本；本节不自动替换当前 PyTorch。
+还需满足实际模型的预检要求，不能仅凭版本号断定推理成功。
+
+确认已有组合正常后，只补装本地 VLM 依赖；不要重装根目录整份 `requirements.txt`，
+以免覆盖 PDM 已固定的 scikit-learn、NumPy 等版本：
+
+```bash
+python -m pip install \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple \
+  --timeout 120 --retries 10 \
+  -r carla_bridge/requirements-local-vlm.txt
+python -m pip check
+```
+
+本清单固定 `transformers==4.51.3`、`accelerate==1.6.0`，兼顾原 Python 3.9 环境与 Qwen2.5-VL。
+若此前安装了第 5.2 节的 Transformers 4.57.6，本步骤会切换到该本地推理版本。
+该实现直接处理 Pillow 图像，不需要额外安装 `qwen-vl-utils` 或编译 `flash-attn`。
+软件依赖的首次安装仍需包源可访问；安装成功后模型加载和生成本身不访问 Hugging Face。
+`pip check` 若报告其他已有依赖冲突，应先保留并检查输出，不能把冲突当作安装成功。
+
+#### 先预检，再进行真实单图推理
+
+截图中的目录已经是展开后的模型目录，应直接指向它，不能指向上一层 `qwen_vlm_models`：
+
+```bash
+MODEL=/data/zjj/qwen_vlm_models/Qwen2.5-VL-3B-Instruct
+python -m src.vla_memory.perception.local_qwen_client \
+  --model-path "$MODEL" --device cuda:1 --dtype auto --check
+```
+
+`--check` 检查本地配置、tokenizer/processor、权重文件及相关依赖/设备，
+也要求存在聊天模板：`chat_template.json`、`chat_template.jinja` 或 `tokenizer_config.json` 内的模板。
+它不加载完整模型权重，不能替代真实推理。随后使用服务器上实际存在的相机图片验证加载和生成；截图中已有
+`/data/zjj/carla_test/first_rgb.png` 时可以直接运行：
+
+```bash
+python -m src.vla_memory.perception.local_qwen_client \
+  --model-path "$MODEL" --device cuda:1 --dtype auto --max-new-tokens 128 \
+  --image /data/zjj/carla_test/first_rgb.png \
+  --prompt '请简要描述图中的车道、交通参与者和交通信号。'
+```
+
+这一步才会读取权重并占用显存，退出后释放该进程的模型。它验证单图推理，不等于六视角驾驶闭环验收。
+`cuda:1` 是当前进程可见的第 2 张 GPU；若设置了 `CUDA_VISIBLE_DEVICES`，设备编号会重新映射。
+使用 `nvidia-smi` 选择有足够空闲显存的卡，尽量将 VLM 与 CARLA 引擎分开。
+
+#### 原场景完整运行：本地 VLM + MPC / PDM
+
+以下继续使用已经生成的 R05 场景，不重新生成路线或交通。先关闭记忆，核对模型后端是否切换成功：
+
+```bash
+python -m carla_bridge.run_carla_demo \
+  --scenario outputs/paper_v1_spawncheck/eval/R05_multilane_eval_s101.yaml \
+  --planner mpc \
+  --vlm-backend local \
+  --local-vlm-model-path /data/zjj/qwen_vlm_models/Qwen2.5-VL-3B-Instruct \
+  --local-vlm-device cuda:1 --local-vlm-dtype auto \
+  --semantic-policy selective --semantic-influence on --model-inference on \
+  --planning-memory off --mode memory_off \
+  --replay-audit on --record-video on --trajectory-visualization off
+```
+
+使用原 PDM 对照时只将 `--planner mpc` 替换为 `--planner pdm_closed`，其余参数保持一致，
+并先完成 `python -m carla_bridge.planning.pdm_planner --check`。
+`selective` 保留条件咨询；正常数值规划未触发咨询时，看不到模型生成并不表示后端无效。
+需要对照旧的周期认知模式时，将 `--semantic-policy selective` 改为 `--semantic-policy always`，
+模型会按原全量认知间隔调用。`--model-inference off` 仍完全跳过模型初始化和推理，
+需同时选择语义 off 和允许的记忆组合；选择本地后端不会使纯规划模式加载 Qwen。
+
+`--mode memory_off` 仅关闭记忆，不会关闭场景理解、决策或其 DINOv2 特征提取；
+保留之前已配置的 DINOv2 本地目录/缓存，必要时追加 `--dinov2-model-dir /实际路径/dinov2`。
+切换本地 Qwen 不改变六视角输入、现有提示词、语义介入条件、MPC/PDM 规划及模型回放审计。
+
+#### 结合已有记忆库
+
+第 12.6、13.6 节的记忆参数全部保留。把上面命令末段的
+`--planning-memory off --mode memory_off` 替换为下列对应组合即可，避免在同条命令中重复这些参数：
+
+| 目的 | 替换为 |
+| --- | --- |
+| 指定共享库持续积累 | `--planning-memory full --mode memory_on --memory-bank outputs/memory_banks/qwen_local/train_general --memory-access read_write` |
+| 场景专用库积累 | 同上，使用不同 bank 路径，例如 `outputs/memory_banks/qwen_local/train_R05` |
+| 只检索已有库，不新增记忆 | `--planning-memory full --mode memory_on --memory-bank outputs/memory_banks/qwen_local/train_general --memory-access read_only` |
+| 仅模型文本/视觉记忆，不用数值规划经验 | `--planning-memory off --mode memory_on --memory-bank <已有完整库> --memory-access read_only` |
+
+论文 `eval` 场景在 memory_on 时强制只读；积累要换成已生成的 `train` 场景，不能在上面的 eval 命令中直接开启写入。
+只读库必须已经存在且完整。API 与本地模型可以读取兼容格式的旧库，但旧模型记忆可能带来输出分布差异；
+做模型对照时明确固定只读库，或使用独立 `qwen_local` 库，记录具体来源，避免混用结果。
+
+#### 固定配置、切回 API 和故障定位
+
+需要省略重复 CLI 参数时，在 `config/api_models.yaml` 中配置下列顶层字段；CLI 优先：
+
+```yaml
+vlm:
+  backend: local  # 仓库默认 api；改 local 后场景理解与决策均使用本地模型
+  local:
+    model_path: /data/zjj/qwen_vlm_models/Qwen2.5-VL-3B-Instruct
+    device: cuda:1
+    dtype: auto
+    attn_implementation: sdpa
+    min_pixels: 200704
+    max_pixels: 1003520
+```
+
+`min_pixels/max_pixels` 控制每张输入图的处理像素预算；当前驾驶图像通常是六视角拼图，
+调低预算会损失交通灯、远处行人等小目标细节。显存不足时先选择空闲卡、关闭并行占用，
+再按实验目的降低 `max_pixels` 或输出 token 上限；不要把图像降采样后的结果与原输入无区别地比较。
+`dtype=auto` 按设备能力选择精度，另可显式使用 `bfloat16`、`float16`、`float32`；
+float32 占用更大、通常更慢。多张 GPU 不会自动合并显存，本实现加载到指定单卡。
+两个角色的输出上限、温度、提示词和 `timeout` 仍使用 `scene_understanding` / `decision` 配置。
+本地 `timeout` 传给 Transformers 的 `max_time`，是在生成步骤间检测的软时间预算，
+不能中断首次模型加载、正在执行的 prefill（输入预填充）或卡住的 CUDA 操作，也不保证整个调用在该秒数内返回。
+输出达到 token/时间预算且未正常结束时，会明确报错并拒绝未完成的结果，不把截断内容作为成功响应。
+
+| 现象 | 处理 |
+| --- | --- |
+| 路径不存在、分片不完整、下载残留或配置不符 | 对照 `model.safetensors.index.json` 补齐本地所有权重分片及 tokenizer/processor 文件，再跑 `--check`；不改为联网模型 ID |
+| 无法导入 `Qwen2_5_VLForConditionalGeneration` | 确认激活的是 mulmem_carla，执行本节独立依赖安装并检查 `python -m pip show transformers` |
+| CUDA 不可用或设备编号超范围 | 检查 `nvidia-smi`、PyTorch CUDA 构建及 `CUDA_VISIBLE_DEVICES`；不要把 CPU 推理误认为 GPU |
+| CUDA out of memory | 换空闲 GPU，检查是否同时启动多个实验；必要时调整上述像素/输出预算并重新做单图及闭环验收 |
+| 单图成功，但驾驶响应格式被拒绝或建议质量下降 | 查看本轮 `replay/index.html` 中实际拼图、提示词、原始输出与验证结果；3B 模型能力和原远程模型不同，不能仅凭能加载就认定效果更好 |
+
+切回远程时显式传 `--vlm-backend api` 并按 5.4 节恢复对应 API Key；本地路径参数不会变成远程模型地址。
+本次集成实现后端切换，不承诺本地 3B 比原 API 更准确或每次更快。首次加载耗时、真实调用延迟、
+路线完成率、碰撞、违规及模型 JSON 合规率都需在服务器验证，验收仍是完整路线 100%。
+
+官方依据：[Qwen 模型说明](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct)、
+[Transformers 4.51.3 Qwen2.5-VL 用法](https://huggingface.co/docs/transformers/v4.51.3/model_doc/qwen2_5_vl)、
+[该版本依赖元数据](https://github.com/huggingface/transformers/blob/v4.51.3/setup.py)、
+[Accelerate 1.6.0 依赖元数据](https://github.com/huggingface/accelerate/blob/v1.6.0/setup.py)。
 
 ---
 
@@ -1976,6 +2149,7 @@ carla:
 | `--scenario` | 场景名或YAML路径；默认 `straight_traffic` | 选择运行场景；论文场景须已完成准备/出生检查 |
 | `--planner` | `mpc`（默认）、`pdm_closed`、`vlm_trajectory` | 独立约束MPC、PDM对照，或旧模型直接输出路点 |
 | `--model-inference` | `on`（默认）、`off` | 是否初始化并调用场景理解/决策模型；off跳过认知相机、DINO和文本/视觉记忆 |
+| `--vlm-backend` | `api`（配置默认）、`local` | 外部 OpenAI-compatible API 或直接加载本地 Qwen2.5-VL；控制两个模型角色，不改变调用调度 |
 | `--semantic-influence` | `on`（默认）、`off` | 模型横纵向语义是否允许影响数值候选选择；off本身不会关闭模型调用 |
 | `--semantic-policy` | `selective`（默认）、`always`、`shadow` | 条件查询和介入；旧版周期查询/无条件语义加分；按需查询并记录假设选择但不实际采纳 |
 | `--planner-recovery` | `on`（默认）、`off` | 允许selective/shadow模型明确请求额外参考；MPC在合法管道内偏移再约束优化，PDM使用其局部扩展；shadow只记录不执行 |
@@ -2034,6 +2208,9 @@ python -m carla_bridge.run_carla_demo \
 
 | 参数 | 当前默认 | 含义 |
 | --- | --- | --- |
+| `--local-vlm-model-path` | 继承 `vlm.local.model_path` | 包含配置、tokenizer/processor 和完整权重分片的本地 Qwen2.5-VL 目录 |
+| `--local-vlm-device` | 继承 `vlm.local.device` | 本地模型单卡设备，例如 `cuda:1`；设备索引按当前进程可见 GPU 计算 |
+| `--local-vlm-dtype` | `auto`、`bfloat16`、`float16`、`float32`，默认继承配置 | 本地模型精度；auto 按设备能力选择；仅 local 后端使用 |
 | `--dinov2-model-dir` | 未指定 | 指定本地DINOv2模型或Hugging Face snapshot目录 |
 | `--dinov2-cache-dir` | `.cache/huggingface` | 指定Hugging Face缓存根目录 |
 | `--allow-model-download` | 默认不传，仅本地加载 | 显式允许DINOv2联网查找/下载；不控制远程VLM API调用 |

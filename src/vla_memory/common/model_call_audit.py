@@ -1,7 +1,8 @@
 """Optional per-consultation request observer; no simulator or SDK dependency.
 
 The caller owns persistence. Nothing is recorded outside an explicit scope.
-One attempt means one SDK dispatch, not an unobservable SDK-internal HTTP retry.
+One attempt means one SDK dispatch or local generation, not an unobservable
+SDK-internal HTTP retry. Model loading and prompt preparation are not dispatches.
 """
 from contextlib import contextmanager
 from contextvars import ContextVar

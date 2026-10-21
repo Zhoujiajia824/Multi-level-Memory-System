@@ -1,7 +1,7 @@
 """
 场景理解流水线
 ==============
-对关键帧图像使用 DINOv2 提取真实 embedding，并使用真实 VLM API
+对关键帧图像使用 DINOv2 提取真实 embedding，并使用真实 VLM（API或本地推理）
 生成驾驶场景结构化理解结果。
 第一版不允许 mock VLM，不允许 mock feature。
 必须实现 JSON 解析、字段校验、失败重试。
@@ -16,7 +16,7 @@ from src.vla_memory.common.json_utils import extract_json_from_text
 from src.vla_memory.common.logging_utils import get_logger
 from src.vla_memory.common.prompt_loader import get_prompt_loader
 from src.vla_memory.perception.dinov2_extractor import DINOv2Extractor
-from src.vla_memory.perception.openai_compatible_client import OpenAICompatibleVLMClient
+from src.vla_memory.perception.vlm_client import VLMClient
 from src.vla_memory.schemas.scene import (
     SceneUnderstandingResult,
     VALID_SCENE_IDS,
@@ -31,7 +31,7 @@ class SceneUnderstandingPipeline:
 
     对每个关键帧：
     1. 使用 DINOv2 提取真实图像 embedding。
-    2. 调用真实 VLM API 进行场景理解。
+    2. 调用真实 VLM 进行场景理解。
     3. 解析和校验 JSON 输出。
     4. 保存 embedding 和场景理解结果。
 
@@ -45,7 +45,7 @@ class SceneUnderstandingPipeline:
     def __init__(
         self,
         feature_extractor: DINOv2Extractor,
-        vlm_client: OpenAICompatibleVLMClient,
+        vlm_client: VLMClient,
         feature_save_dir: str = "outputs/features",
         vlm_retry_times: int = 2,
     ):

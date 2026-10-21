@@ -99,6 +99,11 @@ def main() -> None:
                     help="选择性语义策略下是否允许模型请求扩展脱困候选；off仅保留普通语义加分")
     ap.add_argument("--model-inference", choices=["on", "off"], default=None,
                     help="模型调用开关；off 要求 mpc/pdm_closed、语义off，以及memory_off或显式planning-memory full的数值记忆模式")
+    ap.add_argument("--vlm-backend", choices=["api", "local"], default=None,
+                    help="场景理解和决策VLM后端：api远程调用，local本进程离线Qwen2.5-VL")
+    ap.add_argument("--local-vlm-model-path", help="完整本地Qwen2.5-VL模型目录，不接受远程模型ID")
+    ap.add_argument("--local-vlm-device", help="本地VLM设备，例如cuda:1或cpu；GPU按当前进程可见序号")
+    ap.add_argument("--local-vlm-dtype", choices=["auto", "bfloat16", "float16", "float32"], default=None)
     ap.add_argument("--replay-audit", choices=["on", "off"], default=None,
                     help="模型调用证据与离线回放报告，默认on；保存实际模型输入图片、提示词和输出")
     ap.add_argument("--record-video", choices=["on", "off"], default=None,
@@ -162,6 +167,13 @@ def main() -> None:
         feature_cfg["cache_dir"] = args.dinov2_cache_dir
     if args.allow_model_download:
         feature_cfg["local_files_only"] = False
+    vlm_cfg = carla_cfg.setdefault("vlm", {})
+    if args.vlm_backend is not None:
+        vlm_cfg["backend"] = args.vlm_backend
+    for field in ("model_path", "device", "dtype"):
+        value = getattr(args, "local_vlm_" + field)
+        if value is not None:
+            vlm_cfg.setdefault("local", {})[field] = value
     config = load_config(overrides=carla_cfg)
     try:
         model_inference = model_inference_enabled(
@@ -169,26 +181,10 @@ def main() -> None:
     except ValueError as exc:
         ap.error(str(exc))
 
-    # fail-fast：VLM API Key 缺失立即报错（避免跑完 CARLA+DINOv2 setup 才在第一次 VLM 调用崩）
-    import os as _os
-    _envs = set()
-    for _blk in ("scene_understanding", "decision"):
-        _e = config.get_nested(_blk, "api_key_env", default=None)
-        if _e:
-            _envs.add(_e)
-    if not _envs:
-        _envs = {"DASHSCOPE_API_KEY"}
-    _missing = [e for e in _envs if not _os.environ.get(e, "")] if model_inference else []
-    if _missing:
-        _e0 = _missing[0]
-        raise EnvironmentError(
-            f"VLM API Key 未设置：环境变量 {_missing} 为空。\n"
-            f"  Linux/macOS Bash 或 Git Bash：使用 export\n"
-            f"    export {_e0}=你的key\n"
-            f"  Windows CMD:  set {_e0}=你的key\n"
-            f"  PowerShell:   $env:{_e0}='你的key'\n"
-            f"设好后与运行命令在同一个终端执行。"
-        )
+    # Model-off runs must not import either backend or check model credentials.
+    if model_inference:
+        from src.vla_memory.perception.factory import validate_vlm_setup
+        validate_vlm_setup(config)
 
     scenario_name = args.scenario or config.get_nested(
         "carla", "default_scenario", default="straight_traffic"

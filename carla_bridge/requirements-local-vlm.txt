@@ -1,0 +1,8 @@
+# Optional Qwen2.5-VL local inference, Python >= 3.9.
+# Keep the environment's working CUDA-matched torch/torchvision pair.
+# Check torch/torchvision before installing; do not reinstall the root requirements.
+transformers==4.51.3
+accelerate==1.6.0
+Pillow>=10.0.1
+# Existing PDM/scikit-learn 1.2.2 environments should retain NumPy < 2.
+# No NumPy pin here: avoid changing the environment's working numerical stack.

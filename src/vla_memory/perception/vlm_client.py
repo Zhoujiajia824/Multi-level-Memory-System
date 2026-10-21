@@ -41,8 +41,8 @@ class VLMClient(ABC):
 
         Raises:
             FileNotFoundError: 图像不存在。
-            EnvironmentError: API Key 未设置。
-            RuntimeError: API 调用失败（重试后仍失败）。
+            EnvironmentError: API 后端的 Key 未设置。
+            RuntimeError: 模型加载或推理失败。
         """
         ...
 
@@ -67,7 +67,7 @@ class VLMClient(ABC):
             VLM 的原始文本输出（应为 JSON 字符串）。
 
         Raises:
-            EnvironmentError: API Key 未设置。
-            RuntimeError: API 调用失败。
+            EnvironmentError: API 后端的 Key 未设置。
+            RuntimeError: 模型加载或推理失败。
         """
         ...
