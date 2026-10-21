@@ -1,4 +1,4 @@
-"""Bounded, frame-indexed CARLA display frames for live view and optional video.
+"""Bounded, frame-indexed CARLA driving video with optional model-call HUD.
 
 Tick registration is nonblocking by default; delayed GPU camera callbacks are
 matched to bounded pending metadata and written in simulation-frame order.
@@ -20,21 +20,12 @@ import cv2
 import numpy as np
 
 from src.vla_memory.common.logging_utils import get_logger
-from carla_bridge.visualization.trajectory_renderer import DISPLAY_COLORS, DISPLAY_CANDIDATE_COLORS
 
 logger = get_logger("carla_video")
 
-# Derive the video legend from the exact projection palette. OpenCV uses BGR;
-# keeping one RGB source prevents a style update from leaving a stale legend.
-TRAJECTORY_HUD_COLORS = {"candidate": tuple(DISPLAY_CANDIDATE_COLORS[0][::-1]),
-                         **{kind: tuple(DISPLAY_COLORS[kind][::-1])
-                            for kind in ("selected", "execution", "rejected")}}
-CLASSIC_TRAJECTORY_HUD_COLORS = {"candidate": (235, 100, 50), "selected": (0, 135, 245),
-                                 "execution": (65, 210, 65), "rejected": (70, 65, 235)}
-
 
 class VideoRecorder:
-    """Compose an exact camera frame for each requested CARLA tick.
+    """Record an exact camera frame for each requested CARLA tick.
 
     ``sim_time_s`` is elapsed experiment time; the sensor's absolute timestamp is
     separate. ``video_time_s`` is actual playback time, including any frame gaps.
@@ -43,11 +34,8 @@ class VideoRecorder:
     def __init__(self, world, ego, output_path: str, fps: float = 20,
                  width: int = 1280, height: int = 720, view: str = "chase",
                  frame_timeout_s: float = 0.0, hud: bool = True,
-                 max_pending_frames: int = 32, flush_timeout_s: float = .25,
-                 record_video: bool = True, live_view=None):
+                 max_pending_frames: int = 32, flush_timeout_s: float = .25):
         self.world, self.ego = world, ego
-        self.record_video, self.live_view = bool(record_video), live_view
-        self._live_error_count = 0
         self.output_path = str(output_path)
         self.fps, self.frame_timeout_s = float(fps), float(frame_timeout_s)
         if not math.isfinite(self.fps) or self.fps <= 0:
@@ -107,19 +95,17 @@ class VideoRecorder:
             bp.set_attribute("sensor_tick", "0.0")
             self._sensor = self.world.spawn_actor(bp, self._view_transform(), attach_to=self.ego)
             self._sensor.listen(self._receive_frame)
-            if self.record_video:
-                self._writer = cv2.VideoWriter(self.output_path, cv2.VideoWriter_fourcc(*"mp4v"),
-                                               self.fps, (self.width, self.height))
-                if not self._writer.isOpened():
-                    raise RuntimeError(f"无法打开视频输出: {self.output_path}")
+            self._writer = cv2.VideoWriter(self.output_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                           self.fps, (self.width, self.height))
+            if not self._writer.isOpened():
+                raise RuntimeError(f"无法打开视频输出: {self.output_path}")
             self._started = True
         except Exception:
             self._error_count += 1
             self.flush()
             raise
-        logger.info("独立显示相机开始: %s (%dx%d @ %.3gfps, view=%s, 录像=%s, 实时=%s)",
-                    self.output_path, self.width, self.height, self.fps, self.view,
-                    self.record_video, self.live_view is not None)
+        logger.info("视频录制开始: %s (%dx%d @ %.3gfps, view=%s)",
+                    self.output_path, self.width, self.height, self.fps, self.view)
 
     def _receive_frame(self, frame) -> None:
         """Sensor thread callback: bounded storage also during failed runs."""
@@ -240,12 +226,9 @@ class VideoRecorder:
         that it was dropped. Expiration and final unfulfilled requests have
         explicit events. Neither registration nor close advances the world.
         Optional HUD keys: ``model_call_count``, ``latest_call_id``,
-        ``latest_trigger``, ``selected_id``, ``status``,
-        ``trajectory_visualization`` (the matching planner display audit).
-        ``trajectory_display`` optionally contains detached world polylines for
-        live/video projection through this image's capture transform.
+        ``latest_trigger``, ``selected_id``, ``status``.
         """
-        if not self._started or self._flushed or self._closing:
+        if self._writer is None or self._flushed or self._closing:
             return False
         requested = int(frame_id) if frame_id is not None else None
         self._requested_count += 1
@@ -285,19 +268,15 @@ class VideoRecorder:
                "requested_frame": requested, "sim_time_s": elapsed,
                "sensor_timestamp_s": sensor_time,
                "video_time_s": self._frame_count / self.fps, "fps": self.fps}
-        if not self.record_video:
-            row.update(video_frame_index=None, video_time_s=None,
-                       display_frame_index=self._frame_count)
         try:
             bgr = np.frombuffer(frame.raw_data, dtype=np.uint8).reshape(
                 frame.height, frame.width, 4)[:, :, :3].copy()
             if (frame.width, frame.height) != (self.width, self.height):
                 raise ValueError("camera frame dimensions do not match video writer")
-            bgr = self._apply_trajectory_overlay(bgr, row, overlay or {}, frame)
             if self.hud:
                 self._draw_hud(bgr, row, overlay or {})
             # cv2 normally returns None. Explicit False from a backend is failure.
-            if self._writer is not None and self._writer.write(bgr) is False:
+            if self._writer.write(bgr) is False:
                 raise RuntimeError("video writer rejected frame")
             if self._index_file is not None:
                 self._index_file.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
@@ -309,19 +288,6 @@ class VideoRecorder:
                               carla_frame_id=actual, error=f"{type(exc).__name__}: {exc}")
             logger.warning("视频帧写入失败 (frame=%s): %s", actual, exc)
             return False
-        # Both destinations receive the exact same composited image. JPEG and
-        # slow clients run outside this control thread; live errors cannot drop
-        # an otherwise successfully written MP4 frame.
-        if self.live_view is not None:
-            try:
-                published = self.live_view.publish(bgr, {**row,
-                    **{key: (overlay or {}).get(key) for key in
-                       ("run_id", "planner_sequence", "selected_id")}})
-                if published is False:
-                    self._live_error_count += 1
-            except Exception as exc:
-                self._live_error_count += 1
-                logger.warning("实时画面发布失败 (frame=%s): %s", actual, exc)
         self._frame_count += 1
         self._last_frame_id = actual
         if self._first_sim_time is None:
@@ -329,60 +295,7 @@ class VideoRecorder:
         self._last_sim_time = elapsed
         return True
 
-    def _apply_trajectory_overlay(self, image, row, overlay, frame):
-        """Optional video annotation cannot drop an otherwise valid image.
-
-        Camera callbacks may arrive several ticks later. Only the transform
-        bundled with that exact captured image is valid for projection; querying
-        the live sensor here would shift the paths as the vehicle moves.
-        """
-        display = overlay.get("trajectory_display")
-        visual = overlay.get("trajectory_visualization")
-        if (display is None or (isinstance(visual, dict) and visual.get("enabled") is False)
-                or (isinstance(display, dict) and display.get("enabled") is False)):
-            return image
-        event_reason = None
-        try:
-            transform = getattr(frame, "transform", None)
-            if transform is None:
-                audit = {"enabled": True, "drawn_paths": 0, "drawn_segments": 0,
-                         "camera_transform_source": "captured_image", "depth_occlusion": False,
-                         "skipped_reason": "missing_capture_transform"}
-                event_reason = "trajectory_overlay_skipped"
-            else:
-                from carla_bridge.visualization.camera_overlay import draw_trajectory_overlay
-                painted = image.copy()
-                audit = draw_trajectory_overlay(painted, display, transform, fov_degrees=90.)
-                if not isinstance(audit, dict):
-                    raise TypeError("camera trajectory overlay audit must be a dictionary")
-                # Validate before replacing pixels: even a failed or malformed
-                # optional renderer cannot corrupt the base video frame.
-                audit = json.loads(json.dumps(audit, ensure_ascii=False, allow_nan=False))
-                image = painted
-                if audit.get("skipped_reason"):
-                    event_reason = "trajectory_overlay_skipped"
-        except Exception as exc:
-            audit = {"enabled": True, "drawn_paths": 0, "drawn_segments": 0,
-                     "camera_transform_source": "captured_image", "depth_occlusion": False,
-                     "skipped_reason": "overlay_error",
-                     "error": {"type": type(exc).__name__, "message": str(exc)}}
-            event_reason = "trajectory_overlay_error"
-            logger.warning("视频轨迹投影已跳过 (frame=%s): %s", row["carla_frame_id"], exc)
-        row["trajectory_overlay"] = audit
-        if event_reason is not None:
-            try:
-                self._write_event(event_reason, row["requested_frame"], row["sim_time_s"],
-                                  carla_frame_id=row["carla_frame_id"], trajectory_overlay=audit)
-            except Exception as exc:
-                logger.warning("视频轨迹投影事件写入失败: %s", exc)
-        return image
-
     def _draw_hud(self, image, row: dict, overlay: dict) -> None:
-        visual = overlay.get("trajectory_visualization")
-        if isinstance(visual, dict) and visual.get("enabled") is True:
-            self._draw_trajectory_hud(image, row, overlay, visual)
-            return
-
         def compact(value):
             # cv2 fonts are ASCII; detailed UTF-8 remains in audit artifacts.
             return str(value).encode("ascii", "replace").decode("ascii")[:150]
@@ -402,100 +315,14 @@ class VideoRecorder:
             cv2.putText(image, line, (8, 20 + i * 22), cv2.FONT_HERSHEY_SIMPLEX,
                         .48, (255, 255, 255), 1, cv2.LINE_AA)
 
-    def _draw_trajectory_hud(self, image, row, overlay, visual) -> None:
-        """A bounded video legend for planned rollouts, never an actual trail.
-
-        World debug strings are spectator HUD primitives and are not a reliable
-        RGB-camera legend. Draw this into each exact frame's retained overlay.
-        """
-        height, width = image.shape[:2]
-        classic = visual.get("style") == "classic"
-        colors = CLASSIC_TRAJECTORY_HUD_COLORS if classic else TRAJECTORY_HUD_COLORS
-        wide = width >= 800
-        font = .43 if wide else max(.28, min(.43, width / 1280 * .6, height / 720 * .6))
-        step = 22 if wide else max(11, round(font * 35))
-        panel_height = min(height, 96 if wide else 6 * step + 4)
-        image[:panel_height] = (image[:panel_height].astype(float) * .28).astype(np.uint8)
-
-        def text(value, x, y, available_width):
-            value = str(value).encode("ascii", "replace").decode("ascii")[:150]
-            while value and cv2.getTextSize(value, cv2.FONT_HERSHEY_SIMPLEX, font, 1)[0][0] > available_width:
-                value = value[:-1]
-            if value:
-                cv2.putText(image, value, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-                            font, (245, 245, 245), 1, cv2.LINE_AA)
-
-        def count(name):
-            value = visual.get(name)
-            return str(value) if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else "-"
-
-        def sample(kind, label, x, y, available_width):
-            line_y = y - 4
-            color = colors[kind]
-            cv2.line(image, (x, line_y), (x + 25, line_y), color,
-                     2 if kind == "candidate" else 3, cv2.LINE_AA)
-            text(label, x + 32, y, max(0, available_width - 32))
-
-        elapsed = row.get("sim_time_s")
-        time_label = f"{elapsed:.2f}s" if elapsed is not None else "-"
-        calls = overlay.get("model_call_count", overlay.get("call_count", 0))
-        trigger = overlay.get("latest_trigger", overlay.get("trigger", "-"))
-        selected = overlay.get("selected_id", "-")
-        summary = f"Traj {count('drawn_candidates')}/{count('candidate_pool_count')}"
-        summary += f" | Merged {count('merged_candidates')} | Hidden {count('hidden_candidates')}"
-        if visual.get("error"):
-            summary = "Trajectory draw error | " + summary
-        if wide:
-            legend_width = min(460, int(width * .44))
-            legend_x = width - legend_width
-            left_width = max(0, legend_x - 20)
-            lines = [f"CARLA frame {row.get('carla_frame_id')} | sim {time_label}",
-                     f"Model calls: {calls} | latest: {overlay.get('latest_call_id', '-')}",
-                     f"Trigger: {trigger}", f"Selected plan: {selected}"]
-            for index, line in enumerate(lines):
-                text(line, 8, 20 + index * step, left_width)
-            half = (legend_width - 16) // 2
-            text(summary, legend_x + 4, 18, legend_width - 12)
-            sample("candidate", "Candidates", legend_x + 4, 40, half)
-            sample("selected", "Selected plan", legend_x + 4 + half, 40, half)
-            sample("execution", "Accepted command", legend_x + 4, 62, half)
-            sample("rejected", "Rejected command", legend_x + 4 + half, 62, half)
-            text("Plans, not the vehicle's driven trail", legend_x + 4, 84, legend_width - 12)
-        else:
-            y0 = step
-            lines = [f"F {row.get('carla_frame_id')} | t {time_label} | calls {calls}",
-                     f"Trigger: {trigger}", f"Selected plan: {selected}",
-                     f"Plans {count('drawn_candidates')}/{count('candidate_pool_count')}"
-                     f" | M{count('merged_candidates')} H{count('hidden_candidates')}"
-                     + (" | draw error" if visual.get("error") else "")]
-            for index, line in enumerate(lines):
-                text(line, 6, y0 + index * step, max(0, width - 12))
-            half = max(1, (width - 12) // 2)
-            sample("candidate", "Candidates", 6, y0 + 4 * step, half)
-            sample("selected", "Selected plan", 6 + half, y0 + 4 * step, half)
-            sample("execution", "Accepted cmd", 6, y0 + 5 * step, half)
-            sample("rejected", "Rejected cmd", 6 + half, y0 + 5 * step, half)
-
-    def _live_summary(self):
-        if self.live_view is None:
-            return None
-        try:
-            return json.loads(json.dumps(self.live_view.summary(), ensure_ascii=False, allow_nan=False))
-        except Exception as exc:
-            return {"state": "error", "error": {"type": type(exc).__name__, "message": str(exc)}}
-
     def summary(self) -> dict:
         """Small replay manifest; full frame correspondence remains on disk."""
-        return {"schema_version": 1, "video_path": self.output_path if self.record_video else None,
+        return {"schema_version": 1, "video_path": self.output_path,
                 "frames_path": str(self.index_path), "events_path": str(self.events_path),
                 "summary_path": str(self.summary_path), "fps": self.fps,
                 "width": self.width, "height": self.height, "view": self.view,
                 "hud": self.hud, "requested_frame_count": self._requested_count,
-                "record_video": self.record_video,
-                "encoded_frame_count": self._frame_count if self.record_video else 0,
-                "composited_frame_count": self._frame_count,
-                "live_publish_error_count": self._live_error_count,
-                "live_view": self._live_summary(),
+                "encoded_frame_count": self._frame_count,
                 "pending_frame_count": len(self._pending),
                 "max_pending_frames": self.max_pending_frames,
                 "frame_timeout_s": self.frame_timeout_s,
@@ -506,7 +333,7 @@ class VideoRecorder:
                 "stale_frame_count": self._stale_count,
                 "queue_overflow_count": self._overflow_count,
                 "encode_error_count": self._error_count,
-                "video_duration_s": self._frame_count / self.fps if self.record_video else 0.,
+                "video_duration_s": self._frame_count / self.fps,
                 "first_sim_time_s": self._first_sim_time, "last_sim_time_s": self._last_sim_time,
                 "closed": self._flushed,
                 "timeline_note": "Use frames_path for exact simulation-to-video correspondence; missing frames are not duplicated."}
@@ -519,7 +346,7 @@ class VideoRecorder:
         if self._flushed or self._closing:
             return
         self._closing = True
-        if self._started:
+        if self._writer is not None:
             # Leave the callback active for a small, bounded final drain. A
             # missing GPU frame cannot make close tick or wait indefinitely.
             self._service_pending(self.flush_timeout_s)
@@ -546,11 +373,6 @@ class VideoRecorder:
             except Exception as exc:
                 logger.warning("视频关闭失败: %s", exc)
             self._writer = None
-        if self.live_view is not None:
-            try:
-                self.live_view.close()
-            except Exception as exc:
-                logger.warning("实时显示关闭失败: %s", exc)
         for name in ("_index_file", "_events_file"):
             handle = getattr(self, name)
             if handle is not None:
@@ -566,7 +388,6 @@ class VideoRecorder:
             with self.summary_path.open("w", encoding="utf-8", newline="\n") as handle:
                 json.dump(self.summary(), handle, indent=2, ensure_ascii=False, allow_nan=False)
                 handle.write("\n")
-        logger.info("显示相机结束: %s (%d 合成帧, 录像=%s, 播放 %.1fs, 缺帧 %d；时间以帧索引为准)",
-                    self.output_path, self._frame_count, self.record_video,
-                    self._frame_count / self.fps if self.record_video else 0.,
+        logger.info("视频录制结束: %s (%d 帧, 播放 %.1fs, 缺帧 %d；时间以帧索引为准)",
+                    self.output_path, self._frame_count, self._frame_count / self.fps,
                     self._missing_count)

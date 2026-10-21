@@ -195,26 +195,12 @@ carla:
   replay:
     enabled: true               # 自动生成 replay/index.html；归档实际模型输入，含历史记忆图片
   visualization:
-    live:
-      enabled: null            # null自动跟随trajectory-visualization；可显式on/off独立于录像
-      host: "127.0.0.1"        # 服务器可用SSH -L8765:127.0.0.1:8765转发
-      port: 8765
-      jpeg_quality: 90
-      stale_after_s: 2.0       # 墙钟无新图时提示stale；不假造推进帧
     trajectories:
-      enabled: false            # --trajectory-visualization on 开启实时浏览器及可选录像轨迹标注
-      style: "paper"            # paper: 无发光连续实线投影；classic: 旧版世界debug实线
-      max_candidates: 6         # 仅显示上限；优先横向覆盖和差异，获选者始终显示；0不设上限
-      merge_distance_m: 0.12    # 近重复完整几何仅显示代表；0禁用合并；所有原候选仍保留在日志
-      point_stride: 2           # 仅classic抽样；paper连接每一个真实折点
-      lifetime_s: 0.20          # 仅classic使用；paper逐帧投影，不按有效期消失
-      thickness: 0.045          # 按横向族冷色：细候选线，米
-      selected_thickness: 0.075 # 深蓝：实际获选候选，窄于执行计划
-      execution_thickness: 0.12 # 朱红：校验通过、下发控制器的未来计划
-      candidate_alpha: 0.60
-      selected_alpha: 0.85
-      execution_alpha: 1.0
-      outline_width: 0.0        # 默认不描边、不添加光晕；正数可显式加细描边
+      enabled: false            # --trajectory-visualization on 开启世界内轨迹绘制
+      max_candidates: 0         # 0表示全部候选；可设较小上限降低debug绘制开销
+      point_stride: 1            # 逐点相连的实线，不添加箭头或虚线
+      lifetime_s: 0.3            # 覆盖0.2s重规划间隔和一个0.1s仿真步长
+      thickness: 0.025           # 候选基础线宽；获选×1.6，执行/拒绝×2.8
       z_offset: 0.15
   # ---- 场景 ----
   scenario_dir: "carla_bridge/config/scenarios"

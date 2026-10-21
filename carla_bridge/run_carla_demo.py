@@ -104,11 +104,7 @@ def main() -> None:
     ap.add_argument("--record-video", choices=["on", "off"], default=None,
                     help="录制驾驶视频及CARLA帧索引，配合模型调用回放")
     ap.add_argument("--trajectory-visualization", choices=["on", "off"], default=None,
-                    help="在实时浏览器及可选录像中显示MPC/PDM候选和执行计划，默认off")
-    ap.add_argument("--live-view", choices=["on", "off"], default=None,
-                    help="实时浏览器显示，默认跟随轨迹可视化；与录像开关独立")
-    ap.add_argument("--live-host", default=None, help="实时观察器监听地址，默认127.0.0.1")
-    ap.add_argument("--live-port", type=int, default=None, help="实时观察器端口，默认8765")
+                    help="在CARLA世界绘制MPC/PDM候选和通过验证的执行轨迹，默认off")
     ap.add_argument("--dinov2-model-dir", help="本地 DINOv2 模型目录或缓存 snapshot 目录")
     ap.add_argument("--dinov2-cache-dir", help="Hugging Face 缓存目录（默认项目 .cache/huggingface）")
     ap.add_argument("--allow-model-download", action="store_true", help="显式允许 DINOv2 联网下载；默认仅使用本地文件")
@@ -134,15 +130,6 @@ def main() -> None:
         runtime.setdefault("video", {})["enabled"] = args.record_video == "on"
     if args.trajectory_visualization is not None:
         runtime.setdefault("visualization", {}).setdefault("trajectories", {})["enabled"] = args.trajectory_visualization == "on"
-    live_cfg = runtime.setdefault("visualization", {}).setdefault("live", {})
-    if args.live_view is not None:
-        live_cfg["enabled"] = args.live_view == "on"
-    if args.live_host is not None:
-        live_cfg["host"] = args.live_host
-    if args.live_port is not None:
-        if not 1 <= args.live_port <= 65535:
-            ap.error("--live-port must be in [1, 65535]")
-        live_cfg["port"] = args.live_port
     if args.planner is not None:
         planning["backend"] = args.planner
     if args.pdm_lateral_control is not None:

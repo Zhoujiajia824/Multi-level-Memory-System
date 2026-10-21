@@ -1,15 +1,13 @@
-"""Prepare real planner geometry for non-emissive, continuous video annotation.
+"""Draw the scored PDM rollouts and accepted command through CARLA debug RPCs.
 
 All points are CARLA world actor positions, not ideal path references or nuPlan
 rear-axle positions. Elevation follows the current resolved route's road surface.
-The default paper style never emits CARLA HDR debug primitives. The legacy
-classic style remains an explicit world-debug comparison mode.
+Rendering is optional and may fail without altering a planning/control result.
 """
 from __future__ import annotations
 
 import logging
 import math
-from copy import deepcopy
 from numbers import Real
 
 import numpy as np
@@ -20,47 +18,24 @@ logger = logging.getLogger("carla_trajectory_visualization")
 
 DEFAULTS = {
     "enabled": False,
-    "style": "paper",
-    "max_candidates": 6,  # Display budget only; the actual winner is always included.
-    "point_stride": 2,
-    "lifetime_s": 0.2,
-    "thickness": 0.045,
-    "selected_thickness": 0.075,
-    "execution_thickness": 0.12,
-    "candidate_alpha": 0.60,
-    "selected_alpha": 0.85,
-    "execution_alpha": 1.0,
-    "outline_width": 0.0,
-    "z_offset": 0.15,
-    "dash_length_m": 1.2,
-    "dash_gap_m": 0.8,
-    "merge_distance_m": 0.12,
-    "endpoint_markers": False,
+    "max_candidates": 30,  # 0 draws the entire pool; the winner is always included.
+    "point_stride": 1,
+    "lifetime_s": 0.3,
+    "thickness": 0.025,
+    "z_offset": 0.12,
 }
 
 COLORS = {
     # CARLA 0.9.15 shipping multiplies linear debug color by 1000. Full 255
     # channels cause overlapping proposals to bloom into a white light sheet.
-    "candidate": (0, 0, 2),
+    "candidate": (0, 1, 2),
     "selected": (2, 1, 0),
-    "execution": (0, 2, 0),
+    "execution": (0, 2, 1),
     "rejected": (2, 0, 0),
 }
 
-# Ordinary post-tone-map RGB. Color describes the lateral family, never an
-# arbitrary proposal ID; line weight/opacity separates alternatives and action.
-DISPLAY_COLORS = {"selected": (25, 92, 173), "execution": (222, 58, 55),
-                  "rejected": (153, 47, 47), "infeasible": (150, 155, 161)}
-# Keep the tuple interface used by the video HUD's representative legend.
-DISPLAY_CANDIDATE_COLORS = ((55, 136, 190), (0, 158, 150), (141, 107, 188))
-DISPLAY_FAMILY_COLORS = dict(zip(("center", "left", "right"), DISPLAY_CANDIDATE_COLORS))
-MAX_STROKE_SEGMENTS = 4096
-SNAPSHOT_METADATA = (
-    "lateral", "longitudinal", "physical_lane_side", "lane_offset_m",
-    "lateral_path_index", "longitudinal_policy_id", "maneuver", "maneuver_id",
-    "maneuver_phase", "recovery", "recovery_recipe", "recovery_transition_m",
-    "optimization_feasible", "trajectory_finite", "numerically_valid", "eligible",
-    "ineligible_reason", "forward_progress_m", "terminal_speed_mps", "desired_speed_mps")
+LINE_WIDTH_SCALE = {"candidate": 1., "selected": 1.6,
+                    "execution": 2.8, "rejected": 2.8}
 
 
 def validate_trajectory_visualization_config(config=None):
@@ -69,33 +44,14 @@ def validate_trajectory_visualization_config(config=None):
     values = dict(DEFAULTS, **(config or {}))
     if type(values["enabled"]) is not bool:
         raise ValueError("carla.visualization.trajectories.enabled must be boolean")
-    if values["style"] not in ("paper", "classic"):
-        raise ValueError("carla.visualization.trajectories.style must be paper or classic")
-    if type(values["endpoint_markers"]) is not bool:
-        raise ValueError("carla.visualization.trajectories.endpoint_markers must be boolean")
     for name, minimum in (("max_candidates", 0), ("point_stride", 1)):
         if type(values[name]) is not int or values[name] < minimum:
             raise ValueError("carla.visualization.trajectories.%s must be an integer >= %d" % (name, minimum))
-    for name in ("lifetime_s", "thickness", "z_offset", "selected_thickness",
-                 "execution_thickness", "dash_length_m", "dash_gap_m"):
+    for name in ("lifetime_s", "thickness", "z_offset"):
         value = values[name]
         if (not isinstance(value, Real) or isinstance(value, bool)
                 or not math.isfinite(value) or value <= 0):
             raise ValueError("carla.visualization.trajectories.%s must be positive and finite" % name)
-        values[name] = float(value)
-    for name in ("dash_length_m", "dash_gap_m"):
-        if values[name] < .05:
-            raise ValueError("carla.visualization.trajectories.%s must be >= 0.05 m" % name)
-    for name in ("merge_distance_m", "outline_width"):
-        value = values[name]
-        if not isinstance(value, Real) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
-            raise ValueError("carla.visualization.trajectories.%s must be finite and nonnegative" % name)
-        values[name] = float(value)
-    for name in ("candidate_alpha", "selected_alpha", "execution_alpha"):
-        value = values[name]
-        if (not isinstance(value, Real) or isinstance(value, bool)
-                or not math.isfinite(value) or not 0. <= value <= 1.):
-            raise ValueError("carla.visualization.trajectories.%s must be finite in [0, 1]" % name)
         values[name] = float(value)
     return values
 
@@ -167,8 +123,7 @@ def build_trajectory_visualization_snapshot(scored_states, candidates, selected_
                           "points_world": np.column_stack((points, z)).tolist(),
                           "headings_world_rad": (-heading).tolist(),
                           "base_score": candidate.get("base_score"),
-                          "final_score": candidate.get("final_score"),
-                          **{key: deepcopy(candidate[key]) for key in SNAPSHOT_METADATA if key in candidate}})
+                          "final_score": candidate.get("final_score")})
     return {"source": "native_pdm_scored_rollout", "frame": "carla_world_actor",
             "timestamp_us": timestamp_us, "selected_index": selected_index,
             "candidate_pool_count": len(candidates), "candidates": snapshots,
@@ -176,107 +131,13 @@ def build_trajectory_visualization_snapshot(scored_states, candidates, selected_
             "reference_surface_xyz": reference}
 
 
-def _polyline(points):
-    """Drop repeated vertices for display, preserving every remaining XYZ."""
-    points = np.asarray(points, dtype=float)
-    if points.ndim != 2 or points.shape[1] != 3 or not len(points) or not np.isfinite(points).all():
-        raise ValueError("Visualization points must be finite XYZ vertices")
-    lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
-    points = points[np.r_[True, lengths > 1e-6]]
-    distances = np.r_[0., np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))]
-    return points, distances
-
-
-def _at_distance(points, distances, queries):
-    return np.column_stack([np.interp(queries, distances, points[:, i]) for i in range(3)])
-
-
-def _same_geometry(points, distances, group, tolerance):
-    if tolerance <= 0 or abs(group["length"] - distances[-1]) > tolerance * 2:
-        return False
-    # Include every bend of BOTH polylines. Sparse uniform samples can miss a
-    # short divergence, or a small looping manoeuvre between two sample sites.
-    u = np.unique(np.r_[distances / max(distances[-1], 1e-12),
-                        group["distances"] / max(group["length"], 1e-12)])
-    a = _at_distance(points, distances, u * distances[-1])
-    b = _at_distance(group["points"], group["distances"], u * group["length"])
-    return np.max(np.linalg.norm(a - b, axis=1)) <= tolerance
-
-
-def _display_groups(candidates, selected_index, config):
-    """Merge near-identical FULL geometries; never merge just a common prefix.
-
-    Time and speed variants remain in planner.jsonl; grouped members are also
-    recorded in the visualization audit. Invalid candidates are not repaired.
-    """
-    groups, invalid = [], []
-    tolerance = config["merge_distance_m"]
-    valid_candidates = []
-    for candidate in candidates:
-        if not isinstance(candidate, dict):
-            invalid.append(None)
-        else:
-            valid_candidates.append(candidate)
-    for candidate in sorted(valid_candidates, key=lambda item: str(item.get("id", item.get("index")))):
-        try:
-            points, distances = _polyline(candidate["points_world"])
-        except (KeyError, ValueError, TypeError):
-            invalid.append(candidate.get("id"))
-            continue
-        samples = _at_distance(points, distances, np.linspace(0., distances[-1], 25))
-        # A failed MPC iterate must not acquire the styling of a feasible one.
-        feasible = all(candidate.get(key) is not False for key in
-                       ("optimization_feasible", "trajectory_finite", "numerically_valid", "eligible"))
-        match = next((g for g in groups if g["feasible"] == feasible
-                      and _same_geometry(points, distances, g, tolerance)), None)
-        if match is None:
-            side = str(candidate.get("physical_lane_side", candidate.get("lateral", "unknown")))
-            match = {"members": [], "representative": candidate, "samples": samples,
-                     "length": float(distances[-1]), "family": side, "feasible": feasible,
-                     "points": points, "distances": distances}
-            groups.append(match)
-        match["members"].append(candidate)
-        if selected_index is not None and candidate.get("index") == selected_index:
-            match["representative"] = candidate
-
-    def score(group):
-        value = group["representative"].get("final_score", group["representative"].get("base_score"))
-        return float(value) if isinstance(value, Real) and math.isfinite(value) else -math.inf
-
-    groups.sort(key=lambda g: (-int(g["feasible"]), -score(g), str(g["representative"].get("id"))))
-    selected = next((g for g in groups if selected_index is not None
-                     and g["representative"].get("index") == selected_index), None)
-    chosen = [selected] if selected is not None else []
-    remaining = [g for g in groups if g is not selected]
-    budget = config["max_candidates"] or len(groups)
-    # Cover lateral families before spending the budget on more speed variants.
-    families = {g["family"] for g in chosen}
-    for group in remaining[:]:
-        if len(chosen) >= budget:
-            break
-        if group["family"] not in families:
-            chosen.append(group)
-            families.add(group["family"])
-            remaining = [g for g in remaining if g is not group]
-    while remaining and len(chosen) < budget:
-        # Prefer geometrically distinct paths, rather than the first N indices.
-        group = max(remaining, key=lambda g: min(
-            (float(np.mean(np.linalg.norm(g["samples"] - c["samples"], axis=1))) for c in chosen),
-            default=0.))
-        chosen.append(group)
-        remaining = [g for g in remaining if g is not group]
-    chosen.sort(key=lambda g: g is selected)  # The winner overlays its alternatives.
-    return chosen, groups, invalid
-
-
 class CarlaTrajectoryRenderer:
-    """Prepare camera annotations, or legacy debug lines, without control changes."""
+    """Finite lifetime debug primitives, with no ticks or control mutations."""
 
     def __init__(self, world, config=None):
         self.world = world
         self.config = validate_trajectory_visualization_config(config)
         self._warned = False
-        self.last_display_snapshot = None
 
     def _line(self, points, kind, z_lift=0.):
         import carla
@@ -299,86 +160,13 @@ class CarlaTrajectoryRenderer:
             self.world.debug.draw_line(
                 carla.Location(x=float(start[0]), y=float(start[1]), z=float(start[2] + lift)),
                 carla.Location(x=float(end[0]), y=float(end[1]), z=float(end[2] + lift)),
-                thickness=self.config["thickness"] * (2 if kind in ("execution", "rejected") else 1),
+                thickness=self.config["thickness"] * LINE_WIDTH_SCALE[kind],
                 color=color, life_time=self.config["lifetime_s"], persistent_lines=False)
             count += 1
         return count
 
-    def _draw_paper(self, snapshot, decision, capture_transform, accepted, audit):
-        candidates = (snapshot or {}).get("candidates", [])
-        selected_index = (snapshot or {}).get("selected_index")
-        chosen, groups, invalid = _display_groups(candidates, selected_index, self.config)
-        audit.update(style="paper", backend="camera_overlay", world_drawn_segments=0,
-                     drawable_candidate_count=sum(len(g["members"]) for g in groups),
-                     merged_candidates=sum(len(g["members"]) - 1 for g in groups),
-                     hidden_candidates=len(groups) - len(chosen), invalid_candidate_ids=invalid,
-                     candidate_groups=[], skipped_candidate_errors=[], stationary_paths=[],
-                     xy_geometry_displaced=False, line_style="solid", endpoint_markers=False,
-                     color_encoding="lateral_family")
-        # Publish a complete replacement only. Between replans the same world
-        # geometry is reprojected into each image; no debug lifetime can expire.
-        display = {"style": "paper", "backend": "camera_overlay", "paths": [],
-                   "line_style": "solid", "endpoint_markers": False,
-                   "outline_width_m": self.config["outline_width"],
-                   "color_encoding": "lateral_family"}
-
-        def append_path(points, kind, rgb, width, identifier=None, alpha=1.):
-            points, _ = _polyline(points)
-            if len(points) - 1 > MAX_STROKE_SEGMENTS:
-                raise ValueError("Trajectory exceeds the display segment budget")
-            if len(points) < 2:
-                audit["stationary_paths"].append({"id": identifier, "kind": kind})
-                return 0
-            points = points.copy()
-            points[:, 2] += self.config["z_offset"]
-            display["paths"].append({"kind": kind, "id": identifier,
-                "points_world": points.tolist(), "rgb": list(rgb), "width_m": width,
-                "alpha": alpha, "dashed": False, "marker": False})
-            return len(points) - 1
-
-        for group in chosen:
-            candidate = group["representative"]
-            winner = selected_index is not None and candidate.get("index") == selected_index
-            rgb = (DISPLAY_COLORS["infeasible"] if not group["feasible"] else
-                   DISPLAY_COLORS["selected"] if winner else
-                   DISPLAY_FAMILY_COLORS.get(group["family"], DISPLAY_FAMILY_COLORS["center"]))
-            width = self.config["selected_thickness"] if winner else self.config["thickness"]
-            alpha = self.config["selected_alpha"] if winner else self.config["candidate_alpha"]
-            try:
-                count = append_path(candidate["points_world"], "selected" if winner else "candidate",
-                                    rgb, width, candidate.get("id"), alpha)
-            except (ValueError, TypeError, KeyError) as exc:
-                audit["skipped_candidate_errors"].append({"id": candidate.get("id"),
-                    "type": type(exc).__name__, "message": str(exc)})
-                continue
-            audit["drawn_segments"] += count
-            audit["drawn_candidates"] += bool(count)
-            audit["candidate_groups"].append({"representative_id": candidate.get("id"),
-                "member_ids": [m.get("id") for m in group["members"]],
-                "member_indices": [m.get("index") for m in group["members"]],
-                "family": group["family"], "display_rgb": list(rgb), "selected": winner,
-                "display_alpha": alpha, "display_feasible": group["feasible"], "projectable": bool(count)})
-        trajectory = (decision or {}).get("trajectory") or []
-        if trajectory:
-            try:
-                yaw = math.radians(capture_transform.rotation.yaw)
-                xy = np.array([ego_to_global(float(p["x"]), float(p["y"]),
-                    capture_transform.location.x, capture_transform.location.y, yaw) for p in trajectory])
-                heights = _elevations(xy, (snapshot or {}).get("reference_surface_xyz", []), capture_transform.location.z)
-                kind = "execution" if accepted is True else "rejected"
-                count = append_path(np.column_stack((xy, heights)), kind,
-                                    DISPLAY_COLORS[kind], self.config["execution_thickness"],
-                                    alpha=self.config["execution_alpha"])
-                audit["drawn_segments"] += count
-                audit[kind + "_drawn"] = bool(count)
-            except (ValueError, TypeError, KeyError) as exc:
-                # Current command omitted; never keep an old accepted command
-                # merely to conceal a real invalid/stopped planning interval.
-                audit["command_error"] = {"type": type(exc).__name__, "message": str(exc)}
-        self.last_display_snapshot = display
-
     def draw(self, snapshot, decision, capture_transform, accepted, *, frame_id=None):
-        """Call after validation; current accepted/rejected plans stay distinct.
+        """Call after trajectory validation; rejected commands never appear teal.
 
         ``decision`` is the actual control decision containing ``trajectory`` in
         captured forward/left coordinates. ``accepted`` must be the validator's
@@ -388,16 +176,8 @@ class CarlaTrajectoryRenderer:
                  "drawn_candidates": 0, "drawn_segments": 0,
                  "execution_drawn": False, "rejected_drawn": False}
         if not self.config["enabled"]:
-            self.last_display_snapshot = None
             return audit
         try:
-            audit["candidate_pool_count"] = (snapshot or {}).get("candidate_pool_count", 0)
-            audit["source"] = (snapshot or {}).get("source")
-            audit["style"] = self.config["style"]
-            if self.config["style"] == "paper":
-                self._draw_paper(snapshot, decision, capture_transform, accepted, audit)
-                return audit
-            self.last_display_snapshot = None
             candidates = (snapshot or {}).get("candidates", [])
             selected_index = (snapshot or {}).get("selected_index")
             maximum = self.config["max_candidates"]
@@ -427,7 +207,6 @@ class CarlaTrajectoryRenderer:
             audit["candidate_pool_count"] = (snapshot or {}).get("candidate_pool_count", 0)
             audit["source"] = (snapshot or {}).get("source")
         except Exception as exc:
-            self.last_display_snapshot = None
             audit["error"] = {"type": type(exc).__name__, "message": str(exc)}
             if not self._warned:
                 logger.warning("Trajectory debug rendering failed; control continues: %s", exc)

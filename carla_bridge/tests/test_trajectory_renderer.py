@@ -37,11 +37,6 @@ def color(call):
     return value.r, value.g, value.b
 
 
-def classic_renderer(target, config=None):
-    return CarlaTrajectoryRenderer(target, {"enabled": True, "style": "classic", "z_offset": .12,
-                                           **(config or {})})
-
-
 def test_default_disabled_has_no_debug_rpc_even_without_a_world():
     renderer = CarlaTrajectoryRenderer(None)
     assert not renderer.draw(None, None, None, False)["enabled"]
@@ -100,7 +95,8 @@ def test_snapshot_rigid_body_coordinates_and_native_state_are_preserved(yaw):
 
 def test_all_candidates_limit_winner_colors_endpoints_and_accepted_geometry():
     target = world()
-    renderer = classic_renderer(target, {"max_candidates": 0, "point_stride": 2, "lifetime_s": .3})
+    renderer = CarlaTrajectoryRenderer(target, {"enabled": True, "max_candidates": 0,
+                                                "point_stride": 2, "lifetime_s": .3})
     decision = {"trajectory": [{"x": 0., "y": 0.}, {"x": 1., "y": 0.}, {"x": 3., "y": 0.}]}
     before = deepcopy(decision)
     data = snapshot()
@@ -120,16 +116,16 @@ def test_all_candidates_limit_winner_colors_endpoints_and_accepted_geometry():
 
 def test_candidate_cap_keeps_actual_winner_even_when_it_is_outside_limit():
     target = world()
-    renderer = classic_renderer(target, {"max_candidates": 1})
+    renderer = CarlaTrajectoryRenderer(target, {"enabled": True, "max_candidates": 1})
     result = renderer.draw(snapshot(), None, capture(), True)
     assert result["drawn_candidates"] == 1
-    assert [color(call) for call in target.calls] == [COLORS["selected"]]
+    assert [color(call) for call in target.calls] == [COLORS["selected"], COLORS["selected"]]
     assert target.calls[0][0][0].x == 12.
 
 
 def test_validator_rejection_never_draws_green_execution():
     target = world()
-    renderer = classic_renderer(target)
+    renderer = CarlaTrajectoryRenderer(target, {"enabled": True})
     audit = renderer.draw(None, {"trajectory": [{"x": 0., "y": 0.}, {"x": 3., "y": 0.}]},
                           capture(), False)
     assert not audit["execution_drawn"] and audit["rejected_drawn"]
@@ -140,7 +136,7 @@ def test_debug_rpc_failure_is_reported_without_raising_or_touching_command():
     def fail(*args, **kwargs):
         raise RuntimeError("CARLA debug RPC unavailable")
     target = NS(debug=NS(draw_line=fail))
-    renderer = CarlaTrajectoryRenderer(target, {"enabled": True, "style": "classic"})
+    renderer = CarlaTrajectoryRenderer(target, {"enabled": True})
     command = {"trajectory": [{"x": 0., "y": 0.}, {"x": 3., "y": 0.}]}
     original = deepcopy(command)
     result = renderer.draw(snapshot(), command, capture(), True)
