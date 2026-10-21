@@ -199,10 +199,11 @@ def test_latest_trajectory_legend_overlay_is_a_detached_planner_display_audit(tm
 def test_video_projection_snapshot_and_ego_mask_are_detached_from_planning(tmp_path):
     from copy import deepcopy
     from carla_bridge.tests.test_route_acceptance import fake_loop
+    from carla_bridge.visualization.trajectory_renderer import DEFAULTS, DISPLAY_COLORS
     loop = fake_loop()
     loop.config.data["output_dir"] = tmp_path
-    paths = {"style": "paper", "paths": [{"kind": "selected", "rgb": [245, 195, 0],
-             "points_world": [[2., 3., .156], [5., 3., .156]], "width_m": .24}]}
+    paths = {"style": "paper", "paths": [{"kind": "selected", "rgb": list(DISPLAY_COLORS["selected"]),
+             "points_world": [[2., 3., .156], [5., 3., .156]], "width_m": DEFAULTS["selected_thickness"]}]}
     original = deepcopy(paths)
     loop.trajectory_renderer = NS(last_display_snapshot=paths)
     loop._last_trajectory_visualization_audit = {"enabled": True, "style": "paper"}

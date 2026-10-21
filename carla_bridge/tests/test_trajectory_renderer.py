@@ -140,7 +140,7 @@ def test_debug_rpc_failure_is_reported_without_raising_or_touching_command():
     def fail(*args, **kwargs):
         raise RuntimeError("CARLA debug RPC unavailable")
     target = NS(debug=NS(draw_line=fail))
-    renderer = CarlaTrajectoryRenderer(target, {"enabled": True})
+    renderer = CarlaTrajectoryRenderer(target, {"enabled": True, "style": "classic"})
     command = {"trajectory": [{"x": 0., "y": 0.}, {"x": 3., "y": 0.}]}
     original = deepcopy(command)
     result = renderer.draw(snapshot(), command, capture(), True)

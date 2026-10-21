@@ -20,13 +20,15 @@ import cv2
 import numpy as np
 
 from src.vla_memory.common.logging_utils import get_logger
+from carla_bridge.visualization.trajectory_renderer import DISPLAY_COLORS, DISPLAY_CANDIDATE_COLORS
 
 logger = get_logger("carla_video")
 
-# RGB video is already tone mapped. These ordinary OpenCV BGR values must not
-# reuse the deliberately tiny HDR inputs used by CARLA's world debug drawer.
-TRAJECTORY_HUD_COLORS = {"candidate": (235, 145, 50), "selected": (0, 195, 245),
-                         "execution": (150, 215, 15), "rejected": (70, 65, 235)}
+# Derive the video legend from the exact projection palette. OpenCV uses BGR;
+# keeping one RGB source prevents a style update from leaving a stale legend.
+TRAJECTORY_HUD_COLORS = {"candidate": tuple(DISPLAY_CANDIDATE_COLORS[0][::-1]),
+                         **{kind: tuple(DISPLAY_COLORS[kind][::-1])
+                            for kind in ("selected", "execution", "rejected")}}
 CLASSIC_TRAJECTORY_HUD_COLORS = {"candidate": (235, 100, 50), "selected": (0, 135, 245),
                                  "execution": (65, 210, 65), "rejected": (70, 65, 235)}
 
@@ -409,11 +411,8 @@ class VideoRecorder:
         def sample(kind, label, x, y, available_width):
             line_y = y - 4
             color = colors[kind]
-            if kind == "candidate" and not classic:
-                for start in (0, 10, 20):
-                    cv2.line(image, (x + start, line_y), (x + start + 5, line_y), color, 2, cv2.LINE_AA)
-            else:
-                cv2.line(image, (x, line_y), (x + 25, line_y), color, 3, cv2.LINE_AA)
+            cv2.line(image, (x, line_y), (x + 25, line_y), color,
+                     2 if kind == "candidate" else 3, cv2.LINE_AA)
             text(label, x + 32, y, max(0, available_width - 32))
 
         elapsed = row.get("sim_time_s")

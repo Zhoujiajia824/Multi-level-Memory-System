@@ -104,7 +104,7 @@ def main() -> None:
     ap.add_argument("--record-video", choices=["on", "off"], default=None,
                     help="录制驾驶视频及CARLA帧索引，配合模型调用回放")
     ap.add_argument("--trajectory-visualization", choices=["on", "off"], default=None,
-                    help="在CARLA世界绘制MPC/PDM候选和通过验证的执行轨迹，默认off")
+                    help="在录像中以无发光连续实线显示MPC/PDM候选和执行计划，需配合--record-video on，默认off")
     ap.add_argument("--dinov2-model-dir", help="本地 DINOv2 模型目录或缓存 snapshot 目录")
     ap.add_argument("--dinov2-cache-dir", help="Hugging Face 缓存目录（默认项目 .cache/huggingface）")
     ap.add_argument("--allow-model-download", action="store_true", help="显式允许 DINOv2 联网下载；默认仅使用本地文件")

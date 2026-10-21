@@ -1807,12 +1807,12 @@ python -m carla_bridge.run_carla_demo \
 | --- | --- |
 | `--replay-audit on/off` | 模型调用证据归档和审核页面；默认on |
 | `--record-video on/off` | 驾驶视频和逐帧索引；当前 `carla_bridge/config/carla.yaml` 为on |
-| `--trajectory-visualization on/off` | 在CARLA世界绘制轨迹辅助线；同时录像时，paper样式还在视频中投影彩色候选与计划；默认off，支持MPC/PDM后端 |
+| `--trajectory-visualization on/off` | 默认paper样式在录像中投影候选与计划的连续实线，不向CARLA世界发送发光图元；需同时开启录像，支持MPC/PDM后端，默认off |
 
-命令行优先于YAML。上面示例用于记录模型运行；需要观察世界轨迹时，将最后一项改为
-`--trajectory-visualization on`。观测开关不修改数值规划、候选评分或语义选择规则；
-但世界线会进入RGB相机，模型输入可能随之变化，因此正式模型对照实验保持世界绘制off，
-只在可视化诊断时开启。归档、视频和绘制有I/O、编码及渲染开销，比较运行耗时时应保持观测配置一致。
+命令行优先于YAML。上面示例用于记录模型运行；需要在录像与回放中观察轨迹时，将最后一项改为
+`--trajectory-visualization on`。默认paper样式只处理独立录像画面，不修改数值规划、候选评分、
+语义选择或认知相机原图。显式切换classic时仍绘制原生世界线，可能进入模型RGB输入。
+归档、视频和投影有I/O及编码开销，比较运行耗时时应保持观测配置一致。
 
 #### 找到并打开本轮审核页面
 
@@ -1897,47 +1897,50 @@ GPU相机回调可以迟到，录制器使用有界待匹配队列保留原帧�
 视频HUD显示的是该帧采样时最近已开始的咨询；调用可能在采样后才开始，HUD会在后续tick更新，
 精确触发瞬间以HTML审核中的实际请求帧及索引映射为准。
 
-#### 在仿真环境观察候选和执行计划
+#### 在录像与回放中观察候选和执行计划
 
-启用 `--trajectory-visualization on` 后，默认使用 `style: paper`，按每次重规划绘制实际评分池中的轨迹。
-CARLA世界保留真实几何、线宽、虚实和端点辅助线；同时开启 `--record-video on` 时，
-录像还会在捕获的8位图像上投影彩色轨迹，便于分辨候选与获选结果，不需要新增命令行参数。
-要得到彩色录像，在原运行命令中同时使用 `--record-video on --trajectory-visualization on`。
+启用 `--record-video on --trajectory-visualization on` 后，默认使用 `style: paper`，
+将实际评分池中的候选及本次计划投影到录像画面。关闭录像时，paper仍可记录显示分组审计，
+但不会产生可观看的轨迹画面。查看生成的MP4或 `replay/index.html`，不需要新增命令行参数。
 
-**下表颜色指录像中的稳定投影配色。** CARLA 0.9.15 shipping版的原生debug线有HDR发光放大（约乘1000），
-即使使用低RGB输入，世界线仍可能泛白；不能保证UE窗口或外部独立观察器中的原生世界线显示为表中颜色。
+默认paper**完全不调用 `world.debug` 发送绘制图元**，只在捕获后的8位录像画面上画普通实线，
+因此不产生原生debug轨迹的发光和HDR光晕，也不会把这些标注放入认知相机。
+CARLA 0.9.15 shipping版的原生debug图元有HDR发光放大（约乘1000），降低RGB不能可靠消除；
+默认方案因此不在UE窗口中画世界轨迹，不能承诺live UE窗口或仓库外的独立观察器也显示这些无光晕彩线。
 
 | 录像投影颜色与线型 | 含义 |
 | --- | --- |
-| 多色虚线、黑色描边 | 参与评分的候选轨迹；颜色按候选ID稳定分配，不代表分数高低，也不保证每个候选颜色唯一 |
-| 金色粗实线，默认宽0.24米 | 本次实际获选候选 |
-| 青绿实线，默认宽0.11米 | 通过轨迹校验、下发给控制器的未来执行计划；与金线重合时显示为较窄的内线 |
+| 低饱和蓝灰、紫灰、鼠尾草绿、棕灰、橄榄绿或灰玫瑰色实线 | 参与评分的候选轨迹；颜色按候选ID稳定分配，不代表分数高低，也不保证每个候选颜色唯一 |
+| 深蓝实线，RGB(54, 90, 115)，默认宽0.20米 | 本次实际获选候选 |
+| 陶土色实线，RGB(201, 107, 80)，默认宽0.09米 | 通过轨迹校验、下发给控制器的未来执行计划；与获选线重合时显示为较窄的内线 |
 | 红色实线 | 被轨迹校验拒绝的计划 |
-| 灰色虚线 | 坐标有限、可以绘制，但数值求解失败或被标记为不可用的候选 |
+| 灰色实线 | 坐标有限、可以绘制，但数值求解失败或被标记为不可用的候选 |
 
-青绿线表示未来接受计划，不表示车辆已经实际走过的轨迹。表中米制线宽投影到图像后有像素可读性上下限。
-候选、获选和接受计划可能几何重合；
-绘制不添加XY偏移，也不会为了区分重合候选而伪造分离路径，仅通过线宽、虚线相位、颜色及小幅高度分层改善可读性。
+陶土色线表示未来接受计划，不表示车辆已经实际走过的轨迹。表中米制线宽投影到图像后有像素可读性上下限。
+候选、获选和接受计划可能几何重合，通过颜色和线宽区别，不添加XY偏移，不为区分候选而伪造分离路径。
+每两个相邻原始轨迹点直接连续连接，保留原折点，不额外平滑或改造轨迹；默认无描边，
+也没有虚线、箭头、末端横帽或十字标记。零长度静止路径不画线或标记，记录在显示审计的 `stationary_paths`，
+不虚构向前行驶的轨迹。
+所有路径统一使用 `z_offset`（默认0.15米），没有获选线与接受计划之间的额外高度错层。
 非有限坐标无法绘制，不能用灰线补成一条有效路径；相关候选仍以原规划诊断和绘制审计为准。
-候选末端用短横线标记，主计划用方向箭头；静止或极短计划显示小十字，不虚构向前行驶的轨迹。
 
 为减少同一路径不同速度方案反复叠画，paper样式默认将**完整几何轨迹**接近的候选合并显示，
 距离阈值为 `merge_distance_m: 0.12`；仅起始部分重合、后段分叉的轨迹不会因此合并。
-默认最多显示10个几何组，保留实际获选者，并优先覆盖不同横向方向和不同形状；
+默认最多显示6个几何组，保留实际获选者，并优先覆盖不同横向方向和不同形状；
 这些限制只影响显示，不减少规划候选，不修改评分和选择。`max_candidates: 0` 显示全部几何组；
 需要逐条绘制每个可绘制候选时，同时设置 `max_candidates: 0` 和 `merge_distance_m: 0`。
 
 录像投影使用**该张实际捕获图像的 `Image.transform`** 和录像相机固定的水平FOV90°，
 对该帧关联的规划几何做投影，不查询后来时刻的sensor姿态补齐；延迟到达的图像仍使用自己的捕获位姿。
+正常两次重规划之间持续使用当前显示快照，下一次计划到来再替换，不以世界线的life timer制造间歇空帧。
 同帧保留自车包围盒，可用时将其投影区域的原始像素保留，减少轨迹压在自车车顶上的情况。
 投影是录像的几何标注：未增加深度相机，不对其他车辆、行人或建筑做深度遮挡，
 线条可能覆盖它们，不能将标注当作物理世界中真实可见的地面线。
 这项处理不改变实际XY、规划、控制、相机后处理或曝光；不在认知相机原图中添加彩色投影。
 
-原生世界线仍使用CARLA debug绘制，本机CARLA 0.9.15中已在RGB相机里看到这些线，
-因此同时开启认知相机时，模型仍可能看到原生标记。其他渲染模式的可见性仍需实际核对；
-回放以保存的实际输入图片、视频和规划日志为依据。仓库没有外部独立观察器的实现，
-不能据此声称其图像也已加上彩色投影。
+只有显式使用classic等原生世界绘制时，世界线才仍可能进入认知相机；本机CARLA 0.9.15中已看到过这种情况。
+默认paper的投影不写回CARLA世界，也不修改模型输入。回放以保存的实际输入图片、视频和规划日志为依据。
+仓库没有外部独立观察器的实现，不能据此声称其图像也已加上彩色投影。
 
 配置位于 `carla_bridge/config/carla.yaml` 的 `carla.visualization.trajectories`：
 
@@ -1946,46 +1949,54 @@ carla:
   visualization:
     trajectories:
       enabled: false
-      style: paper          # paper为当前默认；classic保留旧版实线样式
-      max_candidates: 10    # paper下限制显示几何组数量；0显示全部组
+      style: paper          # 录像连续实线投影；不发送世界debug图元
+      max_candidates: 6     # paper下限制准备投影的几何组数量；0保留全部组
       merge_distance_m: 0.12 # paper下合并接近的完整轨迹；0禁用合并
-      point_stride: 2       # 仅classic使用；paper保留原折点，沿折线按米绘制虚线
-      lifetime_s: 0.20      # 短暂保留，随默认0.2秒重规划刷新
+      point_stride: 2       # 仅classic抽样；paper连接全部相邻原点
+      lifetime_s: 0.20      # 仅classic世界线使用；paper持续使用当前显示快照
       thickness: 0.055      # paper候选色芯宽度，米
-      selected_thickness: 0.24
-      execution_thickness: 0.11
-      outline_width: 0.045  # 单侧黑色描边宽度，米
-      dash_length_m: 1.2
-      dash_gap_m: 0.8
-      endpoint_markers: true
-      z_offset: 0.15         # 米；抬高以减少与路面重叠
+      selected_thickness: 0.20
+      execution_thickness: 0.09
+      outline_width: 0      # 默认无描边；显式设为正数可添加细描边
+      z_offset: 0.15        # 米；轨迹投影高度偏移，不改变XY
 ```
 
 `classic` 保留旧版蓝色候选、橙色获选、绿色接受计划和红色拒绝计划的实线绘制，
 这些是原生世界线的输入配色，实际颜色同样受引擎HDR影响；classic不启用新的录像彩色投影。
-classic按 `point_stride` 抽样；paper样式不使用该抽样参数，不会以跨越原折点的直线替代弯道。
-`selected_thickness`、`execution_thickness`、描边、虚线长度、分组和端点设置用于paper样式；
-`thickness` 在classic中仍控制基本线宽。全部候选绘制有性能成本；
+classic按 `point_stride` 抽样，使用 `lifetime_s` 控制世界线寿命；paper不使用这两个参数。
+旧配置中的 `dash_length_m`、`dash_gap_m` 和 `endpoint_markers` 为兼容保留，
+即使显式设置 `endpoint_markers: true`，paper也不画虚线、箭头、横帽或十字。
+`selected_thickness`、`execution_thickness`、分组和可选描边用于paper样式；
+`thickness` 在classic中仍控制基本线宽。全部候选投影有性能成本；
 观察时可先开启，正式批量实验按需要关闭或限制显示数量。
 
 `planner.jsonl` 每条规划记录中的 `trajectory_visualization` 保存显示审计，
-包括原评分池数量 `candidate_pool_count`、可绘制数量 `drawable_candidate_count`、
+包括原评分池数量 `candidate_pool_count`、具有有限几何的候选数 `drawable_candidate_count`（含静止路径）、
 合并掉的候选数 `merged_candidates`、因显示上限隐藏的几何组数 `hidden_candidates`，
-以及实际绘制组数 `drawn_candidates`。`candidate_groups` 记录每个显示组的
-`representative_id`、完整 `member_ids`/`member_indices`、横向方向及获选状态；
-其中 `rgb` 是世界debug线的低HDR输入值，`display_rgb` 是录像投影的普通0–255 RGB配色。
+以及准备投影的非零几何组数 `drawn_candidates`。`drawn_segments` 是准备好的线段总数，
+`execution_drawn`/`rejected_drawn` 表示对应计划已准备为非零投影几何，均不代表已在视频中画出像素。
+默认paper的 `backend` 为 `camera_overlay`，`world_drawn_segments` 为0。
+`candidate_groups` 记录每个显示组的
+`representative_id`、完整 `member_ids`/`member_indices`、横向方向、获选状态及是否具有非零投影几何的 `projectable`；
+`display_rgb` 记录录像投影的普通0–255 RGB配色，不能将颜色字段解读为已向世界发送debug线。
 这些字段便于把一条显示线对应回具体候选；分组显示不替代原始候选日志。
 同时开启录像并保留默认HUD时，视频显示候选/获选/接受/拒绝图例、获选ID和
-`Traj 已绘制组数/原候选数`、`Merged`、`Hidden` 计数；这些计数不是被执行候选的数量。
+`Traj 准备投影组数/原候选数`、`Merged`、`Hidden` 计数；这些计数不是被执行候选的数量。
 
 视频逐帧索引 `*.frames.jsonl` 的 `trajectory_overlay` 记录该实际图像的投影审计，
-包括捕获位姿来源、画出的路径/线段数及跳过原因。缺少 `Image.transform` 或投影失败时，
+包括捕获位姿来源、实际投影绘制的 `drawn_paths`/线段数及跳过原因；这些计数发生在自车遮罩还原前，
+不等于最终画面一定可见的完整路径数。
+准备阶段已识别的零长静止路径见 `planner.jsonl` 的 `trajectory_visualization.stationary_paths`。
+画面外或静止的路径可能已准备好却未画出像素，不能把规划分组计数当作画面路径数。
+本次计划的显示几何构建失败时会记录 `command_error` 并仅省略该计划的标注，当前有效候选仍可投影；
+不会保留上一条已接受计划冒充本次结果。
+缺少 `Image.transform` 或投影失败时，
 跳过相应标注并记录原因，保留相机帧继续编码，不丢帧、不用当前sensor位姿代替捕获位姿。
 HUD开关仅控制文字与图例，**不控制轨迹投影**；在paper样式录像中，要关闭投影应关闭
-`--trajectory-visualization`，该操作也会关闭世界轨迹辅助线。
+`--trajectory-visualization`。默认paper本身不绘制世界轨迹。
 
 以下是此前回放审计与旧版绘制的历史验证记录（`outputs/replay_validation/`，本地生成、不随Git分发），
-不代表本次paper多色虚线、描边、分组、相机投影或新HUD样式的实测验收；本次样式验证另行记录：
+不代表本次paper无发光、克制配色连续实线投影及新HUD样式的实测验收；本次样式验证另行记录：
 
 | 验证 | 结果与范围 |
 | --- | --- |
@@ -2012,13 +2023,14 @@ HUD开关仅控制文字与图例，**不控制轨迹投影**；在paper样式�
 | --- | --- | --- | --- |
 | `--replay-audit on/off` | 归档实际模型输入图片、完整提示词、响应、触发原因、时间/帧/位置；运行结束生成 `replay/index.html`，联动视频并统计使用比例 | 不启用新增调用证据归档和自动审核页面；原有驾驶/规划日志仍保留 | on |
 | `--record-video on/off` | 增加录像相机，输出驾驶MP4、逐帧索引、缺帧事件与HUD；paper样式且轨迹绘制开启时还投影彩色轨迹 | 不初始化录像相机或录制MP4，也不产生录像彩色投影；调用审核仍可查看图片和文本 | on |
-| `--trajectory-visualization on/off` | 绘制实际评分候选、获选及接受/拒绝计划的世界辅助线；默认paper样式，同时录像时加8位彩色投影，并记录分组及投影审计；世界线颜色受HDR影响 | 关闭世界轨迹线和录像轨迹投影；仍正常规划与保存规划日志 | off；开启后默认style为paper |
+| `--trajectory-visualization on/off` | 默认paper仅在录像中投影克制配色的连续实线，无光晕/箭头/虚线，不发送世界debug图元；记录分组与逐帧投影审计；classic另保留旧世界线 | 关闭轨迹显示；仍正常规划与保存规划日志 | off；开启后默认style为paper |
 
 三个开关分别控制审计、录像和轨迹显示；彩色录像投影需要同时开启后两项并使用paper样式。
 关闭HUD不关闭轨迹投影，关闭审计也不等于关闭模型。
 模型是否调用由 `--model-inference` 等规划开关决定。调用帧占比为“实际SDK请求的唯一CARLA帧数 / 全场景真实推进的唯一CARLA帧数”，
 同一帧的场景理解、决策和重试不重复增加分子。视频缺帧按索引明确提示，输入图片独立保存。
-世界线可能进入模型RGB输入，正式VLM对照实验推荐 `on / on / off`，人工观察候选轨迹时再把第三项设为on。
+默认paper可以用 `on / on / on` 在录像中检查轨迹，不向认知相机添加标注；
+若显式使用classic，其世界线可能进入模型RGB输入，正式VLM对照仍应关闭该世界绘制。
 
 #### 场景、模型与规划开关
 
@@ -2223,8 +2235,9 @@ MPC数值经验使用独立 `carla_mpc_execution_v2:<配置哈希>`；旧MPC-v1�
 实际版本见 `manifest.json` 中的 `outcome.execution_planner_version`。
 
 调用审计仍打开本轮 `replay/index.html`；纯MPC模型off时实际SDK调用比例应为0。
-`--trajectory-visualization on` 绘制优化后的候选及实际下发的计划，颜色沿用13.11。
-世界线会进入RGB，正式模型对照仍推荐绘制off；下载回放时保留整个运行目录。
+`--record-video on --trajectory-visualization on` 在默认paper样式录像中投影优化候选及实际下发的未来计划，
+使用13.11节的克制配色连续实线；不向世界发送发光图元，也不改认知相机输入。
+classic仍保留原生世界绘制及其RGB输入影响；下载回放时保留整个运行目录。
 
 ### 14.5 当前数值配置、约束与失败定位
 

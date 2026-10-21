@@ -49,7 +49,7 @@ def path(points, *, kind="candidate", rgb=None, width_m=.1, dashed=False, **kwar
 
 def display(paths, **kwargs):
     return {"style": "paper", "paths": paths, "dash_length_m": 1.2,
-            "dash_gap_m": .8, "outline_width_m": .045,
+            "dash_gap_m": .8, "outline_width_m": 0.,
             "endpoint_markers": False, **kwargs}
 
 
@@ -159,41 +159,40 @@ def test_off_display_is_an_exact_image_noop(off_display):
     assert audit["drawn_paths"] == 0
 
 
-def test_metric_candidate_dashes_continue_across_nonuniform_waypoint_segments():
+def test_nonuniform_waypoint_polyline_is_pixel_continuous_despite_legacy_dash_flag():
     pixels = image()
-    # Depth is constant, so 1m is exactly32px. Waypoint at1.3m falls inside
-    # the first gap; restarting dash phase per polyline edge would paint it.
+    # Depth is constant, so 1m is exactly32px. The entire real polyline must
+    # remain connected, including locations that used to be metric dash gaps.
     data = display([path([[10., -5., 0.], [10., -3.7, 0.],
                           [10., -1.1, 0.], [10., 5., 0.]], dashed=True, width_m=.1)])
     audit = draw_trajectory_overlay(pixels, data, CaptureTransform())
-    colored, painted = color_mask(pixels), changed(pixels)
-    for distance in (.6, 2.6, 4.6):
-        assert near_pixel(colored, round(160 + distance*32), 180, 1)
-    for distance in (1.6, 3.6, 5.6):
-        x = round(160 + distance*32)
-        assert not painted[178:183, x-1:x+2].any()
-    assert audit["drawn_segments"] >= 5
+    assert color_mask(pixels)[180, 162:479].all()
+    assert audit["drawn_segments"] == 3
+    assert audit["line_style"] == "solid" and audit["endpoint_markers"] is False
 
 
 @pytest.mark.parametrize("reverse_input", [False, True])
-def test_gold_selected_outer_and_teal_execution_inner_strokes_stay_visible(reverse_input):
+def test_muted_blue_selected_outer_and_terracotta_execution_inner_remain_visible(reverse_input):
     pixels = image()
-    gold, teal = [255, 196, 50], [0, 220, 170]
+    blue, terracotta = [54, 90, 115], [201, 107, 80]
     points = [[10., 0., -1.5], [10., 0., 1.5]]
     paths = [
-        path(points, kind="selected", rgb=gold, width_m=.4),
-        path(points, kind="execution", rgb=teal, width_m=.12),
+        path(points, kind="selected", rgb=blue, width_m=.20),
+        path(points, kind="execution", rgb=terracotta, width_m=.09),
     ]
     draw_trajectory_overlay(pixels, display(paths[::-1] if reverse_input else paths), CaptureTransform())
-    gold_x, teal_x = np.where(color_mask(pixels, gold)[180])[0], np.where(color_mask(pixels, teal)[180])[0]
-    assert len(gold_x) and len(teal_x)
-    assert gold_x.min() < teal_x.min() <= 320 <= teal_x.max() < gold_x.max()
-    # A one-pixel antialiased casing can blend with its background; require
-    # visible near-black contrast, rather than an implementation RGB literal.
-    assert np.any(np.max(pixels[180], axis=-1) < BACKGROUND * .7)
+    blue_x = np.where(color_mask(pixels, blue)[180])[0]
+    execution_x = np.where(color_mask(pixels, terracotta)[180])[0]
+    assert len(blue_x) and len(execution_x)
+    assert blue_x.min() < execution_x.min() <= 320 <= execution_x.max() < blue_x.max()
+    # With zero outline, AA can only mix source colors with the existing
+    # background. A black halo or glow would leave this per-channel range.
+    minimum = np.minimum(blue[::-1], terracotta[::-1])
+    assert np.all(pixels.min(axis=(0, 1)) >= minimum-1)
+    assert pixels.max() <= BACKGROUND
 
 
-def test_metric_stroke_width_reduces_with_camera_depth():
+def test_readable_bounded_stroke_width_does_not_grow_with_camera_depth():
     pixels = image()
     # Both are .4m wide; near u200 depth10 and far u440 depth20.
     draw_trajectory_overlay(pixels, display([
@@ -202,7 +201,7 @@ def test_metric_stroke_width_reduces_with_camera_depth():
     ]), CaptureTransform())
     row = color_mask(pixels)[180]
     near_width, far_width = row[180:220].sum(), row[420:460].sum()
-    assert far_width > 0 and near_width > far_width * 1.5
+    assert 0 < far_width <= near_width <= 20
 
 
 @pytest.mark.parametrize("bad", [
@@ -243,21 +242,59 @@ def test_missing_capture_transform_cannot_synthesize_a_world_or_live_camera_pose
     assert audit["skipped_reason"] == "missing_capture_transform"
 
 
-def test_metric_dash_phase_shifts_visibility_without_shifting_geometry():
-    normal, phase_shifted = image(), image()
-    points = [[10., -5., 0.], [10., 5., 0.]]
-    draw_trajectory_overlay(normal, display([path(points, dashed=True)]), CaptureTransform())
-    draw_trajectory_overlay(phase_shifted,
-        display([path(points, dashed=True, phase_m=1.)]), CaptureTransform())
-    assert near_pixel(color_mask(normal), round(160 + .6*32), 180, 1)
-    x = round(160 + .6*32)
-    assert not changed(phase_shifted)[178:183, x-1:x+2].any()
-    assert near_pixel(color_mask(phase_shifted), round(160 + 1.6*32), 180, 1)
-    # Both remain on the same projected world polyline and within its ends.
-    for pixels in (normal, phase_shifted):
-        yy, xx = np.where(changed(pixels))
-        assert yy.min() >= 175 and yy.max() <= 185
-        assert xx.min() >= 155 and xx.max() <= 485
+@pytest.mark.parametrize("kind", ["candidate", "selected", "execution", "rejected"])
+def test_legacy_marker_dash_phase_flags_cannot_add_arrow_cap_or_gaps(kind):
+    normal, legacy_flags = image(), image()
+    # A real ground-plane forward line projects vertically below the horizon.
+    # Old endpoint arrows/caps would add lateral pixels near its far endpoint.
+    points = [[5., 0., -1.], [10., 0., -1.], [20., 0., -1.]]
+    draw_trajectory_overlay(normal, display([path(points, kind=kind)]), CaptureTransform())
+    audit = draw_trajectory_overlay(legacy_flags,
+        display([path(points, kind=kind, dashed=True, marker=True, phase_m=1.3)],
+                endpoint_markers=True, dash_length_m=.05, dash_gap_m=100.), CaptureTransform())
+    np.testing.assert_array_equal(normal, legacy_flags)
+    assert audit["drawn_segments"] == 2
+    assert color_mask(legacy_flags)[198:243, 320].all()
+
+
+def test_zero_outline_is_valid_and_never_introduces_a_black_halo_or_glow():
+    pixels = image()
+    rgb = [90, 140, 180]
+    draw_trajectory_overlay(pixels,
+        display([path([[10., -4., 0.], [10., 4., 0.]], rgb=rgb)], outline_width_m=0.), CaptureTransform())
+    assert color_mask(pixels, rgb)[180, 194:447].all()
+    assert np.all(pixels.min(axis=(0, 1)) >= np.asarray(rgb[::-1])-1)
+    assert pixels.max() <= BACKGROUND
+
+
+def test_stationary_polyline_stays_blank_even_with_legacy_markers_enabled():
+    pixels = image()
+    before = pixels.copy()
+    audit = draw_trajectory_overlay(pixels,
+        display([path([[10., 2., 0.]]*3, kind="execution", marker=True, dashed=True)],
+                endpoint_markers=True), CaptureTransform())
+    np.testing.assert_array_equal(pixels, before)
+    assert audit["drawn_paths"] == 0 and audit["drawn_segments"] == 0
+    assert any(p["kind"] == "execution" for p in audit["stationary_paths"])
+
+
+def test_a_billion_meter_two_point_line_is_clipped_as_one_real_segment():
+    pixels = image()
+    audit = draw_trajectory_overlay(pixels,
+        display([path([[10., -1e9, 0.], [10., 1e9, 0.]], dashed=True, marker=True)],
+                endpoint_markers=True), CaptureTransform())
+    assert audit["drawn_paths"] == 1 and audit["drawn_segments"] == 1
+    assert color_mask(pixels)[180, 1:-1].all()
+
+
+def test_excessive_actual_polyline_segments_cannot_hide_a_normal_path():
+    excessive = path(np.column_stack((np.full(5002, 10.), np.linspace(-4., 4., 5002), np.zeros(5002))).tolist())
+    valid = path([[10., 2., -1.], [10., 2., 1.]])
+    expected, actual = image(), image()
+    draw_trajectory_overlay(expected, display([valid]), CaptureTransform())
+    audit = draw_trajectory_overlay(actual, display([excessive, valid]), CaptureTransform())
+    np.testing.assert_array_equal(actual, expected)
+    assert audit["drawn_paths"] == 1 and len(audit["skipped_paths"]) == 1
 
 
 def box_corners(x_range, y_range, z_range):

@@ -309,7 +309,7 @@ def test_trajectory_video_legend_has_real_rgb_colors_bounded_area_and_planning_l
          "trajectory_visualization": {"enabled": True, "style": "paper", "drawn_candidates": 8,
             "candidate_pool_count": 40, "merged_candidates": 20, "hidden_candidates": 12}})
     for color in module.TRAJECTORY_HUD_COLORS.values():
-        assert max(color) > 100  # Display BGR, never world-debug 0/1/2 HDR input.
+        assert max(color) > 32  # Ordinary muted BGR, never world-debug 0/1/2 input.
         assert np.any(np.all(image == color, axis=2))
     assert any("8/40" in label for label in labels)
     assert any("20" in label and "12" in label for label in labels)
@@ -364,7 +364,8 @@ def test_delayed_video_frame_keeps_its_own_trajectory_legend_counts(tmp_path, mo
 
 
 @pytest.mark.parametrize("style", ["paper", "classic"])
-def test_video_legend_matches_the_selected_world_style(tmp_path, monkeypatch, style):
+def test_video_legend_matches_the_selected_display_style_with_continuous_samples(tmp_path, monkeypatch, style):
+    from carla_bridge.visualization.trajectory_renderer import DISPLAY_COLORS, DISPLAY_CANDIDATE_COLORS
     recorder = module.VideoRecorder(Mock(), Mock(), str(tmp_path / "legend.mp4"),
                                     width=1280, height=720)
     image = np.full((720, 1280, 3), 160, dtype=np.uint8)
@@ -385,13 +386,14 @@ def test_video_legend_matches_the_selected_world_style(tmp_path, monkeypatch, st
     for color in colors.values():
         assert np.any(np.all(image == color, axis=2))
     candidates = [call for call in calls if call[2] == colors["candidate"]]
+    assert len(candidates) == 1 and candidates[0][1][0] - candidates[0][0][0] == 25
     if style == "classic":
-        assert len(candidates) == 1 and candidates[0][1][0] - candidates[0][0][0] == 25
-        # Classic accepted commands are green; paper uses a teal command stroke.
+        # Classic is the explicitly selected old native-world style.
         assert colors["execution"][1] > 2 * colors["execution"][0]
-        assert colors["selected"][1] < module.TRAJECTORY_HUD_COLORS["selected"][1]
     else:
-        assert len(candidates) == 3 and all(b[0] - a[0] == 5 for a, b, _ in candidates)
+        assert colors["candidate"] == tuple(DISPLAY_CANDIDATE_COLORS[0][::-1])
+        for kind in ("selected", "execution", "rejected"):
+            assert colors[kind] == tuple(DISPLAY_COLORS[kind][::-1])
 
 
 @pytest.mark.parametrize("style", ["paper", "classic"])
@@ -544,8 +546,7 @@ def test_real_renderer_loop_and_delayed_video_projection_share_world_geometry_an
     from copy import deepcopy
     import carla
     from carla_bridge.tests.test_route_acceptance import fake_loop
-    from carla_bridge.visualization.trajectory_renderer import (
-        CarlaTrajectoryRenderer, DISPLAY_COLORS, PAPER_COLORS)
+    from carla_bridge.visualization.trajectory_renderer import CarlaTrajectoryRenderer, DISPLAY_COLORS
 
     recorder, writer, world = start_mock(tmp_path, monkeypatch, width=1280, height=720,
                                          hud=False, flush_timeout_s=0)
@@ -556,7 +557,9 @@ def test_real_renderer_loop_and_delayed_video_projection_share_world_geometry_an
     loop._control_audit_path = tmp_path / "control.jsonl"
     loop._world_clock_audit = Mock()
     loop.recorder = recorder
-    renderer = CarlaTrajectoryRenderer(world, {"enabled": True, "endpoint_markers": False})
+    # Legacy server YAML flags must not revive either marks or gaps in paper.
+    renderer = CarlaTrajectoryRenderer(world, {"enabled": True, "endpoint_markers": True,
+                                               "dash_length_m": .1, "dash_gap_m": 2.})
     loop.trajectory_renderer = renderer
     ego = loop.scenario.ego_vehicle
     ego.bounding_box = carla.BoundingBox(carla.Location(z=.75), carla.Vector3D(2.4, 1., .75))
@@ -571,7 +574,8 @@ def test_real_renderer_loop_and_delayed_video_projection_share_world_geometry_an
             "reference_surface_xyz": [[x, -2., 0.], [x + 30., -2., 0.]],
             "candidates": [{"id": "winner", "index": 0, "points_world": points},
                 {"id": "invalid", "index": 1, "points_world": [[x, 0., 0.], [float("nan"), 0., 0.]]},
-                {"id": "excessive", "index": 2, "points_world": [[x, 0., 0.], [x + 10000., 0., 0.]]}]}
+                {"id": "excessive", "index": 2, "points_world": np.column_stack(
+                    (x + np.linspace(0., 10., 5001), np.zeros(5001), np.zeros(5001))).tolist()}]}
         loop.pdm_planner = SimpleNamespace(last_visualization_snapshot=snapshot)
         decision = {"trajectory": [{"x": 8., "y": 2.}, {"x": 28., "y": 2.}],
                     "planner_diagnostics": {"selected_id": "winner"}}
@@ -580,8 +584,10 @@ def test_real_renderer_loop_and_delayed_video_projection_share_world_geometry_an
         paths = renderer.last_display_snapshot["paths"]
         assert [path["kind"] for path in paths] == ["selected", "execution"]
         assert {path.get("id") for path in paths}.isdisjoint({"invalid", "excessive"})
-        np.testing.assert_allclose(paths[0]["points_world"], np.asarray(points) + [0., 0., .181])
-        np.testing.assert_allclose(paths[1]["points_world"], np.asarray(points) + [0., 0., .211])
+        for path in paths:
+            np.testing.assert_allclose(path["points_world"],
+                np.asarray(points) + [0., 0., renderer.config["z_offset"]])
+            assert not path["dashed"] and not path["marker"]
         assert decision == before
         loop._record_tick(ego)
         frame = camera_frame(i, color=160, width=1280, height=720)
@@ -604,18 +610,60 @@ def test_real_renderer_loop_and_delayed_video_projection_share_world_geometry_an
         for kind in ("selected", "execution"):
             assert np.any(np.all(pixels == DISPLAY_COLORS[kind][::-1], axis=-1))
     assert np.mean(np.abs(images[0].astype(float) - images[1])) < .1
-    # The native RGB core and the camera overlay use identical lifted Z; only
-    # their color representation differs before/after CARLA tone mapping.
-    for kind, expected_z in (("selected", .181), ("execution", .211)):
-        native = [call for call in world.debug.draw_line.call_args_list
-                  if (call.kwargs["color"].r, call.kwargs["color"].g,
-                      call.kwargs["color"].b) == PAPER_COLORS[kind]]
-        assert len(native) == 2
-        assert all(point.z == pytest.approx(expected_z, abs=2e-6)
-                   for call in native for point in call.args[:2])
+    # No emissive native primitive may enter the raw camera image. The only
+    # trajectory pixels are the muted, continuous post-capture annotation.
+    assert world.debug.method_calls == []
     assert [row["trajectory_visualization"]["invalid_candidate_ids"]
             for row in rows(tmp_path / "planner.jsonl")] == [["invalid"], ["invalid"]]
     sensor.get_transform.assert_not_called()
+    ego.apply_control.assert_not_called()
+    loop.carla_client.tick.assert_not_called()
+    world.tick.assert_not_called()
+
+
+def test_real_paper_video_retains_continuous_plan_between_replans_without_lifetime_expiry(tmp_path, monkeypatch):
+    """The legacy world-line lifetime cannot blink a valid published video plan."""
+    import carla
+    from carla_bridge.tests.test_route_acceptance import fake_loop
+    from carla_bridge.visualization.trajectory_renderer import CarlaTrajectoryRenderer, DISPLAY_COLORS
+
+    recorder, writer, world = start_mock(tmp_path, monkeypatch, width=1280, height=720,
+                                         hud=False, flush_timeout_s=0)
+    loop = fake_loop()
+    loop.config.data["output_dir"] = tmp_path
+    loop._control_audit_path = tmp_path / "control.jsonl"
+    loop._world_clock_audit = Mock()
+    loop.recorder = recorder
+    renderer = CarlaTrajectoryRenderer(world, {"enabled": True, "lifetime_s": .001,
+                                               "endpoint_markers": True})
+    loop.trajectory_renderer = renderer
+    ego = loop.scenario.ego_vehicle
+    ego.bounding_box = carla.BoundingBox(carla.Location(z=.75), carla.Vector3D(2.4, 1., .75))
+    ego.get_control.return_value = carla.VehicleControl()
+    loop.pdm_planner = SimpleNamespace(last_visualization_snapshot={"selected_index": 0,
+        "candidate_pool_count": 1, "reference_surface_xyz": [[0., -2., 0.], [30., -2., 0.]],
+        "candidates": [{"id": "winner", "index": 0, "points_world": [[8., -2., 0.], [28., -2., 0.]]}]})
+    loop._audit_pdm_plan({"trajectory": [{"x": 8., "y": 2.}, {"x": 28., "y": 2.}],
+                         "planner_diagnostics": {"selected_id": "winner"}}, {"accepted": True}, "control_update")
+    published = renderer.last_display_snapshot
+    for i in range(10, 20):
+        loop._elapsed = (i - 9) / 10
+        loop._world_clock_audit.return_value = {"frame": i}
+        loop._record_tick(ego)
+        frame = camera_frame(i, color=160, width=1280, height=720)
+        frame.transform = carla.Transform(carla.Location(x=-7., z=4.), carla.Rotation(pitch=-15.))
+        recorder._receive_frame(frame)
+    recorder.flush()
+    assert renderer.last_display_snapshot is published
+    assert len(rows(tmp_path / "planner.jsonl")) == 1  # No redraw/replan was needed.
+    indexed = rows(recorder.index_path)
+    assert len(indexed) == 10
+    assert all(row["trajectory_overlay"]["drawn_paths"] == 2 for row in indexed)
+    images = [call.args[0] for call in writer.write.call_args_list]
+    for pixels in images:
+        assert np.any(np.all(pixels == DISPLAY_COLORS["execution"][::-1], axis=-1))
+        np.testing.assert_array_equal(pixels, images[0])
+    assert world.debug.method_calls == []
     ego.apply_control.assert_not_called()
     loop.carla_client.tick.assert_not_called()
     world.tick.assert_not_called()

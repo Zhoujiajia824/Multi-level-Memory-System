@@ -196,19 +196,16 @@ carla:
     enabled: true               # 自动生成 replay/index.html；归档实际模型输入，含历史记忆图片
   visualization:
     trajectories:
-      enabled: false            # --trajectory-visualization on 开启世界内轨迹绘制
-      style: "paper"            # paper: 彩色虚线/黑描边/分组；classic: 旧版实线
-      max_candidates: 10        # 仅显示上限；优先横向覆盖和差异，获选者始终显示；0不设上限
+      enabled: false            # --trajectory-visualization on 开启录像轨迹标注
+      style: "paper"            # paper: 无发光连续实线投影；classic: 旧版世界debug实线
+      max_candidates: 6         # 仅显示上限；优先横向覆盖和差异，获选者始终显示；0不设上限
       merge_distance_m: 0.12    # 近重复完整几何仅显示代表；0禁用合并；所有原候选仍保留在日志
-      point_stride: 2           # classic样式的绘制抽样；paper沿原折线按米绘制虚线
-      lifetime_s: 0.20          # 随默认0.2s重规划刷新，减少多代轨迹堆叠
+      point_stride: 2           # 仅classic抽样；paper连接每一个真实折点
+      lifetime_s: 0.20          # 仅classic使用；paper逐帧投影，不按有效期消失
       thickness: 0.055          # 候选色芯宽度，米
-      selected_thickness: 0.24  # 金色：实际获选候选，宽于青绿执行线的描边
-      execution_thickness: 0.11 # 青绿：校验通过、下发控制器的未来计划
-      outline_width: 0.045      # 单侧黑描边宽度，米
-      dash_length_m: 1.2
-      dash_gap_m: 0.8
-      endpoint_markers: true    # 候选终点短横线，主轨迹方向箭头，静止计划十字
+      selected_thickness: 0.20  # 深蓝灰：实际获选候选，宽于执行计划
+      execution_thickness: 0.09 # 陶土色：校验通过、下发控制器的未来计划
+      outline_width: 0.0        # 默认不描边、不添加光晕；正数可显式加细描边
       z_offset: 0.15
   # ---- 场景 ----
   scenario_dir: "carla_bridge/config/scenarios"
