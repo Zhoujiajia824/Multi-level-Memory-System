@@ -234,7 +234,8 @@ def _eight_direction_context(scene,grid):
     available=bool(grid.get('valid',False))
     regions={}
     result={'区域描述可用':available,'对象':[],
-            '未发现可见对象的区域':[],'不存在相邻同向车道的区域':[],'未知区域':[]}
+            '未发现可见对象的区域':[],'不存在相邻同向车道的区域':[],
+            '相邻车道存在但当前位置禁止跨越的区域':[],'未知区域':[]}
     for slot,label in _REGION_NAMES.items():
         info=grid.get('slots',{}).get(slot,{}) if available else {}
         state=info.get('state')
@@ -243,8 +244,12 @@ def _eight_direction_context(scene,grid):
             regions.setdefault(identity,[]).append(label)
         elif state=='empty':
             result['未发现可见对象的区域'].append(label)
-        elif state=='missing_lane' and slot not in ('front','rear'):
+        elif (state=='not_applicable' and info.get('reason')=='no_adjacent_lane'
+              and slot not in ('front','rear')):
             result['不存在相邻同向车道的区域'].append(label)
+        elif (state=='not_applicable' and info.get('reason')=='noncrossable_boundary'
+              and slot not in ('front','rear')):
+            result['相邻车道存在但当前位置禁止跨越的区域'].append(label)
         else:
             # 缺证据或对象已不在可见集合时，不把未知格描述成没有车辆。
             result['未知区域'].append(label)

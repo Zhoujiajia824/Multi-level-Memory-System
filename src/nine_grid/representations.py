@@ -12,13 +12,17 @@ import numpy as np
 import shapely
 from PIL import Image, ImageDraw, ImageFont
 from .paths import filesystem_path
-from shapely.geometry import Polygon, Point, box
+from shapely.geometry import Polygon, Point, LineString, box
 from shapely.ops import unary_union
 
 from .contracts import Actor, SceneSnapshot, Representations
-from .configuration import grid_distance_config, grid_metric_signature
+from .configuration import (grid_distance_config, grid_metric_signature,
+                            grid_observation_config, grid_observation_signature,
+                            occupancy_distance_config)
 
-FEATURE_VERSION = "bev-occ-grid-1.4"
+FEATURE_VERSION = "bev-occ-grid-2.0"
+GRID_REPRESENTATION_VERSION = "lane-eight-interaction-2.0"
+OCC_REPRESENTATION_VERSION = "area-occupancy-evidence-2.0"
 CHANNELS = ("crosswalk", "ego", "vehicle", "bicycle", "pedestrian", "static_obstacle")
 # NAVSIM官方对象配色；保留本项目真实尺寸和行人圆形表示。
 COLORS = {"ego": (222, 112, 97), "vehicle": (105, 156, 219), "bicycle": (227, 140, 71),
@@ -116,6 +120,9 @@ def _project(points, data, anchor_s=None):
 
 
 def _frenet(actor, data, anchor_s=None):
+    if any(np.asarray(value).shape != (2,) or not np.all(np.isfinite(value))
+           for value in (actor.position, actor.velocity, actor.acceleration)) or not np.isfinite(actor.heading):
+        return None
     s, d, angle, k, kp = _project(actor.position, data, anchor_s)[0]
     t = np.array([math.cos(angle), math.sin(angle)])
     n = np.array([-t[1], t[0]])
@@ -132,20 +139,63 @@ def _frenet(actor, data, anchor_s=None):
             "heading": yaw, "reference_heading": float(angle)}
 
 
-def build_grid(scene: SceneSnapshot, reference=None, current_lane_id=None, reference_anchor_s=None, distance_config=None):
-    """每格只选择可见对象；缺车道、已知空格及不可判空格分别编码。"""
+def _adjacent_road_evidence(scene, current, lanes, side, settings):
+    """只在当前截面确认同向邻道与边界权限；远处虚线不能提供当前位置证据。"""
+    unknown = {"known": False, "exists": None, "crossable": None, "reason": "map_unknown"}
+    if current is None or scene.diagnostics.get("lane_map_complete") is not True:
+        return unknown
+    identity = getattr(current, side)
+    if identity is None:
+        return {"known": True, "exists": False, "crossable": False, "reason": "no_adjacent_lane"}
+    target = lanes.get(identity)
+    if target is None:
+        return dict(unknown, reason="adjacent_lane_geometry_missing")
+    try:
+        source_data, target_data = _reference_data(current.center), _reference_data(target.center)
+        source_s, _, source_heading, _, _ = _project(scene.ego.position, source_data)[0]
+        a = np.array([np.interp(source_s, source_data[3], source_data[0][:, i]) for i in (0, 1)])
+        target_s, _, target_heading, _, _ = _project(a, target_data)[0]
+        if math.cos(target_heading-source_heading) <= 0:
+            return {"known": True, "exists": False, "crossable": False, "reason": "no_same_direction_adjacent_lane"}
+        b = np.array([np.interp(target_s, target_data[3], target_data[0][:, i]) for i in (0, 1)])
+        middle = Point((a+b)/2)
+        permissions = []
+        for lane in (current, target):
+            nearby = [edge for edge in lane.boundaries
+                      if len(edge.get("points", [])) >= 2
+                      and LineString(edge["points"]).distance(middle) <= settings["boundary_local_tolerance_m"]]
+            if not nearby or any(type(edge.get("crossable")) is not bool for edge in nearby):
+                return dict(unknown, reason="current_boundary_permission_unknown")
+            permissions.extend(edge["crossable"] for edge in nearby)
+    except (ValueError, TypeError, IndexError):
+        return dict(unknown, reason="current_boundary_geometry_invalid")
+    crossable = bool(all(permissions))
+    return {"known": True, "exists": True, "crossable": crossable,
+            "reason": "crossable_boundary" if crossable else "noncrossable_boundary"}
+
+
+def build_grid(scene: SceneSnapshot, reference=None, current_lane_id=None, reference_anchor_s=None,
+               distance_config=None, observation_config=None):
+    """每格只选当前可见对象；道路不适用、确认空与遮挡未知分别编码。"""
+    observation_config = grid_observation_config(observation_config)
     data = _reference_data(scene.route if reference is None else reference)
     anchor = scene.diagnostics.get("reference_anchor_s") if reference_anchor_s is None and reference is None else reference_anchor_s
     ego_f = _frenet(scene.ego, data, anchor)
     if ego_f is None:
-        return {"version": FEATURE_VERSION, "valid": False, "reason": "自车 Frenet 投影奇异", "objects": []}
+        return {"version": FEATURE_VERSION, "representation_version": GRID_REPRESENTATION_VERSION,
+                "valid": False, "reason": "自车 Frenet 投影奇异", "objects": []}
     ego_s = ego_f["position"][0]
     lane_by_id = {lane.id: lane for lane in scene.lanes}
     current = lane_by_id.get(current_lane_id or scene.ego.lane_id)
+    roads = {side: _adjacent_road_evidence(scene, current, lane_by_id, side, observation_config)
+             for side in ("left", "right")}
     lane_ids = {"center": current.id if current else None, "left": current.left if current else None,
                 "right": current.right if current else None}
     lane_shapes = {}
     for role, lane_id in lane_ids.items():
+        if role != "center" and (not roads[role]["known"] or not roads[role]["crossable"]):
+            lane_shapes[role] = None
+            continue
         lane = lane_by_id.get(lane_id)
         if lane is None:
             lane_shapes[role] = None
@@ -202,11 +252,13 @@ def build_grid(scene: SceneSnapshot, reference=None, current_lane_id=None, refer
     ego_interval = _project(np.asarray(ego_shape.exterior.coords), data, ego_s)[:, 0]
     candidates = {name: [] for row in SLOTS for name in row if name != "ego"}
     object_data = {}
+    invalid_state_ids = []
     for actor in scene.actors:
         if not actor.visible or actor.kind not in ("vehicle", "bicycle", "pedestrian"):
             continue
         f = _frenet(actor, data, ego_s)
         if f is None:
+            invalid_state_ids.append(actor.id)
             continue
         ds = f["position"][0] - ego_s
         if ds < -30 or ds > 70:
@@ -218,7 +270,7 @@ def build_grid(scene: SceneSnapshot, reference=None, current_lane_id=None, refer
         longitudinal_gap = max(0., float(interval.min()-ego_interval.max()) if front else float(ego_interval.min()-interval.max()))
         roles = []
         for side, shape in lane_shapes.items():
-            if shape is None or body.intersection(shape).area < 1e-5:
+            if shape is None or body.intersection(shape).area < observation_config["body_lane_area_tolerance_m2"]:
                 continue
             if side == "center":
                 name = "front" if front else "rear"
@@ -230,25 +282,61 @@ def build_grid(scene: SceneSnapshot, reference=None, current_lane_id=None, refer
         object_data[actor.id] = {"id": actor.id, "kind": actor.kind, "position": [ds, f["position"][1]-ego_f["position"][1]],
                                 "velocity": (np.array(f["velocity"])-ego_f["velocity"]).tolist(),
                                 "acceleration": f["acceleration"], "heading": f["heading"],
-                                "length": actor.length, "width": actor.width, "slots": [], "longitudinal_overlap": bool(overlaps)}
+                                "length": actor.length, "width": actor.width, "slots": [],
+                                "state_valid": True, "longitudinal_overlap": bool(overlaps)}
     visibility = scene.diagnostics.get("visibility_polygon")
     known_geometry = None
     if visibility is not None:
-        known_geometry = unary_union([Polygon(visibility),ego_shape]+[_shape(a) for a in scene.actors if a.visible])
-    def slot_unknown(side, name):
-        if known_geometry is None:
-            return False
-        start,end = (ego_s+scene.ego.length/2,ego_s+70) if name.endswith("front") or name=="front" else ((ego_s-30,ego_s-scene.ego.length/2) if name.endswith("rear") or name=="rear" else (ego_s-scene.ego.length/2,ego_s+scene.ego.length/2))
+        try:
+            observed = Polygon(visibility)
+            if observed.is_valid and not observed.is_empty:
+                known_geometry = unary_union([observed, ego_shape]+[_shape(a) for a in scene.actors if a.visible])
+        except (ValueError, TypeError):
+            pass
+    lateral_widths = {}
+    def slot_coverage(side, name):
+        """空状态只依据可见几何与地图，不使用遮挡后的对象数量或状态。"""
+        if known_geometry is None or lane_shapes[side] is None:
+            return {"coverage": 0., "raw_coverage": 0., "unobserved_area_m2": None,
+                    "observation_reason": "visibility_missing"}
+        if name == "front":
+            start,end = ego_s,ego_s+70
+        elif name == "rear":
+            start,end = ego_s-30,ego_s
+        elif name.endswith("front"):
+            start,end = ego_interval.max(),ego_s+70
+        elif name.endswith("rear"):
+            start,end = ego_s-30,ego_interval.min()
+        else:
+            start,end = ego_interval.min(),ego_interval.max()
         ref,_,_,arc,_,_,_,_ = data
-        ss = np.linspace(max(arc[0],start),min(arc[-1],end),40)
+        if min(arc[-1], end) <= max(arc[0], start):
+            return {"coverage": 0., "raw_coverage": 0., "unobserved_area_m2": None,
+                    "observation_reason": "reference_region_missing"}
+        start,end = max(arc[0],start),min(arc[-1],end)
+        # 沿参考线已有顶点构造截面；不以额外稀疏固定采样漏掉弯道。
+        ss = np.r_[start, arc[(arc>start)&(arc<end)], end]
         xy = np.column_stack([np.interp(ss,arc,ref[:,i]) for i in (0,1)])
         direction = np.gradient(xy,axis=0)
         direction /= np.maximum(np.linalg.norm(direction,axis=1,keepdims=True),1e-9)
         normal = np.column_stack((-direction[:,1],direction[:,0]))
-        band = Polygon(np.vstack((xy+normal*15,(xy-normal*15)[::-1]))).buffer(0)
+        if side not in lateral_widths:
+            boundaries = np.vstack([np.asarray(part.exterior.coords) for part in _iter_polygons(lane_shapes[side])])
+            lateral_extent = float(np.max(np.abs(_project(boundaries,data,ego_s)[:,1])))
+            lateral_widths[side] = lateral_extent+lane_by_id[lane_ids[side]].width
+        half_width = lateral_widths[side]
+        band = Polygon(np.vstack((xy+normal*half_width,(xy-normal*half_width)[::-1]))).buffer(0)
         region = lane_shapes[side].intersection(band)
-        # 几何遮挡区与未知对象是否真实存在无关，不能用全场隐藏对象数量决定空格。
-        return region.difference(known_geometry).area > .25
+        area = region.area
+        if area <= observation_config["geometry_area_epsilon_m2"]:
+            return {"coverage": 0., "raw_coverage": 0., "unobserved_area_m2": None,
+                    "observation_reason": "region_geometry_missing"}
+        unknown_area = float(region.difference(known_geometry).area)
+        known_area = max(0., area-unknown_area)
+        return {"coverage": min(1., (known_area+observation_config["empty_unknown_area_tolerance_m2"])/area),
+                "raw_coverage": known_area/area, "unobserved_area_m2": unknown_area,
+                "region_area_m2": float(area), "known_area_m2": float(known_area),
+                "observation_reason": "geometry_visibility"}
     matrices = {key: [[None for _ in range(3)] for _ in range(3)] for key in ("position", "velocity", "acceleration", "heading")}
     slots, selected = {}, {}
     for i, row in enumerate(SLOTS):
@@ -256,24 +344,42 @@ def build_grid(scene: SceneSnapshot, reference=None, current_lane_id=None, refer
             if name == "ego":
                 for key in matrices:
                     matrices[key][i][j] = [0., 0.] if key in ("position", "velocity") else ego_f[key]
-                slots[name] = {"state": "occupied", "id": scene.ego.id}
+                slots[name] = {"state": "occupied", "id": scene.ego.id, "kind": scene.ego.kind,
+                               "applicable": True, "clear": True, "state_valid": True,
+                               "coverage": 1., "raw_coverage": 1., "unobserved_area_m2": 0.}
                 continue
             side = "left" if name.startswith("left") else "right" if name.startswith("right") else "center"
-            if lane_shapes[side] is None:
-                slots[name] = {"state": "missing_lane", "id": None}
+            road = roads.get(side)
+            shared = {"id": None, "kind": None, "state_valid": False, "coverage": 0.,
+                      "raw_coverage": 0., "unobserved_area_m2": None}
+            if road is not None and not road["known"]:
+                slots[name] = dict(shared, state="unknown", applicable=None, clear=False, reason=road["reason"])
+            elif road is not None and not road["crossable"]:
+                slots[name] = dict(shared, state="not_applicable", applicable=False, clear=True,
+                                   reason="no_adjacent_lane" if not road["exists"] else "noncrossable_boundary")
+            elif lane_shapes[side] is None:
+                slots[name] = dict(shared, state="unknown", applicable=True, clear=False, reason="lane_geometry_missing")
             elif candidates[name]:
                 gap, _, actor_id = min(candidates[name])
-                slots[name] = {"state": "occupied", "id": actor_id, "clearance": float(gap)}
+                slots[name] = dict(slot_coverage(side,name), state="occupied", id=actor_id,
+                                   kind=object_data[actor_id]["kind"], clearance=float(gap),
+                                   applicable=True, clear=True, state_valid=True)
                 selected.setdefault(actor_id, dict(object_data[actor_id], slots=[]))["slots"].append(name)
                 for key in matrices:
                     matrices[key][i][j] = object_data[actor_id][key]
             else:
-                # 存在遮挡时空格不是“该车道确实没有交通对象”的证明。
-                slots[name] = {"state": "unknown" if slot_unknown(side,name) else "empty", "id": None}
+                evidence = slot_coverage(side,name)
+                clear = evidence["coverage"] >= observation_config["empty_min_coverage"]
+                slots[name] = dict(shared, **evidence, state="empty" if clear else "unknown",
+                                   applicable=True, clear=bool(clear), reason="observed_empty" if clear else evidence["observation_reason"])
     distance_config=grid_distance_config(distance_config)
-    return {"version": FEATURE_VERSION, "valid": True, "coordinates": "common_route_frenet", "slots": slots,
+    return {"version": FEATURE_VERSION, "representation_version": GRID_REPRESENTATION_VERSION,
+            "valid": not invalid_state_ids, "reason": "可见对象状态无效" if invalid_state_ids else "",
+            "invalid_state_ids": sorted(invalid_state_ids), "coordinates": "common_route_frenet", "slots": slots, "roads": roads,
             "distance_config":distance_config,"metric_signature":grid_metric_signature(distance_config),
-            "matrices": matrices, "objects": list(selected.values()),
+            "observation_config": observation_config,
+            "observation_signature": grid_observation_signature(observation_config),
+            "matrices": matrices, "objects": [selected[key] for key in sorted(selected)],
             "ego": dict(ego_f, id=scene.ego.id, world_position=np.asarray(scene.ego.position).tolist(),
                         world_velocity=np.asarray(scene.ego.velocity).tolist(), world_acceleration=np.asarray(scene.ego.acceleration).tolist(),
                         world_heading=scene.ego.heading, length=scene.ego.length, width=scene.ego.width)}
@@ -284,6 +390,8 @@ class NineGridBuilder:
     def __init__(self, config=None):
         settings = (config or {}).get("coordinates",{})
         self.distance_config=grid_distance_config((config or {}).get("grid_distance"))
+        self.observation_config=grid_observation_config((config or {}).get("grid_observation"))
+        self.occupancy_config=occupancy_distance_config((config or {}).get("occupancy_distance"))
         self.hold = float(settings.get("lane_switch_hold_s",.3))
         self.fraction = float(settings.get("lane_switch_overlap_fraction",.5))
         self.back = float(settings.get("reference_back_m",60))
@@ -361,7 +469,7 @@ class NineGridBuilder:
             return None
         if self.cached_frame == scene.frame_id:
             return self.cached_grid
-        grid = build_grid(scene,self.reference,self.lane_id,self.anchor,self.distance_config)
+        grid = build_grid(scene,self.reference,self.lane_id,self.anchor,self.distance_config,self.observation_config)
         grid["reference"] = {"lane_id":self.lane_id,"observed_lane_id":scene.ego.lane_id,"revision":self.reference_version,
                              "ego_arc_m":float(self.anchor),"pending_lane_id":self.candidate,
                              "pending_since_s":self.candidate_since}
@@ -718,21 +826,27 @@ def build_occupancy(scene):
             cells = _occupancy_cells()[row0:row1,col0:col1]
             raw[channel,row0:row1,col0:col1] += _occupancy_coverage(cells,part)
     raw = np.clip(raw,0,1)
-    known = np.ones_like(raw,dtype=np.float32)
+    # 缺少可见几何不是全局可见证据；地图横道也须由平台明确确认可用。
+    known = np.zeros_like(raw,dtype=np.float32)
+    known[1] = 1
     visible = scene.diagnostics.get("visibility_polygon")
     if visible is not None:
-        visible_shape = Polygon(visible)
+        try:
+            visible_shape = Polygon(visible)
+        except (ValueError, TypeError):
+            visible_shape = Polygon()
         # 完整状态授权意味着部分可见对象的完整实体占据已知。
-        visible_shape = unary_union([visible_shape, _shape(scene.ego)] + [_shape(a) for a in scene.actors if a.visible])
-        local_visible = unary_union([to_local_polygon(p) for p in _iter_polygons(visible_shape)])
-        dynamic_known = _occupancy_coverage(_occupancy_cells(),local_visible).astype(np.float32)
-        known[2:] = dynamic_known
+        if visible_shape.is_valid and not visible_shape.is_empty:
+            visible_shape = unary_union([visible_shape, _shape(scene.ego)] + [_shape(a) for a in scene.actors if a.visible])
+            local_visible = unary_union([to_local_polygon(p) for p in _iter_polygons(visible_shape)])
+            dynamic_known = _occupancy_coverage(_occupancy_cells(),local_visible).astype(np.float32)
+            known[2:] = dynamic_known
+    if scene.rules.get("map_available",{}).get("crosswalk") is True:
+        known[0] = 1
     available = scene.diagnostics.get("occupancy_channels_available", {})
     for i,name in enumerate(CHANNELS):
         if available.get(name, True) is False:
             known[i] = 0
-    if scene.rules.get("map_available",{}).get("crosswalk") is False:
-        known[0] = 0
     # 检索分辨率 2m，已知比例保留为权重，不能把遮挡填成空车道。
     pooled = raw.reshape(6,50,4,25,4).mean(axis=(2,4))
     pooled_known = known.reshape(6,50,4,25,4).mean(axis=(2,4))
@@ -796,4 +910,5 @@ def build_representations(scene: SceneSnapshot, output_dir, extractor=None, grid
         raise ValueError('图像特征提取器没有有效权重身份；测试替身也必须显式使用 test: 身份')
     return Representations(scene.frame_id,scene.time,str(bev_path.resolve()),str(feature_path.resolve()),occ,known,
                            grid_builder.update(scene) if grid_builder is not None else build_grid(scene),feature,
-                           dino_signature=signature)
+                           dino_signature=signature,
+                           occupancy_config=(grid_builder.occupancy_config if grid_builder is not None else occupancy_distance_config()))

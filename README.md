@@ -159,9 +159,27 @@ python scripts/run_highway.py --scenario highway --fast server --reflection serv
 
 检索或写记忆需要真实 DINOv2 Base 权重。默认使用仓库内的 `models/dinov2-base`，首次克隆后先执行 `git lfs pull`。使用其他本地目录时，在下列命令追加 `--dino-model "模型目录"`。关闭检索和写入时不加载 DINO 权重。
 
-当前表示版本为 `bev-occ-grid-1.4`；NAVSIM白底、浅灰道路及对象配色，不绘制车道边界线和分割线，仅保留深灰虚线中心参考路径；历史轨迹采用鲜亮的同色系饱和度渐变。目标参考线与沿线距离标记只进入模型图和回放，不进入DINO特征图或OCC。模型文本含当前状态、八向区域、目标参考摘要与图像解释，命中时附历史情境和参考答案；不发送完整地图边界、历史状态列表或检索四矩阵。目标参考摘要另携带输入帧、仿真时间、参考身份、当前横偏、候选车道及相关导航规则，供正确解释Frenet目标。未入格的可见对象仍提供。
+当前表示版本为 `bev-occ-grid-2.0`；NAVSIM白底、浅灰道路及对象配色，不绘制车道边界线和分割线，仅保留深灰虚线中心参考路径；历史轨迹采用鲜亮的同色系饱和度渐变。目标参考线与沿线距离标记只进入模型图和回放，不进入DINO特征图或OCC。模型文本含当前状态、八向区域、目标参考摘要与图像解释，命中时附历史情境和参考答案；不发送完整地图边界、历史状态列表或检索四矩阵。目标参考摘要另携带输入帧、仿真时间、参考身份、当前横偏、候选车道及相关导航规则，供正确解释Frenet目标。未入格的可见对象仍提供。
 
-新经验须声明 `local-goal-frenet-1.0` 并保存原帧目标参考。旧多点笛卡尔经验不会自动转为新目标，保留原库但排除新检索；特征版本和九宫格含义不因目标协议改变。需要继续使用旧库时，应在独立旧版本运行，或另行设计显式迁移；当前实现不静默迁移。
+新经验须声明 `local-goal-frenet-1.0` 并保存原帧目标参考。本次三通道表示升级另要求道路存在/可跨越属性、观测掩码及完整运动状态。缺少这些证据的旧记录明确排除，原库保留，不补零、不自动迁移。被排除原因可在轮初 `memory_snapshot.jsonl` 和 `configuration.json` 查看，或使用下方 `memory_admin.py list`。
+
+三通道各召回3条，在并集内等权联合排序，默认要求八向分数至少0.2、联合分数至少0.5，最多返回3条；任何通道无效均拒绝，不补齐。确认空场景可以是有效证据，遮挡未知不能当成空场景。以下参数在 `config/parameters.json` 修改，并随每轮配置保存；改变参数后与旧参数签名不同的经验不会静默混算。
+
+| 检索参数组 | 开发默认值及含义 |
+|---|---|
+| `retrieval.minimum_grid_score / minimum_score` | `0.2 / 0.5`，八向与联合最低相关性 |
+| `retrieval.final_k` | `3`，最终返回数量上限；每通道召回固定3条 |
+| `grid_distance.cutoff_c` | `0.5`，部分匹配阈值；每个未匹配对象代价为其一半 |
+| `grid_distance.min_joint_known_fraction` | `0.75`，八向共同明确比例下限 |
+| `grid_distance.lambda_T / lambda_E` | `1 / 0.5`，道路和自车运动差异惩罚 |
+| `grid_observation.empty_min_coverage` | `0.95`，无对象区域被确认空所需覆盖率 |
+| `grid_observation.empty_unknown_area_tolerance_m2` | `0.25`平方米，空区覆盖计算的离散几何容差 |
+| `occupancy_distance.min_common_known_fraction` | `0.5`，各类别共同观测覆盖下限 |
+| `occupancy_distance.min_foreground_comparable_fraction` | `0.95`，本方已知前景在共同支持下的留存下限 |
+| `occupancy_distance.empty_min_known_fraction` | `0.95`，整个OCC裁剪域确认双空所需本方覆盖率 |
+| `occupancy_distance.min_union_area_m2 / area_tolerance_m2` | `0.01 / 0.01`平方米，面积有效性阈值及舍入容差 |
+
+以上为开发起点，不是已优化的检索参数。禁跨邻道的对象只退出八向集合，仍进入完整场景、BEV、OCC、模型输入和物理避碰。
 
 空库采集，不检索历史：
 
@@ -284,7 +302,7 @@ highway:
 
 ## 7. 查看运行结果和记忆
 
-每轮目录保存 `summary.json`（终止原因及统计）、`run.log`、`timing.jsonl`、`model_inputs.jsonl`、`model_outputs.jsonl`、`retrieval.jsonl`、`predictions.jsonl`、`plans.jsonl`、`quality.jsonl`、`execution_audit.jsonl`、`frames.jsonl` 及 `captures/`。`timing.jsonl`区分表示、模型等待、预测、主MPC、参照和评分，明确管线计时范围；summary区分首次与后续MPC耗时和超期次数。入库经验的资产同时保留实际预测、规划与参照结果；反思通过后另存原帧重新规划验收结果。未启用的功能不一定产生对应日志。批量统计保存在输出根目录的 `*_batch.json`。
+每轮目录保存 `summary.json`（终止原因及统计）、`run.log`、`timing.jsonl`、`model_inputs.jsonl`、`model_outputs.jsonl`、`retrieval.jsonl`、`memory_snapshot.jsonl`、`predictions.jsonl`、`plans.jsonl`、`quality.jsonl`、`execution_audit.jsonl`、`frames.jsonl` 及 `captures/`。`timing.jsonl`区分表示、模型等待、预测、主MPC、参照和评分，明确管线计时范围；summary区分首次与后续MPC耗时和超期次数。入库经验的资产同时保留实际预测、规划与参照结果；反思通过后另存原帧重新规划验收结果。未启用的功能不一定产生对应日志。批量统计保存在输出根目录的 `*_batch.json`。
 
 PowerShell 实时查看日志：
 

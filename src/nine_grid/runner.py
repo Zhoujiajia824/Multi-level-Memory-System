@@ -85,8 +85,17 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
         fallback_controls=0,termination_reason='initialization_failure',progress_m=0.)
     start_wall=time.monotonic()
     logger.info('开始 %s，场景=%s，seed=%s，检索=%s，写入=%s',episode_id,config.get('scenario'),seed,retrieve_enabled,write_enabled)
+    writer.append('memory_snapshot',dict(snapshot_id=store.snapshot_id,read_enabled=retrieve_enabled,
+        accepted=[{'id':record['id'],'revision':record.get('revision',1)} for record in records],
+        excluded=store.audit))
+    if store.audit:
+        reasons='；'.join(dict.fromkeys(str(item.get('reason','原因未提供')) for item in store.audit[:3]))
+        logger.warning('轮初记忆快照接纳%d条、排除%d条；排除原因示例：%s',len(records),len(store.audit),reasons[:400])
+    else:
+        logger.info('轮初记忆快照接纳%d条、排除0条',len(records))
     used=[]
-    timing_samples={'mpc_cold':[],'mpc_warm':[],'prediction':[],'decision_pipeline':[]}
+    timing_samples={'mpc_cold':[],'mpc_warm':[],'prediction':[],'decision_pipeline':[],
+                    'retrieval':[]}
     mpc_overruns=0
     try:
         adapter=HighwayAdapter(config,seed,episode_id,live)
@@ -102,7 +111,7 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
         limit=round(config.get('duration',config['clock']['episode_seconds'])*config['clock']['planner_hz'])
         for step in range(limit):
             cycle_started=time.perf_counter()
-            timing=dict(representations_s=0.,model_s=0.,reference_s=0.,quality_s=0.)
+            timing=dict(representations_s=0.,model_s=0.,reference_s=0.,quality_s=0.,retrieval_s=0.)
             scene=adapter.snapshot()
             # 10Hz推进参考迟滞与投影；完整实体归格仅由1Hz表示阶段消费。
             grids.update(scene,build=False)
@@ -126,12 +135,18 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
                 timing['representations_s']=time.perf_counter()-stage_started
                 scene.assets['scene_json']=writer.save(f'captures/{step:06d}/scene.json',capture_payload(scene))
                 if retrieve_enabled:
-                    active_retrieval=retrieve(reps,records,top_k=config['retrieval']['final_k'],min_score=config['retrieval']['minimum_score'],snapshot_id=store.snapshot_id)
+                    stage_started=time.perf_counter()
+                    active_retrieval=retrieve(reps,records,top_k=config['retrieval']['final_k'],min_score=config['retrieval']['minimum_score'],snapshot_id=store.snapshot_id,config=config)
+                    timing['retrieval_s']=time.perf_counter()-stage_started
+                    timing_samples['retrieval'].append(timing['retrieval_s'])
                 else:
-                    active_retrieval=RetrievalResult(scene.frame_id,snapshot_id=store.snapshot_id,time=scene.time)
+                    active_retrieval=RetrievalResult(scene.frame_id,snapshot_id=store.snapshot_id,time=scene.time,
+                        diagnostics={'reason':'检索开关关闭','candidates':[],'all_records':[]})
                 summary['retrieval_hits']+=len(active_retrieval.records)
                 writer.append('retrieval',dict(frame_id=scene.frame_id,time=scene.time,snapshot_id=store.snapshot_id,scores=active_retrieval.scores,
-                    records=[{'id':r['id'],'revision':r.get('revision',1)} for r in active_retrieval.records]))
+                    records=[{'id':r['id'],'revision':r.get('revision',1)} for r in active_retrieval.records],
+                    enabled=retrieve_enabled,diagnostics=active_retrieval.diagnostics,
+                    wall_seconds=timing['retrieval_s']))
                 active_answer=None
                 if fast.enabled:
                     prompt=build_prompt(scene,reps,active_retrieval)

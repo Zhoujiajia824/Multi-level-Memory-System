@@ -1,6 +1,6 @@
 {
   "theory_version": "nine-grid-rag-mpc-1.0",
-  "parameter_version": "development-1.0.16",
+  "parameter_version": "development-1.0.17",
   "status": "initial_validation_values_not_optimal",
   "clock": {
     "physics_hz": 50,
@@ -63,9 +63,7 @@
       "bicycle",
       "pedestrian",
       "static_obstacle"
-    ],
-    "min_known_fraction": 0.1,
-    "min_union_area_m2": 0.01
+    ]
   },
   "dino": {
     "model": "models/dinov2-base",
@@ -88,16 +86,17 @@
     "require_all_channels": true,
     "near_duplicate_removal": false,
     "cross_platform": true,
-    "cross_road_type": true
+    "cross_road_type": true,
+    "minimum_grid_score": 0.2
   },
   "grid_distance": {
     "scales": {
-      "s_m": 20,
+      "s_m": 20.0,
       "d_m": 3.5,
-      "vs_mps": 10,
-      "vd_mps": 2,
-      "as_mps2": 3,
-      "ad_mps2": 2,
+      "vs_mps": 10.0,
+      "vd_mps": 2.0,
+      "as_mps2": 3.0,
+      "ad_mps2": 2.0,
       "heading_rad": 0.7853981633974483
     },
     "weights": {
@@ -106,12 +105,14 @@
       "acceleration": 0.15,
       "heading": 0.15
     },
-    "ego_weight": 0.15,
-    "unmatched_cost": 1.0,
+    "cutoff_c": 0.5,
+    "lambda_T": 1.0,
+    "lambda_E": 0.5,
+    "min_joint_known_fraction": 0.75,
     "same_type_only": true,
     "require_intersecting_slots": true,
-    "empty_non_ego_both_is_valid": false,
-    "metric": "block_clipped_normalized_euclidean"
+    "empty_non_ego_both_is_valid": true,
+    "metric": "gospa_inspired_region_partial_assignment"
   },
   "prediction": {
     "horizon_s": 3,
@@ -361,5 +362,20 @@
     "attraction_weight": 3.0,
     "longitudinal_scale_m": 30.0,
     "lateral_scale_m": 3.5
+  },
+  "grid_observation": {
+    "empty_min_coverage": 0.95,
+    "empty_unknown_area_tolerance_m2": 0.25,
+    "boundary_local_tolerance_m": 0.3,
+    "body_lane_area_tolerance_m2": 1e-05,
+    "geometry_area_epsilon_m2": 0.01
+  },
+  "occupancy_distance": {
+    "min_common_known_fraction": 0.5,
+    "min_foreground_comparable_fraction": 0.95,
+    "empty_min_known_fraction": 0.95,
+    "min_union_area_m2": 0.01,
+    "area_tolerance_m2": 0.01,
+    "metric": "observed_soft_iou_with_confirmed_empty"
   }
 }

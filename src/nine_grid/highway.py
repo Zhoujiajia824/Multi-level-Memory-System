@@ -483,6 +483,7 @@ class HighwayAdapter:
                "crosswalks":[],"traffic_lights":[],"map_available":{"crosswalk":True,"traffic_light":False,"stop_line":False},
                "road_priority_available":self.scenario=="intersection","goal_s":self._goal_s}
         diagnostics={"route_s":route_s,"previous_control":self._previous_control.tolist(),
+                     "lane_map_complete": True,
                      "reference_revision":self._reference_revision,
                      "stable_navigation_lane_id":self._ego_lane_id,"navigation_progress_m":route_s+self._route_progress_offset,
                      "reference_anchor_s":route_s,"has_occlusion":len(actors)<len(raw),

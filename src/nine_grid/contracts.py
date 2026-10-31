@@ -70,6 +70,7 @@ class Representations:
     version: str = VERSION
     coordinates: str = "bev_ego_x_forward_y_left_m;grid_frenet_m"
     dino_signature: str | None = None
+    occupancy_config: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -81,6 +82,7 @@ class RetrievalResult:
     version: str = VERSION
     time: float | None = None
     coordinates: str = "query_bev_ego;memory_coordinates_are_historical"
+    diagnostics: dict = field(default_factory=dict)
 
 
 @dataclass

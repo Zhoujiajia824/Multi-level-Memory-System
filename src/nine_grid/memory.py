@@ -13,8 +13,12 @@ import threading
 import numpy as np
 
 from .contracts import ANSWER_PROTOCOL_VERSION, ExperienceRecord, Representations, VERSION, plain
-from .representations import FEATURE_VERSION,valid_dino_signature
-from .configuration import grid_metric_signature
+from .representations import (FEATURE_VERSION, GRID_REPRESENTATION_VERSION,
+                              OCC_REPRESENTATION_VERSION, valid_dino_signature)
+from .configuration import (GRID_METRIC_VERSION, OCC_METRIC_VERSION, RETRIEVAL_METRIC_VERSION,
+                            grid_metric_signature, occupancy_distance_config,
+                            occupancy_metric_signature)
+from .retrieval import validate_representations
 from .paths import filesystem_path
 
 
@@ -31,6 +35,24 @@ def _json_write(path,payload):
         json.dump(plain(payload),stream,ensure_ascii=False,indent=2,allow_nan=False)
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def _validate_feature_metadata(record):
+    """新指标需要显式证据；旧元数据不能通过默认值伪装成新版经验。"""
+    versions = {'representation_version': GRID_REPRESENTATION_VERSION,
+                'occupancy_representation_version': OCC_REPRESENTATION_VERSION,
+                'grid_metric_version': GRID_METRIC_VERSION,
+                'occupancy_metric_version': OCC_METRIC_VERSION,
+                'retrieval_metric_version': RETRIEVAL_METRIC_VERSION}
+    for key, expected in versions.items():
+        if record.get(key) != expected:
+            raise ValueError(f'经验表示或检索指标版本缺失/不匹配：{key}；原库保留，不自动迁移')
+    config = record.get('occupancy_config')
+    if not isinstance(config,dict) or not config:
+        raise ValueError('经验缺少显式 OCC 观测与空占据参数，不使用默认值补齐')
+    validated = occupancy_distance_config(config)
+    if validated != config or record.get('occupancy_metric_signature') != occupancy_metric_signature(config):
+        raise ValueError('经验 OCC 参数不完整或指标签名不符')
 
 
 def _validate_metadata(record):
@@ -158,8 +180,19 @@ class MemoryStore:
                 return []
             invalid = self._invalidated(self.read_dir)
             result = []
-            for record_path in sorted((self.read_dir/"records").glob("*/record.json")):
-                if record_path.parent.name.startswith("."):
+            records_root=self.read_dir/'records'
+            if records_root.exists() and not records_root.is_dir():
+                self.audit.append({'path':str(records_root),'reason':'经验记录路径不是目录，未读取'})
+            directories=sorted(records_root.iterdir()) if records_root.is_dir() else []
+            for directory in directories:
+                if directory.name.startswith('.pending-'):
+                    continue
+                if not directory.is_dir():
+                    self.audit.append({'path':str(directory),'reason':'经验记录区域含非目录项，未作为经验读取'})
+                    continue
+                record_path=directory/'record.json'
+                if not record_path.is_file():
+                    self.audit.append({'path':str(directory),'reason':'经验目录缺少 record.json 元数据，拒绝读取'})
                     continue
                 try:
                     record = self._read_record(record_path)
@@ -184,6 +217,7 @@ class MemoryStore:
             raise ValueError("经验或特征版本不匹配")
         if record.get('answer_protocol_version')!=ANSWER_PROTOCOL_VERSION:
             raise ValueError('经验答案协议不匹配；旧多点经验保留但不参与检索')
+        _validate_feature_metadata(record)
         if record.get("status") != "active":
             raise ValueError("经验未处于有效状态")
         _validate_metadata(record)
@@ -213,7 +247,11 @@ class MemoryStore:
             raise ValueError('九宫格距离参数签名不符')
         record["_representations"] = Representations(record["frame_id"],record["time"],str(base/"assets/bev.png"),
                                                      str(base/"assets/feature.png"),occ,known,grid,bev,
-                                                     dino_signature=record['dino_signature'])
+                                                     dino_signature=record['dino_signature'],
+                                                     occupancy_config=record['occupancy_config'])
+        errors = validate_representations(record['_representations'])
+        if errors:
+            raise ValueError('经验表示证据不完整：'+'；'.join(errors))
         record["_asset_root"] = str(base)
         record['_metadata_sha256'] = hashlib.sha256(metadata).hexdigest()
         return record
@@ -246,6 +284,9 @@ class MemoryStore:
         metric_signature=grid_metric_signature(reps.grid.get('distance_config'))
         if reps.grid.get('metric_signature',metric_signature)!=metric_signature:
             raise ValueError('九宫格距离参数签名不符')
+        errors = validate_representations(reps)
+        if errors:
+            raise ValueError('入库表示证据不完整：'+'；'.join(errors))
         length = len(json.dumps({"situation":payload.get("situation"),"answer":payload.get("answer")},ensure_ascii=False))
         if length > 10000:
             raise ValueError("经验文本超出 10000 字符，不截断经验")
@@ -292,9 +333,17 @@ class MemoryStore:
                 payload["status"] = "active"
                 payload["revision"] = revision
                 payload["feature_version"] = FEATURE_VERSION
+                payload['representation_version'] = GRID_REPRESENTATION_VERSION
+                payload['occupancy_representation_version'] = OCC_REPRESENTATION_VERSION
+                payload['grid_metric_version'] = GRID_METRIC_VERSION
+                payload['occupancy_metric_version'] = OCC_METRIC_VERSION
+                payload['retrieval_metric_version'] = RETRIEVAL_METRIC_VERSION
+                payload['occupancy_config'] = copy.deepcopy(reps.occupancy_config)
+                payload['occupancy_metric_signature'] = occupancy_metric_signature(reps.occupancy_config)
                 payload['dino_signature'] = reps.dino_signature
                 payload["metric_signature"] = grid_metric_signature(reps.grid.get('distance_config'))
-                payload["features"] = {"path":"features.npz","bev_dimension":768,"occ_shape":[6,50,25],"grid":"grid.json"}
+                payload["features"] = {"path":"features.npz","bev_dimension":768,"occ_shape":[6,50,25],
+                                       "occupancy_known":"features.npz:known","grid":"grid.json"}
                 np.savez_compressed(temporary/"features.npz",bev=np.asarray(reps.bev_feature,dtype=np.float32),
                                     occ=np.asarray(reps.occ,dtype=np.float32),known=np.asarray(reps.occ_known,dtype=np.float32))
                 _json_write(temporary/"grid.json",reps.grid)

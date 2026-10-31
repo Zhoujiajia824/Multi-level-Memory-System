@@ -6,11 +6,28 @@ import json
 import math
 
 
+GRID_METRIC_VERSION = 'gospa-inspired-region-partial-1.0'
+OCC_METRIC_VERSION = 'observed-soft-iou-2.0'
+RETRIEVAL_METRIC_VERSION = 'bev-occ-eight-joint-2.0'
+
 GRID_DISTANCE_DEFAULT = {
     "scales":{"s_m":20.,"d_m":3.5,"vs_mps":10.,"vd_mps":2.,"as_mps2":3.,"ad_mps2":2.,"heading_rad":math.pi/4},
     "weights":{"position":.35,"velocity":.35,"acceleration":.15,"heading":.15},
-    "ego_weight":.15,"unmatched_cost":1.,"same_type_only":True,"require_intersecting_slots":True,
-    "empty_non_ego_both_is_valid":False,"metric":"block_clipped_normalized_euclidean",
+    "cutoff_c":.5,"lambda_T":1.,"lambda_E":.5,"min_joint_known_fraction":.75,
+    "same_type_only":True,"require_intersecting_slots":True,
+    "empty_non_ego_both_is_valid":True,"metric":"gospa_inspired_region_partial_assignment",
+}
+
+GRID_OBSERVATION_DEFAULT = {
+    'empty_min_coverage':.95, 'empty_unknown_area_tolerance_m2':.25,
+    'boundary_local_tolerance_m':.3, 'body_lane_area_tolerance_m2':1e-5,
+    'geometry_area_epsilon_m2':.01,
+}
+
+OCC_DISTANCE_DEFAULT = {
+    'min_common_known_fraction':.5, 'min_foreground_comparable_fraction':.95,
+    'empty_min_known_fraction':.95, 'min_union_area_m2':.01,
+    'area_tolerance_m2':.01, 'metric':'observed_soft_iou_with_confirmed_empty',
 }
 
 NATIVE_RENDER_FIELDS = {'screen_width','screen_height','scaling','centering_position',
@@ -92,13 +109,13 @@ FIXED_CONTRACT = {
            "meters_per_pixel":.1,"ego_pixel":[250,700],"speed_color_max_kmh":120,"history_seconds":3,"arrow_length_body_width_ratio":1},
     "occupancy":{"raw_resolution_m":.5,"retrieval_resolution_m":2,
                  "channels":["crosswalk","ego","vehicle","bicycle","pedestrian","static_obstacle"],
-                 "score_channels":["crosswalk","vehicle","bicycle","pedestrian","static_obstacle"],
-                 "min_known_fraction":.1,"min_union_area_m2":.01},
+                 "score_channels":["crosswalk","vehicle","bicycle","pedestrian","static_obstacle"]},
     "dino":{"embedding":"CLS","dimension":768,"input_width_px":252,"input_height_px":504,"l2_normalize":True,"labels_in_embedding_image":False},
     "retrieval":{"per_channel_k":3,"weights":{"bev":1/3,"occupancy":1/3,"grid":1/3},"require_all_channels":True,
                  "near_duplicate_removal":False,"cross_platform":True,"cross_road_type":True},
-    "grid_distance":{"same_type_only":True,"require_intersecting_slots":True,"empty_non_ego_both_is_valid":False,
-                     "metric":"block_clipped_normalized_euclidean"},
+    "grid_distance":{"same_type_only":True,"require_intersecting_slots":True,"empty_non_ego_both_is_valid":True,
+                     "metric":"gospa_inspired_region_partial_assignment"},
+    "occupancy_distance":{"metric":"observed_soft_iou_with_confirmed_empty"},
     "risk":{"rank_weight":"1/rank"},
     "mpc":{"state":["x","y","psi","v"],"control":["a","delta"],"minimum_speed_mps":0},
     "models":{"max_total_attempts":6,"sdk_max_retries":0,"retry_backoff_s":[1,2,4,8,16],
@@ -138,21 +155,56 @@ def grid_distance_config(config=None):
         raise ValueError('九宫格距离尺度和权重字段必须与版本契约一致')
     if not math.isclose(sum(result['weights'].values()),1.,abs_tol=1e-8):
         raise ValueError('九宫格四项距离权重之和必须为 1')
-    _unit_interval(result['ego_weight'],'grid_distance.ego_weight')
-    if result['ego_weight']>0 and sum(result['weights'][key] for key in ('velocity','acceleration','heading'))<=0:
-        raise ValueError('自车上下文权重大于零时，必须提供速度、加速度或朝向比较证据')
-    _positive(result['unmatched_cost'],'grid_distance.unmatched_cost')
+    _positive(result['cutoff_c'],'grid_distance.cutoff_c')
+    _unit_interval(result['min_joint_known_fraction'],'grid_distance.min_joint_known_fraction')
+    for key in ('lambda_T','lambda_E'):_nonnegative(result[key],'grid_distance.'+key)
+    if sum(result['weights'][key] for key in ('velocity','acceleration','heading'))<=0:
+        raise ValueError('自车运动差异必须有速度、加速度或朝向证据')
     return result
 
 
 def grid_metric_signature(config=None):
-    cfg=grid_distance_config(config)
+    return _metric_signature(GRID_METRIC_VERSION,grid_distance_config(config))
+
+
+def _metric_signature(version,cfg):
     # 同样的数值 1 和 1.0 应得到相同签名。
     def normalize(value):
         if isinstance(value,dict):return {key:normalize(item) for key,item in value.items()}
         if type(value) in (int,float):return float(value)
         return value
-    return hashlib.sha256(json.dumps(normalize(cfg),sort_keys=True,separators=(',',':')).encode('utf-8')).hexdigest()
+    return hashlib.sha256(json.dumps({'version':version,'parameters':normalize(cfg)},sort_keys=True,separators=(',',':')).encode('utf-8')).hexdigest()
+
+
+def grid_observation_config(config=None):
+    if config is not None and (not isinstance(config,dict) or set(config)-set(GRID_OBSERVATION_DEFAULT)):
+        raise ValueError('八向观测配置包含未实现字段')
+    result=_merge(GRID_OBSERVATION_DEFAULT,config or {})
+    for key,value in result.items():
+        (_unit_interval if key=='empty_min_coverage' else _nonnegative)(value,'grid_observation.'+key)
+    if result['empty_min_coverage']<=0 or result['boundary_local_tolerance_m']<=0 or result['geometry_area_epsilon_m2']<=0:
+        raise ValueError('八向覆盖阈值、边界与几何容差必须为正')
+    return result
+
+
+def grid_observation_signature(config=None):
+    return _metric_signature('lane-observation-2.0',grid_observation_config(config))
+
+
+def occupancy_distance_config(config=None):
+    if config is not None and (not isinstance(config,dict) or set(config)-set(OCC_DISTANCE_DEFAULT)):
+        raise ValueError('占据距离配置包含未实现字段')
+    result=_merge(OCC_DISTANCE_DEFAULT,config or {})
+    _check_fixed(result,FIXED_CONTRACT['occupancy_distance'],'occupancy_distance')
+    for key in ('min_common_known_fraction','min_foreground_comparable_fraction','empty_min_known_fraction'):
+        _unit_interval(result[key],'occupancy_distance.'+key)
+        if result[key]<=0:raise ValueError('占据证据阈值必须为正')
+    for key in ('min_union_area_m2','area_tolerance_m2'):_positive(result[key],'occupancy_distance.'+key)
+    return result
+
+
+def occupancy_metric_signature(config=None):
+    return _metric_signature(OCC_METRIC_VERSION,occupancy_distance_config(config))
 
 
 def _check_fixed(actual,expected,path=''):
@@ -279,10 +331,15 @@ def validate_config(config):
     if geometry.get('circular_angle_step_rad',.02)>.05 or geometry.get('coordinate_precision_m',1e-9)>1e-6:
         raise ValueError('地图圆弧步长不能超过0.05rad，坐标舍入不能超过1微米；不能用粗精度放宽道路')
     result['grid_distance']=grid_distance_config(result.get('grid_distance'))
+    result['grid_observation']=grid_observation_config(result.get('grid_observation'))
+    result['occupancy_distance']=occupancy_distance_config(result.get('occupancy_distance'))
+    if set(result.get('occupancy',{})) & {'min_known_fraction','min_union_area_m2'}:
+        raise ValueError('旧occupancy比较阈值已迁至occupancy_distance，不能保留失效配置')
     retrieval=result.get('retrieval',{})
     if 'minimum_score' in retrieval:_unit_interval(retrieval['minimum_score'],'retrieval.minimum_score')
-    if type(retrieval.get('final_k',3)) is not int or not 0<=retrieval.get('final_k',3)<=9:
-        raise ValueError('最终 Top-K 必须是 0 至 9 的整数')
+    if 'minimum_grid_score' in retrieval:_unit_interval(retrieval['minimum_grid_score'],'retrieval.minimum_grid_score')
+    if type(retrieval.get('final_k',3)) is not int or not 0<=retrieval.get('final_k',3)<=3:
+        raise ValueError('最终 Top-K 必须是 0 至 3 的整数')
     quality=result.get('quality',{})
     if 'minimum_score' in quality:_unit_interval(quality['minimum_score'],'quality.minimum_score')
     for key,value in quality.get('weights',{}).items():_nonnegative(value,'quality.weights.'+key)
