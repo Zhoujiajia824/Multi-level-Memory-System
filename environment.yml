@@ -1,0 +1,8 @@
+name: nine_grid_highway
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - -e .[vision,dev]

@@ -1,0 +1,67 @@
+# EP-Driver发布白名单：未列出的根目录文件仅保留本地。
+/*
+!/.gitignore
+!/.gitattributes
+!/LICENSE
+!/README.md
+!/environment.yml
+!/pyproject.toml
+!/requirements.txt
+!/config/
+!/scripts/
+!/src/
+!/models/
+
+# 运行配置与安全模板；个人模型地址、密钥配置不上传。
+/config/*
+!/config/parameters.json
+!/config/prompts.yaml
+!/config/scenarios.yaml
+!/config/verified_dependencies.txt
+!/config/models.example.yaml
+/config/models.yaml
+
+# 只发布环境检查、实验入口和记忆管理，不上传验收/临时脚本。
+/scripts/*
+!/scripts/check_environment.py
+!/scripts/run_highway.py
+!/scripts/memory_admin.py
+
+# 当前核心为单一Python包；新增包或资产需明确加入发布清单。
+/src/*
+!/src/nine_grid/
+/src/nine_grid/*
+!/src/nine_grid/*.py
+
+# 仅发布运行需要的DINOv2 Base，权重由Git LFS管理。
+/models/*
+!/models/dinov2-base/
+/models/dinov2-base/*
+!/models/dinov2-base/config.json
+!/models/dinov2-base/preprocessor_config.json
+!/models/dinov2-base/model.safetensors
+!/models/dinov2-base/LICENSE
+!/models/dinov2-base/NOTICE
+!/models/dinov2-base/provenance.json
+
+# 以下文件不删除，只在本地保存。
+/tests/
+/docs/
+/outputs/
+/data/
+/.cache/
+/huggingface/
+/logs/
+.env
+.env.*
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+*.log
+*.tmp
+*.bak
+*.swp
+.DS_Store
+Thumbs.db

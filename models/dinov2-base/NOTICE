@@ -1,0 +1,6 @@
+DINOv2 Base pretrained model
+Copyright (c) Meta Platforms, Inc. and affiliates.
+Model and code are provided under the Apache License, Version 2.0.
+Source: https://github.com/facebookresearch/dinov2
+Hugging Face conversion: https://huggingface.co/facebook/dinov2-base
+The supplied weights are unmodified. EP-Driver code has its own root LICENSE.

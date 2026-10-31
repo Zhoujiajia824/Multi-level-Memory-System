@@ -1,0 +1,67 @@
+# 场景与原生画面设置。修改此文件后重启程序生效；命令行显式参数优先。
+# 算法参数统一位于 parameters.json，不能在 native 中改时钟、观测和连续动作契约。
+highway:
+  env_id: highway-v0
+  desired_speed_mps: 25
+  initial_speed_mps: 25
+  vehicles_count: 12
+  lanes_count: 4
+  destination: "1"
+  native:
+    initial_lane_id: null
+    ego_spacing: 2
+    vehicles_density: 1
+    screen_width: 1200
+    screen_height: 300
+    scaling: 11
+    centering_position: [0.3, 0.5]
+    show_trajectories: false
+    real_time_rendering: false
+merge:
+  env_id: merge-v1
+  desired_speed_mps: 15
+  initial_speed_mps: 15
+  vehicles_count: 4
+  destination: d
+  exit_distance_m: 60
+  connection_boundary_clip_radius_m: 12
+  native:
+    screen_width: 1200
+    screen_height: 300
+    scaling: 11
+    centering_position: [0.3, 0.5]
+    show_trajectories: false
+    real_time_rendering: false
+roundabout:
+  env_id: roundabout-v1
+  desired_speed_mps: 8
+  initial_speed_mps: 8
+  initial_longitudinal_m: 110
+  vehicles_count: 4
+  destination: nxr
+  exit_distance_m: 30
+  connection_boundary_clip_radius_m: 12
+  native:
+    incoming_vehicle_destination: null
+    screen_width: 900
+    screen_height: 900
+    scaling: 8.25
+    centering_position: [0.5, 0.6]
+    show_trajectories: false
+    real_time_rendering: false
+intersection:
+  env_id: intersection-v2
+  desired_speed_mps: 10
+  initial_speed_mps: 10
+  vehicles_count: 8
+  spawn_probability: 0.6
+  destination: o1
+  exit_distance_m: 25
+  connection_boundary_clip_radius_m: 12
+  native:
+    screen_width: 900
+    screen_height: 900
+    scaling: 10.725
+    centering_position: [0.5, 0.6]
+    show_trajectories: false
+    real_time_rendering: false

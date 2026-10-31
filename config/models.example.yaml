@@ -1,0 +1,16 @@
+# 复制为models.yaml后填写服务配置；个人文件由.gitignore排除。
+# 两个角色独立选择off、api或server；密钥只从命名环境变量读取。
+fast:
+  backend: "off"
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  model: "your-fast-vision-model"
+  api_key_env: FAST_VLM_API_KEY
+  timeout_s: 120
+  max_tokens: 4096
+reflection:
+  backend: "off"
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  model: "your-reflection-vision-model"
+  api_key_env: REFLECTION_VLM_API_KEY
+  timeout_s: 300
+  max_tokens: 4096

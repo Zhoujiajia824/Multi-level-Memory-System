@@ -1,0 +1,365 @@
+{
+  "theory_version": "nine-grid-rag-mpc-1.0",
+  "parameter_version": "development-1.0.16",
+  "status": "initial_validation_values_not_optimal",
+  "clock": {
+    "physics_hz": 50,
+    "planner_hz": 10,
+    "fast_hz": 1,
+    "history_hz": 2,
+    "history_seconds": 3,
+    "episode_seconds": 30
+  },
+  "perception": {
+    "radius_m": 120,
+    "partial_visibility_included": true,
+    "fully_occluded_in_current_planning": false,
+    "visibility_angular_step_deg": 0.25
+  },
+  "coordinates": {
+    "x_axis": "forward",
+    "y_axis": "left",
+    "yaw_positive": "counterclockwise",
+    "projection_min_abs_one_minus_kappa_d": 0.1,
+    "reference_back_m": 60,
+    "reference_front_m": 150,
+    "lane_switch_hold_s": 0.3,
+    "lane_switch_overlap_fraction": 0.5
+  },
+  "map_geometry": {
+    "circular_angle_step_rad": 0.02,
+    "coordinate_precision_m": 1e-09
+  },
+  "bev": {
+    "front_m": 70,
+    "rear_m": 30,
+    "left_m": 25,
+    "right_m": 25,
+    "width_px": 500,
+    "height_px": 1000,
+    "meters_per_pixel": 0.1,
+    "ego_pixel": [
+      250,
+      700
+    ],
+    "speed_color_max_kmh": 120,
+    "history_seconds": 3,
+    "arrow_length_body_width_ratio": 1
+  },
+  "occupancy": {
+    "raw_resolution_m": 0.5,
+    "retrieval_resolution_m": 2,
+    "channels": [
+      "crosswalk",
+      "ego",
+      "vehicle",
+      "bicycle",
+      "pedestrian",
+      "static_obstacle"
+    ],
+    "score_channels": [
+      "crosswalk",
+      "vehicle",
+      "bicycle",
+      "pedestrian",
+      "static_obstacle"
+    ],
+    "min_known_fraction": 0.1,
+    "min_union_area_m2": 0.01
+  },
+  "dino": {
+    "model": "models/dinov2-base",
+    "embedding": "CLS",
+    "dimension": 768,
+    "input_width_px": 252,
+    "input_height_px": 504,
+    "l2_normalize": true,
+    "labels_in_embedding_image": false
+  },
+  "retrieval": {
+    "per_channel_k": 3,
+    "final_k": 3,
+    "weights": {
+      "bev": 0.3333333333333333,
+      "occupancy": 0.3333333333333333,
+      "grid": 0.3333333333333333
+    },
+    "minimum_score": 0.5,
+    "require_all_channels": true,
+    "near_duplicate_removal": false,
+    "cross_platform": true,
+    "cross_road_type": true
+  },
+  "grid_distance": {
+    "scales": {
+      "s_m": 20,
+      "d_m": 3.5,
+      "vs_mps": 10,
+      "vd_mps": 2,
+      "as_mps2": 3,
+      "ad_mps2": 2,
+      "heading_rad": 0.7853981633974483
+    },
+    "weights": {
+      "position": 0.35,
+      "velocity": 0.35,
+      "acceleration": 0.15,
+      "heading": 0.15
+    },
+    "ego_weight": 0.15,
+    "unmatched_cost": 1.0,
+    "same_type_only": true,
+    "require_intersecting_slots": true,
+    "empty_non_ego_both_is_valid": false,
+    "metric": "block_clipped_normalized_euclidean"
+  },
+  "prediction": {
+    "horizon_s": 3,
+    "step_s": 0.1,
+    "integration_step_s": 0.02,
+    "low_speed_mps": 0.3,
+    "ctra_jerk_psd": 1.0,
+    "ctra_yaw_accel_psd": 0.04,
+    "measurement_std": {
+      "position_m": 0.05,
+      "speed_mps": 0.1,
+      "acceleration_mps2": 0.2,
+      "motion_heading_rad": 0.02,
+      "yaw_rate_radps": 0.03
+    },
+    "singer_tau_s": 1.0,
+    "singer_accel_std_mps2": 1.5,
+    "map_successor_prefix_s": 0.8,
+    "lane_change_min_lateral_speed_mps": 0.3,
+    "lane_change_detect_hold_s": 0.3,
+    "lane_change_finish_offset_m": 0.35,
+    "lane_change_finish_lateral_speed_mps": 0.2,
+    "lane_change_finish_hold_s": 0.5,
+    "lane_change_duration_min_s": 1,
+    "lane_change_duration_max_s": 5,
+    "lane_change_duration_step_s": 0.2,
+    "diagnostic_horizon_s": 3.9,
+    "lateral_speed_limit_mps": 3,
+    "lateral_acceleration_limit_mps2": 4,
+    "lateral_jerk_limit_mps3": 10,
+    "initial_turn_rate_variance": 0.1,
+    "pedestrian_initial_variances": [
+      0.1,
+      0.1,
+      0.1,
+      0.1,
+      0.1,
+      0.1
+    ],
+    "map_successor_heading_scale_rad": 0.5235987755982988
+  },
+  "risk": {
+    "clearance_floor_m": 0.25,
+    "hard_body_margin_m": 0.05,
+    "attention_increment": 1.0,
+    "rank_weight": "1/rank",
+    "classes": {
+      "vehicle": {
+        "eta": 1.0,
+        "influence_m": 20
+      },
+      "bicycle": {
+        "eta": 1.5,
+        "influence_m": 10
+      },
+      "pedestrian": {
+        "eta": 2.0,
+        "influence_m": 10
+      },
+      "static_obstacle": {
+        "eta": 1.0,
+        "influence_m": 12
+      },
+      "noncrossable_line": {
+        "eta": 0.03,
+        "influence_m": 1.5
+      }
+    }
+  },
+  "mpc": {
+    "state": [
+      "x",
+      "y",
+      "psi",
+      "v"
+    ],
+    "control": [
+      "a",
+      "delta"
+    ],
+    "horizon_steps": 30,
+    "step_s": 0.1,
+    "physics_substeps": 5,
+    "minimum_speed_mps": 0,
+    "maximum_speed_mps": 33.3333333333,
+    "acceleration_min_mps2": -6,
+    "acceleration_max_mps2": 3,
+    "steering_abs_max_rad": 0.6,
+    "jerk_abs_max_mps3": 8,
+    "steering_rate_abs_max_radps": 0.8,
+    "lateral_acceleration_abs_max_mps2": 4.89,
+    "body_constraint_tolerance_m": 0.001,
+    "weights": {
+      "contour": 3,
+      "heading": 1,
+      "speed": 1,
+      "acceleration": 0.1,
+      "steering": 0.2,
+      "jerk": 0.2,
+      "steering_rate": 0.2,
+      "risk": 2,
+      "progress": 1
+    },
+    "normalization": {
+      "position_m": 3.5,
+      "heading_rad": 0.5,
+      "speed_mps": 10,
+      "acceleration_mps2": 3,
+      "steering_rad": 0.6,
+      "jerk_mps3": 8,
+      "steering_rate_radps": 0.8,
+      "progress_m": 30
+    },
+    "solver_max_iterations": 4,
+    "solver_wall_budget_s": 0.1,
+    "cold_start_budget_s": 0.5,
+    "warm_start_recovery_speed_mps": 0.3,
+    "qp_max_iterations": 600,
+    "qp_tolerance": 0.0001,
+    "qp_stopline_margin_factor": 5,
+    "sqp_trust_acceleration_mps2": 1.5,
+    "sqp_trust_steering_rad": 0.15,
+    "sqp_regularization": 0.0001,
+    "sqp_line_search_steps": 3
+  },
+  "rules": {
+    "comfort_braking_mps2": 3,
+    "stop_margin_m": 1,
+    "wrong_way_min_speed_mps": 0.5,
+    "wrong_way_heading_limit_rad": 1.5707963267948966,
+    "curve_reference_lateral_acceleration_mps2": 3.5
+  },
+  "quality": {
+    "weights": {
+      "progress": 5,
+      "ttc": 5,
+      "comfort": 2
+    },
+    "minimum_score": 0.7,
+    "ttc_offsets_s": [
+      0,
+      0.3,
+      0.6,
+      0.9
+    ],
+    "progress_floor_m": 0.1,
+    "stopped_speed_mps": 0.005,
+    "comfort": {
+      "long_accel_min_mps2": -4.05,
+      "long_accel_max_mps2": 2.4,
+      "lateral_accel_abs_max_mps2": 4.89,
+      "jerk_magnitude_derivative_abs_max_mps3": 8.37,
+      "long_jerk_abs_max_mps3": 4.13,
+      "yaw_rate_abs_max_radps": 0.95,
+      "yaw_accel_abs_max_radps2": 1.93
+    }
+  },
+  "models": {
+    "fast_backend": "off",
+    "reflection_backend": "off",
+    "max_total_attempts": 6,
+    "sdk_max_retries": 0,
+    "fast_timeout_s": 120,
+    "reflection_timeout_s": 300,
+    "retry_backoff_s": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "attention_max_count": 3,
+    "answer_max_characters": 6000,
+    "experience_max_characters": 10000,
+    "reflection_workers": 1,
+    "reflection_waiting_capacity": 2,
+    "answer_protocol_version": "local-goal-frenet-1.0"
+  },
+  "memory": {
+    "read_enabled": false,
+    "write_enabled": false,
+    "mode": "collect",
+    "snapshot_scope": "episode",
+    "drain_before_next_episode": true,
+    "auto_seed": false,
+    "post_accident_association_s": 3,
+    "admit_requires_all_checks": true
+  },
+  "scenarios": {
+    "highway": {
+      "env_id": "highway-v0",
+      "desired_speed_mps": 25
+    },
+    "merge": {
+      "env_id": "merge-v1",
+      "desired_speed_mps": 15,
+      "exit_distance_m": 60
+    },
+    "roundabout": {
+      "env_id": "roundabout-v1",
+      "desired_speed_mps": 8,
+      "initial_longitudinal_m": 110,
+      "connection_boundary_clip_radius_m": 12,
+      "exit_distance_m": 30
+    },
+    "intersection": {
+      "env_id": "intersection-v2",
+      "desired_speed_mps": 10,
+      "exit_distance_m": 25
+    }
+  },
+  "execution": {
+    "no_feasible_plan": "terminate_episode",
+    "independent_risk_alarm_with_feasible_plan": "execute_current_candidate",
+    "invalid_fast_answer": "clear_entire_semantics_same_mpc_base",
+    "network_failure_without_answer": "same_mpc_base_audit_only",
+    "reflection_control_effect": "none",
+    "reflection_failed_admission": "reject_no_second_reflection"
+  },
+  "local_reference": {
+    "lookahead_m": 140.0,
+    "sample_m": 0.5,
+    "blend_min_m": 30.0,
+    "blend_time_s": 3.0,
+    "minimum_gain_mps": 2.0,
+    "front_gap_m": 8.0,
+    "front_headway_s": 1.2,
+    "rear_gap_m": 8.0,
+    "rear_closing_time_s": 1.5,
+    "prediction_check_s": 3.0,
+    "prediction_min_gap_m": 4.0,
+    "complete_lateral_m": 0.35,
+    "complete_heading_rad": 0.1,
+    "complete_lateral_speed_mps": 0.25,
+    "complete_hold_s": 0.3,
+    "dwell_s": 3.0,
+    "abort_lateral_m": 0.25,
+    "candidate_period_s": 0.5,
+    "geometry_margin_m": 0.001
+  },
+  "local_goal": {
+    "minimum_delta_s_m": 2.0,
+    "maximum_delta_s_m": 70.0,
+    "maximum_lateral_slope": 0.35,
+    "passed_tolerance_m": 0.001,
+    "projection_window_m": 120.0,
+    "attraction_weight": 3.0,
+    "longitudinal_scale_m": 30.0,
+    "lateral_scale_m": 3.5
+  }
+}
