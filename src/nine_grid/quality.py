@@ -153,7 +153,10 @@ def evaluate(scene, plan, baseline, predictions, config=None):
             progress_score=1.
         else:
             progress_score=float(np.clip(progress/max(reference,cfg.get('progress_floor_m',.1)),0,1))
-    gates={'collision_free':not collision,'on_road':onroad,'correct_direction':direction_ok,'rules':rule_ok}
+    # 可执行不再等于安全；软化后的实线/名义间隙等违规仍必须阻止危险经验入库。
+    planner_safety=plan.diagnostics.get('safety_feasible',True) is not False
+    gates={'collision_free':not collision,'on_road':onroad,'correct_direction':direction_ok,'rules':rule_ok,
+           'planner_safety':planner_safety}
     metrics.update(gates=gates,progress_m=progress,reference_progress_m=reference,progress=progress_score,ttc=float(ttc_ok),comfort=float(comfort))
     valid=not reasons
     weights=cfg.get('weights',dict(progress=5,ttc=5,comfort=2))
@@ -165,7 +168,8 @@ def admissible(answer,plan,quality,threshold=.7):
     return bool(answer is not None and answer.frame_id==plan.frame_id==quality.frame_id
         and answer.version==plan.version==quality.version and quality.time is not None
         and np.isclose(answer.time,plan.time,rtol=0,atol=1e-8) and np.isclose(answer.time,quality.time,rtol=0,atol=1e-8)
-        and plan.valid and quality.valid and quality.score is not None and np.isfinite(quality.score)
+        and plan.valid and plan.diagnostics.get('safety_feasible',True) is not False
+        and quality.valid and quality.score is not None and np.isfinite(quality.score)
         and quality.score>=threshold and not quality.collision and not quality.precollision)
 
 

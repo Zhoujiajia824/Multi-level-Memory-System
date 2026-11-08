@@ -16,6 +16,7 @@ from .contracts import ANSWER_PROTOCOL_VERSION, ExperienceRecord, Representation
 from .representations import (FEATURE_VERSION, GRID_REPRESENTATION_VERSION,
                               OCC_REPRESENTATION_VERSION, valid_dino_signature)
 from .configuration import (GRID_METRIC_VERSION, OCC_METRIC_VERSION, RETRIEVAL_METRIC_VERSION,
+                            READABLE_RETRIEVAL_METRIC_VERSIONS,
                             grid_metric_signature, occupancy_distance_config,
                             occupancy_metric_signature)
 from .retrieval import validate_representations
@@ -42,11 +43,12 @@ def _validate_feature_metadata(record):
     versions = {'representation_version': GRID_REPRESENTATION_VERSION,
                 'occupancy_representation_version': OCC_REPRESENTATION_VERSION,
                 'grid_metric_version': GRID_METRIC_VERSION,
-                'occupancy_metric_version': OCC_METRIC_VERSION,
-                'retrieval_metric_version': RETRIEVAL_METRIC_VERSION}
+                'occupancy_metric_version': OCC_METRIC_VERSION}
     for key, expected in versions.items():
         if record.get(key) != expected:
             raise ValueError(f'经验表示或检索指标版本缺失/不匹配：{key}；原库保留，不自动迁移')
+    if record.get('retrieval_metric_version') not in READABLE_RETRIEVAL_METRIC_VERSIONS:
+        raise ValueError('经验检索指标版本缺失/不兼容：retrieval_metric_version；原库保留，不自动迁移')
     config = record.get('occupancy_config')
     if not isinstance(config,dict) or not config:
         raise ValueError('经验缺少显式 OCC 观测与空占据参数，不使用默认值补齐')

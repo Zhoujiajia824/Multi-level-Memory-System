@@ -1,6 +1,6 @@
 {
   "theory_version": "nine-grid-rag-mpc-1.0",
-  "parameter_version": "development-1.0.17",
+  "parameter_version": "development-1.0.20",
   "status": "initial_validation_values_not_optimal",
   "clock": {
     "physics_hz": 50,
@@ -75,14 +75,9 @@
     "labels_in_embedding_image": false
   },
   "retrieval": {
-    "per_channel_k": 3,
-    "final_k": 3,
-    "weights": {
-      "bev": 0.3333333333333333,
-      "occupancy": 0.3333333333333333,
-      "grid": 0.3333333333333333
-    },
-    "minimum_score": 0.5,
+    "per_channel_k": 1,
+    "selection": "per_channel_top1",
+    "merge_same_record": true,
     "require_all_channels": true,
     "near_duplicate_removal": false,
     "cross_platform": true,
@@ -156,7 +151,7 @@
   },
   "risk": {
     "clearance_floor_m": 0.25,
-    "hard_body_margin_m": 0.05,
+    "body_clearance_margin_m": 0.05,
     "attention_increment": 1.0,
     "rank_weight": "1/rank",
     "classes": {
@@ -232,7 +227,19 @@
     "warm_start_recovery_speed_mps": 0.3,
     "qp_max_iterations": 600,
     "qp_tolerance": 0.0001,
-    "qp_stopline_margin_factor": 5,
+    "constraint_policy": "bounded_controls_soft_safety_v1",
+    "safety_penalties": {
+      "actor_clearance": 2000,
+      "road_clearance": 500,
+      "noncrossable_line_clearance": 100,
+      "yield_stop_line": 100,
+      "speed_limit": 10,
+      "lateral_acceleration": 5
+    },
+    "geometry_difference_steps": {
+      "position_m": 0.00001,
+      "heading_rad": 0.00001
+    },
     "sqp_trust_acceleration_mps2": 1.5,
     "sqp_trust_steering_rad": 0.15,
     "sqp_regularization": 0.0001,
@@ -325,7 +332,7 @@
     }
   },
   "execution": {
-    "no_feasible_plan": "terminate_episode",
+    "no_feasible_plan": "return_current_bounded_candidate",
     "independent_risk_alarm_with_feasible_plan": "execute_current_candidate",
     "invalid_fast_answer": "clear_entire_semantics_same_mpc_base",
     "network_failure_without_answer": "same_mpc_base_audit_only",

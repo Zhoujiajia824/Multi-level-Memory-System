@@ -64,13 +64,17 @@ python scripts/run_highway.py --scenario roundabout --seed 1 --duration 30 --fas
 python scripts/run_highway.py --scenario intersection --seed 1 --duration 30 --fast off --reflection off --live --video
 ```
 
-以上指令显式关闭两个模型；记忆检索和写入默认关闭。未指定`--fast / --reflection`时沿用`config/models.yaml`中的个人设置，可能调用模型。纯 MPC 仍使用地图、规则、EKF 和基础风险场。碰撞、到达目标或规划失败会提前结束；30 秒是每轮上限。
+以上指令显式关闭两个模型；记忆检索和写入默认关闭。未指定`--fast / --reflection`时沿用`config/models.yaml`中的个人设置，可能调用模型。纯 MPC 仍使用地图、规则、EKF 和基础风险场。真实碰撞、到达目标会提前结束；30 秒是每轮上限。几何冲突、QP未收敛或预算耗尽时保留当前帧已验收的有界控制轨迹；非法输入或内部异常仍明确记录，不伪造轨迹。
 
 本版按仿真时间同步步进。MPC使用实时SQP与OSQP，后续求解目标预算100毫秒，每个规划器实例首次初始化预算500毫秒，控制执行0.1仿真秒。首次初始化、后续求解及超期均单独记录；这不是整个Python程序的硬实时保证，预测、表示、评分和同步模型调用另有耗时。
 
-`config/parameters.json` 中的 `mpc.warm_start_recovery_speed_mps` 默认 `0.3` m/s，表示低于此速度、且无规则等待时允许比较导航初值；设为 `0` 关闭这项低速比较。初值仍须经过同一个MPC优化和完整验收，共用原求解预算，不直接作为控制执行。
+`config/parameters.json` 中的 `mpc.warm_start_recovery_speed_mps` 默认 `0.3` m/s，表示低于此速度、且无规则等待时允许比较导航初值；设为 `0` 关闭这项低速比较。所有初值都在当前帧按同一动力学、代价和控制边界重新验收，并共享本轮预算。
 
-`--live` 显示highway-env原生窗口，`--video` 保存相同原生视角的50FPS录像；两者可独立使用。视频按仿真时间播放，不包含等待模型的停顿，尚未叠加MPC轨迹线。自绘BEV另存于 `captures/`，不替代原生录像。
+`--live` 显示highway-env原生窗口，`--video` 保存相同原生视角的50FPS录像；两者可独立使用。青色线是当前MPC规划的未来轨迹，每0.1仿真秒更新，车辆仍显示真实状态。视频按仿真时间播放，不包含等待模型的停顿。自绘BEV另存于 `captures/`，不替代原生录像。
+
+当前参数版本为 `development-1.0.20`（本次仅改变检索选择）：硬约束仅保留动力学、加速度 `[-6,3]` m/s²、转角 `±0.6` rad 和非负速度。道路、实体避碰、不可跨越线、让行截面、限速及侧向加速度改为软惩罚；jerk和转角变化率保留平滑代价。`mpc.safety_penalties` 可分别调整软惩罚强度。`plans.jsonl` 的 `safety_feasible` 与 `soft_constraint_violations` 记录安全结果，`valid` 仅代表轨迹可执行；不能用持续输出轨迹证明没有碰撞。危险轨迹不作为合格经验入库。
+
+新有效目标在下一次MPC中立即替换旧目标。上一轮控制可按实际经过时间移位，作为新目标下的数值初值，重新按当前状态积分、计价和验算；旧目标吸引项、路径及车道锁不保留。目标通过、失效或控制缓存过期/非法时不继承该缓存。`plans.jsonl` 中 `warm_start_across_goal_update` 标记是否跨新目标使用热启动，`control_transition` 记录首控制相对实际上一控制的变化。首差分平滑项仍使用实际已执行控制；热启动不是硬连续性或无晃动保证。
 
 空交通检查（匝道原有静态障碍物仍保留）：
 
@@ -163,12 +167,13 @@ python scripts/run_highway.py --scenario highway --fast server --reflection serv
 
 新经验须声明 `local-goal-frenet-1.0` 并保存原帧目标参考。本次三通道表示升级另要求道路存在/可跨越属性、观测掩码及完整运动状态。缺少这些证据的旧记录明确排除，原库保留，不补零、不自动迁移。被排除原因可在轮初 `memory_snapshot.jsonl` 和 `configuration.json` 查看，或使用下方 `memory_admin.py list`。
 
-三通道各召回3条，在并集内等权联合排序，默认要求八向分数至少0.2、联合分数至少0.5，最多返回3条；任何通道无效均拒绝，不补齐。确认空场景可以是有效证据，遮挡未知不能当成空场景。以下参数在 `config/parameters.json` 修改，并随每轮配置保存；改变参数后与旧参数签名不同的经验不会静默混算。
+先要求三通道证据均有效且八向分数至少0.2，再由BEV、OCC、八向各取最相似的一条；同一经验ID合并，最多返回3条，不补齐，不再加权融合。确认空场景可以是有效证据，遮挡未知不能当成空场景。以下可调参数在 `config/parameters.json` 修改，并随每轮配置保存；改变参数后与旧参数签名不同的经验不会静默混算。
 
 | 检索参数组 | 开发默认值及含义 |
 |---|---|
-| `retrieval.minimum_grid_score / minimum_score` | `0.2 / 0.5`，八向与联合最低相关性 |
-| `retrieval.final_k` | `3`，最终返回数量上限；每通道召回固定3条 |
+| `retrieval.minimum_grid_score` | `0.2`，先要求三通道证据有效、八向达到此分数，再按各通道独立选择 |
+| `retrieval.per_channel_k / selection` | 固定 `1 / per_channel_top1`，BEV、OCC、八向各取第一名；同分按经验ID |
+| `retrieval.merge_same_record` | 固定 `true`，同ID只向模型展示一次，保留全部命中通道；不补齐第二名，返回最多3条 |
 | `grid_distance.cutoff_c` | `0.5`，部分匹配阈值；每个未匹配对象代价为其一半 |
 | `grid_distance.min_joint_known_fraction` | `0.75`，八向共同明确比例下限 |
 | `grid_distance.lambda_T / lambda_E` | `1 / 0.5`，道路和自车运动差异惩罚 |
@@ -178,6 +183,8 @@ python scripts/run_highway.py --scenario highway --fast server --reflection serv
 | `occupancy_distance.min_foreground_comparable_fraction` | `0.95`，本方已知前景在共同支持下的留存下限 |
 | `occupancy_distance.empty_min_known_fraction` | `0.95`，整个OCC裁剪域确认双空所需本方覆盖率 |
 | `occupancy_distance.min_union_area_m2 / area_tolerance_m2` | `0.01 / 0.01`平方米，面积有效性阈值及舍入容差 |
+
+本版取消加权融合、融合分门槛和最终Top-K重排；旧 `weights / minimum_score / final_k` 配置会明确报错，请使用以上字段。`retrieval.jsonl` 保存各通道第一名及 `matched_channels`，不再生成 `fused` 分数。检索策略版本为 `bev-occ-eight-channel-top1-3.0`。已有 `bev-occ-eight-joint-2.0` 经验在表示、单通道指标、观测证据与DINO指纹均兼容时仍可只读使用，始终按新选择策略计算，不迁移或改写原库。
 
 以上为开发起点，不是已优化的检索参数。禁跨邻道的对象只退出八向集合，仍进入完整场景、BEV、OCC、模型输入和物理避碰。
 
@@ -245,7 +252,7 @@ python scripts/run_highway.py --scenario highway --episodes 50 --seed 1 --seed-m
 | `--episodes-dir` | 运行产物根目录，默认 `outputs/episodes` |
 | `--prefix` | 本次批量 ID 前缀，默认含微秒的时间戳；重复 episode ID 会报错 |
 | `--live` | 显示原生pygame窗口；同步模型调用期间仿真暂停，不改变求解预算 |
-| `--video` | 原生物理子步50FPS保存 `video.mp4`，可与 `--live` 同用，无规划叠加 |
+| `--video` | 原生物理子步50FPS保存 `video.mp4`，可与 `--live` 同用，叠加青色当前规划轨迹 |
 | `--config` | 算法参数 JSON，默认 `config/parameters.json` |
 | `--scenarios-config` | 场景与路线 YAML，默认 `config/scenarios.yaml` |
 | `--models-config` | 服务配置 YAML，默认 `config/models.yaml`；首次克隆须由 `config/models.example.yaml` 创建 |

@@ -312,9 +312,15 @@ def build_prompt(scene,reps,retrieval=None,reflection=None):
     prompt='当前帧\n'+scene_text(scene,reps)
     if retrieval is not None and retrieval.records:
         examples=[]
+        origins={score['id']:score.get('matched_channels',[]) for score in retrieval.scores}
+        channel_labels={'bev':'BEV视觉布局','occupancy':'OCC面积占据','grid':'车道八向交互'}
         for record in retrieval.records:
-            examples.append({'历史情境':_historical_situation(record.get('situation',{})),'历史参考答案':record.get('answer',{}),
-                             '坐标警告':'历史local_goal仅是历史参考中的示例；须依据当前规划参考独立生成单个目标，不可复制历史坐标'})
+            example={'历史情境':_historical_situation(record.get('situation',{})),'历史参考答案':record.get('answer',{}),
+                     '坐标警告':'历史local_goal仅是历史参考中的示例；须依据当前规划参考独立生成单个目标，不可复制历史坐标'}
+            channels=origins.get(record.get('id'),[])
+            if channels:
+                example['检索来源通道']=[channel_labels[c] for c in channels if c in channel_labels]
+            examples.append(example)
         prompt+='\n历史经验（不包含历史图像，不代表当前坐标）\n'+json.dumps(plain(examples),ensure_ascii=False)
     if reflection is not None:
         prompt+='\n原始快答案\n'+reflection.raw_answer

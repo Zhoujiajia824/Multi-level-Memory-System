@@ -1,4 +1,4 @@
-"""三通道联合场景检索与GOSPA启发的区域约束对象集合匹配。"""
+"""三通道分别取Top-1与GOSPA启发的区域约束对象集合匹配。"""
 from __future__ import annotations
 import math
 import time
@@ -351,17 +351,27 @@ def _same_record_evidence(a,b):
         all(np.array_equal(getattr(left,k),getattr(right,k)) for k in ('bev_feature','occ','occ_known')))
 
 
-def retrieve(query:Representations,records,top_k=3,min_score=.5,snapshot_id='',config=None)->RetrievalResult:
-    """各通道精确Top3并集内联合重排，并非全库融合的全局Top3。"""
+def retrieve(query:Representations,records,snapshot_id='',config=None)->RetrievalResult:
+    """合格经验池内各通道选一条；同ID只展示一次，不融合排序、不补齐。"""
     started=time.perf_counter()
-    minimum_grid=(config or {}).get('retrieval',{}).get('minimum_grid_score',.2)
-    if type(top_k) is not int or not 0<=top_k<=3 or not _finite(min_score) or not 0<=min_score<=1 or not _finite(minimum_grid) or not 0<=minimum_grid<=1:
-        raise ValueError('最终Top-K为0—3，相关性阈值须位于[0,1]')
+    settings=(config or {}).get('retrieval',{})
+    minimum_grid=settings.get('minimum_grid_score',.2)
+    if not _finite(minimum_grid) or not 0<=minimum_grid<=1:
+        raise ValueError('八向最低相关性阈值须位于[0,1]')
+    if set(settings)&{'weights','minimum_score','final_k'}:
+        raise ValueError('旧融合参数已取消，不能用于各通道Top-1检索')
+    for key,value in (('per_channel_k',1),('selection','per_channel_top1'),
+                      ('merge_same_record',True),('require_all_channels',True)):
+        if key in settings and (type(settings[key]) is not type(value) or settings[key]!=value):
+            raise ValueError('当前检索固定契约不匹配：'+key)
     diagnostics=dict(query_frame_id=query.frame_id,versions=dict(representation=FEATURE_VERSION,
         grid_representation=GRID_REPRESENTATION_VERSION,occupancy_representation=OCC_REPRESENTATION_VERSION,
         grid_metric=GRID_METRIC_VERSION,occupancy_metric=OCC_METRIC_VERSION,retrieval_metric=RETRIEVAL_METRIC_VERSION),
         dino_signature=query.dino_signature,timing_s=dict(bev=0.,occupancy=0.,grid=0.,assignment=0.,overall=0.),
-        channel_recalls={},candidate_ids=[],candidates=[],all_records=[],reason='')
+        selection='per_channel_top1',minimum_grid_score=minimum_grid,
+        channel_order=['bev','occupancy','grid'],merge_same_record=True,
+        channel_recalls={c:[] for c in ('bev','occupancy','grid')},
+        candidate_ids=[],candidates=[],all_records=[],reason='')
     result=RetrievalResult(query.frame_id,snapshot_id=snapshot_id,time=query.time,diagnostics=diagnostics)
     def finish(reason):
         diagnostics['reason']=reason
@@ -386,7 +396,9 @@ def retrieve(query:Representations,records,top_k=3,min_score=.5,snapshot_id='',c
         record=groups[identity]
         reps=record.get('_representations')
         diag=dict(query_frame_id=query.frame_id,experience_id=identity,revision=record.get('revision',1),
-                  S_B=None,S_O=None,S_G=None,S_fusion=None,accepted=False,reason='',channels={})
+                  S_B=None,S_O=None,S_G=None,accepted=False,eligible=False,
+                  matched_channels=[],reason='',channels={},
+                  stored_retrieval_metric=record.get('retrieval_metric_version'))
         diagnostics['all_records'].append(diag)
         if record.get('status','active')!='active':
             diag['reason']='经验未启用或同一身份存在冲突副本';continue
@@ -426,34 +438,37 @@ def retrieve(query:Representations,records,top_k=3,min_score=.5,snapshot_id='',c
             diag['channels'][channel]=report
         diag.update(S_B=diag['channels']['bev']['score'],S_O=diag['channels']['occupancy']['score'],S_G=diag['channels']['grid']['score'])
         scored.append(dict(record=record,diag=diag))
-    candidates=set()
-    for channel,key in (('bev','S_B'),('occupancy','S_O'),('grid','S_G')):
-        ordered=sorted((i for i,v in enumerate(scored) if v['diag'][key] is not None),
-                       key=lambda i:(-scored[i]['diag'][key],scored[i]['record']['id']))
-        chosen=ordered[:3]
-        candidates.update(chosen)
-        diagnostics['channel_recalls'][channel]=[scored[i]['record']['id'] for i in chosen]
-    diagnostics['candidate_ids']=sorted(scored[i]['record']['id'] for i in candidates)
+    # 沿用现有证据与八向最低相关性准入；只移除融合分门槛。
+    # 先验收再取第一名，损坏的高分记录不能挤掉有证据的合法候选。
     eligible=[]
-    for i in sorted(candidates,key=lambda i:scored[i]['record']['id']):
-        item,diag=scored[i],scored[i]['diag']
-        diagnostics['candidates'].append(diag)
+    for item in scored:
+        diag=item['diag']
         if any(not v['valid'] for v in diag['channels'].values()):
             diag['reason']='通道证据不足：'+'；'.join(v['reason'] for v in diag['channels'].values() if not v['valid'])
+        elif diag['S_G']<minimum_grid:
+            diag['reason']='八向相关性低于最低阈值'
+        else:
+            diag['eligible']=True
+            diag['reason']='合格但未成为任一通道Top-1'
+            eligible.append(item)
+    selected=[]
+    selected_ids=set()
+    for channel,key in (('bev','S_B'),('occupancy','S_O'),('grid','S_G')):
+        if not eligible:
             continue
-        diag['S_fusion']=float((diag['S_B']+diag['S_O']+diag['S_G'])/3)
-        if diag['S_G']<minimum_grid:diag['reason']='八向相关性低于最低阈值'
-        elif diag['S_fusion']<min_score:diag['reason']='联合相关性低于最低阈值'
-        else:eligible.append(item)
-    eligible.sort(key=lambda v:(-v['diag']['S_fusion'],v['record']['id']))
-    selected=eligible[:top_k]
-    for item in eligible:
-        item['diag']['accepted']=any(item is v for v in selected)
-        item['diag']['reason']='接纳' if item['diag']['accepted'] else '候选联合排序未进入最终Top-K'
-    for item in scored:
-        if not item['diag']['reason']:item['diag']['reason']='未进入任一通道Top3候选'
+        item=min(eligible,key=lambda v:(-v['diag'][key],v['record']['id']))
+        identity=item['record']['id']
+        diagnostics['channel_recalls'][channel]=[identity]
+        item['diag']['matched_channels'].append(channel)
+        item['diag']['accepted']=True
+        item['diag']['reason']='接纳：成为'+','.join(item['diag']['matched_channels'])+'通道Top-1'
+        if identity not in selected_ids:
+            selected.append(item)
+            selected_ids.add(identity)
+    diagnostics['candidate_ids']=sorted(selected_ids)
+    diagnostics['candidates']=[v['diag'] for v in selected]
     result.records=[v['record'] for v in selected]
     result.scores=[dict(id=v['record']['id'],revision=v['record'].get('revision',1),bev=v['diag']['S_B'],
-        occupancy=v['diag']['S_O'],grid=v['diag']['S_G'],fused=v['diag']['S_fusion'],
+        occupancy=v['diag']['S_O'],grid=v['diag']['S_G'],matched_channels=list(v['diag']['matched_channels']),
         object_matches=v['diag']['channels']['grid']['matches']) for v in selected]
-    return finish('返回联合候选Top-K' if selected else '空库' if not groups else '没有满足证据与相关性要求的候选')
+    return finish('返回各通道Top-1并合并同ID' if selected else '空库' if not groups else '没有满足证据与相关性要求的候选')

@@ -29,6 +29,13 @@ class _ContinuousRewards:
     def _info(self, obs, action=None):
         return {"crashed": bool(self.vehicle.crashed)}
 
+    def render(self):
+        # 包括环境自动绘制的物理子步，live与录像始终经过同一原生图层。
+        if self.viewer is None:
+            from .video import PlannedTrajectoryViewer
+            self.viewer = PlannedTrajectoryViewer(self)
+        return super().render()
+
     def step(self,action):
         from highway_env.envs.common.abstract import AbstractEnv
         result=AbstractEnv.step(self,action)
@@ -515,6 +522,18 @@ class HighwayAdapter:
         timeout=self._step*self.dt>=self.duration-1e-8
         return {"terminated":collision or arrival or timeout,"collision":collision,"arrival":arrival,"offroad":offroad,
                 "timeout":timeout,"time":self._step*self.dt,"progress":progress+self._route_progress_offset,"reason":"collision" if collision else "arrival" if arrival else "timeout" if timeout else "running"}
+
+    def set_planned_trajectory(self,states):
+        """保存世界坐标规划状态的副本；空或非法输入清除旧计划，不改变物理状态。"""
+        self.env._planned_trajectory=None
+        try:
+            values=np.asarray(states,dtype=float)
+        except (TypeError,ValueError,OverflowError):
+            return False
+        if values.ndim!=2 or values.shape[0]<2 or values.shape[1] not in (2,4) or not np.isfinite(values).all():
+            return False
+        self.env._planned_trajectory=values[:,:2].copy()
+        return True
 
     def render(self):
         image=self.env.render()

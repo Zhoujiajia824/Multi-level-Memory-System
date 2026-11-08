@@ -82,7 +82,8 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
         simulated_seconds=0.,steps=0,collision=False,arrival=False,planning_failures=0,
         safety_alarms=0,execution_alarms=0,quality_valid=0,quality_total=0,fast_calls=0,communication_failures=0,
         invalid_answers=0,retrieval_hits=0,written_fast=0,offroad_steps=0,
-        fallback_controls=0,termination_reason='initialization_failure',progress_m=0.)
+        fallback_controls=0,soft_safety_violation_steps=0,initialization_candidate_steps=0,
+        termination_reason='initialization_failure',progress_m=0.)
     start_wall=time.monotonic()
     logger.info('开始 %s，场景=%s，seed=%s，检索=%s，写入=%s',episode_id,config.get('scenario'),seed,retrieve_enabled,write_enabled)
     writer.append('memory_snapshot',dict(snapshot_id=store.snapshot_id,read_enabled=retrieve_enabled,
@@ -136,7 +137,7 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
                 scene.assets['scene_json']=writer.save(f'captures/{step:06d}/scene.json',capture_payload(scene))
                 if retrieve_enabled:
                     stage_started=time.perf_counter()
-                    active_retrieval=retrieve(reps,records,top_k=config['retrieval']['final_k'],min_score=config['retrieval']['minimum_score'],snapshot_id=store.snapshot_id,config=config)
+                    active_retrieval=retrieve(reps,records,snapshot_id=store.snapshot_id,config=config)
                     timing['retrieval_s']=time.perf_counter()-stage_started
                     timing_samples['retrieval'].append(timing['retrieval_s'])
                 else:
@@ -178,6 +179,9 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
             writer.append('predictions',predictions)
             stage_started=time.perf_counter()
             plan=planner.solve(scene,predictions,active_answer)
+            adapter.set_planned_trajectory(plan.states if plan.valid else None)
+            summary['soft_safety_violation_steps']+=int(plan.diagnostics.get('safety_feasible') is False)
+            summary['initialization_candidate_steps']+=int(plan.diagnostics.get('candidate_source')=='validated_current_initialization')
             timing['mpc_s']=time.perf_counter()-stage_started
             timing['mpc_cold_start']=bool(plan.diagnostics.get('cold_start',False))
             timing_samples['mpc_cold' if timing['mpc_cold_start'] else 'mpc_warm'].append(timing['mpc_s'])
@@ -212,8 +216,9 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
                 stage_started=time.perf_counter()
                 quality=evaluate(scene,plan,reference,predictions,config)
                 timing['quality_s']=time.perf_counter()-stage_started
-                logger.info('仿真 %.1fs：MPC=%s，主求解=%.1fms（%s），预测=%.1fms，表示=%.1fms，参照=%.1fms，评分=%.1fms，质量=%s，预碰撞=%s，可见对象=%d',
-                    scene.time,plan.valid,timing['mpc_s']*1000,'首次' if timing['mpc_cold_start'] else '后续',
+                logger.info('仿真 %.1fs：轨迹可执行=%s，安全条件满足=%s，候选=%s，主求解=%.1fms（%s），预测=%.1fms，表示=%.1fms，参照=%.1fms，评分=%.1fms，质量=%s，预碰撞=%s，可见对象=%d',
+                    scene.time,plan.valid,plan.diagnostics.get('safety_feasible'),plan.diagnostics.get('candidate_source'),
+                    timing['mpc_s']*1000,'首次' if timing['mpc_cold_start'] else '后续',
                     timing['prediction_s']*1000,timing['representations_s']*1000,timing['reference_s']*1000,
                     timing['quality_s']*1000,quality.score,quality.precollision,len(scene.actors))
                 summary['quality_total']+=1

@@ -8,7 +8,9 @@ import math
 
 GRID_METRIC_VERSION = 'gospa-inspired-region-partial-1.0'
 OCC_METRIC_VERSION = 'observed-soft-iou-2.0'
-RETRIEVAL_METRIC_VERSION = 'bev-occ-eight-joint-2.0'
+RETRIEVAL_METRIC_VERSION = 'bev-occ-eight-channel-top1-3.0'
+# 只改召回选择策略，表示与单通道距离未变；旧记录仍以当前策略重算，不恢复旧融合逻辑。
+READABLE_RETRIEVAL_METRIC_VERSIONS = (RETRIEVAL_METRIC_VERSION, 'bev-occ-eight-joint-2.0')
 
 GRID_DISTANCE_DEFAULT = {
     "scales":{"s_m":20.,"d_m":3.5,"vs_mps":10.,"vd_mps":2.,"as_mps2":3.,"ad_mps2":2.,"heading_rad":math.pi/4},
@@ -111,18 +113,19 @@ FIXED_CONTRACT = {
                  "channels":["crosswalk","ego","vehicle","bicycle","pedestrian","static_obstacle"],
                  "score_channels":["crosswalk","vehicle","bicycle","pedestrian","static_obstacle"]},
     "dino":{"embedding":"CLS","dimension":768,"input_width_px":252,"input_height_px":504,"l2_normalize":True,"labels_in_embedding_image":False},
-    "retrieval":{"per_channel_k":3,"weights":{"bev":1/3,"occupancy":1/3,"grid":1/3},"require_all_channels":True,
+    "retrieval":{"per_channel_k":1,"selection":"per_channel_top1","merge_same_record":True,"require_all_channels":True,
                  "near_duplicate_removal":False,"cross_platform":True,"cross_road_type":True},
     "grid_distance":{"same_type_only":True,"require_intersecting_slots":True,"empty_non_ego_both_is_valid":True,
                      "metric":"gospa_inspired_region_partial_assignment"},
     "occupancy_distance":{"metric":"observed_soft_iou_with_confirmed_empty"},
     "risk":{"rank_weight":"1/rank"},
-    "mpc":{"state":["x","y","psi","v"],"control":["a","delta"],"minimum_speed_mps":0},
+    "mpc":{"state":["x","y","psi","v"],"control":["a","delta"],"minimum_speed_mps":0,
+           "constraint_policy":"bounded_controls_soft_safety_v1"},
     "models":{"max_total_attempts":6,"sdk_max_retries":0,"retry_backoff_s":[1,2,4,8,16],
               "attention_max_count":3,"answer_protocol_version":"local-goal-frenet-1.0","experience_max_characters":10000,
               "reflection_workers":1,"reflection_waiting_capacity":2},
     "memory":{"snapshot_scope":"episode","drain_before_next_episode":True,"auto_seed":False,"admit_requires_all_checks":True},
-    "execution":{"no_feasible_plan":"terminate_episode","independent_risk_alarm_with_feasible_plan":"execute_current_candidate",
+    "execution":{"no_feasible_plan":"return_current_bounded_candidate","independent_risk_alarm_with_feasible_plan":"execute_current_candidate",
                  "invalid_fast_answer":"clear_entire_semantics_same_mpc_base","network_failure_without_answer":"same_mpc_base_audit_only",
                  "reflection_control_effect":"none","reflection_failed_admission":"reject_no_second_reflection"},
 }
@@ -269,6 +272,16 @@ def validate_config(config):
             raise ValueError(f'mpc.weights.{key} 已取消：局部路径为唯一跟踪参考，没有额外引导或滞后项')
     if 'dynamics_tolerance' in mpc:
         raise ValueError('mpc.dynamics_tolerance 已取消：状态由同一动力学积分直接生成')
+    if 'qp_stopline_margin_factor' in mpc:
+        raise ValueError('mpc.qp_stopline_margin_factor 已取消：停止截面改为软惩罚，不再生成QP硬预留')
+    penalty_names={'actor_clearance','road_clearance','noncrossable_line_clearance','yield_stop_line','speed_limit','lateral_acceleration'}
+    if not isinstance(mpc.get('safety_penalties',{}),dict) or set(mpc.get('safety_penalties',{}))-penalty_names:
+        raise ValueError('mpc.safety_penalties 包含未实现的软惩罚项')
+    for key,value in mpc.get('safety_penalties',{}).items():_positive(value,'mpc.safety_penalties.'+key)
+    difference=mpc.get('geometry_difference_steps',{})
+    if not isinstance(difference,dict) or set(difference)-{'position_m','heading_rad'}:
+        raise ValueError('几何差分步长只支持 position_m 和 heading_rad')
+    for key,value in difference.items():_positive(value,'mpc.geometry_difference_steps.'+key)
     clock=result.get('clock',{})
     physics=clock.get('physics_hz',50);planner=clock.get('planner_hz',10);fast=clock.get('fast_hz',1)
     for name,value in (('physics_hz',physics),('planner_hz',planner),('fast_hz',fast)):
@@ -323,7 +336,7 @@ def validate_config(config):
     if 'restarts' in mpc:raise ValueError('mpc.restarts 已取消；实时SQP不执行多次慢NLP重启')
     for key in ('solver_max_iterations','qp_max_iterations','sqp_line_search_steps'):
         if key in mpc and (type(mpc[key]) is not int or mpc[key]<1):raise ValueError(f'mpc.{key} 必须为正整数')
-    for key in ('qp_tolerance','qp_stopline_margin_factor','sqp_trust_acceleration_mps2','sqp_trust_steering_rad','sqp_regularization'):
+    for key in ('qp_tolerance','sqp_trust_acceleration_mps2','sqp_trust_steering_rad','sqp_regularization'):
         if key in mpc:_positive(mpc[key],'mpc.'+key)
     geometry=result.get('map_geometry',{})
     for key in ('circular_angle_step_rad','coordinate_precision_m'):
@@ -336,10 +349,12 @@ def validate_config(config):
     if set(result.get('occupancy',{})) & {'min_known_fraction','min_union_area_m2'}:
         raise ValueError('旧occupancy比较阈值已迁至occupancy_distance，不能保留失效配置')
     retrieval=result.get('retrieval',{})
-    if 'minimum_score' in retrieval:_unit_interval(retrieval['minimum_score'],'retrieval.minimum_score')
+    if 'per_channel_k' in retrieval and type(retrieval['per_channel_k']) is not int:
+        raise ValueError('retrieval.per_channel_k 是固定契约，必须为整数1')
+    obsolete=set(retrieval)&{'weights','minimum_score','final_k'}
+    if obsolete:
+        raise ValueError('retrieval旧融合参数已取消：'+','.join(sorted(obsolete))+'；当前为各通道Top-1，合并同ID，不补齐')
     if 'minimum_grid_score' in retrieval:_unit_interval(retrieval['minimum_grid_score'],'retrieval.minimum_grid_score')
-    if type(retrieval.get('final_k',3)) is not int or not 0<=retrieval.get('final_k',3)<=3:
-        raise ValueError('最终 Top-K 必须是 0 至 3 的整数')
     quality=result.get('quality',{})
     if 'minimum_score' in quality:_unit_interval(quality['minimum_score'],'quality.minimum_score')
     for key,value in quality.get('weights',{}).items():_nonnegative(value,'quality.weights.'+key)
@@ -366,7 +381,9 @@ def validate_config(config):
     for name,settings in result.get('risk',{}).get('classes',{}).items():
         _nonnegative(settings.get('eta',1),'risk.classes.'+name+'.eta')
         _positive(settings.get('influence_m',1),'risk.classes.'+name+'.influence_m')
-    for key in ('clearance_floor_m','hard_body_margin_m'):
+    if 'hard_body_margin_m' in result.get('risk',{}):
+        raise ValueError('risk.hard_body_margin_m 已改名 body_clearance_margin_m；该余量用于软惩罚与审计，不是硬避碰约束')
+    for key in ('clearance_floor_m','body_clearance_margin_m'):
         if key in result.get('risk',{}):_positive(result['risk'][key],'risk.'+key)
     if 'attention_increment' in result.get('risk',{}):_nonnegative(result['risk']['attention_increment'],'risk.attention_increment')
     for key in ('radius_m','visibility_angular_step_deg'):
