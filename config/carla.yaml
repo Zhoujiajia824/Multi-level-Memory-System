@@ -1,0 +1,22 @@
+# CARLA 0.9.15平台与传感器设置；实验场景分别放在config/carla_scenarios/。
+# 场景地图由独立场景YAML指定；开发默认值尚未完成真实服务器验收。
+# 主程序Python 3.12与CARLA SDK解释器分离。python通过--carla-python提供绝对路径。
+carla:
+  python: null
+  host: 127.0.0.1
+  port: 2000
+  timeout_s: 30
+  allow_world_reset: false
+  camera_width: 640
+  camera_height: 360
+  camera_fov: 100
+  camera_height_m: 2.2
+  arrival_margin_m: 3
+  map_resolution_m: 2
+  map_speed_cap_mps: 30
+  same_level_tolerance_m: 1.5
+  observation_resolution_m: 1
+  observation_heights_m: [0.2, 0.8]
+  depth_empty_tolerance_m: 0.05
+  visibility_surface_tolerance_m: 0.35
+  visibility_min_samples: 2

@@ -1,6 +1,6 @@
 # EP-Driver 运行指令与参数
 
-开发分支为 `EP-Driver`。所有运行指令在项目根目录执行；配置和命令中的相对路径均以项目根目录为准。
+当前工作分支为 `EP-Driver-CARLA`，由 `EP-Driver` 创建；本轮未提交或推送，远程尚不能据此克隆新分支。以下克隆指令仍针对已发布的 `EP-Driver`；CARLA指令需使用含本轮新增代码的工作区。配置和命令中的相对路径均以项目根目录为准。
 
 ## 0. 克隆分支、权重与个人配置
 
@@ -32,7 +32,7 @@ if (-not (Test-Path -LiteralPath 'config/models.yaml')) {
 }
 ```
 
-模板中的两个模型均为 `"off"`。`config/models.yaml`、测试、研究文档、验证脚本、记忆库及运行输出不上传；每台机器的模型地址和个人配置自行维护。下述运行指令使用已发布的三个脚本：`run_highway.py`、`check_environment.py`、`memory_admin.py`。
+模板中的两个模型均为 `"off"`。`config/models.yaml`、测试、研究文档、验证脚本、记忆库及运行输出不上传；每台机器的模型地址和个人配置自行维护。已发布入口为 `run_highway.py`、`check_environment.py`、`memory_admin.py`；本分支另新增 `run_carla.py`。
 
 ## 1. 环境
 
@@ -350,3 +350,106 @@ python scripts/memory_admin.py --memory-dir outputs/memory_db/experiment_01 inva
 | `local_goal.attraction_weight` | `3`，单次首次到达吸引项的独立权重，开发起点 |
 | `local_goal.longitudinal_scale_m / lateral_scale_m` | `30 / 3.5`米，目标处切向/法向归一化尺度 |
 | `risk.classes.*.influence_m` | 机动车20、自行车10、行人10、静物12、不可跨越线1.5米，按实体净距，不是硬安全距离 |
+
+## 9. CARLA 0.9.15：独立世界与第一批交互场景
+
+本分支已提供CARLA入口、SDK桥与脚本场景，尚未在真实CARLA服务器完成实测。当前首批场景限制在同层、近直、非路口道路；找不到足够长道路、合法邻道或人行道时明确失败，不用其他情境替代。每份场景YAML可以指定任意已安装的CARLA地图名称或资源路径，不限定Town05/06/10HD；已安装地图仍须满足该交互模板的道路条件。
+
+主程序继续使用Python 3.12的独立环境；CARLA SDK在已有`carla37`（或安装了0.9.15 SDK的Python 3.8）环境中运行，通过子进程交换数据。不要把CARLA旧版SDK安装进主环境，不需要修改已有`carla`、`carla37`和模型服务环境。
+
+先在服务器检查SDK解释器，不连接世界：
+
+```bash
+/home/zjj/miniconda3/envs/carla37/bin/python -c "import carla; print(carla.__file__)"
+conda activate ep-driver-highway
+cd /data/zjj/code/EP-Driver/实际CARLA分支目录
+python scripts/run_carla.py --list-scenarios
+python scripts/run_carla.py --scenario slow_lead --dry-run
+```
+
+`--dry-run`只检查配置和输出运行清单，不导入CARLA SDK、不创建客户端、不加载DINO、不写运行产物。两个模型默认关闭，即使个人YAML配置为开启也不会隐式调用；启用时必须传`--fast server/api`或`--reflection server/api`。模型都关闭且个人配置不存在时可直接使用模板；启用模型时缺少个人配置会报错。
+
+用户先在独立端口启动CARLA 0.9.15服务。该端口不得有其他人的车辆、行人或同步控制程序；关闭已有CARLA观察脚本中主动调用`world.tick()`的功能。程序不自动启动CARLA服务器，也不会接管已有同步世界。首次无模型冒烟运行：
+
+```bash
+python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin/python --host 127.0.0.1 --port 2000 --map Town05 --scenario slow_lead --exclusive-world --duration 3 --fast off --reflection off --no-retrieve --no-write-memory --video --episodes-dir outputs/carla/smoke
+```
+
+`--exclusive-world`是每次真实运行的明确确认。当前空世界地图与`--map`不同时默认拒绝；确认该服务专用后，另外加`--allow-world-reset`才允许切换地图。两项开关不允许清理其他人的车辆或接管其他同步客户端。结束时只销毁本轮创建的对象并恢复本轮修改前的世界设置；被切换的地图不自动切回。
+
+五类脚本交互复用同一个核心预测、目标管理、MPC、检索及反思流程。**每个场景一份独立YAML**；`config/carla.yaml`只配置服务、SDK和传感器。以下`--scenario`分别选择`config/carla_scenarios/`中的同名文件：
+
+```bash
+python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin/python --exclusive-world --scenario slow_lead --duration 30 --video
+python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin/python --exclusive-world --scenario hard_brake --duration 30 --video
+python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin/python --exclusive-world --scenario cut_in --duration 30 --video
+python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin/python --exclusive-world --scenario parked_obstacle --duration 30 --video
+python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin/python --exclusive-world --scenario occluded_pedestrian --duration 30 --video
+```
+
+复制场景文件即可创建相似变体，然后修改新文件中的`name`、`map`、`desired_speed_mps`和`experiment`参数。显式文件入口与`--scenario`互斥，相对路径以项目根目录为准：
+
+```bash
+cp config/carla_scenarios/cut_in.yaml config/carla_scenarios/cut_in_close.yaml
+nano config/carla_scenarios/cut_in_close.yaml
+python scripts/run_carla.py --scenario-config config/carla_scenarios/cut_in_close.yaml --dry-run
+python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin/python --exclusive-world --scenario-config config/carla_scenarios/cut_in_close.yaml --duration 30 --video
+```
+
+同地点变体应固定`map`和`experiment.spawn_index`。首次`spawn_index: null`会按seed查找适用地点；从`frames.jsonl`的`actual.events`中找到`created`事件的实际索引，再填回YAML。随后可改变车距、速度、触发时机、切入侧及切入时长。相同seed而参数改变时，自动搜索可能选到不同地点，不能仅用seed认定同地点。每轮`configuration.json`保留原场景YAML、SHA256和生效参数，`carla_map.json`保存地图OpenDRIVE指纹，`created`事件保存起点道路标识及世界位姿。
+
+确认本地Qwen服务已启动，并在`config/models.yaml`分别填写快模型/反思模型地址及模型名后，先进行不使用记忆的完整模型链路测试：
+
+```bash
+python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin/python --exclusive-world --scenario slow_lead --duration 3 --fast server --reflection server --no-retrieve --no-write-memory --video --episodes-dir outputs/carla/model_smoke
+```
+
+六个当前相机视角拼为一张图，相机拼图在前、同帧BEV在后，共同发送给快模型和原帧反思。模型提示词仍在`config/prompts.yaml`修改。六路RGB和六路深度每个物理tick（50Hz）渲染，仅将控制末帧（10Hz）与相机标定按frame保存；此配置保证对齐，真实GPU渲染耗时尚未实测。深度只用于当前可见性判定，不进入VLM图片。两种平台保持现有单Frenet目标协议。反思只做原帧验收，不接管当前控制。
+
+批量20轮，seed21至40；只读指定经验库，新增合格反思经验另写一个库：
+
+```bash
+python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin/python --exclusive-world --scenario cut_in --episodes 20 --seed 21 --seed-mode increment --duration 30 --fast server --reflection server --retrieve --write-memory --memory-mode formal --memory-read-dir /data/zjj/memory/frozen_carla --memory-write-dir /data/zjj/memory/new_carla_reflections --episodes-dir outputs/carla/cut_in_21_40 --video
+```
+
+检索和写入默认都关闭，独立开关与highway一致。`--memory-dir`是同库读写简写，独立读写路径优先。启用任一记忆功能需要真实DINO权重；当前轮新增经验仍到下一轮快照才可见。CARLA采集数据较大，原始RGB/深度每个控制帧落盘；先跑短轮确认磁盘占用，再启动批量。
+
+| CARLA参数 | 含义 |
+|---|---|
+| `--carla-config` | SDK、服务、传感器公共配置，默认`config/carla.yaml` |
+| `--scenario` | 选择内置独立场景YAML，默认slow_lead；与`--scenario-config`互斥 |
+| `--scenario-config` | 独立场景YAML路径，可自定义文件名；相对路径以项目根为准 |
+| `--carla-python` | 安装CARLA 0.9.15 SDK的解释器绝对路径；默认未配置，真实运行必须提供或在YAML设置 |
+| `--host / --port / --map` | 服务地址、RPC端口及地图覆盖；地图默认取场景YAML，不强制Town05 |
+| `--exclusive-world` | 确认该服务为本实验专用，每次真实运行必需 |
+| `--allow-world-reset` | 专用空世界中允许切换到请求地图，默认禁止；不是强制清空现有世界 |
+| `--list-scenarios / --dry-run` | 分别列出配置场景、校验运行清单，均不连接服务 |
+| `--live / --video` | 显示或录制同一六相机拼图；需GUI时使用`--live`，无显示服务器用`--video`；录像10FPS，每个控制帧一帧 |
+| `--fast / --reflection` | CARLA入口默认均为off，显式选择server或api才调用；与highway入口沿用YAML默认的行为不同 |
+| 其他批量及记忆参数 | `--episodes --seed --seed-mode --duration --retrieve --write-memory --memory-mode --memory-dir --memory-read-dir --memory-write-dir --dino-model --episodes-dir --prefix --models-config --prompts-config --config`与上文同名定义一致 |
+
+| 独立场景YAML字段 | 含义与开发默认值 |
+|---|---|
+| `schema_version` | 固定carla-scene-1.0，不接受旧的defaults/scenarios合并结构 |
+| `name / template` | 实验实例名称与五类模板名称分开；变体可自定义name，template仍使用已有模板 |
+| `map` | 当前场景地图，填写实际安装的名称或资源路径；CLI --map可显式覆盖并记录 |
+| `desired_speed_mps` | 核心规则/MPC期望速度10m/s，与初速度独立，不代表地图限速 |
+| `experiment.spawn_index` | null表示按seed搜索满足模板的地点；整数固定当前地图生成点，失败不换位置 |
+| `experiment.route_length_m / lead_distance_m` | 导航路线180米、交互对象摆放距离35米；地图waypoint离散摆放，实际位姿另存 |
+| `experiment.initial_speed_mps / lead_speed_mps` | 自车初速度10m/s、前车6m/s；静态模板前车为0 |
+| `experiment.trigger_distance_m / trigger_min_time_s` | 距离不超过28米且时间至少0.5秒触发；仅用于急刹、切入和行人模板 |
+| `experiment.hard_brake_amount` | 急刹模板制动输入，(0,1]；默认1，不是m/s² |
+| `experiment.cut_in_side / lane_change_seconds` | 从left或right合法同向邻道切入；持续4秒，均检查可跨越边界 |
+| `experiment.pedestrian_speed_mps / pedestrian_longitudinal_offset_m` | 行人1.4m/s，沿路线在遮挡车摆放参考点前6米 |
+| `experiment.occluder_lateral_fraction` | 遮挡车向右偏移当前车道宽度的0.35倍，允许[-0.5,0.5]；不改变道路规则 |
+| `experiment.ego_blueprint / lead_blueprint / occluder_blueprint` | 自车、交互车、遮挡车的实际车辆蓝图名 |
+| `experiment.pedestrian_blueprint` | null按蓝图ID确定性选择首个行人，或填写实际存在的walker.pedestrian.*蓝图 |
+
+各文件显式列出完整实验参数；注释注明仅某模板使用的字段，修改不相关字段不会为其他模板新增交互。以下公共传感器设置仍在`config/carla.yaml`中：
+
+| 公共平台参数 | 含义与开发默认值 |
+|---|---|
+| `carla.camera_width / camera_height / camera_fov` | 单相机640×360、水平FOV100度；六视角RGB及对应深度同步 |
+| `carla.observation_resolution_m / observation_heights_m` | 确认空区的网格1米、多高度0.2/0.8米；未确认与遮挡区域保留unknown，尚需真实传感器验证 |
+
+每轮沿用第7节的核心日志，另有`carla_bridge.log`、`carla_map.json`、`camera_frames/`及相机资产清单；`--video`保存真实相机拼图录像。相机录像暂不叠加世界中的MPC轨迹，计划轨迹保存在BEV诊断图与`plans.jsonl`，不修改输入模型的原始相机图。当前验证仅包括接口、配置、几何与测试替身，不能据此宣称已在CARLA实现无碰撞或实时运行。

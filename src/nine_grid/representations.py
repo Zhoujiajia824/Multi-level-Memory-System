@@ -174,6 +174,27 @@ def _adjacent_road_evidence(scene, current, lanes, side, settings):
             "reason": "crossable_boundary" if crossable else "noncrossable_boundary"}
 
 
+def _visibility_geometry(scene):
+    """保留相机可见域的孔洞和分离区域；新证据损坏时不退回旧的全覆盖多边形。"""
+    try:
+        if 'visibility_wkt' in scene.diagnostics:
+            raw=scene.diagnostics['visibility_wkt']
+            if not isinstance(raw,str):
+                return None
+            geometry=shapely.from_wkt(raw)
+        else:
+            raw=scene.diagnostics.get('visibility_polygon')
+            if raw is None:
+                return None
+            geometry=Polygon(raw)
+        if (geometry.geom_type not in ('Polygon','MultiPolygon') or geometry.is_empty
+            or not geometry.is_valid or not np.all(np.isfinite(shapely.get_coordinates(geometry)))):
+            return None
+        return geometry
+    except (ValueError,TypeError,shapely.errors.GEOSException):
+        return None
+
+
 def build_grid(scene: SceneSnapshot, reference=None, current_lane_id=None, reference_anchor_s=None,
                distance_config=None, observation_config=None):
     """每格只选当前可见对象；道路不适用、确认空与遮挡未知分别编码。"""
@@ -284,15 +305,10 @@ def build_grid(scene: SceneSnapshot, reference=None, current_lane_id=None, refer
                                 "acceleration": f["acceleration"], "heading": f["heading"],
                                 "length": actor.length, "width": actor.width, "slots": [],
                                 "state_valid": True, "longitudinal_overlap": bool(overlaps)}
-    visibility = scene.diagnostics.get("visibility_polygon")
+    observed = _visibility_geometry(scene)
     known_geometry = None
-    if visibility is not None:
-        try:
-            observed = Polygon(visibility)
-            if observed.is_valid and not observed.is_empty:
-                known_geometry = unary_union([observed, ego_shape]+[_shape(a) for a in scene.actors if a.visible])
-        except (ValueError, TypeError):
-            pass
+    if observed is not None:
+        known_geometry = unary_union([observed, ego_shape]+[_shape(a) for a in scene.actors if a.visible])
     lateral_widths = {}
     def slot_coverage(side, name):
         """空状态只依据可见几何与地图，不使用遮挡后的对象数量或状态。"""
@@ -829,18 +845,13 @@ def build_occupancy(scene):
     # 缺少可见几何不是全局可见证据；地图横道也须由平台明确确认可用。
     known = np.zeros_like(raw,dtype=np.float32)
     known[1] = 1
-    visible = scene.diagnostics.get("visibility_polygon")
-    if visible is not None:
-        try:
-            visible_shape = Polygon(visible)
-        except (ValueError, TypeError):
-            visible_shape = Polygon()
+    visible_shape = _visibility_geometry(scene)
+    if visible_shape is not None:
         # 完整状态授权意味着部分可见对象的完整实体占据已知。
-        if visible_shape.is_valid and not visible_shape.is_empty:
-            visible_shape = unary_union([visible_shape, _shape(scene.ego)] + [_shape(a) for a in scene.actors if a.visible])
-            local_visible = unary_union([to_local_polygon(p) for p in _iter_polygons(visible_shape)])
-            dynamic_known = _occupancy_coverage(_occupancy_cells(),local_visible).astype(np.float32)
-            known[2:] = dynamic_known
+        visible_shape = unary_union([visible_shape, _shape(scene.ego)] + [_shape(a) for a in scene.actors if a.visible])
+        local_visible = unary_union([to_local_polygon(p) for p in _iter_polygons(visible_shape)])
+        dynamic_known = _occupancy_coverage(_occupancy_cells(),local_visible).astype(np.float32)
+        known[2:] = dynamic_known
     if scene.rules.get("map_available",{}).get("crosswalk") is True:
         known[0] = 1
     available = scene.diagnostics.get("occupancy_channels_available", {})

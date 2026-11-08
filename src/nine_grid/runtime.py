@@ -9,7 +9,7 @@ import queue
 import threading
 import numpy as np
 from .contracts import ExperienceRecord, VERSION, plain
-from .models import build_prompt, parse_answer, CommunicationFailure
+from .models import build_prompt, parse_answer, CommunicationFailure, model_image_paths
 from .quality import evaluate, admissible
 from .paths import filesystem_path
 
@@ -98,7 +98,10 @@ class ReflectionWorker:
                 original_reference=task.plan.diagnostics.get('reference_state_before')
                 if original_reference is not None:
                     planner.restore_reference_state(original_reference)
-                raw=self.client.call(build_prompt(task.scene,task.representations,reflection=task),[task.representations.bev_path])
+                images=model_image_paths(task.scene,task.representations)
+                prompt=build_prompt(task.scene,task.representations,reflection=task)
+                event.update(images=images,prompt=prompt)
+                raw=self.client.call(prompt,images)
                 event['raw_answer']=raw
                 answer=parse_answer(raw,task.scene,'reflection',self.config.get('models',{}).get('answer_max_characters',6000),
                                     reference=task.scene.diagnostics.get('goal_reference'),config=self.config)

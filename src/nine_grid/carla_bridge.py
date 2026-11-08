@@ -1,0 +1,620 @@
+"""CARLA 0.9.15 独立 SDK 桥；兼容 Python 3.7，仅依赖标准库及 carla。"""
+import json
+import hashlib
+import math
+import os
+import queue
+import signal
+import sys
+import time
+from pathlib import Path
+
+
+def lane_key(waypoint):
+    return '{}|{}|{}'.format(waypoint.road_id, waypoint.section_id, waypoint.lane_id)
+
+
+def map_identity(road_map):
+    """地图名称和原始OpenDRIVE指纹仅供复现审计，不进入检索分数。"""
+    document = road_map.to_opendrive()
+    if not isinstance(document,str) or not document.strip():
+        raise ValueError('公开地图OpenDRIVE缺失，无法核查同地点实验来源')
+    return {'map_name':str(road_map.name),
+            'opendrive_sha256':hashlib.sha256(document.encode('utf-8')).hexdigest()}
+
+
+def xy(location):
+    return [float(location.x), -float(location.y)]
+
+
+def project_camera(point, inverse, width, height, fov):
+    """UE 相机 x 前 y 右 z 上，返回像素及光轴深度，非欧氏射线长度。"""
+    p = [point.x, point.y, point.z, 1.0]
+    v = [sum(inverse[i][j] * p[j] for j in range(4)) for i in range(3)]
+    if v[0] <= 0.05:
+        return None
+    focal = width / (2.0 * math.tan(math.radians(fov) / 2.0))
+    u, w = width / 2.0 + focal * v[1] / v[0], height / 2.0 - focal * v[2] / v[0]
+    if not (1 <= u < width - 1 and 1 <= w < height - 1):
+        return None
+    return int(u), int(w), v[0]
+
+
+def encoded_depth(image, x, y):
+    i = (y * image.width + x) * 4
+    raw = image.raw_data
+    return (raw[i + 2] + 256 * raw[i + 1] + 65536 * raw[i]) * (1000.0 / 16777215.0)
+
+
+def wheel_geometry(wheels, inverse_transform, box_center_x):
+    """CARLA 轮位为世界厘米；先转米再转车体局部，不能直接拿世界x作轴距。"""
+    if len(wheels) != 4:
+        raise ValueError('首批 CARLA 自车仅支持四轮汽车')
+    local_x = []
+    for wheel in wheels:
+        position = wheel.position
+        world = [position.x / 100., position.y / 100., position.z / 100., 1.]
+        local_x.append(sum(inverse_transform[0][j] * world[j] for j in range(4)))
+    front, rear = sum(local_x[:2]) / 2., sum(local_x[2:]) / 2.
+    wheelbase, rear_distance = front - rear, box_center_x - rear
+    if not wheelbase > 0 or not 0 < rear_distance < wheelbase:
+        raise ValueError('无法从真实轮位提取有效轴距/参考点；不使用车长代替')
+    return wheelbase, rear_distance
+
+
+def closed_crosswalks(locations, base_z, tolerance):
+    """官方地图以重复首点分隔人行横道闭合多边形；不把未闭合片段补齐。"""
+    polygons, pending = [], []
+    for location in locations:
+        pending.append(location)
+        if len(pending) >= 4 and math.sqrt((location.x-pending[0].x)**2+
+                (location.y-pending[0].y)**2+(location.z-pending[0].z)**2) < 1e-4:
+            if all(abs(point.z-base_z) <= tolerance for point in pending):
+                polygons.append([xy(point) for point in pending])
+            pending = []
+    if pending:
+        raise ValueError('地图人行横道包含未闭合多边形，不能声称完整地图证据')
+    return polygons
+
+
+ENVIRONMENT_OBSTACLE_LABELS = ('Car', 'Truck', 'Bus', 'Train', 'Motorcycle', 'Bicycle',
+    'Vehicles', 'Static', 'Other', 'Fences', 'GuardRail', 'Walls', 'Poles', 'TrafficSigns', 'TrafficLight')
+
+
+def environment_catalogue(world, carla):
+    """只读取环境网格，不启停对象。0.9.15官方ObjectLabel.h区分Car/Truck等。
+
+    get_environment_objects的框已经位于世界坐标，不能再乘EnvironmentObject.transform。
+    在创建实验车辆之前读取，配合独立空世界准入避免把动态actor重复成静态物。
+    不读取Building/Road/Sidewalk/Ground等大区域框；不以尺寸或数量截断障碍物。
+    """
+    labels = {getattr(carla.CityObjectLabel, name): name for name in ENVIRONMENT_OBSTACLE_LABELS
+              if hasattr(carla.CityObjectLabel, name)}
+    objects, seen, excluded = [], {}, {}
+    for item in sorted(world.get_environment_objects(carla.CityObjectLabel.Any), key=lambda obj: obj.id):
+        if item.type not in labels:
+            name = str(item.type)
+            excluded[name] = excluded.get(name, 0) + 1
+            continue
+        box = item.bounding_box
+        values = (box.location.x, box.location.y, box.location.z, box.extent.x, box.extent.y,
+                  box.extent.z, box.rotation.yaw, box.rotation.pitch, box.rotation.roll)
+        if not all(math.isfinite(value) for value in values) or min(box.extent.x, box.extent.y, box.extent.z) <= 0:
+            raise ValueError('环境障碍物缺少有限正尺寸：{}'.format(item.id))
+        # 完全相同的环境几何可能有多个组件标签，仅合并精确几何重复，不近似删物体。
+        signature = tuple(values)
+        if signature in seen:
+            seen[signature]['source_ids'].append(str(item.id))
+            continue
+        entry = {'id': 'environment_{}'.format(item.id), 'box': box, 'label': labels[item.type],
+                 'source_ids': [str(item.id)]}
+        seen[signature] = entry
+        objects.append(entry)
+    return objects, {'source': 'CARLA_0.9.15_get_environment_objects_world_bounding_boxes',
+        'included_labels': sorted(labels.values()), 'excluded_label_counts': excluded,
+        'catalogue_count': len(objects), 'loaded_before_experiment_actors': True,
+        'scope': '已标注环境障碍物；排除建筑/道路/地面等区域语义，未缩小或关闭实体'}
+
+
+class CarlaSession:
+    def __init__(self):
+        self.world = None
+        self.saved_settings = None
+        self.experiment = None
+        self.sensors = []
+        self.queues = {}
+        self.frames = {}
+        self.events = []
+        self.collision = False
+        self.t0 = None
+        self.frame = None
+        self.closed = False
+        self.angular_history = {}
+        self.cleanup_errors = []
+
+    def initialize(self, config, directory, seed):
+        if config.get('exclusive_world') is not True:
+            raise ValueError('必须显式确认 exclusive_world=true，仅使用本任务独立 CARLA 世界')
+        for key, default in (('timeout_s', 30), ('map_resolution_m', 2), ('same_level_tolerance_m', 1.5),
+                             ('perception_radius_m', 120), ('visibility_surface_tolerance_m', .35),
+                             ('camera_height_m', 2.2), ('map_speed_cap_mps', 30)):
+            value = config.get(key, default)
+            if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or value <= 0:
+                raise ValueError('CARLA 参数必须为有限正数：' + key)
+        if type(config.get('visibility_min_samples', 2)) is not int or not 1 <= config.get('visibility_min_samples', 2) <= 36:
+            raise ValueError('visibility_min_samples 必须在 1 至 36 之间')
+        import carla
+        from carla_scenarios import create_experiment
+        self.carla = carla
+        self.cfg = config
+        self.root = Path(directory).resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.timeout = float(config.get('timeout_s', 30.0))
+        client = carla.Client(config.get('host', '127.0.0.1'), int(config.get('port', 2000)))
+        client.set_timeout(self.timeout)
+        client_version, server_version = client.get_client_version(), client.get_server_version()
+        if client_version.split('-')[0] != '0.9.15' or server_version.split('-')[0] != '0.9.15':
+            raise ValueError('仅支持 CARLA 0.9.15；客户端={}，服务端={}'.format(client_version, server_version))
+        self.world = client.get_world()
+        initial = self.world.get_settings()
+        existing = (list(self.world.get_actors().filter('vehicle.*')) +
+                    list(self.world.get_actors().filter('walker.pedestrian.*')) +
+                    list(self.world.get_actors().filter('static.prop.*')))
+        if initial.synchronous_mode or existing:
+            raise RuntimeError('拒绝接管正在同步运行或已有车辆/行人/脚本道具的世界；请为实验启动独立 CARLA 服务')
+        requested_map = str(config.get('map', 'Town05'))
+        if self.world.get_map().name.rstrip('/').split('/')[-1] != requested_map.rstrip('/').split('/')[-1]:
+            if not config.get('allow_world_reset', False):
+                raise RuntimeError('当前地图与配置不符；换图必须显式允许 allow_world_reset')
+            self.world = client.load_world(requested_map)
+        self.saved_settings = self.world.get_settings()
+        settings = self.world.get_settings()
+        self.physics_hz = int(config.get('physics_hz', 50))
+        self.planner_hz = int(config.get('planner_hz', 10))
+        if self.physics_hz <= 0 or self.planner_hz <= 0 or self.physics_hz % self.planner_hz:
+            raise ValueError('CARLA 物理频率必须为规划频率的整数倍')
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = 1.0 / self.physics_hz
+        settings.no_rendering_mode = False
+        settings.substepping = True
+        settings.max_substep_delta_time = 0.01
+        settings.max_substeps = max(1, int(math.ceil(settings.fixed_delta_seconds / 0.01)))
+        self.world.apply_settings(settings)
+        self.environment_objects, self.environment_audit = environment_catalogue(self.world, carla)
+        experiment = dict(config.get('experiment', {}))
+        experiment['seed'] = int(seed)
+        self.experiment = create_experiment(self.world, client, experiment, carla)
+        self.ego = self.experiment.ego
+        self.route_wps = self.experiment.route_waypoints
+        if len(self.route_wps) < 2:
+            raise ValueError('场景未提供有效自车导航路线')
+        self.map = self.world.get_map()
+        self.width = int(config.get('camera_width', 640))
+        self.height = int(config.get('camera_height', 360))
+        self.fov = float(config.get('camera_fov', 100.0))
+        if self.width < 64 or self.height < 64 or not 20 < self.fov < 150:
+            raise ValueError('相机尺寸或视场配置非法')
+        self._create_sensors()
+        self.frame = self.world.tick(self.timeout)
+        snap = self.world.get_snapshot()
+        self.t0 = snap.timestamp.elapsed_seconds
+        self._collect(self.frame)
+        result = self.snapshot()
+        result['map'] = self._map_payload()
+        result['bridge_version'] = 'carla-0.9.15-observed-1.0'
+        result['sdk_version'] = client_version
+        return result
+
+    def _create_sensors(self):
+        c = self.carla
+        views = [('front', 0), ('front_left', -60), ('front_right', 60),
+                 ('back', 180), ('back_left', -120), ('back_right', 120)]
+        self.camera_actors = {}
+        for view, yaw in views:
+            for kind in ('rgb', 'depth'):
+                bp = self.world.get_blueprint_library().find('sensor.camera.' + kind)
+                for key, value in (('image_size_x', self.width), ('image_size_y', self.height),
+                                   ('fov', self.fov), ('sensor_tick', 0.0)):
+                    bp.set_attribute(key, str(value))
+                if bp.has_attribute('enable_postprocess_effects'):
+                    bp.set_attribute('enable_postprocess_effects', 'false')
+                pose = c.Transform(c.Location(z=float(self.cfg.get('camera_height_m', 2.2))), c.Rotation(yaw=yaw))
+                sensor = self.world.spawn_actor(bp, pose, attach_to=self.ego, attachment_type=c.AttachmentType.Rigid)
+                self.sensors.append(sensor)
+                key = view + '_' + kind
+                q = queue.Queue(maxsize=4)
+                self.queues[key] = q
+                def callback(image, target=q):
+                    try:
+                        target.put_nowait(image)
+                    except queue.Full:
+                        try:
+                            target.get_nowait()
+                        except queue.Empty:
+                            pass
+                        try:
+                            target.put_nowait(image)
+                        except queue.Full:
+                            pass
+                sensor.listen(callback)
+                self.camera_actors[key] = sensor
+        bp = self.world.get_blueprint_library().find('sensor.other.collision')
+        sensor = self.world.spawn_actor(bp, c.Transform(), attach_to=self.ego)
+        self.sensors.append(sensor)
+        def collision(event):
+            self.collision = True
+            self.events.append({'kind': 'collision', 'frame': event.frame,
+                                'other_id': event.other_actor.id, 'other_type': event.other_actor.type_id})
+        sensor.listen(collision)
+        bp = self.world.get_blueprint_library().find('sensor.other.lane_invasion')
+        sensor = self.world.spawn_actor(bp, c.Transform(), attach_to=self.ego)
+        self.sensors.append(sensor)
+        sensor.listen(lambda event: self.events.append({'kind': 'lane_invasion', 'frame': event.frame,
+            'markings': [str(mark.type) for mark in event.crossed_lane_markings]}))
+
+    def _collect(self, frame):
+        deadline = time.monotonic() + self.timeout
+        result = {}
+        for key, q in self.queues.items():
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('相机同步超时：{}，目标帧{}'.format(key, frame))
+                try:
+                    item = q.get(timeout=remaining)
+                except queue.Empty:
+                    raise TimeoutError('相机同步超时：{}，目标帧{}'.format(key, frame))
+                if item.frame == frame:
+                    result[key] = item
+                    break
+                if item.frame > frame:
+                    raise RuntimeError('相机丢帧：{}需要{}收到{}'.format(key, frame, item.frame))
+        timestamps = [item.timestamp for item in result.values()]
+        if max(timestamps) - min(timestamps) > 1e-6:
+            raise RuntimeError('同帧相机时间戳不一致')
+        if self.world is not None:
+            snap = self.world.get_snapshot()
+            if snap.frame != frame or any(abs(value-snap.timestamp.elapsed_seconds) > 1e-5 for value in timestamps):
+                raise RuntimeError('相机与目标世界帧时间戳不一致')
+        self.frames = result
+
+    def _camera_payload(self):
+        folder = self.root / 'camera_frames' / '{:08d}'.format(self.frame)
+        folder.mkdir(parents=True, exist_ok=True)
+        cameras = []
+        for view in ('front', 'front_left', 'front_right', 'back', 'back_left', 'back_right'):
+            rgb, depth = self.frames[view + '_rgb'], self.frames[view + '_depth']
+            rgb_path, depth_path = folder / (view + '.png'), folder / (view + '_depth.png')
+            if not rgb_path.is_file():
+                rgb.save_to_disk(str(rgb_path))
+            if not depth_path.is_file():
+                depth.save_to_disk(str(depth_path))
+            cameras.append({'view': view, 'rgb_path': str(rgb_path), 'depth_path': str(depth_path),
+                'width': self.width, 'height': self.height, 'fov_deg': self.fov,
+                'frame': self.frame, 'timestamp': rgb.timestamp,
+                'world_to_camera_ue': rgb.transform.get_inverse_matrix(),
+                'camera_to_world_ue': rgb.transform.get_matrix(),
+                'depth_encoding': 'carla_rgb24_planar_m;R+256G+65536B;far=1000'})
+        return cameras
+
+    def _visible(self, actor):
+        """只访问候选车体几何，使用同帧深度验证朝向相机的表面采样。"""
+        return self._box_visible(actor.bounding_box, actor.get_transform())
+
+    def _box_visible(self, bbox, transform):
+        """环境框传入单位变换；actor局部框传入actor世界变换。"""
+        # 面中心与内部采样避免仅车框角点露出天空导致误判。
+        samples = []
+        for axis in (0, 1):
+            for side in (-1, 1):
+                for horizontal in (-0.5, 0, 0.5):
+                    for vertical in (-0.35, 0, 0.35):
+                        p = [horizontal * bbox.extent.x, horizontal * bbox.extent.y, vertical * bbox.extent.z]
+                        p[axis] = side * (bbox.extent.x if axis == 0 else bbox.extent.y)
+                        local = self.carla.Location(x=p[0], y=p[1], z=p[2])
+                        box_transform = self.carla.Transform(bbox.location, bbox.rotation)
+                        point = box_transform.transform(local)
+                        samples.append(transform.transform(point))
+        tolerance = float(self.cfg.get('visibility_surface_tolerance_m', 0.35))
+        minimum = int(self.cfg.get('visibility_min_samples', 2))
+        for view in ('front', 'front_left', 'front_right', 'back', 'back_left', 'back_right'):
+            depth = self.frames[view + '_depth']
+            inverse = depth.transform.get_inverse_matrix()
+            evidence = set()
+            for point in samples:
+                projected = project_camera(point, inverse, self.width, self.height, self.fov)
+                if projected is None:
+                    continue
+                u, v, axial = projected
+                observed = encoded_depth(depth, u, v)
+                if abs(observed - axial) <= tolerance:
+                    evidence.add((u, v))
+            if len(evidence) >= minimum:
+                return True
+        return False
+
+    def _actor(self, actor, is_ego=False):
+        transform, bb = actor.get_transform(), actor.bounding_box
+        center = transform.transform(bb.location)
+        velocity, acceleration, omega = actor.get_velocity(), actor.get_acceleration(), actor.get_angular_velocity()
+        yaw = math.radians(transform.rotation.yaw + bb.rotation.yaw)
+        identity = 'ego' if is_ego else 'carla_{}'.format(actor.id)
+        kind = 'pedestrian' if actor.type_id.startswith('walker.') else 'vehicle'
+        if actor.type_id.startswith('static.'):
+            kind = 'static_obstacle'
+        elif actor.type_id in ('vehicle.bh.crossbike', 'vehicle.diamondback.century', 'vehicle.gazelle.omafiets'):
+            kind = 'bicycle'
+        waypoint = self.map.get_waypoint(center, project_to_road=False, lane_type=self.carla.LaneType.Driving)
+        offset = [center.x - transform.location.x, center.y - transform.location.y]
+        angular = math.radians(omega.z)
+        elapsed = self.world.get_snapshot().timestamp.elapsed_seconds
+        previous = self.angular_history.get(actor.id)
+        alpha = (angular - previous[1]) / (elapsed - previous[0]) if previous and elapsed > previous[0] + 1e-8 else 0.0
+        self.angular_history[actor.id] = (elapsed, angular)
+        result = {'id': identity, 'kind': kind, 'position': xy(center),
+            'velocity': [velocity.x - angular * offset[1], -(velocity.y + angular * offset[0])],
+            'acceleration': [acceleration.x - alpha * offset[1] - angular * angular * offset[0],
+                             -(acceleration.y + alpha * offset[0] - angular * angular * offset[1])],
+            'heading': -yaw, 'length': 2.0 * bb.extent.x, 'width': 2.0 * bb.extent.y,
+            'height_m': 2.0 * bb.extent.z,
+            'lane_id': lane_key(waypoint) if waypoint is not None else None,
+            'visible': True, 'radius': max(bb.extent.x, bb.extent.y) if kind == 'pedestrian' else None,
+            'z': center.z, 'origin_z': transform.location.z,
+            'state_sources': {'position': 'bounding_box_world_center', 'velocity': 'actor_velocity_plus_angular_offset',
+                              'acceleration': 'actor_acceleration_plus_causal_angular_offset',
+                              'angular_acceleration': 'past_difference' if previous else 'initial_zero_assumption'}}
+        if is_ego:
+            wheels = actor.get_physics_control().wheels
+            wheelbase, rear_distance = wheel_geometry(wheels, transform.get_inverse_matrix(), bb.location.x)
+            result['wheelbase_m'], result['rear_axle_to_center_m'] = wheelbase, rear_distance
+        return result
+
+    def _environment_actor(self, entry):
+        box = entry['box']
+        # 倾斜静态框投影成沿原yaw的包络矩形，不缩小其真实平面占据。
+        yaw = math.radians(box.rotation.yaw)
+        vertices = box.get_world_vertices(self.carla.Transform())
+        ex = max(abs((p.x-box.location.x)*math.cos(yaw)+(p.y-box.location.y)*math.sin(yaw)) for p in vertices)
+        ey = max(abs(-(p.x-box.location.x)*math.sin(yaw)+(p.y-box.location.y)*math.cos(yaw)) for p in vertices)
+        waypoint = self.map.get_waypoint(box.location, project_to_road=False,
+                                        lane_type=self.carla.LaneType.Driving)
+        return {'id': entry['id'], 'kind': 'static_obstacle', 'position': xy(box.location),
+            'velocity': [0., 0.], 'acceleration': [0., 0.], 'heading': -math.radians(box.rotation.yaw),
+            'length': 2.*ex, 'width': 2.*ey, 'height_m': max(p.z for p in vertices)-min(p.z for p in vertices),
+            'lane_id': lane_key(waypoint) if waypoint is not None else None, 'visible': True,
+            'radius': None, 'z': box.location.z, 'origin_z': box.location.z,
+            'environment_label': entry['label'], 'environment_ids': entry['source_ids'],
+            'state_sources': {'position': 'environment_bbox_world_center',
+                              'geometry': 'yaw_aligned_envelope_of_world_bbox_xy_projection',
+                              'velocity': 'fixed_map_mesh_zero', 'acceleration': 'fixed_map_mesh_zero'}}
+
+    def _visible_environment(self, ego, radius):
+        result = []
+        for entry in self.environment_objects:
+            box = entry['box']
+            if math.hypot(box.location.x-ego['position'][0], -box.location.y-ego['position'][1]) > radius + math.sqrt(box.extent.x**2+box.extent.y**2+box.extent.z**2):
+                continue
+            # 垂直区间重叠而非中心高度差，避免高护栏/立柱被错误排除。
+            vertices = box.get_world_vertices(self.carla.Transform())
+            if max(p.z for p in vertices) < ego['z']-ego['height_m']/2 or min(p.z for p in vertices) > ego['z']+ego['height_m']/2:
+                continue
+            if self._box_visible(box, self.carla.Transform()):
+                result.append(self._environment_actor(entry))
+        return result
+
+    def _map_payload(self):
+        points = self.map.generate_waypoints(float(self.cfg.get('map_resolution_m', 2.0)))
+        # 添加真实路段端点及导航采样，避免只用均匀采样造成道路端部人工缺口。
+        points.extend(self.route_wps)
+        for start, end in self.map.get_topology():
+            points.extend((start, end))
+        route_positions = [wp.transform.location for wp in self.route_wps]
+        low_x, high_x = min(p.x for p in route_positions) - 120, max(p.x for p in route_positions) + 120
+        low_y, high_y = min(p.y for p in route_positions) - 120, max(p.y for p in route_positions) + 120
+        base_z = self.ego.get_location().z
+        groups = {}
+        for wp in points:
+            p = wp.transform.location
+            if wp.lane_type != self.carla.LaneType.Driving or abs(p.z - base_z) > float(self.cfg.get('same_level_tolerance_m', 1.5)):
+                continue
+            if low_x <= p.x <= high_x and low_y <= p.y <= high_y:
+                groups.setdefault(lane_key(wp), []).append(wp)
+        lanes = []
+        for key, waypoints in sorted(groups.items()):
+            unique = {}
+            for waypoint in waypoints:
+                unique[round(waypoint.s, 6)] = waypoint
+            waypoints = list(unique.values())
+            waypoints.sort(key=lambda w: w.s, reverse=waypoints[0].lane_id > 0)
+            if len(waypoints) < 2:
+                continue
+            center, left, right, boundaries = [], [], [], []
+            for wp in waypoints:
+                p, yaw, width = wp.transform.location, math.radians(wp.transform.rotation.yaw), wp.lane_width
+                center.append(xy(p))
+                left.append([p.x + math.sin(yaw) * width / 2, -p.y + math.cos(yaw) * width / 2])
+                right.append([p.x - math.sin(yaw) * width / 2, -p.y - math.cos(yaw) * width / 2])
+            for side, coordinates in (('left', left), ('right', right)):
+                for i in range(len(waypoints) - 1):
+                    mark = getattr(waypoints[i], side + '_lane_marking')
+                    permission = waypoints[i].lane_change
+                    permitted = bool(int(permission) & int(self.carla.LaneChange.Left if side == 'left' else self.carla.LaneChange.Right))
+                    boundaries.append({'id': '{}:{}:{}'.format(key, side, i), 'points': coordinates[i:i + 2],
+                        'crossable': permitted, 'kind': 'lane_boundary', 'line_type': str(mark.type), 'permission_source': 'current_waypoint_lane_change'})
+            middle = waypoints[len(waypoints) // 2]
+            adjacent = {}
+            for side in ('left', 'right'):
+                other = getattr(middle, 'get_' + side + '_lane')()
+                same = other is not None and other.lane_type == self.carla.LaneType.Driving
+                if same:
+                    dyaw = math.radians(other.transform.rotation.yaw - middle.transform.rotation.yaw)
+                    same = math.cos(dyaw) > 0.5
+                adjacent[side] = lane_key(other) if same and lane_key(other) in groups else None
+            successors = sorted(set(lane_key(w) for w in waypoints[-1].next(float(self.cfg.get('map_resolution_m', 2.0)) * 2)
+                                    if lane_key(w) != key and lane_key(w) in groups))
+            lanes.append({'id': key, 'center': center, 'polygon': left + right[::-1],
+                'width': middle.lane_width, 'speed_limit': float(self.cfg.get('map_speed_cap_mps', 30)),
+                'successors': successors, 'left': adjacent['left'], 'right': adjacent['right'],
+                'priority': 0, 'boundaries': boundaries})
+        route_ids = []
+        for wp in self.route_wps:
+            key = lane_key(wp)
+            if not route_ids or key != route_ids[-1]:
+                route_ids.append(key)
+        return {'lanes': lanes, 'route': [xy(p) for p in route_positions], 'route_lane_ids': route_ids,
+                'identity': map_identity(self.map),
+                'source': 'CARLA_public_waypoints_same_level_local_map', 'priority_available': False,
+                'crosswalks': closed_crosswalks(self.map.get_crosswalks(), base_z, float(self.cfg.get('same_level_tolerance_m', 1.5))),
+                'lane_speed_source': 'configured_map_speed_cap_mps;current_ego_limit_from_CARLA'}
+
+    def snapshot(self):
+        snap = self.world.get_snapshot()
+        if snap.frame != self.frame:
+            raise RuntimeError('检测到其他客户端推进世界；拒绝使用状态与图像不同步的帧')
+        ego = self._actor(self.ego, True)
+        radius = float(self.cfg.get('perception_radius_m', 120.0))
+        actors = []
+        for actor in self.world.get_actors():
+            if actor.id == self.ego.id or not (actor.type_id.startswith('vehicle.') or actor.type_id.startswith('walker.pedestrian.') or actor in self.experiment.actors and actor.type_id.startswith('static.')):
+                continue
+            center = actor.get_transform().transform(actor.bounding_box.location)
+            if abs(center.z - ego['z']) > float(self.cfg.get('same_level_tolerance_m', 1.5)):
+                continue
+            if math.hypot(center.x - ego['position'][0], -center.y - ego['position'][1]) > radius:
+                continue
+            if self._visible(actor):
+                actors.append(self._actor(actor))
+        static_actors = self._visible_environment(ego, radius)
+        actors.extend(static_actors)
+        lights = []
+        for light in self.world.get_actors().filter('traffic.traffic_light*'):
+            locations = light.get_stop_waypoints()
+            affected = [{'lane_id': lane_key(wp), 'position': xy(wp.transform.location)} for wp in locations]
+            if affected:
+                lights.append({'id': 'traffic_light_{}'.format(light.id), 'state': str(light.get_state()).split('.')[-1].lower(), 'stops': affected})
+        actual = self.ego.get_control()
+        current_wp = self.map.get_waypoint(self.ego.get_transform().transform(self.ego.bounding_box.location),
+                                          project_to_road=False, lane_type=self.carla.LaneType.Driving)
+        road_evidence = None
+        if current_wp is not None:
+            road_evidence = {'lane_id': lane_key(current_wp)}
+            for side in ('left', 'right'):
+                other = getattr(current_wp, 'get_' + side + '_lane')()
+                exists = other is not None and other.lane_type == self.carla.LaneType.Driving
+                if exists:
+                    exists = math.cos(math.radians(other.transform.rotation.yaw-current_wp.transform.rotation.yaw)) > .5
+                road_evidence[side] = lane_key(other) if exists else None
+        cameras = self._camera_payload()
+        weather = self.world.get_weather()
+        weather_record = {name: float(getattr(weather, name)) for name in (
+            'cloudiness', 'precipitation', 'precipitation_deposits', 'wind_intensity',
+            'sun_azimuth_angle', 'sun_altitude_angle', 'fog_density', 'fog_distance',
+            'wetness', 'fog_falloff', 'scattering_intensity', 'mie_scattering_scale',
+            'rayleigh_scattering_scale', 'dust_storm') if hasattr(weather, name)}
+        if self.world.get_snapshot().frame != self.frame:
+            raise RuntimeError('读取场景期间世界被其他客户端推进；拒绝输出不同步场景')
+        return {'frame': self.frame, 'time': snap.timestamp.elapsed_seconds - self.t0,
+            'timestamp': snap.timestamp.elapsed_seconds, 'ego': ego, 'actors': actors,
+            'cameras': cameras, 'traffic_lights': lights,
+            'speed_limit_mps': self.ego.get_speed_limit() / 3.6,
+            'collision': self.collision, 'events': list(self.events) + list(self.experiment.events),
+            'actual_actuation': {'throttle': actual.throttle, 'brake': actual.brake, 'steer_normalized_right': actual.steer},
+            'current_road_evidence': road_evidence,
+            'environment_obstacles': dict(self.environment_audit, visible_count=len(static_actors)),
+            'weather': weather_record, 'weather_source': 'current_world_get_weather_no_override',
+            'source': 'current_camera_depth_visible_geometry_then_actor_state',
+            'scenario': self.experiment.name}
+
+    def step(self, control, plan):
+        if len(control) != 2 or not all(math.isfinite(float(v)) for v in control):
+            raise ValueError('控制必须是有限的加速度和转角')
+        acceleration, steering = map(float, control)
+        if not float(self.cfg.get('acceleration_min_mps2', -6)) <= acceleration <= float(self.cfg.get('acceleration_max_mps2', 3)) or abs(steering) > float(self.cfg.get('steering_abs_max_rad', 0.6)) + 1e-8:
+            raise ValueError('CARLA 控制超出规划物理边界')
+        velocity = self.ego.get_velocity()
+        speed = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
+        desired = max(0.0, speed + acceleration / self.planner_hz)
+        command = self.carla.VehicleAckermannControl(steer=-steering, speed=desired, acceleration=acceleration)
+        self.ego.apply_ackermann_control(command)
+        # 不向世界绘制预测线：debug 图元也会被 RGB 传感器拍摄，污染下一帧模型输入。
+        # 计划保留在主程序 BEV 诊断图中，真实相机资产始终不含预测叠加。
+        for _ in range(self.physics_hz // self.planner_hz):
+            elapsed = self.world.get_snapshot().timestamp.elapsed_seconds - self.t0
+            self.experiment.before_tick(elapsed, 1.0 / self.physics_hz)
+            self.frame = self.world.tick(self.timeout)
+        self._collect(self.frame)
+        result = self.snapshot()
+        result['command'] = {'acceleration_mps2': acceleration, 'steering_rad_left': steering,
+                             'speed_mps_ackermann': desired}
+        measured = math.hypot(*result['ego']['velocity'])
+        result['control_response'] = {'speed_error_mps': measured - desired,
+            'mean_acceleration_mps2': (measured - speed) * self.planner_hz,
+            'requested_acceleration_mps2': acceleration, 'executor': 'CARLA_builtin_Ackermann_PID'}
+        return result
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        errors = []
+        for sensor in reversed(self.sensors):
+            try:
+                sensor.stop()
+            except Exception as exc:
+                errors.append(str(exc))
+            try:
+                if sensor.destroy() is False:
+                    errors.append('sensor.destroy返回False')
+            except Exception as exc:
+                errors.append(str(exc))
+        if self.experiment is not None:
+            try:
+                self.experiment.close()
+                errors.extend(str(event) for event in getattr(self.experiment, 'events', [])
+                              if event.get('event') == 'cleanup_error')
+            except Exception as exc:
+                errors.append(str(exc))
+        if self.world is not None and self.saved_settings is not None:
+            try:
+                self.world.apply_settings(self.saved_settings)
+            except Exception as exc:
+                errors.append(str(exc))
+        if errors:
+            self.cleanup_errors = errors
+            raise RuntimeError('CARLA 资源收尾异常，请检查独立世界：' + '; '.join(errors))
+
+
+def main():
+    session = CarlaSession()
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(SystemExit(143)))
+    try:
+        for line in sys.stdin:
+            request = json.loads(line)
+            try:
+                method, params = request['method'], request.get('params', {})
+                if method == 'init':
+                    result = session.initialize(**params)
+                elif method == 'step':
+                    result = session.step(**params)
+                elif method == 'close':
+                    session.close()
+                    result = {'closed': True}
+                else:
+                    raise ValueError('未知桥接操作：' + str(method))
+                reply = {'id': request['id'], 'result': result}
+            except Exception as exc:
+                reply = {'id': request.get('id'), 'error': '{}: {}'.format(type(exc).__name__, exc)}
+            print(json.dumps(reply, ensure_ascii=False, allow_nan=False), flush=True)
+            if request.get('method') == 'close' or 'error' in reply:
+                break
+    finally:
+        try:
+            session.close()
+        except Exception as exc:
+            print(str(exc), file=sys.stderr, flush=True)
+        if session.cleanup_errors:
+            raise SystemExit(2)
+
+
+if __name__ == '__main__':
+    main()

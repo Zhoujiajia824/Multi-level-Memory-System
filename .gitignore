@@ -17,6 +17,10 @@
 !/config/parameters.json
 !/config/prompts.yaml
 !/config/scenarios.yaml
+!/config/carla.yaml
+!/config/carla_scenarios/
+/config/carla_scenarios/*
+!/config/carla_scenarios/*.yaml
 !/config/verified_dependencies.txt
 !/config/models.example.yaml
 /config/models.yaml
@@ -25,6 +29,7 @@
 /scripts/*
 !/scripts/check_environment.py
 !/scripts/run_highway.py
+!/scripts/run_carla.py
 !/scripts/memory_admin.py
 
 # 当前核心为单一Python包；新增包或资产需明确加入发布清单。

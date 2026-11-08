@@ -1,0 +1,35 @@
+# 慢车跟驰：修改前车距离和速度构造不同跟驰/超车难度。
+# 每份文件独立，不继承其他场景；复制本文件并修改name即可创建实验变体。
+# 地图名称不限Town05；必须在服务器已安装且有满足模板的同层近直非路口路段。
+schema_version: carla-scene-1.0
+name: slow_lead
+template: slow_lead
+map: Town05
+# 自车规则/MPC期望速度；与初始速度独立，单位m/s。
+desired_speed_mps: 10
+
+experiment:
+  # null表示按命令seed搜索地点；固定整数表示当前地图的生成点索引。
+  # 比较同地点的参数变体时，请先固定spawn_index，不要只固定seed。
+  spawn_index: null
+  route_length_m: 180
+  initial_speed_mps: 10
+  lead_speed_mps: 6
+  lead_distance_m: 35
+  ego_blueprint: vehicle.tesla.model3
+  lead_blueprint: vehicle.audi.a2
+
+  # 触发参数用于急刹、切入和遮挡行人；慢车/停放模板不使用触发器。
+  trigger_distance_m: 28
+  trigger_min_time_s: 0.5
+  # 仅hard_brake使用；(0,1]为CARLA制动输入。
+  hard_brake_amount: 1.0
+  # 仅cut_in使用：从自车left/right邻道切入自车道。
+  cut_in_side: left
+  lane_change_seconds: 4
+  # 以下仅occluded_pedestrian使用；不读取行人隐藏意图。
+  pedestrian_speed_mps: 1.4
+  pedestrian_longitudinal_offset_m: 6
+  occluder_lateral_fraction: 0.35
+  occluder_blueprint: vehicle.mercedes.sprinter
+  pedestrian_blueprint: null

@@ -105,6 +105,7 @@ def _validate_metadata(record):
             or not vector(actor.get('尺寸'),2) or any(x<=0 for x in actor['尺寸'])):
             raise ValueError('经验情境中的对象信息不完整或数值非法')
         identities.add(actor['id'])
+    visible_identities=identities.copy()
     if not isinstance(answer,dict) or set(answer)!={'attention','local_goal','explanation'}:
         raise ValueError('经验参考答案结构不完整')
     explanation=answer['explanation']
@@ -119,9 +120,10 @@ def _validate_metadata(record):
     for rank,item in enumerate(attention,1):
         if (not isinstance(item,dict) or set(item)!={'id','rank','reason'}
             or not isinstance(item['id'],str) or not item['id'].strip() or item['id'] in identities
+            or item['id'] not in visible_identities
             or type(item['rank']) is not int or item['rank']!=rank
             or not isinstance(item['reason'],str) or not item['reason'].strip()):
-            raise ValueError('经验关注项 ID、排序或依据非法')
+            raise ValueError('经验关注项 ID 不属于原帧可见对象，或排序、依据非法')
         identities.add(item['id'])
     if (not isinstance(goal,dict) or set(goal)!={'delta_s_m','d_m'}
         or not number(goal['delta_s_m']) or goal['delta_s_m']<=0 or not number(goal['d_m'])):
@@ -152,12 +154,23 @@ def _validate_metadata(record):
 
 class MemoryStore:
     """snapshot 返回已载入的独立副本；之后 write 不会改变本轮可检索集合。"""
-    def __init__(self, read_dir, write_dir=None):
+    def __init__(self, read_dir, write_dir=None, *, allow_test_features=False):
+        if type(allow_test_features) is not bool:
+            raise ValueError('测试特征许可必须为布尔值；正式入口不得启用')
+        self.allow_test_features=allow_test_features
         self.read_dir = filesystem_path(read_dir) if read_dir is not None else None
         self.write_dir = filesystem_path(write_dir) if write_dir is not None else None
+        from .offline_memory import ensure_writable_online
+        ensure_writable_online(self.write_dir)
         self.snapshot_id = ""
         self.audit = []
         self._lock = threading.RLock()
+
+    def _check_dino_identity(self, signature):
+        if not valid_dino_signature(signature):
+            raise ValueError('经验缺少有效的 DINO 权重身份')
+        if signature.startswith('test:') and not self.allow_test_features:
+            raise ValueError('正式记忆库拒绝测试替身 DINO 特征；仅隔离测试可显式许可')
 
     def _invalidated(self, root):
         invalid = set()
@@ -181,6 +194,18 @@ class MemoryStore:
             if self.read_dir is None or not self.read_dir.exists():
                 return []
             invalid = self._invalidated(self.read_dir)
+            from .offline_memory import is_offline_library, read_snapshot
+            if is_offline_library(self.read_dir):
+                try:
+                    result,self.audit=read_snapshot(self.read_dir,self._check_dino_identity,
+                        allow_test_features=self.allow_test_features,invalidated=invalid)
+                except (ValueError,KeyError,TypeError,OSError) as exc:
+                    self.audit=[{'path':str(self.read_dir/'manifest.json'),'reason':str(exc)}]
+                    return []
+                evidence=[{'id':r['id'],'revision':r['revision'],'checksums':r['checksums'],
+                           'metadata_sha256':r['_metadata_sha256']} for r in result]
+                self.snapshot_id=hashlib.sha256(json.dumps(evidence,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode('utf-8')).hexdigest()
+                return result
             result = []
             records_root=self.read_dir/'records'
             if records_root.exists() and not records_root.is_dir():
@@ -223,8 +248,7 @@ class MemoryStore:
         if record.get("status") != "active":
             raise ValueError("经验未处于有效状态")
         _validate_metadata(record)
-        if not valid_dino_signature(record.get('dino_signature')):
-            raise ValueError('经验缺少有效的 DINO 权重身份')
+        self._check_dino_identity(record.get('dino_signature'))
         base = filesystem_path(path.parent)
         for name,expected in record.get("checksums",{}).items():
             asset = filesystem_path(base/name)
@@ -261,6 +285,8 @@ class MemoryStore:
     def write(self, record: ExperienceRecord | dict, reps: Representations):
         if self.write_dir is None:
             raise RuntimeError("记忆写入已关闭：未配置写入目录")
+        from .offline_memory import ensure_writable_online
+        ensure_writable_online(self.write_dir)
         payload = plain(record)
         payload = {k:v for k,v in payload.items() if not k.startswith("_")}
         if payload.get("version") != VERSION or reps.version != VERSION or payload.get("frame_id") != reps.frame_id:
@@ -275,8 +301,7 @@ class MemoryStore:
             raise ValueError("无有效 DINOv2 特征，拒绝生成可检索经验")
         if np.linalg.norm(reps.bev_feature) < 1e-8:
             raise ValueError("零向量不是有效 DINOv2 特征")
-        if not valid_dino_signature(reps.dino_signature):
-            raise ValueError('没有有效 DINO 权重身份，拒绝生成可检索经验')
+        self._check_dino_identity(reps.dino_signature)
         if reps.occ.shape != (6,50,25) or reps.occ_known.shape != reps.occ.shape:
             raise ValueError("占据及已知掩码尺寸不匹配")
         if not all(np.all(np.isfinite(x)) and np.all((x>=0)&(x<=1)) for x in (reps.occ,reps.occ_known)):
@@ -365,6 +390,8 @@ class MemoryStore:
         """仅供已确认错误的经验停用；事故关联本身不调用此方法。"""
         if self.write_dir is None:
             raise RuntimeError("未配置可写记忆库")
+        from .offline_memory import ensure_writable_online
+        ensure_writable_online(self.write_dir)
         if not reason.strip():
             raise ValueError("停用经验必须填写原因")
         self.write_dir.mkdir(parents=True,exist_ok=True)

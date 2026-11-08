@@ -138,6 +138,46 @@ def attention_ids(scene):
     return {a.id for a in scene.actors if a.visible}
 
 
+def _camera_entries(scene):
+    """平台只提供与当前冻结帧对齐的图像；不在核心层猜测最近相机帧。"""
+    entries=scene.assets.get('camera_images',[])
+    if not isinstance(entries,list):
+        raise ValueError('camera_images 必须为当前帧图像列表')
+    seen=set()
+    for item in entries:
+        if (not isinstance(item,dict) or not {'view','path','frame_id','time'}.issubset(item)
+            or not isinstance(item['view'],str) or not item['view'].strip()
+            or item['view'] in seen or not isinstance(item['path'],str) or not item['path'].strip()):
+            raise ValueError('相机图像视角、路径或对齐字段缺失/重复')
+        stamp=item['time']
+        if (item['frame_id']!=scene.frame_id or type(stamp) not in (int,float)
+            or not math.isfinite(stamp) or not math.isclose(stamp,scene.time,rel_tol=0.,abs_tol=1e-6)):
+            raise ValueError('相机图像不属于当前冻结帧，禁止使用错帧或过期图像')
+        seen.add(item['view'])
+    return entries
+
+
+def model_image_paths(scene,reps):
+    """快模型与原帧反思共用同一顺序：已命名相机视图在前，当前BEV在后。"""
+    if reps.frame_id!=scene.frame_id or reps.time!=scene.time:
+        raise ValueError('BEV表示与模型原帧身份或时间不一致')
+    paths=[item['path'] for item in _camera_entries(scene)]+[reps.bev_path]
+    for path in paths:
+        if not isinstance(path,str) or not Path(path).is_file():
+            raise ValueError('模型当前帧图像缺失；不能静默丢弃相机或BEV')
+    return paths
+
+
+def _unique_answer_object(pairs):
+    """重复JSON键会产生多个目标解释，整份回答拒收，不采用最后一个值。"""
+    result={}
+    for key,value in pairs:
+        if key in result:
+            raise ValueError('模型回答含重复JSON字段')
+        result[key]=value
+    return result
+
+
 def _goal_reference(scene,config=None):
     """一个原帧只建立一份目标参考，提示词、解析和反思共同使用。"""
     reference=scene.diagnostics.get('goal_reference')
@@ -159,7 +199,7 @@ def parse_answer(raw,scene,source='fast',max_characters=6000,reference=None,conf
             raise ValueError('回答不是单个有效 JSON')
         serialized=wrapped.group(1)
     try:
-        data=json.loads(serialized)
+        data=json.loads(serialized,object_pairs_hook=_unique_answer_object)
     except (ValueError,TypeError):
         raise ValueError('回答不是单个有效 JSON') from None
     if not isinstance(data,dict) or set(data)!= {'attention','local_goal','explanation'}:
@@ -266,6 +306,9 @@ def scene_text(scene,representations):
     data={'自车':_current_actor(scene.ego),'八向图':context,'其他可见对象':others,
         '规划参考':goal_reference_context(scene,_goal_reference(scene)),
         '图像解释':'自车固定朝上，横纵轴为米。非行驶区白色，道路为NAVSIM浅灰，人行横道为30%透明紫色；车道边界线和分割线不绘制，细深灰短虚线表示虚拟车道中心线及连接参考路径，不得将其视作交通标线。模型图的绿色虚线是本次固定Frenet参考，s+距离标签表示从原帧自车投影开始的道路弧长，不等于BEV前向x距离；这些参考标签不进入DINO特征图。颜色不是风险或关注度。自车红色、其他车辆蓝色、自行车橙色、行人紫色、静态障碍黄色；图中历史轨迹保持类别色相和高亮度，速度越高饱和度越高，固定范围0至120km/h。历史只含已观测样本。未被八向图选中的可见对象列于其他可见对象，同样可以被关注。'}
+    cameras=_camera_entries(scene)
+    if cameras:
+        data['图像解释']+=' 当前输入图像依次为：'+ '、'.join(item['view'] for item in cameras)+'、当前BEV。相机图像与上述状态属于同一冻结帧；摄像头视角不能按BEV坐标直接读数。'
     return json.dumps(plain(data),ensure_ascii=False,allow_nan=False)
 
 
@@ -315,8 +358,13 @@ def build_prompt(scene,reps,retrieval=None,reflection=None):
         origins={score['id']:score.get('matched_channels',[]) for score in retrieval.scores}
         channel_labels={'bev':'BEV视觉布局','occupancy':'OCC面积占据','grid':'车道八向交互'}
         for record in retrieval.records:
-            example={'历史情境':_historical_situation(record.get('situation',{})),'历史参考答案':record.get('answer',{}),
-                     '坐标警告':'历史local_goal仅是历史参考中的示例；须依据当前规划参考独立生成单个目标，不可复制历史坐标'}
+            if record.get('record_origin')=='offline_retrospective':
+                example={'经验来源':'离线回顾经验，已人工审核；模型整理内容不是因果或最优驾驶真值',
+                         '完整历史经验':record['offline_text'],
+                         '使用边界':'其中后续过程是历史片段实际记录，不是当前已知事实或当前未来。不得将历史对象描述作为当前ID，也不得复制历史坐标；须依据当前场景独立生成关注列表和单个合法局部目标。'}
+            else:
+                example={'历史情境':_historical_situation(record.get('situation',{})),'历史参考答案':record.get('answer',{}),
+                         '坐标警告':'历史local_goal仅是历史参考中的示例；须依据当前规划参考独立生成单个目标，不可复制历史坐标'}
             channels=origins.get(record.get('id'),[])
             if channels:
                 example['检索来源通道']=[channel_labels[c] for c in channels if c in channel_labels]

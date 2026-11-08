@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import math
 import numpy as np
 from scipy.interpolate import CubicHermiteSpline
@@ -46,6 +47,19 @@ class _ContinuousRewards:
 
 class HighwayAdapter:
     def __init__(self, config: dict, seed: int, episode_id: str, live=False):
+        self.env = None
+        self._video_recorder = None
+        self._traffic_class_name = None
+        try:
+            self._initialize(config, seed, episode_id, live)
+        except BaseException:
+            try:
+                self.close()
+            except Exception:
+                logging.getLogger(__name__).exception('初始化失败后的仿真清理异常；保留原初始化错误')
+            raise
+
+    def _initialize(self, config: dict, seed: int, episode_id: str, live=False):
         from highway_env.envs.highway_env import HighwayEnv
         from highway_env.envs.merge_env import ConnectedLaneMergeEnv
         from highway_env.envs.roundabout_env import ConnectedLaneRoundaboutEnv
@@ -107,7 +121,6 @@ class HighwayAdapter:
         ego.MIN_SPEED, ego.MAX_SPEED = 0., mpc.get("maximum_speed_mps",33.3333333)
         others = [v for v in self.env.road.vehicles if v is not ego]
         if self.scenario in ("merge","roundabout") and count>len(others):
-            self.env.close();globals().pop(self._traffic_class_name,None)
             raise ValueError(f"{self.scenario} 原生模板最多支持 {len(others)} 辆初始交通车辆，收到 {count}；不会静默减少数量")
         # 固定车辆场景的原生构造不服从 vehicles_count；明确裁剪而非假空场。
         self.env.road.vehicles = [ego] + others[:count]
@@ -555,6 +568,18 @@ class HighwayAdapter:
         return self._video_recorder
 
     def close(self):
-        if self._video_recorder is not None:self._video_recorder.close()
-        self.env.close()
-        globals().pop(self._traffic_class_name,None)
+        try:
+            if self._video_recorder is not None:
+                recorder = self._video_recorder
+                self._video_recorder = None
+                recorder.close()
+        finally:
+            try:
+                if self.env is not None:
+                    environment = self.env
+                    self.env = None
+                    environment.close()
+            finally:
+                if self._traffic_class_name:
+                    globals().pop(self._traffic_class_name, None)
+                    self._traffic_class_name = None

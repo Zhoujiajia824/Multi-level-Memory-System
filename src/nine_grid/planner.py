@@ -9,19 +9,21 @@ from shapely.geometry import LineString
 from .contracts import PlanResult
 from .local_reference import LocalReferenceManager, LocalReferenceResult
 from .goals import GoalManager, goal_seed_path, first_arrival_residual
-from .realtime_solver import Dynamics, QuadraticSolver, rectangle_gap, circle_gap, rectangle_distance
+from .realtime_solver import Dynamics, QuadraticSolver, rectangle_gap, circle_gap, rectangle_distance, bicycle_geometry
 from .geometry import (clean_polyline, ego_to_world, world_to_ego,
                        rectangle_corners, polyline_lengths, project_polyline, sample_polyline, wrap_angle)
 
 
-def propagate(state, control, length=5., dt=.1, substeps=5):
-    """与 highway Vehicle.step 同序的显式 Euler，含质心侧偏角。"""
+def propagate(state, control, length=5., dt=.1, substeps=5,
+              wheelbase_m=None,rear_axle_to_center_m=None):
+    """几何中心自行车模型显式Euler；未提供轴距时保持highway原公式。"""
     state=np.asarray(state,float).copy();a,delta=np.asarray(control,float)
-    beta=np.arctan(.5*np.tan(delta));step=dt/substeps
+    wheelbase,rear=bicycle_geometry(length,wheelbase_m,rear_axle_to_center_m)
+    beta=np.arctan(rear/wheelbase*np.tan(delta));step=dt/substeps
     for _ in range(substeps):
         x,y,psi,v=state
         state=np.array([x+v*np.cos(psi+beta)*step,y+v*np.sin(psi+beta)*step,
-                        psi+2*v/length*np.sin(beta)*step,v+a*step])
+                        psi+v/rear*np.sin(beta)*step,v+a*step])
     return state
 
 
@@ -82,6 +84,37 @@ def _project_executable_controls(controls,speed,dt,min_a,max_a,max_delta):
     return result
 
 
+def _validate_prediction_input(scene, predictions, horizon):
+    """拒绝错帧、漏对象和不足时域；不得把接口错误当作空交通或静止尾段。"""
+    if (predictions.frame_id != scene.frame_id or predictions.version != scene.version
+            or predictions.coordinates != 'world_xy_m' or scene.coordinates != 'world_xy_m'
+            or not np.isclose(predictions.time, scene.time, rtol=0., atol=1e-8)):
+        raise ValueError('规划预测输入的原帧、时间、版本或世界坐标不一致')
+    visible = [actor for actor in scene.actors if actor.visible]
+    expected = {actor.id for actor in visible}
+    if len(expected) != len(visible) or set(predictions.actors) != expected or set(predictions.trajectories) != expected:
+        raise ValueError('规划预测对象集合必须完整对应当前可见对象，不能遗漏或引入不可见对象')
+    times = np.asarray(predictions.times, float)
+    if (times.ndim != 1 or len(times) < 2 or not np.isfinite(times).all()
+            or abs(times[0]) > 1e-8 or np.any(np.diff(times) <= 0)):
+        raise ValueError('规划预测时刻必须从零开始、严格递增且数值有限')
+    if expected and times[-1] < horizon-1e-8:
+        raise ValueError('对象预测未覆盖MPC完整时域，不允许静默重复末端位置')
+    for actor in visible:
+        predicted = predictions.actors[actor.id]
+        if (predicted.id != actor.id or not predicted.visible or predicted.kind != actor.kind
+                or predicted.length != actor.length or predicted.width != actor.width
+                or predicted.radius != actor.radius
+                or not np.allclose(predicted.position, actor.position, rtol=0., atol=1e-8)
+                or not np.allclose(predicted.velocity, actor.velocity, rtol=0., atol=1e-8)
+                or abs(float(wrap_angle(predicted.heading-actor.heading))) > 1e-8):
+            raise ValueError(f'对象 {actor.id} 的预测实体描述与当前观测不一致')
+        trajectory = np.asarray(predictions.trajectories[actor.id], float)
+        if (trajectory.shape != (len(times), 4) or not np.isfinite(trajectory).all()
+                or np.any(trajectory[:, 3] < -1e-8)):
+            raise ValueError(f'对象 {actor.id} 的预测维度或运动数值非法')
+
+
 class Planner:
     def __init__(self,config:dict):
         self.config=config
@@ -120,7 +153,7 @@ class Planner:
         rules=self.config.get("rules",{})
         stop_margin=float(rules.get("stop_margin_m",1.))
         self.rule_evidence=[]
-        if scene.scenario=="intersection" and ego_lane and scene.rules.get("road_priority_available"):
+        if ego_lane and scene.rules.get("road_priority_available"):
             route=scene.route;route_shape=LineString(route)
             for identity,actor in predictions.actors.items():
                 other_lane=lanes.get(actor.lane_id)
@@ -196,14 +229,18 @@ class Planner:
 
     def solve(self,scene,predictions,answer=None):
         started=time.perf_counter();p=self.p;n=self.n;dt=self.dt
+        _validate_prediction_input(scene,predictions,n*dt)
+        wheelbase,rear=bicycle_geometry(scene.ego.length,scene.ego.wheelbase_m,scene.ego.rear_axle_to_center_m)
+        axle_ratio=rear/wheelbase
         cold_start=not getattr(self,'_has_solved',False);self._has_solved=True
         tolerance=float(p.get("body_constraint_tolerance_m",.001))
         braking=float(self.config.get("rules",{}).get("comfort_braking_mps2",3.))
         origin=scene.ego.position.copy();angle=scene.ego.heading
         speed=float(np.linalg.norm(scene.ego.velocity));initial=np.array([0.,0.,0.,speed])
         build_seconds=0.
-        if not hasattr(self,'dynamics') or self.dynamics_length!=scene.ego.length:
-            self.dynamics=Dynamics(n,dt,self.substeps,scene.ego.length);self.dynamics_length=scene.ego.length
+        dynamics_key=(n,dt,self.substeps,wheelbase,rear)
+        if not hasattr(self,'dynamics') or self.dynamics_key!=dynamics_key:
+            self.dynamics=Dynamics(n,dt,self.substeps,scene.ego.length,wheelbase,rear);self.dynamics_key=dynamics_key
             self.qp=QuadraticSolver(2*n,int(p.get('qp_max_iterations',600)),float(p.get('qp_tolerance',1e-6)))
             build_seconds=self.dynamics.build_seconds
         ego_s=project_polyline(origin,scene.route,scene.diagnostics.get("route_s"),angle)[0]
@@ -313,17 +350,17 @@ class Planner:
             controls=[];state=initial.copy();last=previous_control.copy()
             for _ in range(n):
                 s,d,_=project_polyline(state[:2],seed_reference);kappa=float(np.interp(s,seed_arc,seed_curvature))
-                feed=np.arctan(scene.ego.length*kappa/np.sqrt(max(.01,1-(scene.ego.length*kappa/2)**2)))
-                heading=float(np.interp(s,seed_arc,seed_tangents))-np.arctan(.5*np.tan(feed))
+                feed=np.arctan(wheelbase*kappa/np.sqrt(max(.01,1-(rear*kappa)**2)))
+                heading=float(np.interp(s,seed_arc,seed_tangents))-np.arctan(axle_ratio*np.tan(feed))
                 steer=feed+1.2*float(wrap_angle(heading-state[2]))-.3*np.arctan(d/max(state[3],2.))
                 navigation_s=s if active_goal is None else project_polyline(state[:2],reference)[0]
-                desired=min(max_speed,float(scene.rules.get('desired_speed',25.))*scale,np.sqrt(max_lat*scene.ego.length/max(2*abs(np.sin(np.arctan(.5*np.tan(steer)))),.001))*.9,float(np.interp(navigation_s,reference_arc,speed_profile)))
+                desired=min(max_speed,float(scene.rules.get('desired_speed',25.))*scale,np.sqrt(max_lat*2*rear/max(2*abs(np.sin(np.arctan(axle_ratio*np.tan(steer)))),.001))*.9,float(np.interp(navigation_s,reference_arc,speed_profile)))
                 if stop_local is not None:
                     global_s=project_polyline(state[:2],global_reference)[0]
                     desired=min(desired,np.sqrt(max(0.,2*braking*(stop_local-global_s-scene.ego.length/2))))
                 control=np.clip([np.clip((desired-state[3])*1.2,last[0]-max_jerk*dt,last[0]+max_jerk*dt),np.clip(steer,last[1]-max_rate*dt,last[1]+max_rate*dt)],[min_a,-max_delta],[max_a,max_delta])
                 control[0]=max(control[0],-max(0.,state[3])/dt)
-                controls.append(control);state=propagate(state,control,scene.ego.length,dt,self.substeps);last=control
+                controls.append(control);state=propagate(state,control,scene.ego.length,dt,self.substeps,wheelbase,rear);last=control
             return np.asarray(controls)
         age=None if self.previous_time is None else scene.time-self.previous_time
         reference_changed=self.previous_reference_revision is not None and self.previous_reference_revision!=selection.revision
@@ -400,10 +437,10 @@ class Planner:
                 signed=-depth if depth>1e-10 else -np.sqrt(areas[local_index])
                 extra_road_minimum=min(extra_road_minimum,signed)
             delta=difference@controls;delta[0]-=previous_control
-            beta=np.arctan(.5*np.tan(controls[:,1]));bp=.5/(np.cos(controls[:,1])**2*(1+.25*np.tan(controls[:,1])**2))
-            lateral=states[:-1,3]**2*2/scene.ego.length*np.sin(beta)
-            lateral_factor=states[:-1,3,None]*4/scene.ego.length*np.sin(beta[:,None])
-            lateral_direct=states[:-1,3,None]**2*2/scene.ego.length*np.cos(beta[:,None])*bp[:,None]*steer_selector
+            beta=np.arctan(axle_ratio*np.tan(controls[:,1]));bp=axle_ratio/(np.cos(controls[:,1])**2*(1+axle_ratio**2*np.tan(controls[:,1])**2))
+            lateral=states[:-1,3]**2/rear*np.sin(beta)
+            lateral_factor=states[:-1,3,None]*2/rear*np.sin(beta[:,None])
+            lateral_direct=states[:-1,3,None]**2/rear*np.cos(beta[:,None])*bp[:,None]*steer_selector
             lateral_jac=lambda c:lateral_factor*c['all'][:-1,3]+lateral_direct
             minima=[min(float(road_distance.min()),extra_road_minimum),float(current[:,3].min()),float((max_speed-current[:,3]).min()),float((max_jerk*dt-np.abs(delta[:,0])).min()),float((max_rate*dt-np.abs(delta[:,1])).min()),float((max_lat-np.abs(lateral)).min())]
             evaluations['geometry_seconds']+=time.perf_counter()-geometry_started
@@ -690,6 +727,8 @@ class Planner:
                 termination='small_qp_step';break
         elapsed=time.perf_counter()-started
         diagnostics={'solver_seconds':time.perf_counter()-solver_started,'planning_seconds':elapsed,'solver_status':statuses,
+            'vehicle_dynamics':{'reference_point':'geometric_center','wheelbase_m':wheelbase,
+                'rear_axle_to_center_m':rear,'geometry_source':'platform' if scene.ego.wheelbase_m is not None else 'highway_legacy'},
             'solver_backend':'casadi_osqp_realtime_sqp','symbolic_build_seconds':build_seconds,'qp_seconds':qp_seconds,'sqp_iterations':iterations,
             'optimizer_termination':termination,'iteration_history':iteration_history,
             'warm_start_recovery':recovery,

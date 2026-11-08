@@ -4,6 +4,7 @@ import numpy as np
 from shapely import prepare
 from .contracts import QualityReport
 from .geometry import actor_shape, project_polyline, signed_body_distance,rectangle_corners
+from .realtime_solver import bicycle_geometry
 
 
 def _route_projection(scene,states):
@@ -48,6 +49,8 @@ def evaluate(scene, plan, baseline, predictions, config=None):
     rule_config=(config or {}).get('rules',{})
     tolerance=(config or {}).get('mpc',{}).get('body_constraint_tolerance_m',.001)
     metrics, reasons = {}, []
+    wheelbase,rear=bicycle_geometry(scene.ego.length,scene.ego.wheelbase_m,scene.ego.rear_axle_to_center_m)
+    axle_ratio=rear/wheelbase
     if not plan.valid or len(plan.states) < 3:
         return QualityReport(scene.frame_id, False, None, metrics, False, False, ['当前规划无有效解'],time=scene.time)
     def invalid(reason):
@@ -118,7 +121,7 @@ def evaluate(scene, plan, baseline, predictions, config=None):
             if states[k,3] < cfg.get('stopped_speed_mps',.005):
                 continue
             steering=plan.controls[min(k,len(plan.controls)-1),1]
-            chi=states[k,2]+np.arctan(.5*np.tan(steering))
+            chi=states[k,2]+np.arctan(axle_ratio*np.tan(steering))
             for tau in cfg.get('ttc_offsets_s',[0,.3,.6,.9]):
                 p=states[k,:2]+tau*states[k,3]*np.array([np.cos(chi),np.sin(chi)])
                 ego=actor_shape(scene.ego,p,states[k,2])
@@ -126,7 +129,7 @@ def evaluate(scene, plan, baseline, predictions, config=None):
                     if intersects(p,states[k,2],ego,actor_id,t+tau):
                         ttc_ok=False
     steering=np.r_[plan.controls[:,1],plan.controls[-1,1]] if len(plan.controls)==len(states)-1 else np.zeros(len(states))
-    beta=np.arctan(.5*np.tan(steering))
+    beta=np.arctan(axle_ratio*np.tan(steering))
     velocity=states[:,3,None]*np.column_stack([np.cos(states[:,2]+beta),np.sin(states[:,2]+beta)])
     acceleration=np.gradient(velocity,dt,axis=0)
     acc=acceleration[:,0]*np.cos(states[:,2])+acceleration[:,1]*np.sin(states[:,2])
@@ -200,7 +203,8 @@ def execution_audit(scene,plan,predictions,config=None):
     intersects=_collision_checker(scene.ego,predictions)
     for i in range(1,substeps+1):
         t=dt*i/substeps
-        state=propagate(state,plan.controls[0],scene.ego.length,dt/substeps,1)
+        state=propagate(state,plan.controls[0],scene.ego.length,dt/substeps,1,
+                        scene.ego.wheelbase_m,scene.ego.rear_axle_to_center_m)
         ego_shape=actor_shape(scene.ego,state[:2],state[2])
         offroad|=not accepted_road.covers(ego_shape)
         for identity in predictions.trajectories:

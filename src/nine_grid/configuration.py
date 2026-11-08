@@ -417,5 +417,9 @@ def validate_config(config):
         if name not in env_ids:raise ValueError(f'未实现的 highway 场景：{name}')
         validate_scenario_settings(settings,name)
         if 'env_id' in settings and settings['env_id']!=env_ids[name]:raise ValueError(f'{name} 的环境实现固定为 {env_ids[name]}')
-    highway_settings(result,result.get('scenario','highway'))
+    platform = result.get('platform', 'highway')
+    if platform not in ('highway', 'carla'):
+        raise ValueError('platform仅支持highway或carla')
+    if platform == 'highway':
+        highway_settings(result,result.get('scenario','highway'))
     return result

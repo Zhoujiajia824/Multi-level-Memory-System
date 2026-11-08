@@ -26,6 +26,7 @@ def _digest(value):
 
 def build_goal_reference(scene, config=None, request_version=0):
     """冻结已确认自车导航中心线。与九宫格参考分开命名，不改变检索语义。"""
+    from .local_reference import LocalReferenceManager
     parameters = {**DEFAULTS, **(config or {}).get('local_goal', {})}
     reference = clean_polyline(scene.route).copy()
     if len(reference) < 2 or not np.isfinite(reference).all():
@@ -72,8 +73,10 @@ def build_goal_reference(scene, config=None, request_version=0):
         'reported_lane_id':reported_lane,'lane_confirmation':confirmation,
         'source_pose': [*scene.ego.position.tolist(), float(scene.ego.heading)],
         'vehicle_constraints': {'steering_abs_max_rad':float((config or {}).get('mpc',{}).get('steering_abs_max_rad',.6)),
-            'length_m':float(scene.ego.length),'width_m':float(scene.ego.width)},
+            'length_m':float(scene.ego.length),'width_m':float(scene.ego.width),
+            'wheelbase_m':scene.ego.wheelbase_m,'rear_axle_to_center_m':scene.ego.rear_axle_to_center_m},
         'limits': parameters, 'route_lane_ids': list(scene.route_lane_ids),
+        'local_reference_parameters': deepcopy(LocalReferenceManager(config or {}).p),
         'definition': '已确认行驶车道中心线，沿已知自车导航连续延伸；s沿道路向前，d左正右负，米'}
 
 
@@ -90,7 +93,9 @@ def _candidate_lanes(scene, reference):
     source, lanes = _source_lane(scene, reference)
     if source is None:
         return []
-    manager = LocalReferenceManager({})
+    if 'local_reference_parameters' not in reference:
+        raise ValueError('原帧目标参考缺少局部参考参数，不能用当前默认值重解释历史目标')
+    manager = LocalReferenceManager({'local_reference': reference['local_reference_parameters']})
     result = [(source, None)]
     for key in (source.left, source.right):
         if key in lanes:
@@ -184,7 +189,7 @@ def validate_local_goal(scene, reference, value):
     candidates = _candidate_lanes(scene, reference)
     target = None
     from .local_reference import LocalReferenceManager
-    manager = LocalReferenceManager({})
+    manager = LocalReferenceManager({'local_reference': reference['local_reference_parameters']})
     _, lanes = _source_lane(scene, reference)
     best = float('inf')
     for lane, reason in candidates:
@@ -216,7 +221,11 @@ def validate_local_goal(scene, reference, value):
     if len(headings)>1:
         curvature=np.abs(np.diff(headings))/np.maximum((lengths[:-1]+lengths[1:])/2,1e-9)
         # 仅排除方向盘极限下也无法通过的几何弯曲；不指定通过速度或到达时间。
-        maximum=2*np.sin(np.arctan(.5*np.tan(reference['vehicle_constraints']['steering_abs_max_rad'])))/scene.ego.length
+        from .realtime_solver import bicycle_geometry
+        constraints=reference['vehicle_constraints']
+        wheelbase,rear=bicycle_geometry(constraints['length_m'],constraints.get('wheelbase_m'),
+                                       constraints.get('rear_axle_to_center_m'))
+        maximum=np.sin(np.arctan(rear/wheelbase*np.tan(constraints['steering_abs_max_rad'])))/rear
         if np.any(curvature>maximum+1e-6):
             raise ValueError('目标连接曲率超过车辆转弯几何能力')
     payload['goal_id'] = _digest({'frame_id': scene.frame_id, 'source_time': scene.time,

@@ -6,20 +6,34 @@ import numpy as np
 import casadi as ca
 
 
+def bicycle_geometry(length, wheelbase_m=None, rear_axle_to_center_m=None):
+    """返回轴距和后轴至几何中心距离；缺省严格保留highway等轴臂模型。"""
+    if wheelbase_m is None and rear_axle_to_center_m is None:
+        wheelbase_m, rear_axle_to_center_m = length, length/2
+    if wheelbase_m is None or rear_axle_to_center_m is None:
+        raise ValueError('车辆轴距和后轴至几何中心距离必须同时提供')
+    wheelbase, rear = float(wheelbase_m), float(rear_axle_to_center_m)
+    if not np.isfinite([wheelbase,rear]).all() or not 0. < rear < wheelbase:
+        raise ValueError('车辆几何要求有限正轴距且几何中心位于前后轴之间')
+    return wheelbase, rear
+
+
 class Dynamics:
     """一次构建符号链；每次同时返回原动力学轨迹和精确控制敏感度。"""
-    def __init__(self,n,dt,substeps,length):
+    def __init__(self,n,dt,substeps,length,wheelbase_m=None,rear_axle_to_center_m=None):
         begin=time.perf_counter()
+        wheelbase,rear=bicycle_geometry(length,wheelbase_m,rear_axle_to_center_m)
+        ratio=rear/wheelbase
         u=ca.SX.sym('u',2*n);initial=ca.SX.sym('initial',4)
         state=initial;columns=[state]
         for k in range(n):
             acceleration,steering=u[2*k],u[2*k+1]
-            beta=ca.atan(.5*ca.tan(steering));step=dt/substeps
+            beta=ca.atan(ratio*ca.tan(steering));step=dt/substeps
             for _ in range(substeps):
                 x,y,heading,speed=ca.vertsplit(state)
                 state=ca.vertcat(x+speed*ca.cos(heading+beta)*step,
                     y+speed*ca.sin(heading+beta)*step,
-                    heading+2*speed/length*ca.sin(beta)*step,speed+acceleration*step)
+                    heading+speed/rear*ca.sin(beta)*step,speed+acceleration*step)
             columns.append(state)
         states=ca.horzcat(*columns)
         sensitivity=ca.jacobian(ca.vec(states),u)

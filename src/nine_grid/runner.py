@@ -13,7 +13,7 @@ from .contracts import ANSWER_PROTOCOL_VERSION, ReflectionTask, RetrievalResult,
 from .goals import build_goal_reference
 from .highway import HighwayAdapter
 from .memory import MemoryStore
-from .models import VisionClient, CommunicationFailure, parse_answer, build_prompt, local_line
+from .models import VisionClient, CommunicationFailure, parse_answer, build_prompt, local_line, model_image_paths
 from .planner import Planner
 from .prediction import Predictor
 from .quality import evaluate, admissible, reflection_reasons, execution_audit
@@ -49,12 +49,14 @@ def capture_payload(scene):
         ego=plain(scene.ego),actors=plain(scene.actors),lanes=lanes,route=plain(scene.route),
         route_lane_ids=scene.route_lane_ids,drivable_wkt=scene.drivable.intersection(region).wkt,
         scenario=scene.scenario,rules=plain(scene.rules),diagnostics=plain(scene.diagnostics),
+        sensor_assets=plain({key:value for key,value in scene.assets.items() if key in (
+            'camera_images','camera_manifest_json','original_camera_images','depth_images','current_state_json')}),
         global_map_asset=scene.assets.get('global_map_json'),map_crop='局部显示为自车中心前后左右各150米；完整地图另存为不可变资产')
 
 
 def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=None,memory_write_dir=None,
                 retrieve_enabled=False,write_enabled=False,memory_mode='collect',seed=1,live=False,video=False,
-                fast_client=None,reflection_client=None,extractor=None):
+                fast_client=None,reflection_client=None,extractor=None,adapter_factory=None):
     fast=fast_client if fast_client is not None else VisionClient('fast',model_settings['fast'])
     reflection=reflection_client if reflection_client is not None else VisionClient('reflection',model_settings['reflection'])
     # 本地模型导入/配置先于图像解码，且绝不以随机特征替代真实权重。
@@ -66,15 +68,20 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
     file_handler=logging.FileHandler(writer.path/'run.log',encoding='utf-8')
     file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s'))
     logging.getLogger().addHandler(file_handler)
-    writer.save('configuration.json',dict(parameters=config,
-        models={role:getattr(client,'settings',model_settings[role])
-                for role,client in (('fast',fast),('reflection',reflection))},seed=seed,
-        effective_parameters_sha256=hashlib.sha256(json.dumps(plain(config),ensure_ascii=False,sort_keys=True,separators=(',',':'),allow_nan=False).encode('utf-8')).hexdigest(),
-        numerical_threads={name:os.environ.get(name) for name in ('MKL_NUM_THREADS','OPENBLAS_NUM_THREADS')},
-        answer_protocol_version=ANSWER_PROTOCOL_VERSION,
-        retrieval_enabled=retrieve_enabled,write_enabled=write_enabled,memory_mode=memory_mode,
-        memory_read_dir=str(memory_read_dir),memory_write_dir=str(memory_write_dir),snapshot_id=store.snapshot_id,
-        snapshot_records=[{'id':r['id'],'revision':r.get('revision',1)} for r in records],excluded_records=store.audit))
+    try:
+        writer.save('configuration.json',dict(parameters=config,
+            models={role:getattr(client,'settings',model_settings[role])
+                    for role,client in (('fast',fast),('reflection',reflection))},seed=seed,
+            effective_parameters_sha256=hashlib.sha256(json.dumps(plain(config),ensure_ascii=False,sort_keys=True,separators=(',',':'),allow_nan=False).encode('utf-8')).hexdigest(),
+            numerical_threads={name:os.environ.get(name) for name in ('MKL_NUM_THREADS','OPENBLAS_NUM_THREADS')},
+            answer_protocol_version=ANSWER_PROTOCOL_VERSION,
+            retrieval_enabled=retrieve_enabled,write_enabled=write_enabled,memory_mode=memory_mode,
+            memory_read_dir=str(memory_read_dir),memory_write_dir=str(memory_write_dir),snapshot_id=store.snapshot_id,
+            snapshot_records=[{'id':r['id'],'revision':r.get('revision',1)} for r in records],excluded_records=store.audit))
+    except BaseException:
+        logging.getLogger().removeHandler(file_handler)
+        file_handler.close()
+        raise
     adapter=None
     worker=None
     video_recorder=None
@@ -86,20 +93,28 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
         termination_reason='initialization_failure',progress_m=0.)
     start_wall=time.monotonic()
     logger.info('开始 %s，场景=%s，seed=%s，检索=%s，写入=%s',episode_id,config.get('scenario'),seed,retrieve_enabled,write_enabled)
-    writer.append('memory_snapshot',dict(snapshot_id=store.snapshot_id,read_enabled=retrieve_enabled,
-        accepted=[{'id':record['id'],'revision':record.get('revision',1)} for record in records],
-        excluded=store.audit))
-    if store.audit:
-        reasons='；'.join(dict.fromkeys(str(item.get('reason','原因未提供')) for item in store.audit[:3]))
-        logger.warning('轮初记忆快照接纳%d条、排除%d条；排除原因示例：%s',len(records),len(store.audit),reasons[:400])
-    else:
-        logger.info('轮初记忆快照接纳%d条、排除0条',len(records))
     used=[]
     timing_samples={'mpc_cold':[],'mpc_warm':[],'prediction':[],'decision_pipeline':[],
                     'retrieval':[]}
     mpc_overruns=0
     try:
-        adapter=HighwayAdapter(config,seed,episode_id,live)
+        writer.append('memory_snapshot',dict(snapshot_id=store.snapshot_id,read_enabled=retrieve_enabled,
+            accepted=[{'id':record['id'],'revision':record.get('revision',1)} for record in records],
+            excluded=store.audit))
+        if store.audit:
+            reasons='；'.join(dict.fromkeys(str(item.get('reason','原因未提供')) for item in store.audit[:3]))
+            logger.warning('轮初记忆快照接纳%d条、排除%d条；排除原因示例：%s',len(records),len(store.audit),reasons[:400])
+        else:
+            logger.info('轮初记忆快照接纳%d条、排除0条',len(records))
+        if adapter_factory is None:
+            if config.get('platform','highway') == 'carla':
+                from .carla_adapter import CarlaAdapter
+                adapter_factory=CarlaAdapter
+            else:
+                adapter_factory=HighwayAdapter
+        adapter=adapter_factory(config,seed,episode_id,live)
+        if hasattr(adapter,'set_output_directory'):
+            adapter.set_output_directory(writer.path)
         if video:video_recorder=adapter.start_recording(writer.path/'video.mp4')
         planner,reference_planner=Planner(config),Planner(config)
         predictor=Predictor(config)
@@ -117,7 +132,7 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
             # 10Hz推进参考迟滞与投影；完整实体归格仅由1Hz表示阶段消费。
             grids.update(scene,build=False)
             if first_s is None:
-                first_s=scene.diagnostics['route_s']
+                first_s=scene.diagnostics.get('navigation_progress_m',scene.diagnostics['route_s'])
                 writer.save('map.json',dict(lanes=scene.lanes,route=scene.route,route_lane_ids=scene.route_lane_ids,drivable=scene.drivable,
                     bev_drivable=scene.assets.get('bev_drivable'),physical_lane_centers=scene.assets.get('physical_lane_centers'),
                     ))
@@ -151,13 +166,14 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
                 active_answer=None
                 if fast.enabled:
                     prompt=build_prompt(scene,reps,active_retrieval)
-                    writer.append('model_inputs',dict(frame_id=scene.frame_id,time=scene.time,prompt=prompt,images=[reps.bev_path],
+                    images=model_image_paths(scene,reps)
+                    writer.append('model_inputs',dict(frame_id=scene.frame_id,time=scene.time,prompt=prompt,images=images,
                         answer_protocol_version=ANSWER_PROTOCOL_VERSION,
                         goal_reference_id=scene.diagnostics['goal_reference']['reference_id']))
                     summary['fast_calls']+=1
                     call_start=time.monotonic()
                     try:
-                        raw=fast.call(prompt,[reps.bev_path])
+                        raw=fast.call(prompt,images)
                         try:
                             active_answer=parse_answer(raw,scene,max_characters=config['models']['answer_max_characters'],
                                 reference=scene.diagnostics['goal_reference'],config=config)
@@ -284,19 +300,32 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
         summary.update(termination_reason='runtime_error',error=f'{type(exc).__name__}: {exc}')
         logger.exception('本轮运行失败，保留现场')
     finally:
+        cleanup_errors=[]
+        def close_resource(name,callback):
+            try:
+                callback()
+            except Exception as exc:
+                cleanup_errors.append({'resource':name,'error':type(exc).__name__})
+                logger.error('收尾失败：%s（%s）；继续释放其他资源',name,type(exc).__name__)
         if worker is not None:
-            worker.close()
+            close_resource('反思队列',worker.close)
             summary['reflection']=worker.counts
         if video_recorder is not None:
-            video_recorder.close()
-            summary['video']=video_recorder.metadata()
+            close_resource('录像',video_recorder.close)
+            close_resource('录像统计',lambda: summary.update(video=video_recorder.metadata()))
         if adapter is not None:
-            adapter.close()
+            close_resource('仿真适配器',adapter.close)
+        if cleanup_errors:
+            summary['cleanup_errors']=cleanup_errors
+            summary['termination_reason_before_cleanup']=summary['termination_reason']
+            summary['termination_reason']='runtime_error'
         summary['wall_seconds']=time.monotonic()-start_wall
         summary['timing']={name:_timing_summary(values) for name,values in timing_samples.items()}
         summary['timing']['mpc_deadline_misses']=mpc_overruns
-        writer.save('summary.json',summary)
-        logging.getLogger().removeHandler(file_handler)
-        file_handler.close()
+        try:
+            writer.save('summary.json',summary)
+        finally:
+            logging.getLogger().removeHandler(file_handler)
+            file_handler.close()
     logger.info('本轮结束：%s',json.dumps(summary,ensure_ascii=False))
     return summary
