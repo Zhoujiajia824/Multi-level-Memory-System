@@ -129,6 +129,8 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
             cycle_started=time.perf_counter()
             timing=dict(representations_s=0.,model_s=0.,reference_s=0.,quality_s=0.,retrieval_s=0.)
             scene=adapter.snapshot()
+            # 标签只影响模型阅读图；不删减对象或改变DINO使用的无字底图。
+            scene.diagnostics['bev_label_options']=copy.deepcopy(config.get('bev',{}).get('labels',{}))
             # 10Hz推进参考迟滞与投影；完整实体归格仅由1Hz表示阶段消费。
             grids.update(scene,build=False)
             if first_s is None:

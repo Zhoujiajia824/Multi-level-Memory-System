@@ -12,6 +12,22 @@ RETRIEVAL_METRIC_VERSION = 'bev-occ-eight-channel-top1-3.0'
 # 只改召回选择策略，表示与单通道距离未变；旧记录仍以当前策略重算，不恢复旧融合逻辑。
 READABLE_RETRIEVAL_METRIC_VERSIONS = (RETRIEVAL_METRIC_VERSION, 'bev-occ-eight-joint-2.0')
 
+# 仅限制VLM阅读层的文字；无字DINO图、实体集合和规划输入不受影响。
+BEV_LABEL_DEFAULTS = {'max_dynamic_labels':8, 'max_vehicle_labels':5, 'max_vulnerable_labels':3}
+
+
+def bev_label_config(options=None):
+    """显示标签的独立参数，不复用检索或风险权重。"""
+    if options is None:
+        return dict(BEV_LABEL_DEFAULTS)
+    if not isinstance(options,dict) or set(options)-set(BEV_LABEL_DEFAULTS):
+        raise ValueError('BEV标签参数只支持动态、机动车和行人/自行车数量上限')
+    result = {**BEV_LABEL_DEFAULTS, **options}
+    for key,value in result.items():
+        if type(value) is not int or not 0 <= value <= 16:
+            raise ValueError('BEV标签数量必须为0至16的整数：'+key)
+    return result
+
 GRID_DISTANCE_DEFAULT = {
     "scales":{"s_m":20.,"d_m":3.5,"vs_mps":10.,"vd_mps":2.,"as_mps2":3.,"ad_mps2":2.,"heading_rad":math.pi/4},
     "weights":{"position":.35,"velocity":.35,"acceleration":.15,"heading":.15},
@@ -264,6 +280,8 @@ def validate_config(config):
         if isinstance(FIXED_CONTRACT[group],dict) and group in result and not isinstance(result[group],dict):
             raise ValueError(f'{group} 必须为对象')
     _check_fixed(result,FIXED_CONTRACT)
+    if 'bev' in result:
+        result['bev']['labels']=bev_label_config(result['bev'].get('labels'))
     if any(key in result.get('models',{}) for key in ('guide_min_count','guide_max_count')):
         raise ValueError('旧guide_min_count/guide_max_count已取消；只接受单个Frenet local_goal')
     mpc=result.get('mpc',{})

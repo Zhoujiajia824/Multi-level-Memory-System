@@ -430,7 +430,19 @@ python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin
 python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin/python --exclusive-world --scenario slow_lead --duration 3 --fast server --reflection server --no-retrieve --no-write-memory --video --episodes-dir outputs/carla/model_smoke
 ```
 
-六个当前相机视角拼为一张图，相机拼图在前、同帧BEV在后，共同发送给快模型和原帧反思。模型提示词仍在`config/prompts.yaml`修改。六路RGB和六路深度每个物理tick（50Hz）渲染，仅将控制末帧（10Hz）与相机标定按frame保存；此配置保证对齐，真实GPU渲染耗时尚未实测。深度只用于当前可见性判定，不进入VLM图片。两种平台保持现有单Frenet目标协议。反思只做原帧验收，不接管当前控制。
+六个当前相机视角拼为一张图，相机拼图在前、同帧BEV在后，共同发送给快模型和原帧反思。模型提示词仍在`config/prompts.yaml`修改。六路RGB和六路深度每个物理tick（50Hz）渲染，仅消费控制末帧（10Hz）；持久保存六路RGB、RGB拼图、标定和当前状态。深度只在内存中用于当前可见性和观测掩码计算，不再保存深度图片或把临时深度载荷写进日志/经验资产。存储版本为`carla-rgb-only-1.0`，当前状态JSON保留已计算观测区域与依据；已保存的深度阈值结果可核查，调整阈值后重新计算需要重新采集。原有实验文件保留。真实GPU渲染和内存传输耗时尚待服务器实测。两种平台保持现有单Frenet目标协议。反思只做原帧验收，不接管当前控制。
+
+BEV文字上限在`config/parameters.json`的`bev.labels`修改：
+
+```json
+"labels": {
+  "max_dynamic_labels": 8,
+  "max_vehicle_labels": 5,
+  "max_vulnerable_labels": 3
+}
+```
+
+三个上限均为0至16的整数。默认在BEV内按车体净距选择最近5辆机动车、最近3个行人/自行车，总动态标签最多8个；自车单独标注。静态环境物和历史残影不写ID，全部实体与轨迹仍绘制，全部可见对象仍提供给模型文本和物理规划。标签避让实体和其他文字，无安全空位或ID过长时省略；不截断ID或生成别名。Frenet参考线每20米标一次弧长，BEV米制刻度保留。DINO继续读取无字底图，标签调整不要求重建原记忆库的DINO特征。
 
 批量20轮，seed21至40；只读指定经验库，新增合格反思经验另写一个库：
 
@@ -438,7 +450,7 @@ python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin
 python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin/python --exclusive-world --scenario cut_in --episodes 20 --seed 21 --seed-mode increment --duration 30 --fast server --reflection server --retrieve --write-memory --memory-mode formal --memory-read-dir /data/zjj/memory/frozen_carla --memory-write-dir /data/zjj/memory/new_carla_reflections --episodes-dir outputs/carla/cut_in_21_40 --video
 ```
 
-检索和写入默认都关闭，独立开关与highway一致。`--memory-dir`是同库读写简写，独立读写路径优先。启用任一记忆功能需要真实DINO权重；当前轮新增经验仍到下一轮快照才可见。CARLA采集数据较大，原始RGB/深度每个控制帧落盘；先跑短轮确认磁盘占用，再启动批量。
+检索和写入默认都关闭，独立开关与highway一致。`--memory-dir`是同库读写简写，独立读写路径优先。启用任一记忆功能需要真实DINO权重；当前轮新增经验仍到下一轮快照才可见。CARLA每个控制帧保留原始RGB和拼图；必要BEV、无字特征图、观测证据及视频按原有频率保存。
 
 | CARLA参数 | 含义 |
 |---|---|

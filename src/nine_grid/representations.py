@@ -18,7 +18,7 @@ from shapely.ops import unary_union
 from .contracts import Actor, SceneSnapshot, Representations
 from .configuration import (grid_distance_config, grid_metric_signature,
                             grid_observation_config, grid_observation_signature,
-                            occupancy_distance_config)
+                            occupancy_distance_config, bev_label_config)
 
 FEATURE_VERSION = "bev-occ-grid-2.0"
 GRID_REPRESENTATION_VERSION = "lane-eight-interaction-2.0"
@@ -32,6 +32,7 @@ ROAD_COLOR = (211, 211, 211)
 CENTER_LINE_COLOR = (102, 102, 102)
 CROSSWALK_COLOR = (176, 122, 161)
 CROSSWALK_ALPHA = .3
+BEV_LABEL_VERSION = "sparse-dynamic-labels-1.0"
 SLOTS = (("left_front", "front", "right_front"), ("left_side", "ego", "right_side"),
          ("left_rear", "rear", "right_rear"))
 
@@ -660,11 +661,68 @@ def _draw_trajectory(draw,samples,ego,color):
                       fill=_trajectory_color(color,speed),width=3.5)
 
 
+def _bev_label_actors(scene):
+    """仅选择裁剪内最近的动态实体作显示标签，不改变任何感知或规划集合。
+
+    机动车和弱势交通参与者分别保留名额，按真实车体净距选择；ID仅用于同分排序。
+    """
+    options=bev_label_config(scene.diagnostics.get('bev_label_options'))
+    ego_shape=_shape(scene.ego)
+    candidates=[]
+    for actor in scene.actors:
+        if not actor.visible or actor.id==scene.ego.id or actor.kind not in ('vehicle','bicycle','pedestrian'):
+            continue
+        point=_pixel([actor.position],scene.ego)[0]
+        if np.all(np.isfinite(point)) and 0<=point[0]<500 and 0<=point[1]<1000:
+            candidates.append(actor)
+    def order(actor):
+        return (float(ego_shape.distance(_shape(actor))),str(actor.id))
+    vehicles=sorted((a for a in candidates if a.kind=='vehicle'),key=order)[:options['max_vehicle_labels']]
+    vulnerable=sorted((a for a in candidates if a.kind in ('bicycle','pedestrian')),key=order)[:options['max_vulnerable_labels']]
+    chosen=sorted(vehicles+vulnerable,key=order)[:options['max_dynamic_labels']]
+    return [scene.ego]+chosen
+
+
+def _draw_actor_labels(draw,scene,actors,reserved):
+    """实体全部绘完再标注；文字框与任一可见车体/行人以及已有标签均不相交。"""
+    bodies=[Polygon(_pixel(np.asarray(_shape(actor).exterior.coords),scene.ego)) for actor in actors]
+    tree=shapely.STRtree(bodies)
+    # 留出原有米制坐标刻度区域，不用大面积白底文字覆盖道路实体。
+    boxes=list(reserved)+[box(0,0,54,1000),box(0,970,500,1000)]
+    placed=[]
+    for actor in _bev_label_actors(scene):
+        shape=Polygon(_pixel(np.asarray(_shape(actor).exterior.coords),scene.ego))
+        minimum_x,minimum_y,maximum_x,maximum_y=shape.bounds
+        center=_pixel([actor.position],scene.ego)[0]
+        label=str(actor.id)
+        width=max(20,math.ceil(draw.textlength(label))+6)
+        if width>180:
+            # 原ID过长时不截成会误指实体的别名，直接省略该显示标签。
+            continue
+        candidates=((maximum_x+4,center[1]-7),(minimum_x-width-4,center[1]-7),
+                    (center[0]-width/2,minimum_y-18),(center[0]-width/2,maximum_y+4),
+                    (maximum_x+4,minimum_y-18),(minimum_x-width-4,minimum_y-18),
+                    (maximum_x+4,maximum_y+4),(minimum_x-width-4,maximum_y+4))
+        for x,y in candidates:
+            if not (0<=x and x+width<=500 and 0<=y and y+14<=1000):
+                continue
+            rectangle=box(x,y,x+width,y+14)
+            if len(tree.query(rectangle.buffer(2),predicate='intersects')) or any(rectangle.intersects(other) for other in boxes):
+                continue
+            boxes.append(rectangle)
+            draw.rectangle((x,y,x+width,y+14),fill=(255,255,255))
+            draw.text((x+2,y),label,fill=(20,20,20))
+            placed.append({'id':label,'bounds':(x,y,x+width,y+14)})
+            break
+    return placed
+
+
 def render_bev(scene, labels=True):
     """固定尺寸画布；标签层仅用于 VLM，DINO 使用同一底图的无字版本。"""
     scale=4
     image = Image.new("RGB", (500*scale, 1000*scale), BACKGROUND_COLOR)
     draw = _AntialiasedDraw(image,scale)
+    reserved_labels=[]
     # 显示实际道路地表，规划 on_lane 的端部容差不应绘成突出或虚构的路口。
     surface=scene.assets.get('bev_drivable',scene.drivable)
     if surface is not None:
@@ -694,12 +752,14 @@ def render_bev(scene, labels=True):
         if len(arc)>1:
             _draw_dashed(draw,_pixel(sample_polyline(reference,arc),scene.ego),
                          (25,110,75),width=1.,dash=7,gap=4)
-        for distance in range(0,71,10):
+        for distance in range(0,71,20):
             if anchor+distance>stop:continue
             point=_pixel([sample_polyline(reference,anchor+distance)],scene.ego)[0]
             if 10<point[0]<440 and 15<point[1]<970:
                 draw.ellipse((point[0]-1.5,point[1]-1.5,point[0]+1.5,point[1]+1.5),fill=(25,110,75))
-                draw.text((point[0]+4,point[1]-11),f"s+{distance}m",fill=(25,110,75))
+                text=f"s+{distance}m"
+                draw.text((point[0]+4,point[1]-11),text,fill=(25,110,75))
+                reserved_labels.append(box(point[0]+4,point[1]-11,point[0]+8+draw.textlength(text),point[1]+3))
     # 已离开可见集合的对象只绘制真实旧观测，不外推车体、方向或位置。
     for actor_id, history in scene.diagnostics.get("historical_only_objects", {}).items():
         if actor_id == scene.ego.id or any(actor.id == actor_id and actor.visible for actor in scene.actors):
@@ -720,13 +780,6 @@ def render_bev(scene, labels=True):
         for sample in sampled:
             point = _pixel([sample['position']],scene.ego)[0]
             draw.ellipse((point[0]-1,point[1]-1,point[0]+1,point[1]+1),fill=(130,130,130))
-        if labels and sampled:
-            point = _pixel([sampled[-1]["position"]],scene.ego)[0]
-            if 0 <= point[0] < 500 and 0 <= point[1] < 1000:
-                label = f"past {actor_id} t={sampled[-1]['time']:.1f}s"
-                width = int(draw.textlength(label))+4
-                position = (min(max(0,point[0]+4),max(0,500-width)),min(max(0,point[1]-12),986))
-                draw.text(position,label,fill=(110,110,110))
     actors = [a for a in scene.actors if a.visible] + [scene.ego]
     # 所有历史先画，车体后画，避免另一对象的轨迹衬线擦掉当前可见车体。
     for actor in actors:
@@ -740,7 +793,6 @@ def render_bev(scene, labels=True):
             if not sampled or float(h.get("time", 0))-float(sampled[-1].get("time", 0)) >= .5-1e-6:
                 sampled.append(h)
         _draw_trajectory(draw,sampled,scene.ego,color)
-    label_boxes = []
     for actor in actors:
         kind = "ego" if actor.id == scene.ego.id else actor.kind
         color = COLORS.get(kind, (80, 80, 80))
@@ -758,22 +810,8 @@ def render_bev(scene, labels=True):
             normal = np.array([-vector[1], vector[0]]) / norm
             base = p1-vector/norm*min(5., norm/2)
             draw.polygon([tuple(p1), tuple(base+normal*3), tuple(base-normal*3)], fill=color)
-        if labels:
-            anchor = _pixel([actor.position], scene.ego)[0]
-            if not (0 <= anchor[0] < 500 and 0 <= anchor[1] < 1000):
-                continue
-            label = str(actor.id)
-            width = max(20, int(draw.textlength(label))+6)
-            for offset in ((8,-15),(8,5),(-width-8,-15),(-width-8,5),(8,-32),(8,22)):
-                x = min(max(0, anchor[0]+offset[0]), 500-width)
-                y = min(max(0, anchor[1]+offset[1]), 986)
-                rect = box(x, y, x+width, y+14)
-                if all(not rect.intersects(r) for r in label_boxes):
-                    label_boxes.append(rect)
-                    draw.rectangle((x,y,x+width,y+14), fill=(255,255,255))
-                    draw.text((x+2,y), label, fill=(20,20,20))
-                    break
     if labels:
+        _draw_actor_labels(draw,scene,actors,reserved_labels)
         for x in range(-30, 71, 10):
             y = 700-x*10
             if 0 < y < 1000:

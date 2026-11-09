@@ -1,4 +1,5 @@
 """CARLA 0.9.15 独立 SDK 桥；兼容 Python 3.7，仅依赖标准库及 carla。"""
+import base64
 import json
 import hashlib
 import math
@@ -7,6 +8,7 @@ import queue
 import signal
 import sys
 import time
+import zlib
 from pathlib import Path
 
 
@@ -362,16 +364,30 @@ class CarlaSession:
         cameras = []
         for view in ('front', 'front_left', 'front_right', 'back', 'back_left', 'back_right'):
             rgb, depth = self.frames[view + '_rgb'], self.frames[view + '_depth']
-            rgb_path, depth_path = folder / (view + '.png'), folder / (view + '_depth.png')
+            if (rgb.frame != self.frame or depth.frame != self.frame or
+                    not all(math.isfinite(t) for t in (rgb.timestamp, depth.timestamp)) or
+                    abs(rgb.timestamp-depth.timestamp) > 1e-6):
+                raise ValueError('RGB与临时深度必须来自同一帧和时间戳：'+view)
+            if (rgb.width != self.width or depth.width != self.width or
+                    rgb.height != self.height or depth.height != self.height):
+                raise ValueError('RGB与临时深度尺寸不符合相机配置：'+view)
+            depth_bytes = bytes(depth.raw_data)
+            if len(depth_bytes) != self.width*self.height*4:
+                raise ValueError('临时深度BGRA字节数不符合相机尺寸：'+view)
+            rgb_path = folder / (view + '.png')
             if not rgb_path.is_file():
                 rgb.save_to_disk(str(rgb_path))
-            if not depth_path.is_file():
-                depth.save_to_disk(str(depth_path))
-            cameras.append({'view': view, 'rgb_path': str(rgb_path), 'depth_path': str(depth_path),
+            # 深度只用于同帧可见性/观测证据，通过内存RPC交付，不生成深度图片。
+            transport = {'encoding': 'zlib-base64-bgra8-1.0', 'frame': int(depth.frame),
+                'timestamp': float(depth.timestamp), 'width': self.width, 'height': self.height,
+                'data': base64.b64encode(zlib.compress(depth_bytes, 1)).decode('ascii')}
+            cameras.append({'view': view, 'rgb_path': str(rgb_path), 'depth_transport': transport,
                 'width': self.width, 'height': self.height, 'fov_deg': self.fov,
                 'frame': self.frame, 'timestamp': rgb.timestamp,
                 'world_to_camera_ue': rgb.transform.get_inverse_matrix(),
                 'camera_to_world_ue': rgb.transform.get_matrix(),
+                'depth_frame': int(depth.frame), 'depth_timestamp': float(depth.timestamp),
+                'depth_retention': 'runtime_only_not_saved',
                 'depth_encoding': 'carla_rgb24_planar_m;R+256G+65536B;far=1000'})
         return cameras
 

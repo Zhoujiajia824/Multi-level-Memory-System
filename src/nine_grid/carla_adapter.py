@@ -1,6 +1,8 @@
 """CARLA SDK 子进程到平台无关场景契约；主环境不导入 carla。"""
 from __future__ import annotations
 
+import base64
+import binascii
 import copy
 import json
 import math
@@ -9,6 +11,7 @@ import queue
 import subprocess
 import threading
 import time
+import zlib
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -94,9 +97,57 @@ class BridgeProcess:
 
 
 def decode_depth(path):
-    """原始 CARLA RGB24 光轴深度；不可读取可视化后的灰度深度图。"""
-    rgb = np.asarray(Image.open(path).convert('RGB'), dtype=np.float64)
+    """兼容读取已有原始深度资产；新运行不再写入或依赖深度图片。"""
+    with Image.open(path) as source:
+        rgb = np.asarray(source.convert('RGB'), dtype=np.float64)
     return (rgb[:, :, 0] + 256 * rgb[:, :, 1] + 65536 * rgb[:, :, 2]) * (1000. / 16777215.)
+
+
+def camera_depth(camera):
+    """同帧临时BGRA深度解码；缺证据/损坏不能当作空区，也不静默回退旧文件。"""
+    if 'depth_transport' not in camera:
+        if 'depth_path' not in camera:
+            raise ValueError('相机缺少临时深度观测证据')
+        depth = decode_depth(camera['depth_path'])
+        if depth.shape != (camera['height'], camera['width']):
+            raise ValueError('已有深度资产尺寸与相机不一致')
+        return depth
+    payload = camera['depth_transport']
+    if not isinstance(payload, dict) or payload.get('encoding') != 'zlib-base64-bgra8-1.0':
+        raise ValueError('临时深度编码无效')
+    width, height = camera.get('width'), camera.get('height')
+    if any(type(v) is not int or v <= 0 for v in (width,height)):
+        raise ValueError('临时深度相机尺寸无效')
+    if (payload.get('width') != width or payload.get('height') != height or
+            type(payload.get('frame')) is not int or payload['frame'] != camera.get('frame')):
+        raise ValueError('临时深度尺寸或帧号不一致')
+    timestamp, source_time = payload.get('timestamp'), camera.get('timestamp')
+    if (any(isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(v)
+            for v in (timestamp,source_time)) or abs(timestamp-source_time) > 1e-6):
+        raise ValueError('临时深度时间戳不一致')
+    encoded = payload.get('data')
+    expected = width*height*4
+    if not isinstance(encoded,str) or len(encoded) > 4*((expected*2+128+2)//3):
+        raise ValueError('临时深度载荷长度无效')
+    try:
+        compressed = base64.b64decode(encoded, validate=True)
+        decoder = zlib.decompressobj()
+        raw = decoder.decompress(compressed, expected+1)
+    except (ValueError,binascii.Error,zlib.error) as exc:
+        raise ValueError('临时深度载荷损坏') from exc
+    if (len(raw) != expected or not decoder.eof or decoder.unconsumed_tail or decoder.unused_data):
+        raise ValueError('临时深度字节数或压缩边界无效')
+    bgra = np.frombuffer(raw,dtype=np.uint8).reshape(height,width,4).astype(np.float64)
+    return (bgra[:,:,2]+256*bgra[:,:,1]+65536*bgra[:,:,0])*(1000./16777215.)
+
+
+def retained_camera_metadata(camera):
+    """只保留RGB及标定/观测来源；临时深度数据和旧深度路径不进入落盘资产。"""
+    keys = ('view','rgb_path','width','height','fov_deg','frame','timestamp',
+            'world_to_camera_ue','camera_to_world_ue','depth_frame','depth_timestamp','depth_encoding')
+    result = {key:copy.deepcopy(camera[key]) for key in keys if key in camera}
+    result['depth_retention'] = 'not_saved_by_current_run'
+    return result
 
 
 def observed_geometry(ego, cameras, cfg):
@@ -116,7 +167,7 @@ def observed_geometry(ego, cameras, cfg):
     if not np.isfinite(tolerance) or tolerance < 0:
         raise ValueError('深度空区容差必须为有限非负米值')
     world_origin_z = float(ego['origin_z'])
-    prepared = [(c, decode_depth(c['depth_path'])) for c in cameras]
+    prepared = [(c, camera_depth(c)) for c in cameras]
     for offset in ([.01, .01], [resolution - .01, .01], [.01, resolution - .01], [resolution - .01, resolution - .01]):
         world = ego_to_world(centers + offset, np.asarray(ego['position']), float(ego['heading']))
         for height in heights:
@@ -356,6 +407,7 @@ class CarlaAdapter:
             actor.history = copy.deepcopy(self._history.get(actor.id, []))
         self._route_s = project_polyline(ego.position, self.route, self._route_s, ego.heading)[0]
         observed, observation_audit = observed_geometry(raw['ego'], raw['cameras'], self.cfg)
+        observation_audit['depth_storage'] = 'runtime_only; retained_RGB_and_observation_mask'
         # 已确认部分可见对象按既定权限提供完整框；这些实体面积本身是已知占据，
         # 不能被“后方空区不可见”误删。框外遮挡仍为未知，不补隐藏对象。
         observed = unary_union([observed, actor_shape(ego)] + [actor_shape(a) for a in actors])
@@ -366,11 +418,16 @@ class CarlaAdapter:
         mosaic_path = folder / 'multi_camera_mosaic.png'
         mosaic.save(mosaic_path)
         self._mosaic = np.asarray(mosaic)
+        # RPC载荷仅在本帧内存使用；不换成另一种深度文件或写入JSON/记忆库。
+        retained_cameras = [retained_camera_metadata(camera) for camera in raw['cameras']]
         manifest = {'frame_id': frame_id, 'time': timestamp, 'carla_frame': raw['frame'],
-            'carla_timestamp': raw['timestamp'], 'cameras': raw['cameras'], 'calibration_version': 'carla-pinhole-rgb-depth-1.0'}
+            'carla_timestamp': raw['timestamp'], 'cameras': retained_cameras,
+            'calibration_version': 'carla-pinhole-rgb-depth-1.0', 'storage_version': 'carla-rgb-only-1.0'}
         manifest_path = folder / 'manifest.json'
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, allow_nan=False), encoding='utf-8')
-        (folder / 'current_observed_state.json').write_text(json.dumps(raw, ensure_ascii=False, allow_nan=False), encoding='utf-8')
+        retained_raw = {**raw, 'cameras': retained_cameras, 'storage_version': 'carla-rgb-only-1.0',
+            'observed_support_wkt': observed.wkt, 'observation_evidence': observation_audit}
+        (folder / 'current_observed_state.json').write_text(json.dumps(retained_raw, ensure_ascii=False, allow_nan=False), encoding='utf-8')
         stop_s, light_records = None, []
         for light in raw.get('traffic_lights', []):
             relevant = []
@@ -419,7 +476,7 @@ class CarlaAdapter:
                                       'frame_id': frame_id, 'time': timestamp}],
                     'camera_manifest_json': str(manifest_path.resolve()),
                     'original_camera_images': [c['rgb_path'] for c in raw['cameras']],
-                    'depth_images': [c['depth_path'] for c in raw['cameras']],
+                    'depth_images': [],
                     'current_state_json': str((folder / 'current_observed_state.json').resolve()),
                     'physical_lane_centers': {l.id: l.center for l in self.lanes}, 'bev_drivable': self.drivable},
             diagnostics=diagnostics)

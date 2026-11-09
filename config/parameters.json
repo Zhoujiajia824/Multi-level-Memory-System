@@ -1,6 +1,6 @@
 {
   "theory_version": "nine-grid-rag-mpc-1.0",
-  "parameter_version": "development-1.0.22",
+  "parameter_version": "development-1.0.23",
   "status": "initial_validation_values_not_optimal",
   "clock": {
     "physics_hz": 50,
@@ -44,7 +44,12 @@
     ],
     "speed_color_max_kmh": 120,
     "history_seconds": 3,
-    "arrow_length_body_width_ratio": 1
+    "arrow_length_body_width_ratio": 1,
+    "labels": {
+      "max_dynamic_labels": 8,
+      "max_vehicle_labels": 5,
+      "max_vulnerable_labels": 3
+    }
   },
   "occupancy": {
     "raw_resolution_m": 0.5,
