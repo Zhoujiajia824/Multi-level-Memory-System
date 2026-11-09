@@ -357,6 +357,8 @@ python scripts/memory_admin.py --memory-dir outputs/memory_db/experiment_01 inva
 
 主程序继续使用Python 3.12的独立环境；CARLA SDK在已有`carla37`（或安装了0.9.15 SDK的Python 3.8）环境中运行，通过子进程交换数据。不要把CARLA旧版SDK安装进主环境，不需要修改已有`carla`、`carla37`和模型服务环境。
 
+轮位/参考点诊断：轮位按CARLA 0.9.15的世界厘米转换，包围框中心保留为actor局部米；坐标变换只修改临时副本。当前输出的`state_sources.wheel_geometry_version`为`carla-wheel-reference-1.1`。如实际轮位仍不合法，错误会列出前后轴局部位置、框中心、轴距和后轴到中心距离；不会使用车长或虚构尺寸代替。无需为本次修复更改场景YAML或重装环境。
+
 先在服务器检查SDK解释器，不连接世界：
 
 ```bash

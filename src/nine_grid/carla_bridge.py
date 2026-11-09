@@ -48,6 +48,16 @@ def xy(location):
     return [float(location.x), -float(location.y)]
 
 
+def bounding_box_world_center(transform, box, carla):
+    """CARLA Transform.transform会原地修改参数，必须复制框的actor局部中心。
+
+    保留box.location供后续轴距参考点、可见性及重复状态读取使用；不能将其变成世界坐标。
+    """
+    local = box.location
+    point = carla.Location(x=local.x, y=local.y, z=local.z)
+    return transform.transform(point)
+
+
 def project_camera(point, inverse, width, height, fov):
     """UE 相机 x 前 y 右 z 上，返回像素及光轴深度，非欧氏射线长度。"""
     p = [point.x, point.y, point.z, 1.0]
@@ -78,8 +88,12 @@ def wheel_geometry(wheels, inverse_transform, box_center_x):
         local_x.append(sum(inverse_transform[0][j] * world[j] for j in range(4)))
     front, rear = sum(local_x[:2]) / 2., sum(local_x[2:]) / 2.
     wheelbase, rear_distance = front - rear, box_center_x - rear
-    if not wheelbase > 0 or not 0 < rear_distance < wheelbase:
-        raise ValueError('无法从真实轮位提取有效轴距/参考点；不使用车长代替')
+    if (not all(math.isfinite(v) for v in local_x+[box_center_x,wheelbase,rear_distance])
+            or not wheelbase > 0 or not 0 < rear_distance < wheelbase):
+        raise ValueError('无法从真实轮位提取有效轴距/参考点：'
+            'front_x_m={}，rear_x_m={}，bbox_actor_local_x_m={}，wheelbase_m={}，'
+            'rear_axle_to_center_m={}；轮位按世界厘米转换，框中心须为actor局部米；不使用车长代替'.format(
+                front,rear,box_center_x,wheelbase,rear_distance))
     return wheelbase, rear_distance
 
 
@@ -399,7 +413,8 @@ class CarlaSession:
 
     def _actor(self, actor, is_ego=False):
         transform, bb = actor.get_transform(), actor.bounding_box
-        center = transform.transform(bb.location)
+        box_center_x = float(bb.location.x)
+        center = bounding_box_world_center(transform,bb,self.carla)
         velocity, acceleration, omega = actor.get_velocity(), actor.get_acceleration(), actor.get_angular_velocity()
         yaw = math.radians(transform.rotation.yaw + bb.rotation.yaw)
         identity = 'ego' if is_ego else 'carla_{}'.format(actor.id)
@@ -429,8 +444,10 @@ class CarlaSession:
                               'angular_acceleration': 'past_difference' if previous else 'initial_zero_assumption'}}
         if is_ego:
             wheels = actor.get_physics_control().wheels
-            wheelbase, rear_distance = wheel_geometry(wheels, transform.get_inverse_matrix(), bb.location.x)
+            wheelbase, rear_distance = wheel_geometry(wheels, transform.get_inverse_matrix(), box_center_x)
             result['wheelbase_m'], result['rear_axle_to_center_m'] = wheelbase, rear_distance
+            result['state_sources']['wheel_geometry'] = 'world_cm_to_actor_m;immutable_actor_local_bbox_center'
+            result['state_sources']['wheel_geometry_version'] = 'carla-wheel-reference-1.1'
         return result
 
     def _environment_actor(self, entry):
@@ -541,7 +558,7 @@ class CarlaSession:
         for actor in self.world.get_actors():
             if actor.id == self.ego.id or not (actor.type_id.startswith('vehicle.') or actor.type_id.startswith('walker.pedestrian.') or actor in self.experiment.actors and actor.type_id.startswith('static.')):
                 continue
-            center = actor.get_transform().transform(actor.bounding_box.location)
+            center = bounding_box_world_center(actor.get_transform(),actor.bounding_box,self.carla)
             if abs(center.z - ego['z']) > float(self.cfg.get('same_level_tolerance_m', 1.5)):
                 continue
             if math.hypot(center.x - ego['position'][0], -center.y - ego['position'][1]) > radius:
@@ -557,7 +574,7 @@ class CarlaSession:
             if affected:
                 lights.append({'id': 'traffic_light_{}'.format(light.id), 'state': str(light.get_state()).split('.')[-1].lower(), 'stops': affected})
         actual = self.ego.get_control()
-        current_wp = self.map.get_waypoint(self.ego.get_transform().transform(self.ego.bounding_box.location),
+        current_wp = self.map.get_waypoint(bounding_box_world_center(self.ego.get_transform(),self.ego.bounding_box,self.carla),
                                           project_to_road=False, lane_type=self.carla.LaneType.Driving)
         road_evidence = None
         if current_wp is not None:
