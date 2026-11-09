@@ -1,6 +1,6 @@
 # EP-Driver 运行指令与参数
 
-当前工作分支为 `EP-Driver-CARLA`，由 `EP-Driver` 创建；本轮未提交或推送，远程尚不能据此克隆新分支。以下克隆指令仍针对已发布的 `EP-Driver`；CARLA指令需使用含本轮新增代码的工作区。配置和命令中的相对路径均以项目根目录为准。
+当前工作分支为 `EP-Driver-CARLA`，由 `EP-Driver` 创建。下文高速环境的克隆示例使用 `EP-Driver`；运行CARLA请使用远程同名分支 `EP-Driver-CARLA` 的独立工作区。配置和命令中的相对路径均以项目根目录为准。
 
 ## 0. 克隆分支、权重与个人配置
 
@@ -353,7 +353,7 @@ python scripts/memory_admin.py --memory-dir outputs/memory_db/experiment_01 inva
 
 ## 9. CARLA 0.9.15：独立世界与第一批交互场景
 
-本分支已提供CARLA入口、SDK桥与脚本场景，尚未在真实CARLA服务器完成实测。当前首批场景限制在同层、近直、非路口道路；找不到足够长道路、合法邻道或人行道时明确失败，不用其他情境替代。每份场景YAML可以指定任意已安装的CARLA地图名称或资源路径，不限定Town05/06/10HD；已安装地图仍须满足该交互模板的道路条件。
+本分支已提供CARLA入口、SDK桥与脚本场景，尚未在真实CARLA服务器完成实测。局部交互段要求同层、近直、非路口；后续自车导航允许沿公开连接经过路口和温和弯道，不要求整条180米都是直线。找不到合法交互走廊、足够导航长度、邻道或人行道时明确失败，不换模板、不自动缩短路线。每份场景YAML可以指定任意已安装的CARLA地图名称或资源路径，不限定Town05/06/10HD；已安装地图仍须满足该交互模板的道路条件。
 
 主程序继续使用Python 3.12的独立环境；CARLA SDK在已有`carla37`（或安装了0.9.15 SDK的Python 3.8）环境中运行，通过子进程交换数据。不要把CARLA旧版SDK安装进主环境，不需要修改已有`carla`、`carla37`和模型服务环境。
 
@@ -376,6 +376,30 @@ python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin
 ```
 
 `--exclusive-world`是每次真实运行的明确确认。当前空世界地图与`--map`不同时默认拒绝；确认该服务专用后，另外加`--allow-world-reset`才允许切换地图。两项开关不允许清理其他人的车辆或接管其他同步客户端。结束时只销毁本轮创建的对象并恢复本轮修改前的世界设置；被切换的地图不自动切回。
+
+先检查当前服务地图上的场景选址（不生成演员、不改世界设置、不换地图、不推进仿真，不调用模型）：
+
+```bash
+python scripts/run_carla.py \
+  --carla-python /home/zjj/miniconda3/envs/carla37/bin/python \
+  --host 127.0.0.1 --port 22000 \
+  --scenario-config config/carla_scenarios/slow_lead.yaml \
+  --seed 1 --inspect-scene \
+  --prefix slow_lead_check --episodes-dir outputs/carla/scene_checks
+```
+
+报告保存为 `outputs/carla/scene_checks/slow_lead_check_scene_selection.json`。其中可用起点只是地图条件通过，仍需运行验证生成空间、传感器及控制。把选定索引填入该地图YAML的 `experiment.spawn_index` 可固定地点；不能照搬其他地图索引。真实运行每轮保存 `carla_scene_selection.json`，选址失败时也保存逐点原因。
+
+场景模式版本为 `carla-scene-1.1`；旧1.0文件仍可读，新增默认参数和实际选址算法版本会被记录：
+
+| YAML字段 | 含义 |
+|---|---|
+| `experiment.route_length_m: 180` | 完整自车导航长度，不自动缩短 |
+| `experiment.interaction_length_m: null` | 自动计算近直非路口的局部交互段：慢车/急刹/占道为前车距离+10m；行人再加偏移；切入不少于前车距离+前车速度×(切入时长+8s)。可显式加长，不能小于模板所需长度 |
+| `experiment.navigation_step_yaw_limit_deg: 30` | 每2m导航采样的局部航向变化上限，非整条导航累计转角；交互段仍保留相对起点0.3rad限制 |
+| `experiment.spawn_index` | null按seed检查起点；整数只检查该点，不因失败偷换地点 |
+
+导航采用公开合法后继中局部转角较小者优先的有界回溯；保持相对起点1.5m的高度范围、每段0.1—3m连续性、0.5m重复空间点拒绝，单起点最多扩展5000个搜索节点。这不是指定终点的全局A*。远端导航可经过路口不代表已经验证完整无信号路口路权、坡道或回环场景。上述阈值是开发起点。
 
 五类脚本交互复用同一个核心预测、目标管理、MPC、检索及反思流程。**每个场景一份独立YAML**；`config/carla.yaml`只配置服务、SDK和传感器。以下`--scenario`分别选择`config/carla_scenarios/`中的同名文件：
 
@@ -452,4 +476,4 @@ python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin
 | `carla.camera_width / camera_height / camera_fov` | 单相机640×360、水平FOV100度；六视角RGB及对应深度同步 |
 | `carla.observation_resolution_m / observation_heights_m` | 确认空区的网格1米、多高度0.2/0.8米；未确认与遮挡区域保留unknown，尚需真实传感器验证 |
 
-每轮沿用第7节的核心日志，另有`carla_bridge.log`、`carla_map.json`、`camera_frames/`及相机资产清单；`--video`保存真实相机拼图录像。相机录像暂不叠加世界中的MPC轨迹，计划轨迹保存在BEV诊断图与`plans.jsonl`，不修改输入模型的原始相机图。当前验证仅包括接口、配置、几何与测试替身，不能据此宣称已在CARLA实现无碰撞或实时运行。
+每轮沿用第7节的核心日志，另有`carla_bridge.log`、`carla_map.json`、`carla_environment_audit.json`、`camera_frames/`及相机资产清单；`--video`保存真实相机拼图录像。`carla_environment_audit.json`记录地图环境框的读取范围、数量及镜像网格半尺寸规范化明细。CARLA 0.9.15的组件负缩放可能产生负半尺寸，程序只对有限非零半尺寸取绝对值，保持原世界中心、旋转及八角点集合，不删除障碍物、不修改地图；零半尺寸或非有限值仍拒绝，并报告ID、名称、类别及原始框数值。相机录像暂不叠加世界中的MPC轨迹，计划轨迹保存在BEV诊断图与`plans.jsonl`，不修改输入模型的原始相机图。当前验证仅包括接口、配置、几何与测试替身，不能据此宣称已在CARLA实现无碰撞或实时运行。

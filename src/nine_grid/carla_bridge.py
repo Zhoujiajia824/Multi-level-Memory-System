@@ -23,6 +23,27 @@ def map_identity(road_map):
             'opendrive_sha256':hashlib.sha256(document.encode('utf-8')).hexdigest()}
 
 
+def inspect_scene(config, seed):
+    """只读场景选址：不换地图、不设置同步、不创建或销毁演员、不推进时钟。"""
+    import carla
+    from carla_scenarios import select_route
+    client = carla.Client(config.get('host','127.0.0.1'),int(config.get('port',2000)))
+    client.set_timeout(float(config.get('timeout_s',30.)))
+    if (client.get_client_version().split('-')[0] != '0.9.15' or
+            client.get_server_version().split('-')[0] != '0.9.15'):
+        raise ValueError('选址检查仅支持CARLA 0.9.15')
+    world = client.get_world()
+    road_map = world.get_map()
+    requested = str(config.get('map','Town05')).rstrip('/').split('/')[-1]
+    if road_map.name.rstrip('/').split('/')[-1] != requested:
+        raise ValueError('只读检查不切换地图：当前{}，场景要求{}'.format(road_map.name,requested))
+    settings = dict(config.get('experiment',{})); settings['seed'] = int(seed)
+    _, report = select_route(road_map,settings,carla,audit_all=True)
+    report.update(map_identity(road_map))
+    report['read_only'] = True
+    return report
+
+
 def xy(location):
     return [float(location.x), -float(location.y)]
 
@@ -90,7 +111,7 @@ def environment_catalogue(world, carla):
     """
     labels = {getattr(carla.CityObjectLabel, name): name for name in ENVIRONMENT_OBSTACLE_LABELS
               if hasattr(carla.CityObjectLabel, name)}
-    objects, seen, excluded = [], {}, {}
+    objects, seen, excluded, normalizations = [], {}, {}, []
     for item in sorted(world.get_environment_objects(carla.CityObjectLabel.Any), key=lambda obj: obj.id):
         if item.type not in labels:
             name = str(item.type)
@@ -99,8 +120,23 @@ def environment_catalogue(world, carla):
         box = item.bounding_box
         values = (box.location.x, box.location.y, box.location.z, box.extent.x, box.extent.y,
                   box.extent.z, box.rotation.yaw, box.rotation.pitch, box.rotation.roll)
-        if not all(math.isfinite(value) for value in values) or min(box.extent.x, box.extent.y, box.extent.z) <= 0:
-            raise ValueError('环境障碍物缺少有限正尺寸：{}'.format(item.id))
+        if not all(math.isfinite(value) for value in values) or any(value == 0 for value in values[3:6]):
+            raise ValueError('环境障碍物框包含非有限值或零半尺寸：id={}，name={!r}，label={}，'
+                'center={}，extent={}，rotation={}'.format(item.id, getattr(item, 'name', ''),
+                    labels[item.type], values[:3], values[3:6], values[6:]))
+        if any(value < 0 for value in values[3:6]):
+            # 0.9.15直接将半尺寸乘组件缩放，镜像网格会保留负号。
+            # ±半尺寸枚举的八角点集合不变；不删除障碍物，不修改原始地图框。
+            extent = tuple(abs(value) for value in values[3:6])
+            positive_box = carla.BoundingBox(
+                carla.Location(x=values[0], y=values[1], z=values[2]),
+                carla.Vector3D(x=extent[0], y=extent[1], z=extent[2]))
+            positive_box.rotation = carla.Rotation(yaw=values[6], pitch=values[7], roll=values[8])
+            normalizations.append({'id': str(item.id), 'name': getattr(item, 'name', ''),
+                'label': labels[item.type], 'source_extent_m': list(values[3:6]),
+                'canonical_extent_m': list(extent)})
+            box = positive_box
+            values = values[:3] + extent + values[6:]
         # 完全相同的环境几何可能有多个组件标签，仅合并精确几何重复，不近似删物体。
         signature = tuple(values)
         if signature in seen:
@@ -113,6 +149,9 @@ def environment_catalogue(world, carla):
     return objects, {'source': 'CARLA_0.9.15_get_environment_objects_world_bounding_boxes',
         'included_labels': sorted(labels.values()), 'excluded_label_counts': excluded,
         'catalogue_count': len(objects), 'loaded_before_experiment_actors': True,
+        'geometry_version': 'carla-environment-box-1.1',
+        'signed_extent_normalized_count': len(normalizations),
+        'signed_extent_normalizations': normalizations,
         'scope': '已标注环境障碍物；排除建筑/道路/地面等区域语义，未缩小或关闭实体'}
 
 
@@ -181,9 +220,34 @@ class CarlaSession:
         settings.max_substeps = max(1, int(math.ceil(settings.fixed_delta_seconds / 0.01)))
         self.world.apply_settings(settings)
         self.environment_objects, self.environment_audit = environment_catalogue(self.world, carla)
+        audit_path = self.root / 'carla_environment_audit.json'
+        audit_path.write_text(json.dumps(self.environment_audit, ensure_ascii=False,
+                                        allow_nan=False, indent=2), encoding='utf-8')
+        # 全地图规范化明细只保存一次，避免每帧重复写入全部环境物体。
+        self.environment_audit = {key: value for key, value in self.environment_audit.items()
+                                  if key != 'signed_extent_normalizations'}
+        self.environment_audit['audit_path'] = str(audit_path)
+        if self.environment_audit['signed_extent_normalized_count']:
+            print('已对{}条镜像环境包围框作等价半尺寸规范化，未删除障碍物；明细：{}'.format(
+                self.environment_audit['signed_extent_normalized_count'], audit_path),
+                file=sys.stderr, flush=True)
         experiment = dict(config.get('experiment', {}))
         experiment['seed'] = int(seed)
-        self.experiment = create_experiment(self.world, client, experiment, carla)
+        selection_path = self.root / 'carla_scene_selection.json'
+        try:
+            self.experiment = create_experiment(self.world, client, experiment, carla)
+        except Exception as exc:
+            if hasattr(exc,'report'):
+                selection_path.write_text(json.dumps(exc.report,ensure_ascii=False,
+                    allow_nan=False,indent=2),encoding='utf-8')
+            raise
+        selection = getattr(self.experiment,'selection_report',None)
+        if selection is not None:
+            selection_path.write_text(json.dumps(selection,ensure_ascii=False,
+                allow_nan=False,indent=2),encoding='utf-8')
+            print('场景选址完成：起点{}，局部交互段{}m，完整导航{}m；诊断：{}'.format(
+                selection['selected_spawn_index'],selection['interaction_length_m'],
+                selection['route_length_m'],selection_path),file=sys.stderr,flush=True)
         self.ego = self.experiment.ego
         self.route_wps = self.experiment.route_waypoints
         if len(self.route_wps) < 2:
@@ -594,6 +658,8 @@ def main():
                 method, params = request['method'], request.get('params', {})
                 if method == 'init':
                     result = session.initialize(**params)
+                elif method == 'inspect_scene':
+                    result = inspect_scene(**params)
                 elif method == 'step':
                     result = session.step(**params)
                 elif method == 'close':

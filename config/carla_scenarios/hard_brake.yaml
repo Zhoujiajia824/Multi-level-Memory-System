@@ -1,7 +1,7 @@
 # 前车急刹：修改触发距离、最早触发时间和制动力构造相似交互。
 # 每份文件独立，不继承其他场景；复制本文件并修改name即可创建实验变体。
-# 地图名称不限Town05；必须在服务器已安装且有满足模板的同层近直非路口路段。
-schema_version: carla-scene-1.0
+# 地图名称不限Town05；交互区须为同层近直非路口，后续导航允许公开路口与温和弯曲。
+schema_version: carla-scene-1.1
 name: hard_brake
 template: hard_brake
 map: Town05
@@ -12,7 +12,13 @@ experiment:
   # null表示按命令seed搜索地点；固定整数表示当前地图的生成点索引。
   # 比较同地点的参数变体时，请先固定spawn_index，不要只固定seed。
   spawn_index: null
+  # 完整自车导航长度；不要求整条180m都为直线或无路口。
   route_length_m: 180
+  # null自动覆盖交互摆放范围；慢车默认45m、遮挡行人51m、切入107m。
+  # 可显式加长；不能缩至模板需要的交互段以下。
+  interaction_length_m: null
+  # 每2m导航采样的最大航向变化，度；不限制整条导航的累计转角。
+  navigation_step_yaw_limit_deg: 30
   initial_speed_mps: 10
   lead_speed_mps: 6
   lead_distance_m: 35

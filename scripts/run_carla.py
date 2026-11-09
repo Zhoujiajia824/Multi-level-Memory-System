@@ -62,19 +62,20 @@ def positive(value,name,allow_zero=False):
         raise ValueError(name+'必须为有限'+('非负数' if allow_zero else '正数'))
 
 
-SCENE_SCHEMA_VERSION='carla-scene-1.0'
+SCENE_SCHEMA_VERSION='carla-scene-1.1'
 SCENE_DIRECTORY=Path('config/carla_scenarios')
 
 
 def scene_configuration(path,seed):
     """每份场景文件独立声明地图、模板和完整实验参数，不继承其他场景。"""
-    from nine_grid.carla_scenarios import SCENARIOS,EXPERIMENT_FIELDS,validate_experiment
+    from nine_grid.carla_scenarios import (SCENARIOS,EXPERIMENT_FIELDS,REQUIRED_EXPERIMENT_FIELDS,
+        OPTIONAL_EXPERIMENT_DEFAULTS,ROUTE_SELECTION_VERSION,validate_experiment)
     raw=path.read_bytes()
     data=load_yaml(path,raw)
     required={'schema_version','name','template','map','desired_speed_mps','experiment'}
     if set(data)!=required:
         raise ValueError('场景YAML必须且仅包含schema_version、name、template、map、desired_speed_mps、experiment')
-    if data['schema_version']!=SCENE_SCHEMA_VERSION:
+    if data['schema_version'] not in ('carla-scene-1.0',SCENE_SCHEMA_VERSION):
         raise ValueError('场景schema_version不兼容：'+str(data['schema_version']))
     name=data['name']
     if (not isinstance(name,str) or not name or
@@ -90,10 +91,12 @@ def scene_configuration(path,seed):
     if not isinstance(experiment,dict):raise ValueError('场景experiment必须为对象')
     fields=set(EXPERIMENT_FIELDS)-{'name','seed'}
     unknown=set(experiment)-fields
-    missing=fields-set(experiment)
+    missing=(set(REQUIRED_EXPERIMENT_FIELDS)-{'name','seed'})-set(experiment)
     if unknown:raise ValueError('CARLA场景experiment包含未实现字段：'+str(sorted(unknown)))
     if missing:raise ValueError('CARLA场景experiment缺少显式参数：'+str(sorted(missing)))
     experiment=copy.deepcopy(experiment)
+    for key,value in OPTIONAL_EXPERIMENT_DEFAULTS.items():
+        experiment.setdefault(key,value)
     experiment.update(name=data['template'],seed=seed)
     validate_experiment(experiment)
     index=experiment.get('spawn_index')
@@ -102,7 +105,8 @@ def scene_configuration(path,seed):
     for field in ('ego_blueprint','lead_blueprint','occluder_blueprint'):
         if not isinstance(experiment.get(field),str) or not experiment[field].strip():
             raise ValueError(field+'必须为非空字符串')
-    return data,experiment,{'schema_version':SCENE_SCHEMA_VERSION,'path':str(path),
+    return data,experiment,{'schema_version':data['schema_version'],
+        'effective_schema_version':SCENE_SCHEMA_VERSION,'route_selection_version':ROUTE_SELECTION_VERSION,'path':str(path),
         'sha256':hashlib.sha256(raw).hexdigest(),'yaml':raw.decode('utf-8-sig'),
         'name':name,'template':data['template'],'requested_map':data['map'],
         'requested_desired_speed_mps':data['desired_speed_mps']}
@@ -184,7 +188,9 @@ def main(argv=None):
     parser.add_argument('--exclusive-world',action='store_true',help='确认此端口为本实验专用CARLA世界')
     parser.add_argument('--allow-world-reset',action='store_true',help='只在专用空世界允许按配置切换地图')
     parser.add_argument('--list-scenarios',action='store_true')
-    parser.add_argument('--dry-run',action='store_true',help='只检查配置并显示运行清单，不连接任何服务')
+    mode=parser.add_mutually_exclusive_group()
+    mode.add_argument('--dry-run',action='store_true',help='只检查配置并显示运行清单，不连接任何服务')
+    mode.add_argument('--inspect-scene',action='store_true',help='只读连接当前地图检查所有候选起点，不换地图、不生成演员、不推进仿真')
     parser.add_argument('--models-config',default='config/models.yaml')
     parser.add_argument('--prompts-config',default='config/prompts.yaml')
     parser.add_argument('--fast',choices=['off','api','server'],default='off')
@@ -268,12 +274,30 @@ def main(argv=None):
                 '提示词SHA256':{role:model_settings[role]['system_prompt_sha256'] for role in ('fast','reflection')},
                 '真实运行待满足':['已启动CARLA 0.9.15专用空世界','--exclusive-world','有效--carla-python及SDK','启用模型时需可用服务']},ensure_ascii=False,indent=2))
             return 0
-        if not args.exclusive_world:raise ValueError('真实运行须显式指定--exclusive-world确认专用CARLA世界')
+        if not args.inspect_scene and not args.exclusive_world:raise ValueError('真实运行须显式指定--exclusive-world确认专用CARLA世界')
         if not cfg.get('python') or not Path(cfg['python']).is_file():
             raise ValueError('真实运行需要--carla-python指向已安装CARLA 0.9.15 SDK的解释器文件')
     except (OSError,ValueError,TypeError,KeyError,yaml.YAMLError) as exc:
         parser.error(str(exc))
     logging.basicConfig(level=logging.INFO,format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
+    if args.inspect_scene:
+        from nine_grid.carla_adapter import BridgeProcess
+        paths['episodes'].mkdir(parents=True,exist_ok=True)
+        output=paths['episodes']/(args.prefix+'_scene_selection.json')
+        bridge=BridgeProcess(cfg['python'],paths['episodes'],timeout_s=float(cfg['timeout_s'])*2+10)
+        try:
+            result=bridge.call('inspect_scene',config=cfg,seed=args.seed)
+        finally:
+            bridge.close()
+        temporary=output.with_suffix('.json.tmp')
+        temporary.write_text(json.dumps(result,ensure_ascii=False,indent=2,allow_nan=False),encoding='utf-8')
+        temporary.replace(output)
+        print(json.dumps({'模式':'只读选址检查','报告':str(output),'地图':result['map'],
+            '成功':result['success'],'选定起点':result['selected_spawn_index'],
+            '可用起点':[row['spawn_index'] for row in result['candidates'] if row['reason']=='accepted'],
+            '拒绝原因':result['rejection_counts'],'交互段m':result['interaction_length_m'],
+            '导航长度m':result['route_length_m']},ensure_ascii=False))
+        return 0 if result['success'] else 2
     from nine_grid.models import VisionClient
     from nine_grid.representations import DINOExtractor
     from nine_grid.runner import run_episode

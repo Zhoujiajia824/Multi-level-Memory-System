@@ -1,18 +1,22 @@
 """CARLA 0.9.15首批可控交互场景；兼容SDK的Python 3.7，不推进世界时钟。
 
-场景使用公开地图选择足够长、同层、非路口路段；不能把无法生成当成实验成功。
+局部交互段与完整自车导航分开检查；不能把无法生成当成实验成功。
 周车使用物理Ackermann控制，行人使用WalkerControl，运行期间不瞬移对象。
 """
 import math
 import random
+import json
 
 
 SCENARIOS = ('slow_lead', 'hard_brake', 'cut_in', 'parked_obstacle', 'occluded_pedestrian')
-EXPERIMENT_FIELDS = frozenset(('name', 'seed', 'spawn_index', 'route_length_m', 'initial_speed_mps',
+REQUIRED_EXPERIMENT_FIELDS = frozenset(('name', 'seed', 'spawn_index', 'route_length_m', 'initial_speed_mps',
     'lead_speed_mps', 'lead_distance_m', 'trigger_distance_m', 'lane_change_seconds',
     'pedestrian_speed_mps', 'ego_blueprint', 'lead_blueprint', 'trigger_min_time_s',
     'hard_brake_amount', 'cut_in_side', 'pedestrian_longitudinal_offset_m',
     'occluder_lateral_fraction', 'occluder_blueprint', 'pedestrian_blueprint'))
+OPTIONAL_EXPERIMENT_DEFAULTS = {'interaction_length_m': None, 'navigation_step_yaw_limit_deg': 30.}
+EXPERIMENT_FIELDS = REQUIRED_EXPERIMENT_FIELDS | frozenset(OPTIONAL_EXPERIMENT_DEFAULTS)
+ROUTE_SELECTION_VERSION = 'carla-local-corridor-navigation-1.1'
 
 
 def _distance(a, b):
@@ -23,26 +27,75 @@ def _angle(value):
     return (value+math.pi) % (2*math.pi)-math.pi
 
 
-def _trace(wp, length, spacing=2.0):
-    """只选公开合法后继中最接近当前方向的路段，拒绝路口和高度歧义。"""
-    points = [wp]
-    travelled = 0.0
-    while travelled < length:
-        options = [p for p in points[-1].next(spacing)
-                   if not p.is_junction and abs(p.transform.location.z-wp.transform.location.z) < 1.5]
-        if not options:
-            return None
-        current = points[-1]
-        nxt = min(options, key=lambda p: (abs(_angle(math.radians(p.transform.rotation.yaw-current.transform.rotation.yaw))),
-                                         p.road_id, p.section_id, p.lane_id, p.s))
-        if abs(_angle(math.radians(nxt.transform.rotation.yaw-wp.transform.rotation.yaw))) > .3:
-            return None
-        distance = _distance(nxt.transform.location, current.transform.location)
-        if distance < .1:
-            return None
-        travelled += distance
-        points.append(nxt)
-    return points
+def _waypoint_key(wp):
+    return (wp.road_id, wp.section_id, wp.lane_id, round(float(wp.s), 2))
+
+
+def _trace_details(wp, length, interaction_length, spacing=2., max_step_yaw_deg=30.):
+    """公开合法后继的有界深度搜索。近直非路口仅约束交互段，不约束远端导航。
+
+    后续分支优先最小局部转角，断路时尝试其余公开后继；不是指定终点的A*。
+    保持相对起点的同层限制，与桥的地图高度筛选一致；不允许重复路段回环。
+    """
+    points, arcs, choices = [wp], [0.], [None]
+    visited = {_waypoint_key(wp)}
+    longest, failure, expanded = 0., 'navigation_dead_end', 0
+    while points:
+        if arcs[-1] >= length:
+            return list(points), 'accepted', arcs[-1]
+        if choices[-1] is None:
+            if expanded >= 5000:
+                return None, 'navigation_search_limit', longest
+            expanded += 1
+            current = points[-1]
+            choices[-1] = sorted(current.next(spacing), key=lambda p: (
+                abs(_angle(math.radians(p.transform.rotation.yaw-current.transform.rotation.yaw))),
+                p.road_id, p.section_id, p.lane_id, p.s))
+            if not choices[-1] and arcs[-1] >= longest:
+                longest, failure = arcs[-1], 'navigation_dead_end'
+        if not choices[-1]:
+            visited.remove(_waypoint_key(points.pop()))
+            arcs.pop(); choices.pop()
+            continue
+        nxt = choices[-1].pop(0)
+        current, arc = points[-1], arcs[-1]
+        step = _distance(nxt.transform.location, current.transform.location)
+        reason = None
+        if str(nxt.lane_type) != 'Driving':
+            reason = 'navigation_not_driving'
+        elif abs(nxt.transform.location.z-wp.transform.location.z) >= 1.5:
+            reason = 'navigation_other_level'
+        elif not .1 <= step <= spacing*1.5:
+            reason = 'navigation_discontinuous'
+        elif abs(_angle(math.radians(nxt.transform.rotation.yaw-current.transform.rotation.yaw))) > math.radians(max_step_yaw_deg):
+            reason = 'navigation_step_turn'
+        elif (_waypoint_key(nxt) in visited or
+              any(_distance(nxt.transform.location, p.transform.location) < .5 for p in points[:-2])):
+            reason = 'navigation_loop'
+        elif arc < interaction_length and nxt.is_junction:
+            reason = 'interaction_junction'
+        elif arc < interaction_length and abs(_angle(math.radians(nxt.transform.rotation.yaw-wp.transform.rotation.yaw))) > .3:
+            reason = 'interaction_bend'
+        if reason:
+            if arc >= longest:
+                longest, failure = arc, reason
+            continue
+        points.append(nxt); arcs.append(arc+step); choices.append(None)
+        visited.add(_waypoint_key(nxt))
+    return None, failure, longest
+
+
+def interaction_length(settings):
+    """交互走廊须覆盖实际布置及模板核查段；10m为开发起点的布置余量。"""
+    lead = float(settings.get('lead_distance_m', 35.))
+    required = lead+10.
+    if settings.get('name', 'slow_lead') == 'occluded_pedestrian':
+        required += float(settings.get('pedestrian_longitudinal_offset_m', 6.))
+    elif settings.get('name') == 'cut_in':
+        required = max(required, lead+float(settings.get('lead_speed_mps', 6.))*(
+            float(settings.get('lane_change_seconds', 4.))+8.))
+    explicit = settings.get('interaction_length_m')
+    return required if explicit is None else float(explicit)
 
 
 def _at(points, distance):
@@ -113,7 +166,108 @@ def validate_experiment(settings):
     index = settings.get('spawn_index')
     if index is not None and (type(index) is not int or index<0):
         raise ValueError('spawn_index必须为null或非负整数')
+    explicit = settings.get('interaction_length_m')
+    if explicit is not None:
+        if (type(explicit) not in (int,float) or not math.isfinite(explicit)
+                or explicit < interaction_length(dict(settings, interaction_length_m=None))):
+            raise ValueError('interaction_length_m必须覆盖完整交互布置走廊，或使用null自动计算')
+    if interaction_length(settings) > settings.get('route_length_m',180.):
+        raise ValueError('interaction_length_m不能超过route_length_m')
+    yaw_limit = settings.get('navigation_step_yaw_limit_deg',30.)
+    if type(yaw_limit) not in (int,float) or not math.isfinite(yaw_limit) or not 0 < yaw_limit <= 45.:
+        raise ValueError('navigation_step_yaw_limit_deg必须在(0,45]度内')
     return name
+
+
+def _sidewalk(wp):
+    other = wp.get_right_lane()
+    for _ in range(5):
+        if other is None or str(other.lane_type) == 'Sidewalk':
+            break
+        other = other.get_right_lane()
+    return other if other is not None and str(other.lane_type) == 'Sidewalk' else None
+
+
+def select_route(road_map, settings, carla, audit_all=False):
+    """纯地图选址，不创建演员、不推进时钟；检查与真实初始化使用同一实现。"""
+    name = validate_experiment(settings)
+    spawn_points = list(road_map.get_spawn_points())
+    index = settings.get('spawn_index')
+    if index is not None:
+        if not 0 <= index < len(spawn_points):
+            raise ValueError('spawn_index不在当前地图生成点范围内')
+        candidates = [(index, spawn_points[index])]
+    else:
+        candidates = list(enumerate(spawn_points))
+        random.Random(settings.get('seed',1)).shuffle(candidates)
+    length = float(settings.get('route_length_m',180.))
+    local_length = interaction_length(settings)
+    report = {'version': ROUTE_SELECTION_VERSION, 'success': False,
+              'map': str(getattr(road_map,'name','unknown')), 'seed': settings.get('seed',1),
+              'template': name, 'route_length_m': length, 'interaction_length_m': local_length,
+              'total_spawn_points': len(spawn_points), 'selected_spawn_index': None,
+              'rejection_counts': {}, 'candidates': [], 'audit_all': bool(audit_all),
+              'scope': '交互区同层近直非路口；导航允许公开路口/温和弯曲；未验证完整路口路权'}
+    selected = None
+    for idx, pose in candidates:
+        wp = road_map.get_waypoint(pose.location)
+        route, prefix, reason, lead_wp = None, 0., None, None
+        if wp is None or str(wp.lane_type) != 'Driving':
+            reason = 'start_not_driving'
+        elif wp.is_junction:
+            reason = 'start_in_junction'
+        else:
+            route, reason, prefix = _trace_details(wp,length,local_length,
+                max_step_yaw_deg=float(settings.get('navigation_step_yaw_limit_deg',30.)))
+            if route is not None:
+                lead_wp = _at(route,float(settings.get('lead_distance_m',35.)))
+                if name in ('cut_in','parked_obstacle'):
+                    side = settings.get('cut_in_side','left') if name=='cut_in' else 'left'
+                    if not _can_cross(lead_wp,carla,side,name=='cut_in'):
+                        reason = 'interaction_adjacent_lane_or_crossing'
+                    elif name == 'cut_in':
+                        end_s = float(settings.get('lead_distance_m',35.))+float(settings.get('lead_speed_mps',6.))*(
+                            float(settings.get('lane_change_seconds',4.))+8.)
+                        checked = [_at(route,d) for d in range(int(settings.get('lead_distance_m',35.)),int(end_s),2)]
+                        if not all(_can_cross(p,carla,side,True) for p in checked):
+                            reason = 'interaction_cut_in_crossing_range'
+                elif name == 'occluded_pedestrian':
+                    pedestrian_wp = _at(route,float(settings.get('lead_distance_m',35.))+
+                        float(settings.get('pedestrian_longitudinal_offset_m',6.)))
+                    if _sidewalk(pedestrian_wp) is None:
+                        reason = 'interaction_pedestrian_sidewalk'
+        row = {'spawn_index': idx, 'reason': reason, 'valid_prefix_m': prefix}
+        if wp is not None:
+            t = wp.transform
+            row['start_pose_carla'] = {'x_m': float(t.location.x), 'y_m': float(t.location.y),
+                'z_m': float(t.location.z), 'yaw_deg': float(t.rotation.yaw)}
+        report['candidates'].append(row)
+        if reason == 'accepted':
+            if selected is None:
+                selected = (idx,wp,route,lead_wp)
+                report.update(success=True, selected_spawn_index=idx)
+                report['selected_route'] = [{'x_m': float(p.transform.location.x),
+                    'y_m': float(p.transform.location.y), 'z_m': float(p.transform.location.z),
+                    'yaw_deg': float(p.transform.rotation.yaw), 'junction': bool(p.is_junction),
+                    'road_id': p.road_id, 'section_id': p.section_id, 'lane_id': p.lane_id,
+                    's_m': float(p.s)} for p in route]
+            if not audit_all:
+                break
+        else:
+            counts = report['rejection_counts']
+            counts[reason] = counts.get(reason,0)+1
+    report['checked_spawn_points'] = len(report['candidates'])
+    report['longest_valid_prefix_m'] = max([row['valid_prefix_m'] for row in report['candidates']] or [0.])
+    return selected, report
+
+
+class RouteSelectionError(RuntimeError):
+    def __init__(self, report):
+        self.report = report
+        super().__init__('场景选址失败：检查{}个起点，交互段{}m，导航{}m；原因={}。'
+                         '请用--inspect-scene查看同一地图的逐点诊断，不会更换模板或缩短路线'.format(
+            report['checked_spawn_points'],report['interaction_length_m'],report['route_length_m'],
+            json.dumps(report['rejection_counts'],ensure_ascii=False,sort_keys=True)))
 
 
 class Experiment:
@@ -151,48 +305,9 @@ class Experiment:
 
     def _setup(self):
         road_map = self.world.get_map()
-        spawn_points = list(road_map.get_spawn_points())
-        index = self.settings.get('spawn_index')
-        if index is not None:
-            if type(index) is not int or not 0 <= index < len(spawn_points):
-                raise ValueError('spawn_index不在当前地图生成点范围内')
-            candidates = [(index, spawn_points[index])]
-        else:
-            candidates = list(enumerate(spawn_points))
-            self.rng.shuffle(candidates)
-        selected = None
-        for idx, pose in candidates:
-            wp = road_map.get_waypoint(pose.location)
-            if wp is None or wp.is_junction:
-                continue
-            route = _trace(wp, float(self.settings.get('route_length_m', 180.)))
-            if route is None:
-                continue
-            lead_wp = _at(route, float(self.settings.get('lead_distance_m', 35.)))
-            if self.name in ('cut_in', 'parked_obstacle'):
-                side = self.settings.get('cut_in_side','left') if self.name=='cut_in' else 'left'
-                if not _can_cross(lead_wp,self.carla,side,self.name=='cut_in'):
-                    continue
-                if self.name == 'cut_in':
-                    # 预先核对本次交互会经过的路段；实际控制阶段仍逐帧核对。
-                    end_s = min(float(self.settings.get('route_length_m',180.)),
-                                float(self.settings.get('lead_distance_m',35.))+
-                                float(self.settings.get('lead_speed_mps',6.))*(float(self.settings.get('lane_change_seconds',4.))+8.))
-                    checked=[_at(route,d) for d in range(int(self.settings.get('lead_distance_m',35.)),int(end_s),2)]
-                    if not all(_can_cross(p,self.carla,side,True) for p in checked):
-                        continue
-            if self.name == 'occluded_pedestrian':
-                sidewalk = lead_wp.get_right_lane()
-                for _ in range(5):
-                    if sidewalk is None or str(sidewalk.lane_type) == 'Sidewalk':
-                        break
-                    sidewalk = sidewalk.get_right_lane()
-                if sidewalk is None or str(sidewalk.lane_type) != 'Sidewalk':
-                    continue
-            selected = idx, wp, route, lead_wp
-            break
+        selected, self.selection_report = select_route(road_map,self.settings,self.carla)
         if selected is None:
-            raise RuntimeError('当前地图没有满足本模板的同层连续路段；明确指定适用地图或spawn_index，不会换成其他模板')
+            raise RouteSelectionError(self.selection_report)
         idx, wp, self.forward_route, lead_wp = selected
         self.selected_spawn_index = idx
         self.ego = self._spawn(self.settings.get('ego_blueprint', 'vehicle.tesla.model3'), wp,
@@ -221,12 +336,8 @@ class Experiment:
             self.lead.apply_control(self.carla.VehicleControl(brake=1., hand_brake=True))
             pedestrian_wp = _at(self.forward_route, float(self.settings.get('lead_distance_m',35.))+
                                 float(self.settings.get('pedestrian_longitudinal_offset_m',6.)))
-            sidewalk = pedestrian_wp.get_right_lane()
-            for _ in range(5):
-                if sidewalk is None or str(sidewalk.lane_type) == 'Sidewalk':
-                    break
-                sidewalk = sidewalk.get_right_lane()
-            if sidewalk is None or str(sidewalk.lane_type) != 'Sidewalk':
+            sidewalk = _sidewalk(pedestrian_wp)
+            if sidewalk is None:
                 raise RuntimeError('行人所在位置缺少真实人行道，不在车道内伪造遮挡行人')
             pedestrians = sorted(self.world.get_blueprint_library().filter('walker.pedestrian.*'), key=lambda b:b.id)
             if not pedestrians:
