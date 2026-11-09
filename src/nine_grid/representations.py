@@ -20,7 +20,8 @@ from .configuration import (grid_distance_config, grid_metric_signature,
                             grid_observation_config, grid_observation_signature,
                             occupancy_distance_config, bev_label_config)
 
-FEATURE_VERSION = "bev-occ-grid-2.0"
+# 静态实体不再绘制方向箭头，改变了无字BEV及其DINO输入；旧库保留但不可混检。
+FEATURE_VERSION = "bev-occ-grid-2.1"
 GRID_REPRESENTATION_VERSION = "lane-eight-interaction-2.0"
 OCC_REPRESENTATION_VERSION = "area-occupancy-evidence-2.0"
 CHANNELS = ("crosswalk", "ego", "vehicle", "bicycle", "pedestrian", "static_obstacle")
@@ -798,6 +799,9 @@ def render_bev(scene, labels=True):
         color = COLORS.get(kind, (80, 80, 80))
         shape = _shape(actor)
         _paint_shape(draw, shape, scene.ego, color, (40, 40, 40))
+        # 仅车辆（含自行车）、行人和自车显示朝向；静态障碍物保留真实形状。
+        if kind not in ('ego','vehicle','bicycle','pedestrian'):
+            continue
         # 箭头从车体前沿延伸一个车宽；行人使用运动朝向而非伪造意图。
         direction = math.atan2(actor.velocity[1],actor.velocity[0]) if np.linalg.norm(actor.velocity)>.1 else actor.heading
         start = actor.position + np.array([math.cos(direction), math.sin(direction)])*actor.length/2

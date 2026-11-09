@@ -126,11 +126,21 @@ def platform_configuration(data,args,scene_path):
     allowed={'python','host','port','timeout_s','allow_world_reset','camera_width','camera_height',
         'camera_fov','camera_height_m','arrival_margin_m','map_resolution_m',
         'map_speed_cap_mps','same_level_tolerance_m','observation_resolution_m','observation_heights_m',
-        'depth_empty_tolerance_m','visibility_surface_tolerance_m','visibility_min_samples'}
+        'depth_empty_tolerance_m','visibility_surface_tolerance_m','visibility_min_samples',
+        'world_plan_debug','display_plan_overlay','camera_save_hz','rgb_postprocess_effects'}
     if set(data['carla'])-allowed:
         raise ValueError('carla包含未实现字段：'+str(sorted(set(data['carla'])-allowed)))
     scene,experiment,source=scene_configuration(scene_path,args.seed)
     cfg=copy.deepcopy(data['carla'])
+    for key,default in (('world_plan_debug',False),('display_plan_overlay',True),
+                        ('rgb_postprocess_effects',True)):
+        cfg.setdefault(key,default)
+        if type(cfg[key]) is not bool:raise ValueError('carla.'+key+'必须为布尔值')
+    cfg.setdefault('camera_save_hz',1)
+    if type(cfg['camera_save_hz']) not in (int,float) or cfg['camera_save_hz']!=1:
+        raise ValueError('carla.camera_save_hz当前固定为1Hz，与1Hz模型源帧同步')
+    if getattr(args,'world_plan',None) is not None:
+        cfg['world_plan_debug']=args.world_plan
     cfg['map']=scene['map']
     cfg['desired_speed_mps']=scene['desired_speed_mps']
     for key in ('python','host','port','map'):
@@ -168,6 +178,8 @@ def platform_configuration(data,args,scene_path):
         if getattr(args,'carla_python' if key=='python' else key) is not None}
     source['command_overrides'].update(exclusive_world=bool(args.exclusive_world),
         allow_world_reset=bool(args.allow_world_reset))
+    if getattr(args,'world_plan',None) is not None:
+        source['command_overrides']['world_plan_debug']=args.world_plan
     cfg['experiment']=experiment
     cfg['scenario_source']=source
     refresh_scene_audit(cfg)
@@ -207,7 +219,10 @@ def main(argv=None):
     parser.add_argument('--memory-dir',default='outputs/memory_db/carla')
     parser.add_argument('--memory-read-dir');parser.add_argument('--memory-write-dir')
     parser.add_argument('--dino-model')
-    parser.add_argument('--live',action='store_true');parser.add_argument('--video',action='store_true')
+    parser.add_argument('--live',action='store_true',help='在有桌面的本机显示相机拼图；无桌面服务器请使用外部旁观端')
+    parser.add_argument('--video',action='store_true',help='录制每轮六相机RGB显示拼图，退出时检查可播放性')
+    parser.add_argument('--world-plan',action=argparse.BooleanOptionalAction,default=None,
+        help='在CARLA世界绘制有限寿命规划线；相机可能拍到，严格原图采集使用--no-world-plan')
     args=parser.parse_args(argv)
     try:
         if args.episodes<1 or args.seed<0:raise ValueError('轮数必须为正整数，seed必须非负')
@@ -262,6 +277,8 @@ def main(argv=None):
         config['memory'].update(read_enabled=args.retrieve,write_enabled=args.write_memory,mode=args.memory_mode)
         from nine_grid.configuration import validate_config
         config=validate_config(config)
+        from nine_grid.carla_bridge import validate_camera_source_clock
+        validate_camera_source_clock(config.get('clock', {}))
         paths={'episodes':project_path(args.episodes_dir),'read':project_path(args.memory_read_dir or args.memory_dir),
                'write':project_path(args.memory_write_dir or args.memory_dir)}
         seeds=[args.seed if args.seed_mode=='fixed' else args.seed+i for i in range(args.episodes)]

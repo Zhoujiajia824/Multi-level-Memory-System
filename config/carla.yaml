@@ -11,6 +11,10 @@ carla:
   camera_height: 360
   camera_fov: 100
   camera_height_m: 2.2
+  # 原始RGB/拼图/同帧核查资产按仿真时间1Hz归档；实时视频仍10Hz。
+  camera_save_hz: 1
+  # RGB使用CARLA默认光照/色调处理；深度传感器独立保持关闭后处理。
+  rgb_postprocess_effects: true
   arrival_margin_m: 3
   map_resolution_m: 2
   map_speed_cap_mps: 30
@@ -20,3 +24,7 @@ carla:
   depth_empty_tolerance_m: 0.05
   visibility_surface_tolerance_m: 0.35
   visibility_min_samples: 2
+  # 世界debug线可能被相机拍摄；严格无叠加采集时保持false。
+  # 命令行--world-plan可开启；RGB显示副本/录像的投影不依赖世界debug线。
+  world_plan_debug: false
+  display_plan_overlay: true

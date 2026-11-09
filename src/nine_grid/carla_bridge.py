@@ -12,6 +12,23 @@ import zlib
 from pathlib import Path
 
 
+def validate_camera_source_clock(clock):
+    """文件型模型输入只能使用本轮归档源帧，禁止高频调用时混入旧相机图。"""
+    frequency = clock.get('fast_hz', 1)
+    if isinstance(frequency, bool) or frequency != 1:
+        raise ValueError('CARLA相机按1Hz归档，clock.fast_hz当前也必须为1；不复用旧图调用模型')
+
+
+def camera_storage_due(sim_time, camera_save_hz=1):
+    """RGB资产只落盘整秒原帧；10Hz规划/录像仍消费各自当前帧。"""
+    if isinstance(camera_save_hz, bool) or camera_save_hz != 1:
+        raise ValueError('camera_save_hz当前必须为1，与快模型原帧采样对齐')
+    if isinstance(sim_time, bool) or not isinstance(sim_time, (int, float)) or not math.isfinite(sim_time) or sim_time < -1e-5:
+        raise ValueError('相机落盘需要有限非负仿真时间')
+    # 只容忍物理时钟的浮点误差，不把相邻控制帧舍入成源帧。
+    return abs(sim_time-round(sim_time)) <= 1e-5
+
+
 def lane_key(waypoint):
     return '{}|{}|{}'.format(waypoint.road_id, waypoint.section_id, waypoint.lane_id)
 
@@ -190,6 +207,11 @@ class CarlaSession:
     def initialize(self, config, directory, seed):
         if config.get('exclusive_world') is not True:
             raise ValueError('必须显式确认 exclusive_world=true，仅使用本任务独立 CARLA 世界')
+        if type(config.get('world_plan_debug',False)) is not bool:
+            raise ValueError('world_plan_debug必须为布尔值')
+        camera_storage_due(0., config.get('camera_save_hz', 1))
+        if type(config.get('rgb_postprocess_effects', True)) is not bool:
+            raise ValueError('rgb_postprocess_effects必须为布尔值')
         for key, default in (('timeout_s', 30), ('map_resolution_m', 2), ('same_level_tolerance_m', 1.5),
                              ('perception_radius_m', 120), ('visibility_surface_tolerance_m', .35),
                              ('camera_height_m', 2.2), ('map_speed_cap_mps', 30)):
@@ -202,6 +224,9 @@ class CarlaSession:
         from carla_scenarios import create_experiment
         self.carla = carla
         self.cfg = config
+        if config.get('world_plan_debug',False):
+            print('已开启CARLA世界规划线：RGB相机可能拍到调试线；严格无叠加采集请使用--no-world-plan。',
+                  file=sys.stderr,flush=True)
         self.root = Path(directory).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.timeout = float(config.get('timeout_s', 30.0))
@@ -297,7 +322,10 @@ class CarlaSession:
                                    ('fov', self.fov), ('sensor_tick', 0.0)):
                     bp.set_attribute(key, str(value))
                 if bp.has_attribute('enable_postprocess_effects'):
-                    bp.set_attribute('enable_postprocess_effects', 'false')
+                    # CARLA关闭RGB后处理同时会关闭光照并使用线性gamma；恢复原生RGB默认管线。
+                    # 深度是几何证据，始终禁用后处理；不额外调色或覆盖默认gamma/曝光参数。
+                    enabled = kind == 'rgb' and self.cfg.get('rgb_postprocess_effects', True)
+                    bp.set_attribute('enable_postprocess_effects', 'true' if enabled else 'false')
                 pose = c.Transform(c.Location(z=float(self.cfg.get('camera_height_m', 2.2))), c.Rotation(yaw=yaw))
                 sensor = self.world.spawn_actor(bp, pose, attach_to=self.ego, attachment_type=c.AttachmentType.Rigid)
                 self.sensors.append(sensor)
@@ -360,7 +388,10 @@ class CarlaSession:
 
     def _camera_payload(self):
         folder = self.root / 'camera_frames' / '{:08d}'.format(self.frame)
-        folder.mkdir(parents=True, exist_ok=True)
+        if self.t0 is None:
+            raise ValueError('相机落盘缺少本轮起始仿真时间')
+        saved = camera_storage_due(float(self.frames['front_rgb'].timestamp)-self.t0,
+                                   self.cfg.get('camera_save_hz', 1))
         cameras = []
         for view in ('front', 'front_left', 'front_right', 'back', 'back_left', 'back_right'):
             rgb, depth = self.frames[view + '_rgb'], self.frames[view + '_depth']
@@ -374,14 +405,24 @@ class CarlaSession:
             depth_bytes = bytes(depth.raw_data)
             if len(depth_bytes) != self.width*self.height*4:
                 raise ValueError('临时深度BGRA字节数不符合相机尺寸：'+view)
+            rgb_bytes = bytes(rgb.raw_data)
+            if len(rgb_bytes) != self.width*self.height*4:
+                raise ValueError('临时RGB BGRA字节数不符合相机尺寸：'+view)
             rgb_path = folder / (view + '.png')
-            if not rgb_path.is_file():
+            if saved and not rgb_path.is_file():
+                folder.mkdir(parents=True, exist_ok=True)
                 rgb.save_to_disk(str(rgb_path))
+            # 当前RGB始终传输，非落盘帧也用于当前视频/显示，绝不重复上一整秒图片。
+            rgb_transport = {'encoding': 'zlib-base64-bgra8-1.0', 'frame': int(rgb.frame),
+                'timestamp': float(rgb.timestamp), 'width': self.width, 'height': self.height,
+                'data': base64.b64encode(zlib.compress(rgb_bytes, 1)).decode('ascii')}
             # 深度只用于同帧可见性/观测证据，通过内存RPC交付，不生成深度图片。
             transport = {'encoding': 'zlib-base64-bgra8-1.0', 'frame': int(depth.frame),
                 'timestamp': float(depth.timestamp), 'width': self.width, 'height': self.height,
                 'data': base64.b64encode(zlib.compress(depth_bytes, 1)).decode('ascii')}
-            cameras.append({'view': view, 'rgb_path': str(rgb_path), 'depth_transport': transport,
+            cameras.append({'view': view, 'rgb_path': str(rgb_path) if saved else None,
+                'rgb_saved': saved, 'rgb_transport': rgb_transport, 'depth_transport': transport,
+                'rgb_postprocess_effects': self.cfg.get('rgb_postprocess_effects', True),
                 'width': self.width, 'height': self.height, 'fov_deg': self.fov,
                 'frame': self.frame, 'timestamp': rgb.timestamp,
                 'world_to_camera_ue': rgb.transform.get_inverse_matrix(),
@@ -622,6 +663,43 @@ class CarlaSession:
             'source': 'current_camera_depth_visible_geometry_then_actor_state',
             'scenario': self.experiment.name}
 
+    def _show_plan(self, plan):
+        """显示层使用真实世界坐标；不参与感知/控制。debug可能进入相机，不能声称原图隔离。"""
+        enabled = self.cfg.get('world_plan_debug', False)
+        result = {'version': 'carla-plan-display-1.0', 'world_debug_enabled': enabled,
+                  'points_carla_xyz': [], 'segments_drawn': 0,
+                  'source_carla_frame': self.frame, 'life_time_s': 1.1 / self.planner_hz,
+                  'sensor_debug_exposure': 'possible' if enabled else 'disabled'}
+        if not plan:
+            return result
+        if (not isinstance(plan,list) or len(plan)>1000 or
+                any(not isinstance(p,list) or len(p)!=2 or
+                    any(isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(v) for v in p)
+                    for p in plan)):
+            raise ValueError('显示规划必须为有限世界二维点列表')
+        c = self.carla
+        origin_z = float(self.ego.get_location().z)
+        for x, y in plan:
+            point = c.Location(x=float(x), y=-float(y), z=origin_z)
+            waypoint = self.map.get_waypoint(point, project_to_road=True, lane_type=c.LaneType.Driving)
+            z = float(waypoint.transform.location.z) if waypoint is not None else float(point.z)
+            result['points_carla_xyz'].append([float(x), -float(y), z+.15])
+        if enabled:
+            try:
+                for a,b in zip(result['points_carla_xyz'],result['points_carla_xyz'][1:]):
+                    if sum((x-y)**2 for x,y in zip(a,b)) < 1e-10:
+                        continue
+                    self.world.debug.draw_line(c.Location(x=a[0],y=a[1],z=a[2]),
+                        c.Location(x=b[0],y=b[1],z=b[2]), thickness=.08,
+                        color=c.Color(0,230,255), life_time=result['life_time_s'], persistent_lines=False)
+                    result['segments_drawn'] += 1
+                # 同步查询降低异步绘制请求迟到风险，但不是官方保证的debug flush。
+                self.world.get_settings()
+            except Exception as exc:
+                result['error'] = type(exc).__name__+': '+str(exc)
+                print('CARLA世界规划线绘制失败：'+result['error'], file=sys.stderr, flush=True)
+        return result
+
     def step(self, control, plan):
         if len(control) != 2 or not all(math.isfinite(float(v)) for v in control):
             raise ValueError('控制必须是有限的加速度和转角')
@@ -633,14 +711,16 @@ class CarlaSession:
         desired = max(0.0, speed + acceleration / self.planner_hz)
         command = self.carla.VehicleAckermannControl(steer=-steering, speed=desired, acceleration=acceleration)
         self.ego.apply_ackermann_control(command)
-        # 不向世界绘制预测线：debug 图元也会被 RGB 传感器拍摄，污染下一帧模型输入。
-        # 计划保留在主程序 BEV 诊断图中，真实相机资产始终不含预测叠加。
+        # 世界线仅在显式开关下绘制，寿命略长于一控制周期，避免永久残留。
+        visualization = self._show_plan(plan)
         for _ in range(self.physics_hz // self.planner_hz):
             elapsed = self.world.get_snapshot().timestamp.elapsed_seconds - self.t0
             self.experiment.before_tick(elapsed, 1.0 / self.physics_hz)
             self.frame = self.world.tick(self.timeout)
         self._collect(self.frame)
         result = self.snapshot()
+        visualization['capture_carla_frame'] = self.frame
+        result['plan_visualization'] = visualization
         result['command'] = {'acceleration_mps2': acceleration, 'steering_rad_left': steering,
                              'speed_mps_ackermann': desired}
         measured = math.hypot(*result['ego']['velocity'])
