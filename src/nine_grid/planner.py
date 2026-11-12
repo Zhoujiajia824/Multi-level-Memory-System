@@ -7,6 +7,7 @@ import shapely
 from shapely.geometry import Polygon
 from shapely.geometry import LineString
 from .contracts import PlanResult
+from .planning_objects import planning_view
 from .local_reference import LocalReferenceManager, LocalReferenceResult
 from .goals import GoalManager, goal_seed_path, first_arrival_residual
 from .realtime_solver import Dynamics, QuadraticSolver, rectangle_gap, circle_gap, rectangle_distance
@@ -80,6 +81,37 @@ def _project_executable_controls(controls,speed,dt,min_a,max_a,max_delta):
         result[index,1]=np.clip(result[index,1],-max_delta,max_delta)
         speed=max(0.,speed+result[index,0]*dt)
     return result
+
+
+def _validate_prediction_input(scene, predictions, horizon):
+    """拒绝错帧、漏对象和不足时域；不得把接口错误当作空交通或静止尾段。"""
+    if (predictions.frame_id != scene.frame_id or predictions.version != scene.version
+            or predictions.coordinates != 'world_xy_m' or scene.coordinates != 'world_xy_m'
+            or not np.isclose(predictions.time, scene.time, rtol=0., atol=1e-8)):
+        raise ValueError('规划预测输入的原帧、时间、版本或世界坐标不一致')
+    visible = [actor for actor in scene.actors if actor.visible]
+    expected = {actor.id for actor in visible}
+    if len(expected) != len(visible) or set(predictions.actors) != expected or set(predictions.trajectories) != expected:
+        raise ValueError('规划预测对象集合必须完整对应当前可见对象，不能遗漏或引入不可见对象')
+    times = np.asarray(predictions.times, float)
+    if (times.ndim != 1 or len(times) < 2 or not np.isfinite(times).all()
+            or abs(times[0]) > 1e-8 or np.any(np.diff(times) <= 0)):
+        raise ValueError('规划预测时刻必须从零开始、严格递增且数值有限')
+    if expected and times[-1] < horizon-1e-8:
+        raise ValueError('对象预测未覆盖MPC完整时域，不允许静默重复末端位置')
+    for actor in visible:
+        predicted = predictions.actors[actor.id]
+        if (predicted.id != actor.id or not predicted.visible or predicted.kind != actor.kind
+                or predicted.length != actor.length or predicted.width != actor.width
+                or predicted.radius != actor.radius
+                or not np.allclose(predicted.position, actor.position, rtol=0., atol=1e-8)
+                or not np.allclose(predicted.velocity, actor.velocity, rtol=0., atol=1e-8)
+                or abs(float(wrap_angle(predicted.heading-actor.heading))) > 1e-8):
+            raise ValueError(f'对象 {actor.id} 的预测实体描述与当前观测不一致')
+        trajectory = np.asarray(predictions.trajectories[actor.id], float)
+        if (trajectory.shape != (len(times), 4) or not np.isfinite(trajectory).all()
+                or np.any(trajectory[:, 3] < -1e-8)):
+            raise ValueError(f'对象 {actor.id} 的预测维度或运动数值非法')
 
 
 class Planner:
@@ -196,6 +228,9 @@ class Planner:
 
     def solve(self,scene,predictions,answer=None):
         started=time.perf_counter();p=self.p;n=self.n;dt=self.dt
+        _validate_prediction_input(scene,predictions,n*dt)
+        # 完整输入必须先验明；局部MPC视图不污染模型、检索、反思和独立审计。
+        scene,predictions,object_selection=planning_view(scene,predictions,self.config,answer)
         cold_start=not getattr(self,'_has_solved',False);self._has_solved=True
         tolerance=float(p.get("body_constraint_tolerance_m",.001))
         braking=float(self.config.get("rules",{}).get("comfort_braking_mps2",3.))
@@ -690,6 +725,7 @@ class Planner:
                 termination='small_qp_step';break
         elapsed=time.perf_counter()-started
         diagnostics={'solver_seconds':time.perf_counter()-solver_started,'planning_seconds':elapsed,'solver_status':statuses,
+            'planning_object_selection':object_selection,
             'solver_backend':'casadi_osqp_realtime_sqp','symbolic_build_seconds':build_seconds,'qp_seconds':qp_seconds,'sqp_iterations':iterations,
             'optimizer_termination':termination,'iteration_history':iteration_history,
             'warm_start_recovery':recovery,

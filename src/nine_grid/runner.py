@@ -57,6 +57,11 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
                 fast_client=None,reflection_client=None,extractor=None):
     fast=fast_client if fast_client is not None else VisionClient('fast',model_settings['fast'])
     reflection=reflection_client if reflection_client is not None else VisionClient('reflection',model_settings['reflection'])
+    # 关闭全部语义/记忆消费者时，只执行物理闭环；不能仍在后台做表示和评测。
+    pure_base=not (fast.enabled or reflection.enabled or retrieve_enabled or write_enabled)
+    execution_mode='pure_base' if pure_base else 'full_pipeline'
+    skipped_stages=(['bev_occ_eightway','retrieval','fast_model','reflection','reference_mpc',
+                     'trajectory_quality','goal_bev_overlay','semantic_capture'] if pure_base else [])
     # 本地模型导入/配置先于图像解码，且绝不以随机特征替代真实权重。
     if (retrieve_enabled or write_enabled) and extractor is None:
         extractor=DINOExtractor(config.get('dino',{}).get('model','facebook/dinov2-base'))
@@ -72,6 +77,7 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
         effective_parameters_sha256=hashlib.sha256(json.dumps(plain(config),ensure_ascii=False,sort_keys=True,separators=(',',':'),allow_nan=False).encode('utf-8')).hexdigest(),
         numerical_threads={name:os.environ.get(name) for name in ('MKL_NUM_THREADS','OPENBLAS_NUM_THREADS')},
         answer_protocol_version=ANSWER_PROTOCOL_VERSION,
+        execution_mode=execution_mode,skipped_stages=skipped_stages,
         retrieval_enabled=retrieve_enabled,write_enabled=write_enabled,memory_mode=memory_mode,
         memory_read_dir=str(memory_read_dir),memory_write_dir=str(memory_write_dir),snapshot_id=store.snapshot_id,
         snapshot_records=[{'id':r['id'],'revision':r.get('revision',1)} for r in records],excluded_records=store.audit))
@@ -83,9 +89,13 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
         safety_alarms=0,execution_alarms=0,quality_valid=0,quality_total=0,fast_calls=0,communication_failures=0,
         invalid_answers=0,retrieval_hits=0,written_fast=0,offroad_steps=0,
         fallback_controls=0,soft_safety_violation_steps=0,initialization_candidate_steps=0,
-        termination_reason='initialization_failure',progress_m=0.)
+        termination_reason='initialization_failure',progress_m=0.,execution_mode=execution_mode,
+        skipped_stages=skipped_stages,
+        reflection=dict(accepted=0,queue_full=0,completed=0,rejected=0,failed=0,written=0))
     start_wall=time.monotonic()
     logger.info('开始 %s，场景=%s，seed=%s，检索=%s，写入=%s',episode_id,config.get('scenario'),seed,retrieve_enabled,write_enabled)
+    if pure_base:
+        logger.info('纯基础规划：跳过BEV/OCC/九宫格、参照MPC、质量评分、语义采集和轨迹BEV；保留实际控制、审计与原始录像')
     writer.append('memory_snapshot',dict(snapshot_id=store.snapshot_id,read_enabled=retrieve_enabled,
         accepted=[{'id':record['id'],'revision':record.get('revision',1)} for record in records],
         excluded=store.audit))
@@ -96,15 +106,19 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
         logger.info('轮初记忆快照接纳%d条、排除0条',len(records))
     used=[]
     timing_samples={'mpc_cold':[],'mpc_warm':[],'prediction':[],'decision_pipeline':[],
-                    'retrieval':[]}
+                    'retrieval':[],'snapshot':[],'execution_audit':[],'physics_step':[],
+                    'video_display':[],'control_cycle':[],'world_plan':[],
+                    'representations':[],'reference':[],'quality':[],'goal_overlay':[]}
     mpc_overruns=0
     try:
         adapter=HighwayAdapter(config,seed,episode_id,live)
         if video:video_recorder=adapter.start_recording(writer.path/'video.mp4')
-        planner,reference_planner=Planner(config),Planner(config)
+        planner=Planner(config)
+        reference_planner=None if pure_base else Planner(config)
         predictor=Predictor(config)
-        grids=NineGridBuilder(config)
-        worker=ReflectionWorker(reflection,lambda:Planner(config),config,store,writer,write_enabled)
+        grids=None if pure_base else NineGridBuilder(config)
+        if not pure_base:
+            worker=ReflectionWorker(reflection,lambda:Planner(config),config,store,writer,write_enabled)
         active_answer=None
         active_retrieval=RetrievalResult('',snapshot_id=store.snapshot_id)
         first_s=None
@@ -112,10 +126,14 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
         limit=round(config.get('duration',config['clock']['episode_seconds'])*config['clock']['planner_hz'])
         for step in range(limit):
             cycle_started=time.perf_counter()
-            timing=dict(representations_s=0.,model_s=0.,reference_s=0.,quality_s=0.,retrieval_s=0.)
+            timing=dict(representations_s=0.,model_s=0.,reference_s=0.,quality_s=0.,retrieval_s=0.,
+                        goal_overlay_s=0.,execution_audit_s=0.,physics_step_s=0.,video_display_s=0.)
             scene=adapter.snapshot()
+            timing['snapshot_s']=time.perf_counter()-cycle_started
+            timing_samples['snapshot'].append(timing['snapshot_s'])
             # 10Hz推进参考迟滞与投影；完整实体归格仅由1Hz表示阶段消费。
-            grids.update(scene,build=False)
+            if grids is not None:
+                grids.update(scene,build=False)
             if first_s is None:
                 first_s=scene.diagnostics['route_s']
                 writer.save('map.json',dict(lanes=scene.lanes,route=scene.route,route_lane_ids=scene.route_lane_ids,drivable=scene.drivable,
@@ -123,7 +141,7 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
                     ))
             scene.assets['global_map_json']=str((writer.path/'map.json').resolve())
             scene.assets['configuration_json']=str((writer.path/'configuration.json').resolve())
-            source_frame=step%fast_every==0
+            source_frame=not pure_base and step%fast_every==0
             raw,answer_errors=None,[]
             reps=None
             if source_frame:
@@ -134,6 +152,7 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
                 capture_dir=writer.path/'captures'/f'{step:06d}'
                 reps=build_representations(scene,capture_dir,extractor,grid_builder=grids)
                 timing['representations_s']=time.perf_counter()-stage_started
+                timing_samples['representations'].append(timing['representations_s'])
                 scene.assets['scene_json']=writer.save(f'captures/{step:06d}/scene.json',capture_payload(scene))
                 if retrieve_enabled:
                     stage_started=time.perf_counter()
@@ -179,14 +198,17 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
             writer.append('predictions',predictions)
             stage_started=time.perf_counter()
             plan=planner.solve(scene,predictions,active_answer)
-            adapter.set_planned_trajectory(plan.states if plan.valid else None)
+            timing['mpc_s']=time.perf_counter()-stage_started
             summary['soft_safety_violation_steps']+=int(plan.diagnostics.get('safety_feasible') is False)
             summary['initialization_candidate_steps']+=int(plan.diagnostics.get('candidate_source')=='validated_current_initialization')
-            timing['mpc_s']=time.perf_counter()-stage_started
             timing['mpc_cold_start']=bool(plan.diagnostics.get('cold_start',False))
             timing_samples['mpc_cold' if timing['mpc_cold_start'] else 'mpc_warm'].append(timing['mpc_s'])
             timing_samples['prediction'].append(timing['prediction_s'])
             mpc_overruns+=int(plan.diagnostics.get('deadline_missed',False))
+            stage_started=time.perf_counter()
+            adapter.set_planned_trajectory(plan.states if plan.valid else None)
+            timing['world_plan_s']=time.perf_counter()-stage_started
+            timing_samples['world_plan'].append(timing['world_plan_s'])
             goal_overlay_path=None
             if source_frame:
                 stage_started=time.perf_counter()
@@ -202,6 +224,7 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
                     goal_overlay_path=overlay_path
                     scene.assets['goal_overlay_png']=str(goal_overlay_path.resolve())
                 timing['goal_overlay_s']=time.perf_counter()-stage_started
+                timing_samples['goal_overlay'].append(timing['goal_overlay_s'])
             writer.append('plans',dict(frame_id=scene.frame_id,time=scene.time,answer_source=active_answer.frame_id if active_answer else None,
                 plan=plan,goal_overlay_path=str(goal_overlay_path.resolve()) if goal_overlay_path is not None else None))
             if 'goal_state' in plan.diagnostics or 'goal_events' in plan.diagnostics:
@@ -213,9 +236,11 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
                 stage_started=time.perf_counter()
                 reference=reference_planner.solve(scene,predictions,None)
                 timing['reference_s']=time.perf_counter()-stage_started
+                timing_samples['reference'].append(timing['reference_s'])
                 stage_started=time.perf_counter()
                 quality=evaluate(scene,plan,reference,predictions,config)
                 timing['quality_s']=time.perf_counter()-stage_started
+                timing_samples['quality'].append(timing['quality_s'])
                 logger.info('仿真 %.1fs：轨迹可执行=%s，安全条件满足=%s，候选=%s，主求解=%.1fms（%s），预测=%.1fms，表示=%.1fms，参照=%.1fms，评分=%.1fms，质量=%s，预碰撞=%s，可见对象=%d',
                     scene.time,plan.valid,plan.diagnostics.get('safety_feasible'),plan.diagnostics.get('candidate_source'),
                     timing['mpc_s']*1000,'首次' if timing['mpc_cold_start'] else '后续',
@@ -246,8 +271,13 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
                         writer.append('memory_admission',dict(frame_id=scene.frame_id,status='拒收',reason=str(exc)))
             timing['decision_pipeline_s']=time.perf_counter()-cycle_started
             timing_samples['decision_pipeline'].append(timing['decision_pipeline_s'])
-            writer.append('timing',dict(frame_id=scene.frame_id,time=scene.time,**timing,
-                definition='决策管线含同步表示、模型等待、预测、主规划、参照评分和对应落盘；不含随后执行审计、物理步进、显示和录像'))
+            def record_cycle_timing(executed):
+                # 终点在本条timing记录写入前，避免把写入自身递归计入；其他本周期落盘均包含。
+                timing['control_cycle_s']=time.perf_counter()-cycle_started
+                timing_samples['control_cycle'].append(timing['control_cycle_s'])
+                writer.append('timing',dict(frame_id=scene.frame_id,time=scene.time,**timing,
+                    execution_mode=execution_mode,source_frame=bool(source_frame),executed=executed,
+                    definition='decision_pipeline_s不含执行审计/物理步进/显示录像；control_cycle_s包含这些阶段及此前落盘，不含本条timing写入、轮次初始化与收尾'))
             if not plan.valid:
                 summary['planning_failures']+=1
                 summary['termination_reason']='planning_failure'
@@ -256,26 +286,42 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
                     scene.time,plan.diagnostics.get('solver_status'),plan.diagnostics.get('deadline_missed'),
                     last_constraints.get('minimum_by_group'))
                 writer.save('failure_scene.json',scene)
+                record_cycle_timing(False)
                 break
             used.append(dict(time=scene.time,frame_id=scene.frame_id,answer_source=active_answer.frame_id if active_answer else None,
                              retrieved=[r['id'] for r in active_retrieval.records] if active_answer is not None else []))
             # 有解时即使独立风险报警也执行当前控制；不存在旧控制/备用控制器分支。
+            stage_started=time.perf_counter()
             audit=execution_audit(scene,plan,predictions,config)
+            timing['execution_audit_s']=time.perf_counter()-stage_started
+            timing_samples['execution_audit'].append(timing['execution_audit_s'])
             summary['execution_alarms']+=int(audit['alarm'])
             writer.append('execution_audit',dict(frame_id=scene.frame_id,time=scene.time,**audit))
+            stage_started=time.perf_counter()
             result=adapter.step(plan.controls[0])
+            timing['physics_step_s']=time.perf_counter()-stage_started
+            timing_samples['physics_step'].append(timing['physics_step_s'])
             used=[u for u in used if result['time']-u['time']<=config.get('memory',{}).get('post_accident_association_s',3)+1e-8]
             summary.update(simulated_seconds=result['time'],steps=step+1,collision=result['collision'],arrival=result['arrival'],
                            progress_m=result['progress']-first_s,termination_reason=result['reason'])
             summary['offroad_steps']+=int(result['offroad'])
             writer.append('frames',dict(frame_id=scene.frame_id,time=scene.time,ego=scene.ego,actors=scene.actors,
                 applied_control=plan.controls[0],actual=result,answer_source=active_answer.frame_id if active_answer else None))
+            stage_started=time.perf_counter()
             if video_recorder is not None:
                 video_recorder._capture_frame()
             elif live:
                 adapter.render()
+            timing['video_display_s']=time.perf_counter()-stage_started
+            if video_recorder is not None or live:
+                timing_samples['video_display'].append(timing['video_display_s'])
+            if pure_base and step%fast_every==0:
+                logger.info('仿真 %.1fs：纯基础规划，轨迹可执行=%s，MPC=%.1fms，预测=%.1fms，场景=%.1fms，步进=%.1fms，显示录像=%.1fms；表示/参照/评分=关闭',
+                    scene.time,plan.valid,timing['mpc_s']*1000,timing['prediction_s']*1000,
+                    timing['snapshot_s']*1000,timing['physics_step_s']*1000,timing['video_display_s']*1000)
             if result['collision']:
                 writer.save('accident_review.json',dict(status='待人工复查，不自动停用经验',actual=result,associated=used))
+            record_cycle_timing(True)
             if result['terminated']:
                 break
         else:
@@ -295,6 +341,10 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
         summary['wall_seconds']=time.monotonic()-start_wall
         summary['timing']={name:_timing_summary(values) for name,values in timing_samples.items()}
         summary['timing']['mpc_deadline_misses']=mpc_overruns
+        summary['timing']['control_cycle_over_100ms']=sum(value>.1 for value in timing_samples['control_cycle'])
+        summary['timing']['control_cycle_over_100ms_fraction']=(
+            sum(value>.1 for value in timing_samples['control_cycle'])/len(timing_samples['control_cycle'])
+            if timing_samples['control_cycle'] else None)
         writer.save('summary.json',summary)
         logging.getLogger().removeHandler(file_handler)
         file_handler.close()

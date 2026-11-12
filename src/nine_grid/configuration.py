@@ -264,6 +264,8 @@ def validate_config(config):
         if isinstance(FIXED_CONTRACT[group],dict) and group in result and not isinstance(result[group],dict):
             raise ValueError(f'{group} 必须为对象')
     _check_fixed(result,FIXED_CONTRACT)
+    from .planning_objects import validate_planning_object_config
+    result['planning_objects']=validate_planning_object_config(result.get('planning_objects'))
     if any(key in result.get('models',{}) for key in ('guide_min_count','guide_max_count')):
         raise ValueError('旧guide_min_count/guide_max_count已取消；只接受单个Frenet local_goal')
     mpc=result.get('mpc',{})

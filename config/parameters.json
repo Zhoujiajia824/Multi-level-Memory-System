@@ -1,6 +1,6 @@
 {
   "theory_version": "nine-grid-rag-mpc-1.0",
-  "parameter_version": "development-1.0.20",
+  "parameter_version": "development-1.0.21",
   "status": "initial_validation_values_not_optimal",
   "clock": {
     "physics_hz": 50,
@@ -237,8 +237,8 @@
       "lateral_acceleration": 5
     },
     "geometry_difference_steps": {
-      "position_m": 0.00001,
-      "heading_rad": 0.00001
+      "position_m": 1e-05,
+      "heading_rad": 1e-05
     },
     "sqp_trust_acceleration_mps2": 1.5,
     "sqp_trust_steering_rad": 0.15,
@@ -384,5 +384,13 @@
     "min_union_area_m2": 0.01,
     "area_tolerance_m2": 0.01,
     "metric": "observed_soft_iou_with_confirmed_empty"
+  },
+  "planning_objects": {
+    "version": "frenet-eight-planning-1.0",
+    "front_m": 30.0,
+    "rear_m": 10.0,
+    "lateral_m": 25.0,
+    "include_attention": true,
+    "max_attention_objects": 3
   }
 }
