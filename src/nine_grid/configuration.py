@@ -280,6 +280,8 @@ def validate_config(config):
         if isinstance(FIXED_CONTRACT[group],dict) and group in result and not isinstance(result[group],dict):
             raise ValueError(f'{group} 必须为对象')
     _check_fixed(result,FIXED_CONTRACT)
+    from .planning_objects import validate_planning_object_config
+    result['planning_objects']=validate_planning_object_config(result.get('planning_objects'))
     if 'bev' in result:
         result['bev']['labels']=bev_label_config(result['bev'].get('labels'))
     if any(key in result.get('models',{}) for key in ('guide_min_count','guide_max_count')):

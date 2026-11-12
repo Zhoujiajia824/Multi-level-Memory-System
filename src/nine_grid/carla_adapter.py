@@ -399,6 +399,7 @@ class CarlaAdapter:
         self._planned = None
         self._recorder = None
         self._mosaic = None
+        self._representation_capture_enabled = True
         self._display_info = {'plan_overlay':False,'plan_segments':0}
         self._step = 0
         self._confirmed_lane = None
@@ -413,6 +414,14 @@ class CarlaAdapter:
             raise RuntimeError('CARLA 连接后不能更换资产目录')
         self.output_dir = Path(path).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def set_representation_capture_enabled(self, enabled):
+        """只控制检索用完整空区证据；对象可见性仍由同帧深度逐实体确认。"""
+        if type(enabled) is not bool:
+            raise ValueError('表示采集开关必须为布尔值')
+        if self.bridge is not None:
+            raise RuntimeError('必须在CARLA初始化前确定表示采集模式')
+        self._representation_capture_enabled = enabled
 
     def _initialize(self):
         if self.output_dir is None:
@@ -546,12 +555,19 @@ class CarlaAdapter:
         for actor in [ego] + actors:
             actor.history = copy.deepcopy(self._history.get(actor.id, []))
         self._route_s = project_polyline(ego.position, self.route, self._route_s, ego.heading)[0]
-        observed, observation_audit = observed_geometry(raw['ego'], raw['cameras'], self.cfg)
-        observation_audit['depth_storage'] = 'runtime_only; retained_RGB_and_observation_mask'
-        # 已确认部分可见对象按既定权限提供完整框；这些实体面积本身是已知占据，
-        # 不能被“后方空区不可见”误删。框外遮挡仍为未知，不补隐藏对象。
-        observed = unary_union([observed, actor_shape(ego)] + [actor_shape(a) for a in actors])
-        observation_audit['visible_body_support'] = '允许部分可见对象的完整几何框；不填补框外遮挡'
+        if self._representation_capture_enabled:
+            observed, observation_audit = observed_geometry(raw['ego'], raw['cameras'], self.cfg)
+            observation_audit['depth_storage'] = 'runtime_only; retained_RGB_and_observation_mask'
+            # 已确认部分可见对象按既定权限提供完整框；框外遮挡仍为未知。
+            observed = unary_union([observed, actor_shape(ego)] + [actor_shape(a) for a in actors])
+            observation_audit['visible_body_support'] = '允许部分可见对象的完整几何框；不填补框外遮挡'
+            observed_wkt = observed.wkt
+        else:
+            # 纯基础规划不消费OCC空区证据。None表示未计算，不能伪造为空或满覆盖。
+            observed_wkt = None
+            observation_audit = {'method':'not_computed_for_pure_base', 'valid':False,
+                'reason':'纯基础规划未构建检索空区掩码；对象同帧深度可见性保持不变',
+                'depth_storage':'runtime_only; no_occupancy_observation_geometry'}
         frame_id = '{}:{:06d}'.format(self.episode_id, self._step)
         mosaic = self._build_mosaic(raw['cameras'])
         self._mosaic = np.asarray(mosaic)
@@ -578,7 +594,7 @@ class CarlaAdapter:
             manifest_path = folder / 'manifest.json'
             manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, allow_nan=False), encoding='utf-8')
             retained_raw = {**raw, 'cameras': retained_cameras, 'storage_version': 'carla-rgb-sampled-1.1',
-                'camera_save_hz': 1, 'observed_support_wkt': observed.wkt, 'observation_evidence': observation_audit}
+                'camera_save_hz': 1, 'observed_support_wkt': observed_wkt, 'observation_evidence': observation_audit}
             state_path = folder / 'current_observed_state.json'
             state_path.write_text(json.dumps(retained_raw, ensure_ascii=False, allow_nan=False), encoding='utf-8')
             camera_images = [{'view': 'multi_camera_mosaic', 'path': str(mosaic_path.resolve()),
@@ -615,7 +631,7 @@ class CarlaAdapter:
         diagnostics = {'route_s': self._route_s, 'reference_anchor_s': self._route_s,
             'navigation_progress_m': self._route_s+self._progress_offset, 'stable_navigation_lane_id': self._confirmed_lane,
             'previous_control': self._previous_control.tolist(), 'reference_revision': self._reference_revision,
-            'lane_map_complete': map_complete, 'visibility_wkt': observed.wkt,
+            'lane_map_complete': map_complete, 'visibility_wkt': observed_wkt,
             'visibility_evidence': observation_audit, 'physics_hz': self.cfg['physics_hz'],
             'historical_only_objects': {k: v for k, v in self._history.items() if k not in {a.id for a in [ego] + actors}},
             'platform': 'carla', 'carla_frame': raw['frame'], 'carla_timestamp': raw['timestamp'],

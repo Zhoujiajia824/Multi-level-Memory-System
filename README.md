@@ -56,6 +56,36 @@ python scripts/check_environment.py
 `config/verified_dependencies.txt` 固定本机验证使用的核心依赖版本；本机实测 Python 3.12.13、CPU 推理。CUDA 服务器的驱动与 PyTorch 安装需单独验证。
 
 ## 2. 四场景：纯 MPC
+### 局部规划对象与纯基础路径（2026-11-12）
+
+MPC 在完整可见场景的内部视图中选取对象，不再对所有可见实体逐一计算风险。`config/parameters.json` 中统一配置：
+
+```json
+"planning_objects": {
+  "version": "frenet-eight-planning-1.0",
+  "front_m": 30.0,
+  "rear_m": 10.0,
+  "lateral_m": 25.0,
+  "include_attention": true,
+  "max_attention_objects": 3
+}
+```
+
+范围按导航连续 Frenet 投影的对象中心判断，左正右负。八向每格选择一个最近对象，前后按车体纵向净距、侧方按真实几何净距；跨格同ID去重，因此基础规划至多8个对象。有效模型关注可以在**同一空间范围、当前可见集合内**额外加入至多3个，总数至多11个；关闭扩容可将 `include_attention` 设为 false。实线邻道不会因不能跨越而从物理候选中删除；行人、横穿来车和静态障碍物可按Frenet侧向补充归格。注意这与检索九宫格的范围和可跨越车道语义不同，没有修改检索特征或旧库解释。
+
+当快模型、反思模型、检索、写入**四项同时关闭**时，自动进入 `pure_base`：
+
+- 不构建BEV、OCC和检索九宫格，不做DINO特征提取。
+- 不实例化参照MPC和反思worker，不做轨迹质量评分、语义采集或轨迹BEV绘制。
+- 继续使用同一MPC、导航、规则、EKF和基础风险场；保留原生实时画面、轨迹线与视频。
+- CARLA跳过OCC空区覆盖几何，但仍使用同帧深度进行对象可见性判断，不取消遮挡。
+- 质量计数为0，不生成虚假的质量分；开启四项中的任意一项则走完整功能路径。
+
+每轮 `configuration.json` / `summary.json` 保存执行模式和跳过阶段，`plans.jsonl` 中的 `planning_object_selection` 保存每格代表、完整/范围内/选中数量、关注补充及排除原因。完整可见对象仍保存在帧日志和模型上下文；独立执行前审计保留完整集合，但不会把被排除对象的风险重新加入MPC。
+
+`timing.jsonl` 与汇总分别统计快照、预测、MPC求解、世界轨迹显示、表示、参照、评分、执行审计、物理步进、显示录像和整个控制周期；纯模式跳过阶段的样本数为0。MPC求解时长不再包含CARLA世界轨迹绘制RPC。`control_cycle` 不含初始化、收尾及该条计时日志自身的写入。
+
+30/10米是开发起点，不是停车安全距离；每向只选一个对象可能漏掉随后出现的第二个障碍物。此策略不保证对被排除对象的全时域避碰，也不保证整个控制周期达到10Hz。现有3秒时域、交通密度、车体尺寸、风险权重和控制频率保持不变。
 
 ```bash
 python scripts/run_highway.py --scenario highway --seed 1 --duration 30 --fast off --reflection off --live --video

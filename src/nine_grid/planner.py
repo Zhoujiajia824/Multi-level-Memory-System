@@ -7,6 +7,7 @@ import shapely
 from shapely.geometry import Polygon
 from shapely.geometry import LineString
 from .contracts import PlanResult
+from .planning_objects import planning_view
 from .local_reference import LocalReferenceManager, LocalReferenceResult
 from .goals import GoalManager, goal_seed_path, first_arrival_residual
 from .realtime_solver import Dynamics, QuadraticSolver, rectangle_gap, circle_gap, rectangle_distance, bicycle_geometry
@@ -230,6 +231,8 @@ class Planner:
     def solve(self,scene,predictions,answer=None):
         started=time.perf_counter();p=self.p;n=self.n;dt=self.dt
         _validate_prediction_input(scene,predictions,n*dt)
+        # 完整输入必须先验明；局部MPC视图不污染模型、检索、反思和独立审计。
+        scene,predictions,object_selection=planning_view(scene,predictions,self.config,answer)
         wheelbase,rear=bicycle_geometry(scene.ego.length,scene.ego.wheelbase_m,scene.ego.rear_axle_to_center_m)
         axle_ratio=rear/wheelbase
         cold_start=not getattr(self,'_has_solved',False);self._has_solved=True
@@ -727,6 +730,7 @@ class Planner:
                 termination='small_qp_step';break
         elapsed=time.perf_counter()-started
         diagnostics={'solver_seconds':time.perf_counter()-solver_started,'planning_seconds':elapsed,'solver_status':statuses,
+            'planning_object_selection':object_selection,
             'vehicle_dynamics':{'reference_point':'geometric_center','wheelbase_m':wheelbase,
                 'rear_axle_to_center_m':rear,'geometry_source':'platform' if scene.ego.wheelbase_m is not None else 'highway_legacy'},
             'solver_backend':'casadi_osqp_realtime_sqp','symbolic_build_seconds':build_seconds,'qp_seconds':qp_seconds,'sqp_iterations':iterations,
