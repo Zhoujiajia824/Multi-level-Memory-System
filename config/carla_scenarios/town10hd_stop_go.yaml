@@ -1,0 +1,48 @@
+# 独立场景；距离m、速度m/s、时间s，offset_m沿车道左正。
+# route_anchors固定道路地点；修改actor距离/速度/触发条件可构造相似变体。
+schema_version: carla-scene-1.2
+name: town10hd_stop_go
+template: scripted_traffic
+map: Town10HD
+description: 城市走停交通：前车触发停车，停稳等待4秒后恢复前进。
+desired_speed_mps: 7
+duration_s: 180
+experiment:
+  spawn_index: null
+  route_length_m: 500
+  route_anchors:
+  - road_id: 2
+    lane_id: 2
+    s_m: 0.000000
+  route_requirements:
+    kind: junction
+    min_junctions: 1
+    min_same_direction_lanes: 1
+    search_limit: 10000
+  navigation_step_yaw_limit_deg: 30
+  initial_speed_mps: 7
+  ego_blueprint: vehicle.tesla.model3
+  weather: ClearNoon
+  actors:
+  - role: queue_lead
+    type: vehicle
+    blueprint: vehicle.audi.a2
+    placement:
+      s_m: 32
+      lane: current
+      offset_m: 0
+    behavior: stop_resume
+    speed_mps: 5
+    trigger:
+      time_s: 3
+      ego_distance_m: 28
+    stop_duration_s: 4
+  - role: far_car
+    type: vehicle
+    blueprint: vehicle.audi.a2
+    placement:
+      s_m: 80
+      lane: current
+      offset_m: 0
+    behavior: follow
+    speed_mps: 7

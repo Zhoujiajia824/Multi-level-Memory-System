@@ -1,0 +1,34 @@
+# 对应分层Opt地图的独立配置；不是运行中自动替换地图。
+schema_version: carla-scene-1.2
+name: town07_rural_follow_opt
+template: scripted_traffic
+map: Town07_Opt
+description: 乡村弯道路段：慢速货车跟驰，保留对向道路和真实弯曲拓扑。 分层Opt地图变体，保持相同道路锚点和交通参数。
+desired_speed_mps: 8
+duration_s: 180
+experiment:
+  spawn_index: null
+  route_length_m: 600
+  route_anchors:
+  - road_id: 14
+    lane_id: -1
+    s_m: 20.0
+  route_requirements:
+    kind: any
+    min_junctions: 0
+    min_same_direction_lanes: 1
+    search_limit: 10000
+  navigation_step_yaw_limit_deg: 30
+  initial_speed_mps: 8
+  ego_blueprint: vehicle.tesla.model3
+  weather: ClearNoon
+  actors:
+  - role: slow_van
+    type: vehicle
+    blueprint: vehicle.mercedes.sprinter
+    placement:
+      s_m: 35
+      lane: current
+      offset_m: 0
+    behavior: follow
+    speed_mps: 5

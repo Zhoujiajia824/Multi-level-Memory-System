@@ -8,7 +8,7 @@ import random
 import json
 
 
-SCENARIOS = ('slow_lead', 'hard_brake', 'cut_in', 'parked_obstacle', 'occluded_pedestrian')
+SCENARIOS = ('slow_lead', 'hard_brake', 'cut_in', 'parked_obstacle', 'occluded_pedestrian', 'scripted_traffic')
 REQUIRED_EXPERIMENT_FIELDS = frozenset(('name', 'seed', 'spawn_index', 'route_length_m', 'initial_speed_mps',
     'lead_speed_mps', 'lead_distance_m', 'trigger_distance_m', 'lane_change_seconds',
     'pedestrian_speed_mps', 'ego_blueprint', 'lead_blueprint', 'trigger_min_time_s',
@@ -190,6 +190,12 @@ def _sidewalk(wp):
 
 def select_route(road_map, settings, carla, audit_all=False):
     """纯地图选址，不创建演员、不推进时钟；检查与真实初始化使用同一实现。"""
+    if settings.get('name') == 'scripted_traffic':
+        try:
+            from .carla_scripted_scenarios import select_scripted_route
+        except ImportError:
+            from carla_scripted_scenarios import select_scripted_route
+        return select_scripted_route(road_map, settings, carla, audit_all=audit_all)
     name = validate_experiment(settings)
     spawn_points = list(road_map.get_spawn_points())
     index = settings.get('spawn_index')
@@ -428,4 +434,10 @@ class Experiment:
 
 
 def create_experiment(world, client, settings, carla):
+    if settings.get('name') == 'scripted_traffic':
+        try:
+            from .carla_scripted_scenarios import ScriptedExperiment
+        except ImportError:
+            from carla_scripted_scenarios import ScriptedExperiment
+        return ScriptedExperiment(world, client, settings, carla)
     return Experiment(world,client,settings,carla)

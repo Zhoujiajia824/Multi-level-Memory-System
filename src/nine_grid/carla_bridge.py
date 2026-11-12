@@ -116,14 +116,128 @@ def wheel_geometry(wheels, inverse_transform, box_center_x):
     return wheelbase, rear_distance
 
 
-def closed_crosswalks(locations, base_z, tolerance):
+class RouteElevationSupport:
+    """按公开导航的最近平面路段插值高度，不将坡道固定在起点高度。
+
+    只负责地图提取。导航车道带自身跨层重叠时，当前二维核心无法分层，明确拒绝。
+    查询距离相同但层高不同也拒绝，不能按待查询车道的高度自行挑选另一层。
+    """
+    VERSION = 'carla-route-elevation-1.0'
+    CELL_M = 20.
+
+    def __init__(self, waypoints, tolerance_m, radius_m=120.):
+        if (not math.isfinite(tolerance_m) or tolerance_m <= 0
+                or not math.isfinite(radius_m) or radius_m <= 0):
+            raise ValueError('导航高度筛选范围必须为有限正数')
+        self.tolerance_m, self.radius_m = tolerance_m, radius_m
+        self.segments, self.cells = [], {}
+        arc = 0.
+        for first, second in zip(waypoints, waypoints[1:]):
+            a, b = first.transform.location, second.transform.location
+            values = tuple(float(v) for v in (a.x,a.y,a.z,b.x,b.y,b.z))
+            if not all(math.isfinite(v) for v in values):
+                raise ValueError('导航高度参考包含非有限坐标')
+            dx, dy = values[3]-values[0], values[4]-values[1]
+            length = math.hypot(dx,dy)
+            if length < 1e-6:
+                if abs(values[5]-values[2]) > 1e-6:
+                    raise ValueError('导航存在平面零长度但高度跳变的路段')
+                continue
+            width = max(float(first.lane_width),float(second.lane_width))
+            if not math.isfinite(width) or width <= 0:
+                raise ValueError('导航车道宽度必须有限且为正')
+            segment = (values,dx,dy,length*length,width,arc)
+            index = len(self.segments)
+            self.segments.append(segment)
+            arc += length
+            for ix in range(math.floor(min(a.x,b.x)/self.CELL_M),math.floor(max(a.x,b.x)/self.CELL_M)+1):
+                for iy in range(math.floor(min(a.y,b.y)/self.CELL_M),math.floor(max(a.y,b.y)/self.CELL_M)+1):
+                    self.cells.setdefault((ix,iy),[]).append(index)
+        if not self.segments:
+            raise ValueError('导航高度参考至少需要两个不同平面位置')
+        self._check_level_overlap()
+
+    @staticmethod
+    def _project(segment, x, y):
+        values,dx,dy,norm2,_,_ = segment
+        alpha = max(0.,min(1.,((x-values[0])*dx+(y-values[1])*dy)/norm2))
+        px,py = values[0]+alpha*dx, values[1]+alpha*dy
+        return math.hypot(x-px,y-py), values[2]+alpha*(values[5]-values[2]), alpha
+
+    def _check_level_overlap(self):
+        # 非相邻路段的最近点：交点或四个端点的正交投影。只核查导航车道带，
+        # 不禁止普通同层路口，也不把相距很远的山坡误认成重叠道路。
+        checked = set()
+        for index, segment in enumerate(self.segments):
+            a,dx,dy,_,width,arc = segment
+            pad = width
+            candidates = set()
+            for ix in range(math.floor((min(a[0],a[3])-pad)/self.CELL_M),math.floor((max(a[0],a[3])+pad)/self.CELL_M)+1):
+                for iy in range(math.floor((min(a[1],a[4])-pad)/self.CELL_M),math.floor((max(a[1],a[4])+pad)/self.CELL_M)+1):
+                    candidates.update(self.cells.get((ix,iy),()))
+            for other_index in candidates:
+                if other_index <= index+1 or (index,other_index) in checked:
+                    continue
+                checked.add((index,other_index))
+                other = self.segments[other_index]
+                b,ex,ey,_,other_width,other_arc = other
+                # 连续坡道在局部车道宽度内无需当成两层道路。
+                if other_arc-arc < max(10.,width+other_width):
+                    continue
+                tests = []
+                for x,y,z in ((a[0],a[1],a[2]),(a[3],a[4],a[5])):
+                    distance,height,_ = self._project(other,x,y)
+                    tests.append((distance,abs(z-height)))
+                for x,y,z in ((b[0],b[1],b[2]),(b[3],b[4],b[5])):
+                    distance,height,_ = self._project(segment,x,y)
+                    tests.append((distance,abs(z-height)))
+                cross = dx*ey-dy*ex
+                if abs(cross)>1e-12:
+                    rx,ry = b[0]-a[0],b[1]-a[1]
+                    ta,tb = (rx*ey-ry*ex)/cross,(rx*dy-ry*dx)/cross
+                    if 0<=ta<=1 and 0<=tb<=1:
+                        tests.append((0.,abs(a[2]+ta*(a[5]-a[2])-b[2]-tb*(b[5]-b[2]))))
+                distance,height_difference = min(tests)
+                if distance < .5*(width+other_width) and height_difference>self.tolerance_m:
+                    raise ValueError('导航自身存在跨层平面重叠，当前二维规划地图不支持；请缩短路线或更换公开路线锚点')
+
+    def height(self, x, y):
+        # 仅在120m地图走廊内查找；空间桶减少大地图上的全部逐段扫描。
+        radius, cell = self.radius_m, self.CELL_M
+        buckets=[]
+        for ix in range(math.floor((x-radius)/cell),math.floor((x+radius)/cell)+1):
+            for iy in range(math.floor((y-radius)/cell),math.floor((y+radius)/cell)+1):
+                indices=self.cells.get((ix,iy))
+                if indices:
+                    lower=math.hypot(max(ix*cell-x,0.,x-(ix+1)*cell),max(iy*cell-y,0.,y-(iy+1)*cell))
+                    if lower <= radius:buckets.append((lower,ix,iy,indices))
+        best, height, visited = radius+1e-9, None, set()
+        for lower,_,_,indices in sorted(buckets):
+            if lower>best+1e-6:break
+            for index in indices:
+                if index in visited:continue
+                visited.add(index)
+                distance,value,_=self._project(self.segments[index],x,y)
+                if distance<best-1e-6 or (height is None and distance<=radius):
+                    best,height=distance,value
+                elif abs(distance-best)<=1e-6 and height is not None and abs(value-height)>self.tolerance_m:
+                    raise ValueError('地图点到导航的最近投影具有跨层歧义，不能静默选取另一层道路')
+        return height if best <= radius and height is not None else None
+
+    def contains(self, location):
+        height=self.height(location.x,location.y)
+        return height is not None and abs(location.z-height)<=self.tolerance_m
+
+
+def closed_crosswalks(locations, base_z, tolerance, height_support=None):
     """官方地图以重复首点分隔人行横道闭合多边形；不把未闭合片段补齐。"""
     polygons, pending = [], []
     for location in locations:
         pending.append(location)
         if len(pending) >= 4 and math.sqrt((location.x-pending[0].x)**2+
                 (location.y-pending[0].y)**2+(location.z-pending[0].z)**2) < 1e-4:
-            if all(abs(point.z-base_z) <= tolerance for point in pending):
+            if all((height_support.contains(point) if height_support is not None
+                    else abs(point.z-base_z) <= tolerance) for point in pending):
                 polygons.append([xy(point) for point in pending])
             pending = []
     if pending:
@@ -550,13 +664,19 @@ class CarlaSession:
         low_x, high_x = min(p.x for p in route_positions) - 120, max(p.x for p in route_positions) + 120
         low_y, high_y = min(p.y for p in route_positions) - 120, max(p.y for p in route_positions) + 120
         base_z = self.ego.get_location().z
+        tolerance = float(self.cfg.get('same_level_tolerance_m', 1.5))
+        elevation = RouteElevationSupport(self.route_wps,tolerance)
         groups = {}
+        rejected_height = 0
         for wp in points:
             p = wp.transform.location
-            if wp.lane_type != self.carla.LaneType.Driving or abs(p.z - base_z) > float(self.cfg.get('same_level_tolerance_m', 1.5)):
+            if wp.lane_type != self.carla.LaneType.Driving:
                 continue
             if low_x <= p.x <= high_x and low_y <= p.y <= high_y:
-                groups.setdefault(lane_key(wp), []).append(wp)
+                if elevation.contains(p):
+                    groups.setdefault(lane_key(wp), []).append(wp)
+                else:
+                    rejected_height += 1
         lanes = []
         for key, waypoints in sorted(groups.items()):
             unique = {}
@@ -599,10 +719,17 @@ class CarlaSession:
             key = lane_key(wp)
             if not route_ids or key != route_ids[-1]:
                 route_ids.append(key)
+        missing=set(route_ids)-{lane['id'] for lane in lanes}
+        if missing:
+            raise ValueError('导航高度地图缺少路线车道：'+','.join(sorted(missing)))
         return {'lanes': lanes, 'route': [xy(p) for p in route_positions], 'route_lane_ids': route_ids,
                 'identity': map_identity(self.map),
-                'source': 'CARLA_public_waypoints_same_level_local_map', 'priority_available': False,
-                'crosswalks': closed_crosswalks(self.map.get_crosswalks(), base_z, float(self.cfg.get('same_level_tolerance_m', 1.5))),
+                'source': 'CARLA_public_waypoints_navigation_relative_elevation', 'priority_available': False,
+                'elevation_filter': {'version':elevation.VERSION,'tolerance_m':tolerance,
+                    'map_corridor_radius_m':elevation.radius_m,'rejected_waypoint_samples':rejected_height,
+                    'rule':'nearest_xy_route_segment_interpolated_height;reject_multilevel_route_overlap',
+                    'scope':'地图坡度延伸；当前对象的可见性和高度准入保持原有规则'},
+                'crosswalks': closed_crosswalks(self.map.get_crosswalks(), base_z, tolerance,elevation),
                 'lane_speed_source': 'configured_map_speed_cap_mps;current_ego_limit_from_CARLA'}
 
     def snapshot(self):
@@ -659,7 +786,8 @@ class CarlaSession:
             'actual_actuation': {'throttle': actual.throttle, 'brake': actual.brake, 'steer_normalized_right': actual.steer},
             'current_road_evidence': road_evidence,
             'environment_obstacles': dict(self.environment_audit, visible_count=len(static_actors)),
-            'weather': weather_record, 'weather_source': 'current_world_get_weather_no_override',
+            'weather': weather_record, 'weather_source': ('scenario_weather_then_current_world_get_weather'
+                if self.cfg.get('experiment',{}).get('weather') is not None else 'current_world_get_weather_no_override'),
             'source': 'current_camera_depth_visible_geometry_then_actor_state',
             'scenario': self.experiment.name}
 

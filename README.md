@@ -486,8 +486,8 @@ python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin
 
 | 独立场景YAML字段 | 含义与开发默认值 |
 |---|---|
-| `schema_version` | 固定carla-scene-1.0，不接受旧的defaults/scenarios合并结构 |
-| `name / template` | 实验实例名称与五类模板名称分开；变体可自定义name，template仍使用已有模板 |
+| `schema_version` | 旧五模板接受carla-scene-1.0/1.1；多演员长路线使用carla-scene-1.2，不使用跨场景继承 |
+| `name / template` | 实例名称与模板分开；原五模板保留，新增scripted_traffic多演员模板 |
 | `map` | 当前场景地图，填写实际安装的名称或资源路径；CLI --map可显式覆盖并记录 |
 | `desired_speed_mps` | 核心规则/MPC期望速度10m/s，与初速度独立，不代表地图限速 |
 | `experiment.spawn_index` | null表示按seed搜索满足模板的地点；整数固定当前地图生成点，失败不换位置 |
@@ -510,4 +510,118 @@ python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin
 | `carla.camera_width / camera_height / camera_fov` | 单相机640×360、水平FOV100度；六视角RGB及对应深度同步 |
 | `carla.observation_resolution_m / observation_heights_m` | 确认空区的网格1米、多高度0.2/0.8米；未确认与遮挡区域保留unknown，尚需真实传感器验证 |
 
-每轮沿用第7节的核心日志，另有`carla_bridge.log`、`carla_map.json`、`carla_environment_audit.json`、`camera_frames/`及相机资产清单；`--video`保存真实相机拼图录像。`carla_environment_audit.json`记录地图环境框的读取范围、数量及镜像网格半尺寸规范化明细。CARLA 0.9.15的组件负缩放可能产生负半尺寸，程序只对有限非零半尺寸取绝对值，保持原世界中心、旋转及八角点集合，不删除障碍物、不修改地图；零半尺寸或非有限值仍拒绝，并报告ID、名称、类别及原始框数值。相机录像暂不叠加世界中的MPC轨迹，计划轨迹保存在BEV诊断图与`plans.jsonl`，不修改输入模型的原始相机图。当前验证仅包括接口、配置、几何与测试替身，不能据此宣称已在CARLA实现无碰撞或实时运行。
+每轮沿用第7节的核心日志，另有`carla_bridge.log`、`carla_map.json`、`carla_environment_audit.json`、`camera_frames/`及相机资产清单；`--video`保存真实相机拼图录像。`carla_environment_audit.json`记录地图环境框的读取范围、数量及镜像网格半尺寸规范化明细。CARLA 0.9.15的组件负缩放可能产生负半尺寸，程序只对有限非零半尺寸取绝对值，保持原世界中心、旋转及八角点集合，不删除障碍物、不修改地图；零半尺寸或非有限值仍拒绝，并报告ID、名称、类别及原始框数值。录像可在RGB显示副本投影MPC轨迹；世界调试线由独立开关控制，计划另存BEV诊断图与`plans.jsonl`。当前验证仅包括接口、配置、几何与测试替身，不能据此宣称已在CARLA实现无碰撞或实时运行。
+
+
+## 10. 第二批：逐地图长路线与多演员场景
+
+每个场景仍是一份独立的 `config/carla_scenarios/*.yaml`。保留旧五场景，新增16份主体场景及8份 `_opt` 地图变体，共覆盖12个Town、20个公开地图资源名称。Town08/09/14等挑战赛保留地图不在本地已安装公开地图清单中，不虚构可用配置。
+
+**验证边界：道路和布置使用本机CARLA 0.9.15 SDK读取真实OpenDRIVE进行离线检查；没有代替服务器执行物理闭环。** 检查不证明道具蓝图可生成、动态避碰成功或MPC实时。此前制动执行偏差、OCC几何及导航偏离后的异常不在本次场景扩展中修复，应在实验日志中区分，不能将它们全部解释为场景难度。
+
+| YAML文件名（不含.yaml） | 地图 | 路线/m | 时限/s | 交互 |
+|---|---|---:|---:|---|
+| `town01_urban_follow` | Town01 | 500 | 120 | 城市日常跟驰：慢车与远处前车，连续街区及路口。 |
+| `town02_school_crossing` | Town02 | 400 | 150 | 校园式低速路段：两名行人分时从真实人行道横穿；不是地图学校POI标注。 |
+| `town03_junction_flow` | Town03 | 600 | 150 | 城市多路口：本车道前车、邻道车辆和公开支路横向来车，保留实际信号约束。 |
+| `town04_multilane_exit` | Town04 | 900 | 180 | 多车道主路经公开分流连接进入单车道出口，保持已知导航分支。 |
+| `town04_multilane_merge` | Town04 | 900 | 180 | 单车道入口经公开连接汇入多车道主路；前方慢车形成速度调整需求。 |
+| `town05_multi_vehicle` | Town05 | 650 | 180 | 多车交互：本车道跟驰、左右邻车不同速度；不预先要求自车换道。 |
+| `town05_roadworks` | Town05 | 600 | 180 | 临时施工占道：锥桶渐变收窄、停放工程车辆和邻道通行车辆。 |
+| `town06_cut_in` | Town06 | 900 | 180 | 相邻车辆在合法虚线区触发切入，远处慢车增加交互；切入过程连续。 |
+| `town06_ramp_entry` | Town06 | 1000 | 180 | 匝道汇入：单车道入口进入多车道公路，前车沿同一合法连接汇入。 |
+| `town06_ramp_exit` | Town06 | 1000 | 180 | 公路驶出：已知导航沿公开出口连接驶离多车道主路。 |
+| `town07_rural_follow` | Town07 | 600 | 180 | 乡村弯道路段：慢速货车跟驰，保留对向道路和真实弯曲拓扑。 |
+| `town10hd_stop_go` | Town10HD | 500 | 180 | 城市走停交通：前车触发停车，停稳等待4秒后恢复前进。 |
+| `town11_long_follow` | Town11 | 800 | 180 | 未装饰大地图的连续道路跟驰；用于长路线和坡度适配，不模拟建筑语义。 |
+| `town12_mixed_flow` | Town12 | 800 | 180 | 大地图连续街区：两辆不同速度前车，路线包含真实路口。 |
+| `town13_roadworks` | Town13 | 800 | 200 | 大地图临时施工：工程车与锥桶占据本车道，邻道保留通行交通。 |
+| `town15_campus_crossing` | Town15 | 450 | 180 | 校园地图低速交互：真实人行道起步横穿，前方车辆低速通行。 |
+
+Town01、02、03、04、05、06、07、10HD各有一份文件名以`_opt`结尾的分层地图版本，YAML中显式指定`TownXX_Opt`。它们保持对应主体场景的道路锚点和演员配置；没有把原地图改名后自动替换运行。
+
+### 10.1 无模型运行
+
+在代码更新至本次版本后，使用现有环境与已启动的专用CARLA服务。以下指令不启动模型、不加载DINO、不检索也不写记忆；不会关闭CARLA进程。
+
+```bash
+conda activate ep-driver-carla
+cd /data/zjj/code/EP-Driver/EP-Driver-CARLA
+python scripts/run_carla.py --list-scenarios
+python scripts/run_carla.py --scenario town01_urban_follow --dry-run
+
+python scripts/run_carla.py \
+  --carla-python /home/zjj/miniconda3/envs/carla37/bin/python \
+  --host 127.0.0.1 --port 22000 \
+  --scenario town01_urban_follow \
+  --exclusive-world --allow-world-reset \
+  --episodes 1 --seed 1 \
+  --fast off --reflection off --no-retrieve --no-write-memory \
+  --world-plan --video \
+  --episodes-dir outputs/carla/long_routes/town01_urban_follow
+```
+
+未传`--duration`时使用该场景的`duration_s`，而非统一30秒；传入则显式覆盖。`--world-plan`使旁观窗口可看世界中的规划线，但线也可能被相机拍到；正式无叠加采集使用`--no-world-plan`。图片仍按1Hz保存，录像10Hz。
+
+可先分场景运行，再串行批量运行选定场景。切勿并行控制同一个CARLA世界。下面批次总共16轮，每轮各用seed1；`BATCH_DIR`保留完整输出和终端日志。单场景返回非零时仍进入下一场景，并单独记录返回码。
+
+```bash
+BATCH_DIR="outputs/carla/long_routes_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$BATCH_DIR"
+set -o pipefail
+for scene in town01_urban_follow town02_school_crossing town03_junction_flow \
+  town04_multilane_merge town04_multilane_exit town05_roadworks town05_multi_vehicle \
+  town06_ramp_entry town06_ramp_exit town06_cut_in town07_rural_follow \
+  town10hd_stop_go town11_long_follow town12_mixed_flow town13_roadworks town15_campus_crossing
+do
+  python scripts/run_carla.py \
+    --carla-python /home/zjj/miniconda3/envs/carla37/bin/python \
+    --host 127.0.0.1 --port 22000 --scenario "$scene" \
+    --exclusive-world --allow-world-reset --episodes 1 --seed 1 \
+    --fast off --reflection off --no-retrieve --no-write-memory \
+    --world-plan --video --episodes-dir "$BATCH_DIR/$scene" \
+    2>&1 | tee "$BATCH_DIR/$scene.log"
+  printf '%s,%s\n' "$scene" "${PIPESTATUS[0]}" >> "$BATCH_DIR/exit_codes.csv"
+done
+```
+
+先检查`summary.json`的终止原因、真实碰撞、进度、帧数和`video_recording.json`。`timeout`只表示用完时限，不等于到达或成功。触发/完成事件保存在帧日志，选址信息在`carla_scene_selection.json`；切入指令结束也不等于真实横向到达。
+
+### 10.2 修改配置构造相似场景
+
+新模板的参数全部在单份YAML中：
+
+| 字段 | 含义 |
+|---|---|
+| `description` | 实验说明，不自动进入VLM/规划器输入 |
+| `duration_s` | 场景默认最长仿真时间，秒；命令行可覆盖 |
+| `experiment.route_anchors` | 公开地图`road_id/lane_id/s_m`锚点；第一项固定起点，其余项要求经过，不是周车隐藏路线 |
+| `experiment.spawn_index` | 与非空route_anchors互斥；不固定锚点时才使用地图生成点 |
+| `experiment.route_length_m` | 请求导航长度，实际2m采样通常略长；不能自动缩短凑通过 |
+| `route_requirements.kind` | any、junction、merge、diverge；汇入/分流须有路线选定分支和非路口单/多车道过渡证据 |
+| `route_requirements.min_junctions` | 最少不同路口数量，不保证灯控/无保护左转等语义 |
+| `route_requirements.min_same_direction_lanes` | 路线上至少一段同向车道数；不代表每处都可变道 |
+| `route_requirements.search_limit` | 单起点有界搜索上限；按合法连接，不穿越无连接道路 |
+| `experiment.weather` | CARLA天气预设，默认ClearNoon；退出恢复原天气 |
+| `actors[].role/type/blueprint` | 唯一演员名称、vehicle/pedestrian/prop、实际资源蓝图 |
+| `actors[].placement.s_m` | 沿自车已知导航路线的摆放距离，米 |
+| `actors[].placement.lane` | current/left/right，行人使用sidewalk_left/sidewalk_right |
+| `actors[].placement.offset_m` | 相对选中车道中心横移，左正，米；非论文模型目标d |
+| `actors[].placement.anchor` | 交叉车辆可使用独立公开支路锚点，替代s_m/lane；须验证同层路口内与自车路径横向相交 |
+| `actors[].behavior` | follow、parked、cut_in、stop_resume；行人为cross；道具为parked |
+| `actors[].speed_mps` | 场景演员目标速度；自车始终使用主程序MPC，不被脚本接管 |
+| `actors[].trigger` | time_s与ego_distance_m同时满足才触发；距离null表示只按时间 |
+| `actors[].duration_s` | 切入几何过渡时间，秒；不会瞬移；行人按真实剩余距离结束横穿 |
+| `actors[].stop_duration_s` | 前车停稳后保持的秒数，再恢复行驶 |
+
+复制一个场景、修改name及演员距离/速度/触发条件，保留地图和锚点，即可构造同路段变体。道路改变后务必重新检查可生成条件；`--inspect-scene`只读检查**当前已加载**地图，不能替你换图。道具缺失、道路不适用或生成碰撞会明确报错，不偷偷丢弃演员。切入不仅要求有邻道，还检查跨越许可；行人要求两端真实人行道。学校路段是实验语义，不声称学校建筑、斑马线或儿童行为已被真实建模。
+
+固定锚点且不修改演员参数时，seed变化不会自动生成不同车距和行为；这些配置主要用于可控同地点对比。交通灯保留服务器周期并记录初始相位，当前seed不保证信号相位完全相同。跨支路车辆使用160m公开路线，之后停下；NPC是简单跟踪、跟驰与信号控制，不是已验证专家策略，也没有实现完整无信号路口协商。
+
+### 10.3 长路线的地图与平台边界
+
+导航通过公开`next(2m)`连通，不再要求整条路线近直或处于起点高度。地图提取沿最近导航段插值高度，以1.5m容差筛选道路，版本`carla-route-elevation-1.0`；拒绝导航自身跨层平面重叠和不可区分的层高投影，不把立交上下层直接并为同一可行驶面。**当前物体的高度准入仍按自车高度±1.5m，坡道远处对象可能被排除；本次没有放宽这项感知权限。**
+
+Town11/12/13/15使用hero自车支持CARLA大地图瓦片加载。公开道路文件的连通性验证不包含GPU瓦片加载、静态环境对象缓存完整性或世界原点重定位；现有0.9.15环境框接口在大地图重定位后的坐标需要服务器进一步核查。这四张图配置可用于开发测试，暂不作为已验证正式闭环能力。建议先运行Town01/02/05，再测试坡道和大地图。Town11本身无完整装饰，不能用其图像代表真实城市视觉复杂度。
+
+本批场景保持原预测、APF、MPC、目标协议、模型开关和记忆接口。新场景不引入真实API调用，也不改变既有记忆库。地图和演员配置越复杂，越需要区分场景初始化失败、主程序内部异常、碰撞及正常等待，不能仅以“跑满时限”统计成功。

@@ -1,0 +1,55 @@
+# 独立场景；距离m、速度m/s、时间s，offset_m沿车道左正。
+# route_anchors固定道路地点；修改actor距离/速度/触发条件可构造相似变体。
+schema_version: carla-scene-1.2
+name: town03_junction_flow
+template: scripted_traffic
+map: Town03
+description: 城市多路口：本车道前车、邻道车辆和公开支路横向来车，保留实际信号约束。
+desired_speed_mps: 8
+duration_s: 150
+experiment:
+  spawn_index: null
+  route_length_m: 600
+  route_anchors:
+  - road_id: 3
+    lane_id: 3
+    s_m: 40.000000
+  route_requirements:
+    kind: junction
+    min_junctions: 1
+    min_same_direction_lanes: 2
+    search_limit: 10000
+  navigation_step_yaw_limit_deg: 30
+  initial_speed_mps: 8
+  ego_blueprint: vehicle.tesla.model3
+  weather: ClearNoon
+  actors:
+  - role: lead
+    type: vehicle
+    blueprint: vehicle.audi.a2
+    placement:
+      s_m: 35
+      lane: current
+      offset_m: 0
+    behavior: follow
+    speed_mps: 6
+  - role: adjacent
+    type: vehicle
+    blueprint: vehicle.audi.a2
+    placement:
+      s_m: 55
+      lane: left
+      offset_m: 0
+    behavior: follow
+    speed_mps: 8
+  - role: cross_traffic
+    type: vehicle
+    blueprint: vehicle.audi.a2
+    placement:
+      anchor:
+        road_id: 19
+        lane_id: -1
+        s_m: 40.0
+      offset_m: 0
+    behavior: follow
+    speed_mps: 4

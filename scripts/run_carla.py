@@ -62,7 +62,7 @@ def positive(value,name,allow_zero=False):
         raise ValueError(name+'必须为有限'+('非负数' if allow_zero else '正数'))
 
 
-SCENE_SCHEMA_VERSION='carla-scene-1.1'
+SCENE_SCHEMA_VERSION='carla-scene-1.2'
 SCENE_DIRECTORY=Path('config/carla_scenarios')
 
 
@@ -73,10 +73,14 @@ def scene_configuration(path,seed):
     raw=path.read_bytes()
     data=load_yaml(path,raw)
     required={'schema_version','name','template','map','desired_speed_mps','experiment'}
-    if set(data)!=required:
-        raise ValueError('场景YAML必须且仅包含schema_version、name、template、map、desired_speed_mps、experiment')
-    if data['schema_version'] not in ('carla-scene-1.0',SCENE_SCHEMA_VERSION):
+    optional={'description','duration_s'} if data.get('schema_version')==SCENE_SCHEMA_VERSION else set()
+    if required-set(data) or set(data)-required-optional:
+        raise ValueError('场景YAML缺少必需字段或包含未知字段；1.2版另支持description和duration_s')
+    if data['schema_version'] not in ('carla-scene-1.0','carla-scene-1.1',SCENE_SCHEMA_VERSION):
         raise ValueError('场景schema_version不兼容：'+str(data['schema_version']))
+    if 'duration_s' in data:positive(data['duration_s'],'场景duration_s')
+    if 'description' in data and (not isinstance(data['description'],str) or not data['description'].strip()):
+        raise ValueError('场景description必须为非空文字')
     name=data['name']
     if (not isinstance(name,str) or not name or
         any(not (c.isascii() and (c.isalnum() or c in '_-')) for c in name) or
@@ -89,27 +93,43 @@ def scene_configuration(path,seed):
     positive(data['desired_speed_mps'],'场景desired_speed_mps',True)
     experiment=data['experiment']
     if not isinstance(experiment,dict):raise ValueError('场景experiment必须为对象')
-    fields=set(EXPERIMENT_FIELDS)-{'name','seed'}
+    scripted=data['template']=='scripted_traffic'
+    if scripted:
+        if data['schema_version']!=SCENE_SCHEMA_VERSION:
+            raise ValueError('scripted_traffic需要carla-scene-1.2')
+        from nine_grid.carla_scripted_scenarios import (SCRIPTED_EXPERIMENT_FIELDS,
+            SCRIPTED_REQUIRED_FIELDS,SCRIPTED_DEFAULTS,validate_scripted_experiment)
+        experiment_fields=SCRIPTED_EXPERIMENT_FIELDS
+        required_fields=SCRIPTED_REQUIRED_FIELDS
+        defaults=SCRIPTED_DEFAULTS
+    else:
+        experiment_fields=EXPERIMENT_FIELDS
+        required_fields=REQUIRED_EXPERIMENT_FIELDS
+        defaults=OPTIONAL_EXPERIMENT_DEFAULTS
+    fields=set(experiment_fields)-{'name','seed'}
     unknown=set(experiment)-fields
-    missing=(set(REQUIRED_EXPERIMENT_FIELDS)-{'name','seed'})-set(experiment)
+    missing=(set(required_fields)-{'name','seed'})-set(experiment)
     if unknown:raise ValueError('CARLA场景experiment包含未实现字段：'+str(sorted(unknown)))
     if missing:raise ValueError('CARLA场景experiment缺少显式参数：'+str(sorted(missing)))
     experiment=copy.deepcopy(experiment)
-    for key,value in OPTIONAL_EXPERIMENT_DEFAULTS.items():
-        experiment.setdefault(key,value)
+    for key,value in defaults.items():
+        experiment.setdefault(key,copy.deepcopy(value))
     experiment.update(name=data['template'],seed=seed)
-    validate_experiment(experiment)
+    (validate_scripted_experiment if scripted else validate_experiment)(experiment)
     index=experiment.get('spawn_index')
     if index is not None and (type(index) is not int or index<0):
         raise ValueError('spawn_index必须为null或非负整数')
-    for field in ('ego_blueprint','lead_blueprint','occluder_blueprint'):
+    for field in (('ego_blueprint',) if scripted else ('ego_blueprint','lead_blueprint','occluder_blueprint')):
         if not isinstance(experiment.get(field),str) or not experiment[field].strip():
             raise ValueError(field+'必须为非空字符串')
+    if scripted:
+        from nine_grid.carla_extended_routes import ROUTE_SELECTION_VERSION
     return data,experiment,{'schema_version':data['schema_version'],
         'effective_schema_version':SCENE_SCHEMA_VERSION,'route_selection_version':ROUTE_SELECTION_VERSION,'path':str(path),
         'sha256':hashlib.sha256(raw).hexdigest(),'yaml':raw.decode('utf-8-sig'),
         'name':name,'template':data['template'],'requested_map':data['map'],
-        'requested_desired_speed_mps':data['desired_speed_mps']}
+        'requested_desired_speed_mps':data['desired_speed_mps'],
+        'description':data.get('description'), 'duration_s':data.get('duration_s')}
 
 
 def refresh_scene_audit(cfg):
@@ -195,7 +215,7 @@ def main(argv=None):
     parser.add_argument('--carla-python',help='CARLA SDK Python 3.7/3.8解释器绝对路径')
     parser.add_argument('--host');parser.add_argument('--port',type=int);parser.add_argument('--map')
     selection=parser.add_mutually_exclusive_group()
-    selection.add_argument('--scenario',choices=['slow_lead','hard_brake','cut_in','parked_obstacle','occluded_pedestrian'],help='选择内置独立场景YAML，默认slow_lead')
+    selection.add_argument('--scenario',choices=sorted(p.stem for p in (ROOT/SCENE_DIRECTORY).glob('*.yaml')),help='选择内置独立场景YAML，默认slow_lead')
     selection.add_argument('--scenario-config',help='指定独立场景YAML；相对路径以项目根为准')
     parser.add_argument('--exclusive-world',action='store_true',help='确认此端口为本实验专用CARLA世界')
     parser.add_argument('--allow-world-reset',action='store_true',help='只在专用空世界允许按配置切换地图')
@@ -239,11 +259,13 @@ def main(argv=None):
                 _,experiment,source=scene_configuration(path,args.seed)
                 if source['name'] in listed:raise ValueError('内置场景name重复：'+source['name'])
                 listed[source['name']]={'template':source['template'],'map':source['requested_map'],
-                    'config':str(path),'experiment':experiment,'sha256':source['sha256']}
+                    'config':str(path),'description':source['description'],'duration_s':source['duration_s'],
+                    'experiment':experiment,'sha256':source['sha256']}
             print(json.dumps({'场景清单':listed,'说明':'仅列出独立场景配置；未连接CARLA，也不证明地图适配成功'},ensure_ascii=False,indent=2))
             return 0
         config=json.loads(project_path(args.config).read_text(encoding='utf-8-sig'))
         config.update(platform='carla',scenario=cfg['scenario_source']['name'],carla=cfg)
+        if cfg['scenario_source']['duration_s'] is not None:config['duration']=cfg['scenario_source']['duration_s']
         if args.duration is not None:config['duration']=args.duration
         if args.dino_model:
             local=project_path(args.dino_model)
