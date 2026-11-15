@@ -65,7 +65,7 @@ def evaluate(scene, plan, baseline, predictions, config=None):
                 return invalid('规划状态或控制维度错误、数值非有限')
     expected={actor.id for actor in scene.actors if actor.visible}
     if set(predictions.trajectories)!=expected or set(predictions.actors)!=expected:
-        return invalid('可见对象与预测集合不完整或包含不可见对象')
+        return invalid('本次明确规划范围与预测集合不一致')
     prediction_times=np.asarray(predictions.times)
     if prediction_times.ndim!=1 or len(prediction_times)<2 or not np.isfinite(prediction_times).all() or abs(prediction_times[0])>1e-8 or np.any(np.diff(prediction_times)<=0):
         return invalid('预测时刻序列无效')
@@ -148,8 +148,9 @@ def evaluate(scene, plan, baseline, predictions, config=None):
     progress=float(max(0.,route_s[-1]-route_s[0]))
     reference=None
     progress_score=None
-    if not baseline.valid:
-        reasons.append('无语义物理参照规划失败')
+    if (not baseline.valid or baseline.diagnostics.get('safety_feasible') is False
+            or baseline.diagnostics.get('emergency', False)):
+        reasons.append('无语义物理参照没有安全解，紧急制动不能作满分参照')
     else:
         reference=_progress(scene,baseline.states)
         if rules.get('must_wait',False) and rules.get('wait_reason') and rule_ok:
@@ -157,10 +158,13 @@ def evaluate(scene, plan, baseline, predictions, config=None):
         else:
             progress_score=float(np.clip(progress/max(reference,cfg.get('progress_floor_m',.1)),0,1))
     # 可执行不再等于安全；软化后的实线/名义间隙等违规仍必须阻止危险经验入库。
-    planner_safety=plan.diagnostics.get('safety_feasible',True) is not False
+    planner_safety=(plan.diagnostics.get('safety_feasible',True) is not False
+                    and not plan.diagnostics.get('emergency', False))
     gates={'collision_free':not collision,'on_road':onroad,'correct_direction':direction_ok,'rules':rule_ok,
            'planner_safety':planner_safety}
-    metrics.update(gates=gates,progress_m=progress,reference_progress_m=reference,progress=progress_score,ttc=float(ttc_ok),comfort=float(comfort))
+    metrics.update(gates=gates,progress_m=progress,reference_progress_m=reference,progress=progress_score,ttc=float(ttc_ok),comfort=float(comfort),
+        planning_scope=scene.diagnostics.get('planning_scope'), evaluated_actor_ids=sorted(expected),
+        evaluation_scope='筛选后的道路对象及安全例外；不声称评估未纳入对象')
     valid=not reasons
     weights=cfg.get('weights',dict(progress=5,ttc=5,comfort=2))
     score=(float(all(gates.values()))*sum(weights[k]*metrics[k] for k in weights)/sum(weights.values())) if valid else None
@@ -172,6 +176,7 @@ def admissible(answer,plan,quality,threshold=.7):
         and answer.version==plan.version==quality.version and quality.time is not None
         and np.isclose(answer.time,plan.time,rtol=0,atol=1e-8) and np.isclose(answer.time,quality.time,rtol=0,atol=1e-8)
         and plan.valid and plan.diagnostics.get('safety_feasible',True) is not False
+        and not plan.diagnostics.get('emergency',False)
         and quality.valid and quality.score is not None and np.isfinite(quality.score)
         and quality.score>=threshold and not quality.collision and not quality.precollision)
 
@@ -189,26 +194,43 @@ def reflection_reasons(quality,invalid_answer=False,threshold=.7):
 
 
 def execution_audit(scene,plan,predictions,config=None):
-    """对将执行的 0.1 秒独立采样审计，结果不改写或否决候选控制。"""
+    """审计重规划前全部控制前缀；正常解报警须重新计算制动。
+
+    重规划 10Hz 时仍只检查首个 0.1s；重规划 1Hz、MPC 网格
+    0.1s 时检查前十段，不重置对象预测时间，也不将首控制保持一秒。
+    """
     from .planner import propagate
+    from .control_clock import execution_prefix_count
     if not plan.valid:
         return {'available':False,'alarm':False,'reason':'无可执行候选'}
     cfg=(config or {}).get('mpc',{})
     dt=cfg.get('step_s',.1)
     substeps=cfg.get('physics_substeps',5)
+    prefix_count=execution_prefix_count(config)
+    controls=np.asarray(plan.controls,float)
+    if (controls.ndim!=2 or controls.shape[1]!=2 or len(controls)<prefix_count
+            or not np.isfinite(controls[:prefix_count]).all()):
+        raise ValueError('规划控制前缀缺失、维度无效或包含非有限数值')
+    duration=prefix_count*dt
+    if predictions.trajectories and predictions.times[-1]+1e-7<duration:
+        raise ValueError('预测时域不足以覆盖实际执行窗口')
     state=np.array([*scene.ego.position,scene.ego.heading,np.linalg.norm(scene.ego.velocity)])
     collisions=[];offroad=False
     accepted_road=scene.drivable.buffer(cfg.get('body_constraint_tolerance_m',.001))
     prepare(accepted_road)
     intersects=_collision_checker(scene.ego,predictions)
-    for i in range(1,substeps+1):
-        t=dt*i/substeps
-        state=propagate(state,plan.controls[0],scene.ego.length,dt/substeps,1,
-                        scene.ego.wheelbase_m,scene.ego.rear_axle_to_center_m)
-        ego_shape=actor_shape(scene.ego,state[:2],state[2])
-        offroad|=not accepted_road.covers(ego_shape)
-        for identity in predictions.trajectories:
-            if intersects(state[:2],state[2],ego_shape,identity,t):
-                collisions.append(identity)
+    for control_index,control in enumerate(controls[:prefix_count]):
+        for i in range(1,substeps+1):
+            # 相对于同一原帧的累计时间，不能在每段重新从零查询周车预测。
+            t=dt*(control_index+i/substeps)
+            state=propagate(state,control,scene.ego.length,dt/substeps,1,
+                            scene.ego.wheelbase_m,scene.ego.rear_axle_to_center_m)
+            ego_shape=actor_shape(scene.ego,state[:2],state[2])
+            offroad|=not accepted_road.covers(ego_shape)
+            for identity in predictions.trajectories:
+                if intersects(state[:2],state[2],ego_shape,identity,t):
+                    collisions.append(identity)
     return {'available':True,'alarm':bool(collisions or offroad),'collision_ids':sorted(set(collisions)),
-            'offroad':offroad,'executed_policy':'报警仍执行当前有效候选','sample_step_s':dt/substeps}
+            'offroad':offroad,'executed_policy':'正常解报警转制动；无安全解仅执行单列紧急制动','sample_step_s':dt/substeps,
+            'execution_duration_s':duration,'executed_control_count':prefix_count,
+            'audit_samples':prefix_count*substeps}

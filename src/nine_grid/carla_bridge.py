@@ -1,5 +1,6 @@
 """CARLA 0.9.15 独立 SDK 桥；兼容 Python 3.7，仅依赖标准库及 carla。"""
 import base64
+import copy
 import json
 import hashlib
 import math
@@ -7,9 +8,15 @@ import os
 import queue
 import signal
 import sys
+import threading
 import time
 import zlib
 from pathlib import Path
+
+try:
+    from .carla_execution import ControlTimeline
+except ImportError:
+    from carla_execution import ControlTimeline
 
 
 def validate_camera_source_clock(clock):
@@ -20,7 +27,7 @@ def validate_camera_source_clock(clock):
 
 
 def camera_storage_due(sim_time, camera_save_hz=1):
-    """RGB资产只落盘整秒原帧；10Hz规划/录像仍消费各自当前帧。"""
+    """从真实10Hz采集帧中选择1Hz原始图片归档，不影响显示/录像时钟。"""
     if isinstance(camera_save_hz, bool) or camera_save_hz != 1:
         raise ValueError('camera_save_hz当前必须为1，与快模型原帧采样对齐')
     if isinstance(sim_time, bool) or not isinstance(sim_time, (int, float)) or not math.isfinite(sim_time) or sim_time < -1e-5:
@@ -31,6 +38,29 @@ def camera_storage_due(sim_time, camera_save_hz=1):
 
 def lane_key(waypoint):
     return '{}|{}|{}'.format(waypoint.road_id, waypoint.section_id, waypoint.lane_id)
+
+
+def boundary_semantics(marking_type, waypoint_permission, marking_permission, is_junction):
+    """当前位置的实物标线与路口虚拟连接边分离；不拿无标线当实线。
+
+    双线的通行方向由CARLA当前waypoint/marking许可共同提供，不猜测名称顺序。
+    未知地图属性保守保留，但明确标记为未知而非伪造实线。
+    """
+    name = str(marking_type).split('.')[-1].lower()
+    virtual = bool(is_junction) and name in ('none', 'nonetype')
+    known = name in ('none', 'nonetype', 'solid', 'solidsolid', 'solidbroken',
+                     'brokensolid', 'broken', 'brokenbroken', 'bottsdots', 'grass', 'curb')
+    physical = name not in ('none', 'nonetype')
+    crossable = bool(waypoint_permission and marking_permission)
+    if name in ('solid', 'solidsolid', 'curb', 'grass'):
+        crossable = False
+    if not known:
+        crossable = False
+    if virtual:
+        crossable = True  # 仅移除虚拟连接边的实体惩罚；道路多边形仍独立约束。
+    return {'crossable': crossable, 'kind': 'virtual_lane_boundary' if virtual else 'lane_boundary',
+            'physical_marking': physical, 'map_evidence_known': known,
+            'permission_source': 'junction_unmarked_virtual' if virtual else 'current_waypoint_and_marking'}
 
 
 def map_identity(road_map):
@@ -75,25 +105,6 @@ def bounding_box_world_center(transform, box, carla):
     local = box.location
     point = carla.Location(x=local.x, y=local.y, z=local.z)
     return transform.transform(point)
-
-
-def project_camera(point, inverse, width, height, fov):
-    """UE 相机 x 前 y 右 z 上，返回像素及光轴深度，非欧氏射线长度。"""
-    p = [point.x, point.y, point.z, 1.0]
-    v = [sum(inverse[i][j] * p[j] for j in range(4)) for i in range(3)]
-    if v[0] <= 0.05:
-        return None
-    focal = width / (2.0 * math.tan(math.radians(fov) / 2.0))
-    u, w = width / 2.0 + focal * v[1] / v[0], height / 2.0 - focal * v[2] / v[0]
-    if not (1 <= u < width - 1 and 1 <= w < height - 1):
-        return None
-    return int(u), int(w), v[0]
-
-
-def encoded_depth(image, x, y):
-    i = (y * image.width + x) * 4
-    raw = image.raw_data
-    return (raw[i + 2] + 256 * raw[i + 1] + 65536 * raw[i]) * (1000.0 / 16777215.0)
 
 
 def wheel_geometry(wheels, inverse_transform, box_center_x):
@@ -317,6 +328,32 @@ class CarlaSession:
         self.closed = False
         self.angular_history = {}
         self.cleanup_errors = []
+        self._condition = threading.Condition()
+        self._stop = threading.Event()
+        self._ticker = None
+        self._latest = None
+        self._worker_error = None
+        self._terminal_reason = None
+        self._terminal_published = False
+        self._paused = True
+        self._sim_time = 0.
+        self._latest_published_at = None
+        self._started_at = None
+        self._initialized_at = None
+        self._history = {}
+        self._history_sample_index = -1
+        self._entities_cache = None
+        self._last_applied_control = None
+        self._last_command = None
+        self._applied_key = None
+        self._pending_plan = None
+        self._visualization = None
+        self._camera_payload_cache = None
+        self._display_frames = []
+        self._timing = dict((name, 0.) for name in
+            ('tick_s', 'sensor_wait_s', 'snapshot_state_s', 'image_s', 'pacing_s', 'scenario_s'))
+        self._runtime_metrics = {'physical_ticks': 0, 'wall_pacing_wait_s': 0.,
+                                 'wall_lag_max_s': 0., 'wall_deadline_misses': 0}
 
     def initialize(self, config, directory, seed):
         if config.get('exclusive_world') is not True:
@@ -324,16 +361,26 @@ class CarlaSession:
         if type(config.get('world_plan_debug',False)) is not bool:
             raise ValueError('world_plan_debug必须为布尔值')
         camera_storage_due(0., config.get('camera_save_hz', 1))
+        self.runtime_mode = config.get('runtime_mode', 'sync')
+        if self.runtime_mode not in ('sync', 'async'):
+            raise ValueError('runtime_mode必须为sync或async')
+        if type(config.get('rgb_enabled', False)) is not bool:
+            raise ValueError('rgb_enabled必须为布尔值')
+        self.rgb_enabled = config.get('rgb_enabled', False)
+        if isinstance(config.get('camera_hz', 10), bool) or config.get('camera_hz', 10) != 10:
+            raise ValueError('RGB真实采样频率camera_hz当前必须为10，原始图片归档独立为1Hz')
+        self._display_enabled = bool(set(config.get('consumers', [])) & {'video', 'live'})
+        self.display_capacity = config.get('display_queue_frames', 50)
+        if type(self.display_capacity) is not int or self.display_capacity < 10:
+            raise ValueError('display_queue_frames必须为至少10的整数')
         if type(config.get('rgb_postprocess_effects', True)) is not bool:
             raise ValueError('rgb_postprocess_effects必须为布尔值')
         for key, default in (('timeout_s', 30), ('map_resolution_m', 2), ('same_level_tolerance_m', 1.5),
-                             ('perception_radius_m', 120), ('visibility_surface_tolerance_m', .35),
+                             ('perception_radius_m', 120),
                              ('camera_height_m', 2.2), ('map_speed_cap_mps', 30)):
             value = config.get(key, default)
             if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or value <= 0:
                 raise ValueError('CARLA 参数必须为有限正数：' + key)
-        if type(config.get('visibility_min_samples', 2)) is not int or not 1 <= config.get('visibility_min_samples', 2) <= 36:
-            raise ValueError('visibility_min_samples 必须在 1 至 36 之间')
         import carla
         from carla_scenarios import create_experiment
         self.carla = carla
@@ -363,10 +410,30 @@ class CarlaSession:
             self.world = client.load_world(requested_map)
         self.saved_settings = self.world.get_settings()
         settings = self.world.get_settings()
-        self.physics_hz = int(config.get('physics_hz', 50))
-        self.planner_hz = int(config.get('planner_hz', 10))
+        if type(config.get('physics_hz', 50)) is not int or type(config.get('planner_hz', 10)) is not int:
+            raise ValueError('CARLA物理与规划频率必须为整数')
+        self.physics_hz = config.get('physics_hz', 50)
+        self.planner_hz = config.get('planner_hz', 10)
         if self.physics_hz <= 0 or self.planner_hz <= 0 or self.physics_hz % self.planner_hz:
             raise ValueError('CARLA 物理频率必须为规划频率的整数倍')
+        if self.planner_hz not in (1, 2, 10):
+            raise ValueError('CARLA planner_hz只支持1、2、10')
+        if type(config.get('control_step_s', .1)) not in (int, float):
+            raise ValueError('MPC控制网格必须为有限数字')
+        self.control_step_s = float(config.get('control_step_s', .1))
+        if (not math.isfinite(self.control_step_s) or self.control_step_s <= 0 or
+                abs(self.control_step_s*self.physics_hz-round(self.control_step_s*self.physics_hz)) > 1e-8 or
+                abs(1./self.planner_hz/self.control_step_s-round(1./self.planner_hz/self.control_step_s)) > 1e-8):
+            raise ValueError('MPC控制网格必须与物理及规划时钟整除对齐')
+        if self.physics_hz != 50 or abs(self.control_step_s-.1) > 1e-8:
+            raise ValueError('CARLA保留50Hz物理与0.1秒MPC控制网格')
+        self.duration_s = config.get('duration_s')
+        if self.duration_s is not None and (isinstance(self.duration_s, bool) or
+                not isinstance(self.duration_s, (int, float)) or
+                not math.isfinite(self.duration_s) or self.duration_s <= 0):
+            raise ValueError('duration_s必须为有限正数')
+        self.timeline = ControlTimeline(config.get('acceleration_min_mps2', -6),
+            config.get('acceleration_max_mps2', 3), config.get('steering_abs_max_rad', .6))
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = 1.0 / self.physics_hz
         settings.no_rendering_mode = False
@@ -414,14 +481,21 @@ class CarlaSession:
         if self.width < 64 or self.height < 64 or not 20 < self.fov < 150:
             raise ValueError('相机尺寸或视场配置非法')
         self._create_sensors()
+        started = time.monotonic()
         self.frame = self.world.tick(self.timeout)
+        self._add_timing('tick_s', time.monotonic()-started)
         snap = self.world.get_snapshot()
         self.t0 = snap.timestamp.elapsed_seconds
         self._collect(self.frame)
+        self._sample_history(force=True)
         result = self.snapshot()
+        self._queue_display_frame(result.get('cameras', []))
+        self._publish(result)
+        result = self._latest_result()
         result['map'] = self._map_payload()
-        result['bridge_version'] = 'carla-0.9.15-observed-1.0'
+        result['bridge_version'] = 'carla-0.9.15-range-runtime-3.0'
         result['sdk_version'] = client_version
+        self._initialized_at = time.monotonic()
         return result
 
     def _create_sensors(self):
@@ -429,37 +503,34 @@ class CarlaSession:
         views = [('front', 0), ('front_left', -60), ('front_right', 60),
                  ('back', 180), ('back_left', -120), ('back_right', 120)]
         self.camera_actors = {}
-        for view, yaw in views:
-            for kind in ('rgb', 'depth'):
-                bp = self.world.get_blueprint_library().find('sensor.camera.' + kind)
-                for key, value in (('image_size_x', self.width), ('image_size_y', self.height),
-                                   ('fov', self.fov), ('sensor_tick', 0.0)):
-                    bp.set_attribute(key, str(value))
-                if bp.has_attribute('enable_postprocess_effects'):
-                    # CARLA关闭RGB后处理同时会关闭光照并使用线性gamma；恢复原生RGB默认管线。
-                    # 深度是几何证据，始终禁用后处理；不额外调色或覆盖默认gamma/曝光参数。
-                    enabled = kind == 'rgb' and self.cfg.get('rgb_postprocess_effects', True)
-                    bp.set_attribute('enable_postprocess_effects', 'true' if enabled else 'false')
-                pose = c.Transform(c.Location(z=float(self.cfg.get('camera_height_m', 2.2))), c.Rotation(yaw=yaw))
-                sensor = self.world.spawn_actor(bp, pose, attach_to=self.ego, attachment_type=c.AttachmentType.Rigid)
-                self.sensors.append(sensor)
-                key = view + '_' + kind
-                q = queue.Queue(maxsize=4)
-                self.queues[key] = q
-                def callback(image, target=q):
+        for view, yaw in views if self.rgb_enabled else []:
+            bp = self.world.get_blueprint_library().find('sensor.camera.rgb')
+            for key, value in (('image_size_x', self.width), ('image_size_y', self.height),
+                               ('fov', self.fov), ('sensor_tick', .1)):
+                bp.set_attribute(key, str(value))
+            if bp.has_attribute('enable_postprocess_effects'):
+                enabled = self.cfg.get('rgb_postprocess_effects', True)
+                bp.set_attribute('enable_postprocess_effects', 'true' if enabled else 'false')
+            pose = c.Transform(c.Location(z=float(self.cfg.get('camera_height_m', 2.2))), c.Rotation(yaw=yaw))
+            sensor = self.world.spawn_actor(bp, pose, attach_to=self.ego, attachment_type=c.AttachmentType.Rigid)
+            self.sensors.append(sensor)
+            key = view + '_rgb'
+            q = queue.Queue(maxsize=4)
+            self.queues[key] = q
+            def callback(image, target=q):
+                try:
+                    target.put_nowait(image)
+                except queue.Full:
+                    try:
+                        target.get_nowait()
+                    except queue.Empty:
+                        pass
                     try:
                         target.put_nowait(image)
                     except queue.Full:
-                        try:
-                            target.get_nowait()
-                        except queue.Empty:
-                            pass
-                        try:
-                            target.put_nowait(image)
-                        except queue.Full:
-                            pass
-                sensor.listen(callback)
-                self.camera_actors[key] = sensor
+                        pass
+            sensor.listen(callback)
+            self.camera_actors[key] = sensor
         bp = self.world.get_blueprint_library().find('sensor.other.collision')
         sensor = self.world.spawn_actor(bp, c.Transform(), attach_to=self.ego)
         self.sensors.append(sensor)
@@ -474,113 +545,87 @@ class CarlaSession:
         sensor.listen(lambda event: self.events.append({'kind': 'lane_invasion', 'frame': event.frame,
             'markings': [str(mark.type) for mark in event.crossed_lane_markings]}))
 
+    def _add_timing(self, name, elapsed):
+        self._timing[name] = self._timing.get(name, 0.) + float(elapsed)
+
     def _collect(self, frame):
-        deadline = time.monotonic() + self.timeout
-        result = {}
-        for key, q in self.queues.items():
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError('相机同步超时：{}，目标帧{}'.format(key, frame))
-                try:
-                    item = q.get(timeout=remaining)
-                except queue.Empty:
-                    raise TimeoutError('相机同步超时：{}，目标帧{}'.format(key, frame))
-                if item.frame == frame:
-                    result[key] = item
-                    break
-                if item.frame > frame:
-                    raise RuntimeError('相机丢帧：{}需要{}收到{}'.format(key, frame, item.frame))
-        timestamps = [item.timestamp for item in result.values()]
-        if max(timestamps) - min(timestamps) > 1e-6:
-            raise RuntimeError('同帧相机时间戳不一致')
-        if self.world is not None:
+        # 无图像消费者时绝不访问front_rgb，也不等待不存在的传感器。
+        if not self.queues:
+            self.frames = {}
+            return
+        if self.frames and all(image.frame == frame for image in self.frames.values()):
+            return
+        started = time.monotonic()
+        try:
+            deadline = time.monotonic() + self.timeout
+            result = {}
+            for key, q in self.queues.items():
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError('10Hz RGB同步超时：{}，目标帧{}'.format(key, frame))
+                    try:
+                        if self._stop.is_set() and threading.current_thread() is self._ticker:
+                            raise RuntimeError('RGB等待被运行暂停中断')
+                        item = q.get(timeout=min(remaining, .1))
+                    except queue.Empty:
+                        continue
+                    if item.frame == frame:
+                        result[key] = item
+                        break
+                    if item.frame > frame:
+                        raise RuntimeError('RGB源帧丢失：{}需要{}收到{}'.format(key, frame, item.frame))
+            timestamps = [item.timestamp for item in result.values()]
+            if max(timestamps) - min(timestamps) > 1e-6:
+                raise RuntimeError('同帧RGB时间戳不一致')
             snap = self.world.get_snapshot()
             if snap.frame != frame or any(abs(value-snap.timestamp.elapsed_seconds) > 1e-5 for value in timestamps):
-                raise RuntimeError('相机与目标世界帧时间戳不一致')
-        self.frames = result
+                raise RuntimeError('RGB与目标世界帧时间戳不一致；拒绝旧图配新状态')
+            self.frames = result
+            self._camera_payload_cache = None
+        finally:
+            self._add_timing('sensor_wait_s', time.monotonic()-started)
 
     def _camera_payload(self):
-        folder = self.root / 'camera_frames' / '{:08d}'.format(self.frame)
-        if self.t0 is None:
-            raise ValueError('相机落盘缺少本轮起始仿真时间')
-        saved = camera_storage_due(float(self.frames['front_rgb'].timestamp)-self.t0,
-                                   self.cfg.get('camera_save_hz', 1))
-        cameras = []
-        for view in ('front', 'front_left', 'front_right', 'back', 'back_left', 'back_right'):
-            rgb, depth = self.frames[view + '_rgb'], self.frames[view + '_depth']
-            if (rgb.frame != self.frame or depth.frame != self.frame or
-                    not all(math.isfinite(t) for t in (rgb.timestamp, depth.timestamp)) or
-                    abs(rgb.timestamp-depth.timestamp) > 1e-6):
-                raise ValueError('RGB与临时深度必须来自同一帧和时间戳：'+view)
-            if (rgb.width != self.width or depth.width != self.width or
-                    rgb.height != self.height or depth.height != self.height):
-                raise ValueError('RGB与临时深度尺寸不符合相机配置：'+view)
-            depth_bytes = bytes(depth.raw_data)
-            if len(depth_bytes) != self.width*self.height*4:
-                raise ValueError('临时深度BGRA字节数不符合相机尺寸：'+view)
-            rgb_bytes = bytes(rgb.raw_data)
-            if len(rgb_bytes) != self.width*self.height*4:
-                raise ValueError('临时RGB BGRA字节数不符合相机尺寸：'+view)
-            rgb_path = folder / (view + '.png')
-            if saved and not rgb_path.is_file():
-                folder.mkdir(parents=True, exist_ok=True)
-                rgb.save_to_disk(str(rgb_path))
-            # 当前RGB始终传输，非落盘帧也用于当前视频/显示，绝不重复上一整秒图片。
-            rgb_transport = {'encoding': 'zlib-base64-bgra8-1.0', 'frame': int(rgb.frame),
-                'timestamp': float(rgb.timestamp), 'width': self.width, 'height': self.height,
-                'data': base64.b64encode(zlib.compress(rgb_bytes, 1)).decode('ascii')}
-            # 深度只用于同帧可见性/观测证据，通过内存RPC交付，不生成深度图片。
-            transport = {'encoding': 'zlib-base64-bgra8-1.0', 'frame': int(depth.frame),
-                'timestamp': float(depth.timestamp), 'width': self.width, 'height': self.height,
-                'data': base64.b64encode(zlib.compress(depth_bytes, 1)).decode('ascii')}
-            cameras.append({'view': view, 'rgb_path': str(rgb_path) if saved else None,
-                'rgb_saved': saved, 'rgb_transport': rgb_transport, 'depth_transport': transport,
-                'rgb_postprocess_effects': self.cfg.get('rgb_postprocess_effects', True),
-                'width': self.width, 'height': self.height, 'fov_deg': self.fov,
-                'frame': self.frame, 'timestamp': rgb.timestamp,
-                'world_to_camera_ue': rgb.transform.get_inverse_matrix(),
-                'camera_to_world_ue': rgb.transform.get_matrix(),
-                'depth_frame': int(depth.frame), 'depth_timestamp': float(depth.timestamp),
-                'depth_retention': 'runtime_only_not_saved',
-                'depth_encoding': 'carla_rgb24_planar_m;R+256G+65536B;far=1000'})
-        return cameras
-
-    def _visible(self, actor):
-        """只访问候选车体几何，使用同帧深度验证朝向相机的表面采样。"""
-        return self._box_visible(actor.bounding_box, actor.get_transform())
-
-    def _box_visible(self, bbox, transform):
-        """环境框传入单位变换；actor局部框传入actor世界变换。"""
-        # 面中心与内部采样避免仅车框角点露出天空导致误判。
-        samples = []
-        for axis in (0, 1):
-            for side in (-1, 1):
-                for horizontal in (-0.5, 0, 0.5):
-                    for vertical in (-0.35, 0, 0.35):
-                        p = [horizontal * bbox.extent.x, horizontal * bbox.extent.y, vertical * bbox.extent.z]
-                        p[axis] = side * (bbox.extent.x if axis == 0 else bbox.extent.y)
-                        local = self.carla.Location(x=p[0], y=p[1], z=p[2])
-                        box_transform = self.carla.Transform(bbox.location, bbox.rotation)
-                        point = box_transform.transform(local)
-                        samples.append(transform.transform(point))
-        tolerance = float(self.cfg.get('visibility_surface_tolerance_m', 0.35))
-        minimum = int(self.cfg.get('visibility_min_samples', 2))
-        for view in ('front', 'front_left', 'front_right', 'back', 'back_left', 'back_right'):
-            depth = self.frames[view + '_depth']
-            inverse = depth.transform.get_inverse_matrix()
-            evidence = set()
-            for point in samples:
-                projected = project_camera(point, inverse, self.width, self.height, self.fov)
-                if projected is None:
-                    continue
-                u, v, axial = projected
-                observed = encoded_depth(depth, u, v)
-                if abs(observed - axial) <= tolerance:
-                    evidence.add((u, v))
-            if len(evidence) >= minimum:
-                return True
-        return False
+        if not self.rgb_enabled:
+            return []
+        if self._camera_payload_cache is not None and self._camera_payload_cache[0] == self.frame:
+            return self._camera_payload_cache[1]
+        started = time.monotonic()
+        try:
+            folder = self.root / 'camera_frames' / '{:08d}'.format(self.frame)
+            if self.t0 is None or 'front_rgb' not in self.frames:
+                raise ValueError('RGB源帧未就绪')
+            saved = camera_storage_due(float(self.frames['front_rgb'].timestamp)-self.t0,
+                                       self.cfg.get('camera_save_hz', 1))
+            cameras = []
+            for view in ('front', 'front_left', 'front_right', 'back', 'back_left', 'back_right'):
+                rgb = self.frames[view + '_rgb']
+                if rgb.frame != self.frame or not math.isfinite(rgb.timestamp):
+                    raise ValueError('RGB必须来自当前冻结观测帧：'+view)
+                if rgb.width != self.width or rgb.height != self.height:
+                    raise ValueError('RGB尺寸不符合相机配置：'+view)
+                rgb_bytes = bytes(rgb.raw_data)
+                if len(rgb_bytes) != self.width*self.height*4:
+                    raise ValueError('RGB BGRA字节数不符合相机尺寸：'+view)
+                rgb_path = folder / (view + '.png')
+                if saved and not rgb_path.is_file():
+                    folder.mkdir(parents=True, exist_ok=True)
+                    rgb.save_to_disk(str(rgb_path))
+                transport = {'encoding': 'zlib-base64-bgra8-1.0', 'frame': int(rgb.frame),
+                    'timestamp': float(rgb.timestamp), 'width': self.width, 'height': self.height,
+                    'data': base64.b64encode(zlib.compress(rgb_bytes, 1)).decode('ascii')}
+                cameras.append({'view': view, 'rgb_path': str(rgb_path) if saved else None,
+                    'rgb_saved': saved, 'rgb_transport': transport,
+                    'rgb_postprocess_effects': self.cfg.get('rgb_postprocess_effects', True),
+                    'width': self.width, 'height': self.height, 'fov_deg': self.fov,
+                    'frame': self.frame, 'timestamp': float(rgb.timestamp), 'sample_hz': 10.,
+                    'world_to_camera_ue': rgb.transform.get_inverse_matrix(),
+                    'camera_to_world_ue': rgb.transform.get_matrix()})
+            self._camera_payload_cache = (self.frame, cameras)
+            return cameras
+        finally:
+            self._add_timing('image_s', time.monotonic()-started)
 
     def _actor(self, actor, is_ego=False):
         transform, bb = actor.get_transform(), actor.bounding_box
@@ -640,7 +685,7 @@ class CarlaSession:
                               'geometry': 'yaw_aligned_envelope_of_world_bbox_xy_projection',
                               'velocity': 'fixed_map_mesh_zero', 'acceleration': 'fixed_map_mesh_zero'}}
 
-    def _visible_environment(self, ego, radius):
+    def _range_environment(self, ego, radius):
         result = []
         for entry in self.environment_objects:
             box = entry['box']
@@ -650,8 +695,7 @@ class CarlaSession:
             vertices = box.get_world_vertices(self.carla.Transform())
             if max(p.z for p in vertices) < ego['z']-ego['height_m']/2 or min(p.z for p in vertices) > ego['z']+ego['height_m']/2:
                 continue
-            if self._box_visible(box, self.carla.Transform()):
-                result.append(self._environment_actor(entry))
+            result.append(self._environment_actor(entry))
         return result
 
     def _map_payload(self):
@@ -696,9 +740,11 @@ class CarlaSession:
                 for i in range(len(waypoints) - 1):
                     mark = getattr(waypoints[i], side + '_lane_marking')
                     permission = waypoints[i].lane_change
-                    permitted = bool(int(permission) & int(self.carla.LaneChange.Left if side == 'left' else self.carla.LaneChange.Right))
+                    direction = int(self.carla.LaneChange.Left if side == 'left' else self.carla.LaneChange.Right)
+                    semantics = boundary_semantics(mark.type, bool(int(permission) & direction),
+                        bool(int(mark.lane_change) & direction), bool(waypoints[i].is_junction))
                     boundaries.append({'id': '{}:{}:{}'.format(key, side, i), 'points': coordinates[i:i + 2],
-                        'crossable': permitted, 'kind': 'lane_boundary', 'line_type': str(mark.type), 'permission_source': 'current_waypoint_lane_change'})
+                        'line_type': str(mark.type), **semantics})
             middle = waypoints[len(waypoints) // 2]
             adjacent = {}
             for side in ('left', 'right'):
@@ -728,29 +774,88 @@ class CarlaSession:
                 'elevation_filter': {'version':elevation.VERSION,'tolerance_m':tolerance,
                     'map_corridor_radius_m':elevation.radius_m,'rejected_waypoint_samples':rejected_height,
                     'rule':'nearest_xy_route_segment_interpolated_height;reject_multilevel_route_overlap',
-                    'scope':'地图坡度延伸；当前对象的可见性和高度准入保持原有规则'},
+                    'scope':'地图坡度延伸；当前对象仅按范围与同层高度准入，不作遮挡判断'},
                 'crosswalks': closed_crosswalks(self.map.get_crosswalks(), base_z, tolerance,elevation),
                 'lane_speed_source': 'configured_map_speed_cap_mps;current_ego_limit_from_CARLA'}
 
-    def snapshot(self):
-        snap = self.world.get_snapshot()
-        if snap.frame != self.frame:
-            raise RuntimeError('检测到其他客户端推进世界；拒绝使用状态与图像不同步的帧')
+    def _entities(self):
+        # 同物理帧只读取一次，避免历史采样与输出各自重复查询对象。
+        if self._entities_cache is not None and self._entities_cache[0] == self.frame:
+            return self._entities_cache[1:]
         ego = self._actor(self.ego, True)
-        radius = float(self.cfg.get('perception_radius_m', 120.0))
+        radius = float(self.cfg.get('perception_radius_m', 120.))
         actors = []
         for actor in self.world.get_actors():
             if actor.id == self.ego.id or not (actor.type_id.startswith('vehicle.') or actor.type_id.startswith('walker.pedestrian.') or actor in self.experiment.actors and actor.type_id.startswith('static.')):
                 continue
-            center = bounding_box_world_center(actor.get_transform(),actor.bounding_box,self.carla)
-            if abs(center.z - ego['z']) > float(self.cfg.get('same_level_tolerance_m', 1.5)):
+            center = bounding_box_world_center(actor.get_transform(), actor.bounding_box, self.carla)
+            if abs(center.z-ego['z']) > float(self.cfg.get('same_level_tolerance_m', 1.5)):
                 continue
-            if math.hypot(center.x - ego['position'][0], -center.y - ego['position'][1]) > radius:
+            if math.hypot(center.x-ego['position'][0], -center.y-ego['position'][1]) > radius:
                 continue
-            if self._visible(actor):
-                actors.append(self._actor(actor))
-        static_actors = self._visible_environment(ego, radius)
+            actors.append(self._actor(actor))
+        static_actors = self._range_environment(ego, radius)
         actors.extend(static_actors)
+        actors.sort(key=lambda actor: actor['id'])
+        self._entities_cache = (self.frame, ego, actors, len(static_actors))
+        return ego, actors, len(static_actors)
+
+    def _sample_history(self, force=False):
+        elapsed = self.world.get_snapshot().timestamp.elapsed_seconds-self.t0
+        index = int(round(elapsed*2.))
+        if not force and (abs(elapsed-index*.5) > 1e-5 or index <= self._history_sample_index):
+            return
+        started = time.monotonic()
+        ego, actors, _ = self._entities()
+        for actor in [ego]+actors:
+            if actor['kind'] == 'static_obstacle':
+                continue
+            sample = {'time': float(elapsed), 'position': list(actor['position']),
+                'velocity': list(actor['velocity']), 'acceleration': list(actor['acceleration']),
+                'heading': actor['heading'], 'observed': True}
+            samples = self._history.setdefault(actor['id'], [])
+            if not samples or abs(samples[-1]['time']-elapsed) > 1e-7:
+                samples.append(sample)
+        # 不在范围内的对象只保留已有历史，绝不外推填充当前对象。
+        for identity in list(self._history):
+            self._history[identity] = [row for row in self._history[identity]
+                                      if row['time'] >= elapsed-3.-1e-6]
+            if not self._history[identity]:
+                del self._history[identity]
+        self._history_sample_index = index
+        self._add_timing('snapshot_state_s', time.monotonic()-started)
+
+    def _runtime_payload(self):
+        source = self.timeline.source_time
+        applied = self._last_applied_control
+        now = time.monotonic()
+        return dict(self._runtime_metrics, mode=self.runtime_mode,
+            world_driver='application_wall_paced_sync_ticks' if self.runtime_mode == 'async' else 'synchronous_plan_then_tick',
+            carla_native_synchronous=True, physics_hz=self.physics_hz, planner_hz=self.planner_hz,
+            control_step_s=self.control_step_s, camera_hz=10. if self.rgb_enabled else 0.,
+            rgb_enabled=self.rgb_enabled, depth_sensor_count=0,
+            terminal_reason=self._terminal_reason,
+            sequence_exhausted=self._terminal_reason == 'sequence_exhausted',
+            paused=self._paused, realtime_started=self._ticker is not None,
+            startup_policy='world_paused_until_first_valid_control_sequence',
+            startup_paused_wall_s=None if self._initialized_at is None else
+                max(0., (self._started_at or now)-self._initialized_at),
+            current_sim_time=self._sim_time,
+            plan_source_time=source,
+            plan_age_s=None if source is None else max(0., self._sim_time-source),
+            control_age_s=None if applied is None else max(0., self._sim_time-applied['applied_time']),
+            observation_age_s=None if self._latest is None else max(0., self._sim_time-self._latest['time']),
+            observation_wall_age_s=None if self._latest_published_at is None else max(0., now-self._latest_published_at),
+            worker_error=self._worker_error,
+            last_applied_control=copy.deepcopy(self._last_applied_control))
+
+    def snapshot(self, include_cameras=True):
+        started = time.monotonic()
+        image_before = self._timing.get('image_s', 0.)
+        snap = self.world.get_snapshot()
+        if snap.frame != self.frame:
+            raise RuntimeError('检测到其他客户端推进世界；拒绝输出不一致的观测帧')
+        ego, actors, static_count = self._entities()
         lights = []
         for light in self.world.get_actors().filter('traffic.traffic_light*'):
             locations = light.get_stop_waypoints()
@@ -769,7 +874,7 @@ class CarlaSession:
                 if exists:
                     exists = math.cos(math.radians(other.transform.rotation.yaw-current_wp.transform.rotation.yaw)) > .5
                 road_evidence[side] = lane_key(other) if exists else None
-        cameras = self._camera_payload()
+        cameras = self._camera_payload() if include_cameras else []
         weather = self.world.get_weather()
         weather_record = {name: float(getattr(weather, name)) for name in (
             'cloudiness', 'precipitation', 'precipitation_deposits', 'wind_intensity',
@@ -778,6 +883,8 @@ class CarlaSession:
             'rayleigh_scattering_scale', 'dust_storm') if hasattr(weather, name)}
         if self.world.get_snapshot().frame != self.frame:
             raise RuntimeError('读取场景期间世界被其他客户端推进；拒绝输出不同步场景')
+        self._add_timing('snapshot_state_s', max(0., time.monotonic()-started-
+            (self._timing.get('image_s', 0.)-image_before)))
         return {'frame': self.frame, 'time': snap.timestamp.elapsed_seconds - self.t0,
             'timestamp': snap.timestamp.elapsed_seconds, 'ego': ego, 'actors': actors,
             'cameras': cameras, 'traffic_lights': lights,
@@ -785,10 +892,19 @@ class CarlaSession:
             'collision': self.collision, 'events': list(self.events) + list(self.experiment.events),
             'actual_actuation': {'throttle': actual.throttle, 'brake': actual.brake, 'steer_normalized_right': actual.steer},
             'current_road_evidence': road_evidence,
-            'environment_obstacles': dict(self.environment_audit, visible_count=len(static_actors)),
+            'environment_obstacles': dict(self.environment_audit, in_range_count=static_count),
             'weather': weather_record, 'weather_source': ('scenario_weather_then_current_world_get_weather'
                 if self.cfg.get('experiment',{}).get('weather') is not None else 'current_world_get_weather_no_override'),
-            'source': 'current_camera_depth_visible_geometry_then_actor_state',
+            'source': 'range_limited_ground_truth_no_occlusion',
+            'visibility_radius_m': float(self.cfg.get('perception_radius_m', 120.)),
+            'observation_support': {'kind': 'range_disk', 'center_world_xy': list(ego['position']),
+                'radius_m': float(self.cfg.get('perception_radius_m', 120.)), 'occlusion_test': False},
+            'observation_evidence': {'mode': 'range_limited_ground_truth_no_occlusion',
+                'occlusion_test': False, 'not_camera_visibility': True,
+                'height_filter': 'same_level_geometry', 'hidden_routes_or_future': False},
+            'observed_history': copy.deepcopy(self._history),
+            'last_applied_control': copy.deepcopy(self._last_applied_control),
+            'runtime': self._runtime_payload(), 'bridge_timing': dict(self._timing),
             'scenario': self.experiment.name}
 
     def _show_plan(self, plan):
@@ -828,38 +944,263 @@ class CarlaSession:
                 print('CARLA世界规划线绘制失败：'+result['error'], file=sys.stderr, flush=True)
         return result
 
-    def step(self, control, plan):
-        if len(control) != 2 or not all(math.isfinite(float(v)) for v in control):
-            raise ValueError('控制必须是有限的加速度和转角')
-        acceleration, steering = map(float, control)
-        if not float(self.cfg.get('acceleration_min_mps2', -6)) <= acceleration <= float(self.cfg.get('acceleration_max_mps2', 3)) or abs(steering) > float(self.cfg.get('steering_abs_max_rad', 0.6)) + 1e-8:
-            raise ValueError('CARLA 控制超出规划物理边界')
-        velocity = self.ego.get_velocity()
-        speed = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
-        desired = max(0.0, speed + acceleration / self.planner_hz)
-        command = self.carla.VehicleAckermannControl(steer=-steering, speed=desired, acceleration=acceleration)
-        self.ego.apply_ackermann_control(command)
-        # 世界线仅在显式开关下绘制，寿命略长于一控制周期，避免永久残留。
-        visualization = self._show_plan(plan)
-        for _ in range(self.physics_hz // self.planner_hz):
-            elapsed = self.world.get_snapshot().timestamp.elapsed_seconds - self.t0
-            self.experiment.before_tick(elapsed, 1.0 / self.physics_hz)
-            self.frame = self.world.tick(self.timeout)
-        self._collect(self.frame)
-        result = self.snapshot()
-        visualization['capture_carla_frame'] = self.frame
-        result['plan_visualization'] = visualization
-        result['command'] = {'acceleration_mps2': acceleration, 'steering_rad_left': steering,
-                             'speed_mps_ackermann': desired}
-        measured = math.hypot(*result['ego']['velocity'])
-        result['control_response'] = {'speed_error_mps': measured - desired,
-            'mean_acceleration_mps2': (measured - speed) * self.planner_hz,
-            'requested_acceleration_mps2': acceleration, 'executor': 'CARLA_builtin_Ackermann_PID'}
+    def _publish(self, result):
+        # 状态/图片仅由推进世界的一方读取；RPC读取不可变副本。
+        with self._condition:
+            runtime = result.get('runtime', {})
+            runtime.update(source_frame=result['frame'], source_time=result['time'],
+                current_sim_time=result['time'], observation_age_s=0., observation_wall_age_s=0.)
+            self._latest = copy.deepcopy(result)
+            self._terminal_published = result.get('runtime', {}).get('terminal_reason') is not None
+            self._latest_published_at = time.monotonic()
+            self._condition.notify_all()
+
+    def _latest_result(self):
+        with self._condition:
+            result = copy.deepcopy(self._latest)
+            display_frames, self._display_frames = self._display_frames, []
+        if result is None:
+            raise RuntimeError('CARLA尚未初始化观测')
+        # 源帧的终态和控制证据必须随源状态一起冻结。后台推进信息单独标识，
+        # 否则终止发布期间的live标志会把旧ego/图片误判成最终观测。
+        result['runtime']['live'] = self._runtime_payload()
+        result['display_frames'] = display_frames
         return result
+
+    def _install(self, controls, control_step_s, source_time, plan, source_speed_mps):
+        if self.closed or self._terminal_reason is not None:
+            raise RuntimeError('CARLA执行已终止：{}'.format(self._terminal_reason or 'closed'))
+        if (type(control_step_s) not in (int, float) or not math.isfinite(control_step_s) or
+                abs(control_step_s-self.control_step_s) > 1e-8):
+            raise ValueError('控制网格必须保持0.1秒')
+        # 校验完整批次，失败不能损坏当前正在执行的序列。
+        candidate = ControlTimeline(self.timeline.minimum, self.timeline.maximum, self.timeline.steering_max)
+        if source_speed_mps is None:
+            raise ValueError('必须传递规划原帧自车速度，不按每段实测速误差重新生成目标速度')
+        candidate.install(controls, source_time, control_step_s, source_speed_mps)
+        if len(candidate.controls) != 30:
+            raise ValueError('CARLA必须提交完整30段MPC控制序列')
+        if plan is not None and (not isinstance(plan, list) or len(plan) > 1000 or
+                any(not isinstance(point, list) or len(point) != 2 or
+                    any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+                        for v in point) for point in plan)):
+            raise ValueError('显示规划必须为有限世界二维点列表')
+        with self._condition:
+            if self.closed or self._terminal_reason is not None:
+                raise RuntimeError('CARLA执行已终止：{}'.format(self._terminal_reason or 'closed'))
+            if self.timeline.source_time is not None and source_time < self.timeline.source_time-1e-8:
+                raise ValueError('旧源帧控制不能覆盖新控制序列')
+            state = candidate.at(self._sim_time)
+            if not state['available']:
+                raise ValueError('新控制序列无法用于当前仿真时间：'+state['reason'])
+            candidate.revision = self.timeline.revision+1
+            self.timeline = candidate
+            self._runtime_metrics['submitted_sequences'] = self._runtime_metrics.get('submitted_sequences', 0)+1
+            self._runtime_metrics['last_submission_skipped_segments'] = state['index']
+            self._pending_plan = (candidate.revision, copy.deepcopy(plan))
+            self._paused = False
+
+    def _apply_current(self):
+        with self._condition:
+            state = self.timeline.at(self._sim_time)
+            if not state['available']:
+                self._terminal_reason = state['reason']
+                if state['reason'] == 'sequence_exhausted':
+                    self._worker_error = 'RuntimeError: MPC控制序列耗尽；未补写控制、未保持末项推进'
+                return False
+            pending = self._pending_plan
+            self._pending_plan = None
+            source_time = self.timeline.source_time
+        if pending is not None:
+            self._visualization = self._show_plan(pending[1])
+            self._visualization['sequence_revision'] = pending[0]
+        key = (state['revision'], state['index'])
+        if key != self._applied_key:
+            acceleration, steering = state['control']
+            velocity = self.ego.get_velocity()
+            speed = math.sqrt(velocity.x**2+velocity.y**2+velocity.z**2)
+            # 源时标中途接纳的段只执行剩余部分，过期段不重放。
+            remaining = min(self.control_step_s,
+                source_time+(state['index']+1)*self.control_step_s-self._sim_time)
+            # CARLA0.9.15 Ackermann控制器将speed作为跟踪目标，acceleration的绝对值
+            # 是内部速度PID的加速度上限，并非直接加速度命令。每段目标速度必须
+            # 从源帧按已规划a序列累计，不能每段重新锚定滞后的实测速。
+            desired = state['target_speed_mps']
+            steering_rate = float(self.cfg.get('steering_rate_abs_max_radps', .8))
+            command = self.carla.VehicleAckermannControl(steer=-steering, speed=desired,
+                acceleration=abs(acceleration), steer_speed=steering_rate)
+            self.ego.apply_ackermann_control(command)
+            self._last_command = {'acceleration_mps2': acceleration, 'steering_rad_left': steering,
+                'speed_mps_ackermann': desired, 'measured_speed_mps': speed,
+                'speed_error_mps': desired-speed, 'ackermann_acceleration_limit_mps2': abs(acceleration),
+                'ackermann_steering_rate_rps': steering_rate,
+                'actuation_mapping': 'source_speed_plus_planned_acceleration_integral-1.0'}
+            self._last_applied_control = dict(self._last_command, sequence_index=state['index'],
+                sequence_revision=state['revision'], source_time=source_time,
+                applied_time=self._sim_time, frame=self.frame,
+                control=[acceleration, steering], remaining_segment_s=remaining)
+            self._applied_key = key
+        return True
+
+    def _tick_once(self):
+        started = time.monotonic()
+        self.experiment.before_tick(self._sim_time, 1./self.physics_hz)
+        self._add_timing('scenario_s', time.monotonic()-started)
+        started = time.monotonic()
+        self.frame = self.world.tick(self.timeout)
+        self._add_timing('tick_s', time.monotonic()-started)
+        snap = self.world.get_snapshot()
+        if snap.frame != self.frame:
+            raise RuntimeError('检测到其他客户端推进世界，物理帧不一致')
+        self._sim_time = float(snap.timestamp.elapsed_seconds-self.t0)
+        self._runtime_metrics['physical_ticks'] += 1
+        self._sample_history()
+        if self.rgb_enabled and self._at_frequency(10.):
+            self._collect(self.frame)
+            # 录像/观看独立消费10Hz；模型及归档仍只消费整秒原帧。
+            if self._display_enabled or camera_storage_due(self._sim_time):
+                self._queue_display_frame(self._camera_payload())
+
+    def _queue_display_frame(self, cameras):
+        if not cameras or not self._display_enabled:
+            return
+        packet = {'frame': self.frame, 'time': self._sim_time, 'cameras': cameras,
+                  'plan_visualization': copy.deepcopy(self._visualization or {})}
+        with self._condition:
+            if self._display_frames and self._display_frames[-1]['frame'] == self.frame:
+                return
+            if len(self._display_frames) >= self.display_capacity:
+                self._display_frames.pop(0)
+                self._runtime_metrics['display_frames_dropped'] = self._runtime_metrics.get('display_frames_dropped', 0)+1
+            self._display_frames.append(packet)
+
+    def _capture(self, include_cameras=True):
+        if include_cameras:
+            self._collect(self.frame)
+        result = self.snapshot(include_cameras=include_cameras)
+        if self._visualization is not None:
+            result['plan_visualization'] = dict(self._visualization, capture_carla_frame=self.frame)
+        if self._last_command is not None:
+            result['command'] = copy.deepcopy(self._last_command)
+        self._publish(result)
+        return result
+
+    def _at_source_frame(self):
+        return self._at_frequency(self.planner_hz)
+
+    def _at_frequency(self, frequency):
+        phase = self._sim_time*frequency
+        return abs(phase-round(phase)) < 1e-4
+
+    def _duration_reached(self):
+        with self._condition:
+            if self.duration_s is not None and self._sim_time >= self.duration_s-1e-8:
+                self._terminal_reason = 'duration'
+                return True
+            return False
+
+    def _run_realtime(self):
+        dt = 1./self.physics_hz
+        started = time.monotonic()
+        tick_count = 0
+        try:
+            while not self._stop.is_set():
+                if self._duration_reached() or not self._apply_current():
+                    break
+                deadline = started+(tick_count+1)*dt
+                delay = max(0., deadline-time.monotonic())
+                wait_started = time.monotonic()
+                interrupted = self._stop.wait(delay)
+                waited = time.monotonic()-wait_started
+                self._add_timing('pacing_s', waited)
+                self._runtime_metrics['wall_pacing_wait_s'] += waited
+                if interrupted:
+                    break
+                lag = max(0., time.monotonic()-deadline)
+                self._runtime_metrics['wall_lag_max_s'] = max(self._runtime_metrics['wall_lag_max_s'], lag)
+                if lag >= dt:
+                    self._runtime_metrics['wall_deadline_misses'] += 1
+                # 提交可能发生在等待期间；推进前重新选择源时标控制。
+                if not self._apply_current():
+                    break
+                self._tick_once()
+                tick_count += 1
+                if self._at_source_frame():
+                    self._capture()
+        except Exception as exc:
+            if not self._stop.is_set():
+                self._worker_error = type(exc).__name__+': '+str(exc)
+                self._terminal_reason = 'bridge_error'
+        finally:
+            self._paused = True
+            if self._terminal_reason is not None:
+                try:
+                    # 终止可能落在非RGB采样帧；不将旧图挂到新状态。
+                    self._capture(include_cameras=False)
+                except Exception as exc:
+                    self._worker_error = (self._worker_error or '')+'; terminal_snapshot: '+str(exc)
+            with self._condition:
+                self._condition.notify_all()
+
+    def step(self, controls, control_step_s, source_time, plan=None, source_speed_mps=None):
+        self._install(controls, control_step_s, source_time, plan, source_speed_mps)
+        if self._started_at is None:
+            self._started_at = time.monotonic()
+        if self.runtime_mode == 'async':
+            with self._condition:
+                if self._ticker is None:
+                    self._ticker = threading.Thread(target=self._run_realtime, name='carla-50hz-ticker', daemon=True)
+                    self._ticker.start()
+                return self._latest_result()
+        # 1/2/10Hz分别执行10/5/1段控制；每段0.1秒、五个物理子步。
+        try:
+            for _ in range(self.physics_hz // self.planner_hz):
+                if self._duration_reached() or not self._apply_current():
+                    break
+                self._tick_once()
+            self._duration_reached()
+            self._paused = True
+            self._capture(include_cameras=self._at_frequency(10.))
+            return self._latest_result()
+        except Exception:
+            self._paused = True
+            raise
+
+    def observe(self, after_frame=None):
+        if after_frame is not None and (type(after_frame) is not int or after_frame < 0):
+            raise ValueError('after_frame必须为非负整数或空')
+        with self._condition:
+            deadline = time.monotonic()+self.timeout
+            while (after_frame is not None and self._latest is not None and
+                    self._latest['frame'] <= after_frame and self.runtime_mode == 'async' and
+                    self._ticker is not None and self._ticker.is_alive() and
+                    not self._terminal_published and not self._stop.is_set()):
+                remaining = deadline-time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('等待下一规划时钟CARLA源帧超时')
+                self._condition.wait(remaining)
+            return self._latest_result()
+
+    def pause(self):
+        self._stop.set()
+        ticker = self._ticker
+        if ticker is not None and ticker is not threading.current_thread():
+            ticker.join(self.timeout+2.)
+            if ticker.is_alive():
+                raise RuntimeError('CARLA后台推进未停止；拒绝并发销毁传感器或恢复设置')
+        self._paused = True
+        if self.world is not None and self._latest is not None:
+            if self._terminal_reason is None:
+                self._terminal_reason = 'paused'
+                self._capture(include_cameras=False)
+            return self._latest_result()
+        return {'paused': True}
 
     def close(self):
         if self.closed:
             return
+        # join成功后才允许销毁演员和恢复原世界设置。
+        self.pause()
         self.closed = True
         errors = []
         for sensor in reversed(self.sensors):
@@ -903,6 +1244,10 @@ def main():
                     result = inspect_scene(**params)
                 elif method == 'step':
                     result = session.step(**params)
+                elif method == 'observe':
+                    result = session.observe(**params)
+                elif method == 'pause':
+                    result = session.pause()
                 elif method == 'close':
                     session.close()
                     result = {'closed': True}

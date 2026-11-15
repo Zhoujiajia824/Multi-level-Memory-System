@@ -7,23 +7,24 @@ carla:
   port: 2000
   timeout_s: 30
   allow_world_reset: false
+  # sync等待本次计算后推进；async由独立时钟推进，模型在后台返回。
+  runtime_mode: sync
+  # 重规划可选1/2/10Hz；同步模式默认10Hz，计算结束后再执行0.1秒。
+  planner_hz: 10
   camera_width: 640
   camera_height: 360
   camera_fov: 100
   camera_height_m: 2.2
-  # 原始RGB/拼图/同帧核查资产按仿真时间1Hz归档；实时视频仍10Hz。
+  # 六路RGB真实采集/录像10Hz，原始图片与模型源帧1Hz归档；无深度。
+  camera_hz: 10
+  display_queue_frames: 50  # 10Hz录像传输有界缓冲；溢出单列，不补造重复帧
   camera_save_hz: 1
-  # RGB使用CARLA默认光照/色调处理；深度传感器独立保持关闭后处理。
+  # RGB使用CARLA默认光照/色调处理；不创建深度相机。
   rgb_postprocess_effects: true
   arrival_margin_m: 3
   map_resolution_m: 2
   map_speed_cap_mps: 30
   same_level_tolerance_m: 1.5
-  observation_resolution_m: 1
-  observation_heights_m: [0.2, 0.8]
-  depth_empty_tolerance_m: 0.05
-  visibility_surface_tolerance_m: 0.35
-  visibility_min_samples: 2
   # 世界debug线可能被相机拍摄；严格无叠加采集时保持false。
   # 命令行--world-plan可开启；RGB显示副本/录像的投影不依赖世界debug线。
   world_plan_debug: false

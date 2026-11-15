@@ -67,6 +67,8 @@ def main():
         config.setdefault('environment',{})['spawn_probability']=args.spawn_probability
     if args.dino_model:
         config['dino']['model']=str(path(args.dino_model)) if path(args.dino_model).is_dir() else args.dino_model
+    elif path(config['dino']['model']).is_dir():
+        config['dino']['model']=str(path(config['dino']['model']))
     model_settings=yaml.safe_load(path(args.models_config).read_text(encoding='utf-8'))
     from nine_grid.models import load_system_prompts
     try:
@@ -96,7 +98,10 @@ def main():
     try:
         fast=VisionClient('fast',model_settings['fast'])
         reflection=VisionClient('reflection',model_settings['reflection'])
-        extractor=DINOExtractor(config['dino']['model']) if args.retrieve or args.write_memory else None
+        diagnostics=config.get('diagnostics',{})
+        extractor=(DINOExtractor(config['dino']['model'],device=config['dino'].get('device'),
+                   local_files_only=config['dino'].get('local_files_only',True))
+                   if args.retrieve or args.write_memory or (diagnostics.get('enabled',True) and diagnostics.get('dino',True)) else None)
     except (ValueError,RuntimeError) as exc:
         parser.error(str(exc))
     summaries=[]
