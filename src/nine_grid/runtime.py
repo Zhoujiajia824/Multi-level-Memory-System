@@ -9,9 +9,10 @@ import queue
 import threading
 import numpy as np
 from .contracts import ExperienceRecord, VERSION, plain
-from .models import build_prompt, parse_answer, CommunicationFailure
+from .models import build_prompt, parse_answer, CommunicationFailure, model_image_paths
 from .quality import evaluate, admissible
 from .paths import filesystem_path
+from .planning_context import prepare_planning_context
 
 logger=logging.getLogger(__name__)
 
@@ -45,6 +46,8 @@ def make_record(scene,reps,answer,quality,asset_path=None):
         '原点世界姿态':[*scene.ego.position,scene.ego.heading],
         '情境':answer.explanation['情境'],'自车速度':float(np.linalg.norm(scene.ego.velocity)),
         '可见对象':[{'id':a.id,'类型':a.kind,'世界位置':plain(a.position),'速度':plain(a.velocity),'尺寸':[a.length,a.width]} for a in scene.actors if a.visible]}
+    if scene.diagnostics.get('observation_policy'):
+        situation['观测来源']=scene.diagnostics['observation_policy']
     selected={'attention':answer.attention,'local_goal':answer.local_goal,'explanation':answer.explanation}
     assets={**scene.assets}
     if asset_path:
@@ -98,13 +101,19 @@ class ReflectionWorker:
                 original_reference=task.plan.diagnostics.get('reference_state_before')
                 if original_reference is not None:
                     planner.restore_reference_state(original_reference)
-                raw=self.client.call(build_prompt(task.scene,task.representations,reflection=task),[task.representations.bev_path])
+                images=model_image_paths(task.scene,task.representations)
+                prompt=build_prompt(task.scene,task.representations,reflection=task)
+                event.update(images=images,prompt=prompt)
+                raw=self.client.call(prompt,images)
                 event['raw_answer']=raw
                 answer=parse_answer(raw,task.scene,'reflection',self.config.get('models',{}).get('answer_max_characters',6000),
                                     reference=task.scene.diagnostics.get('goal_reference'),config=self.config)
                 # planner 实例只属于后台，避免求解热启动与前台互相污染。
-                plan=planner.solve(task.scene,task.predictions,answer)
-                quality=evaluate(task.scene,plan,task.baseline,task.predictions,self.config)
+                scoped,predictions=prepare_planning_context(task.scene,self.config,answer,existing=task.predictions)
+                plan=planner.solve(scoped,predictions,answer)
+                base_scene,base_predictions=prepare_planning_context(task.scene,self.config,existing=predictions)
+                baseline=self.planner_factory().solve(base_scene,base_predictions,None)
+                quality=evaluate(scoped,plan,baseline,predictions,self.config)
                 event.update(answer=plain(answer),plan=plain(plan),quality=plain(quality))
                 if not admissible(answer,plan,quality,self.config['quality']['minimum_score']):
                     event['status']='验收不通过，拒收且不再次修正'
@@ -116,7 +125,7 @@ class ReflectionWorker:
                         identity=hashlib.sha256(task.scene.frame_id.encode('utf-8')).hexdigest()[:20]
                         task.scene.assets['reflection_acceptance_json']=self.writer.save(
                             f'reflection_acceptance/{identity}.json',
-                            dict(event,version=task.scene.version,predictions=task.predictions,reference=task.baseline))
+                            dict(event,version=task.scene.version,predictions=predictions,reference=baseline))
                         record=make_record(task.scene,task.representations,answer,quality,task.scene.assets.get('scene_json'))
                         self.store.write(record,task.representations)
                         self.counts['written']+=1

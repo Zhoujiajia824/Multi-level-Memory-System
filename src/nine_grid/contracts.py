@@ -23,6 +23,9 @@ class Actor:
     visible: bool = True
     history: list[dict] = field(default_factory=list)
     radius: float | None = None
+    # CARLA几何中心运动学参数；None保持原highway车体模型，不把车长当真实轴距。
+    wheelbase_m: float | None = None
+    rear_axle_to_center_m: float | None = None
 
 
 @dataclass

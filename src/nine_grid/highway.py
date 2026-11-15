@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import math
 import numpy as np
 from scipy.interpolate import CubicHermiteSpline
@@ -46,6 +47,19 @@ class _ContinuousRewards:
 
 class HighwayAdapter:
     def __init__(self, config: dict, seed: int, episode_id: str, live=False):
+        self.env = None
+        self._video_recorder = None
+        self._traffic_class_name = None
+        try:
+            self._initialize(config, seed, episode_id, live)
+        except BaseException:
+            try:
+                self.close()
+            except Exception:
+                logging.getLogger(__name__).exception('初始化失败后的仿真清理异常；保留原初始化错误')
+            raise
+
+    def _initialize(self, config: dict, seed: int, episode_id: str, live=False):
         from highway_env.envs.highway_env import HighwayEnv
         from highway_env.envs.merge_env import ConnectedLaneMergeEnv
         from highway_env.envs.roundabout_env import ConnectedLaneRoundaboutEnv
@@ -65,7 +79,9 @@ class HighwayAdapter:
             raise ValueError(f"未知场景：{self.scenario}")
         self.settings = highway_settings(config,self.scenario)
         self.episode_id = episode_id
-        self.dt = 1 / config.get("clock", {}).get("planner_hz", 10)
+        # 原生连续控制每段仍为MPC采样间隔；低频重规划须执行多段，
+        # 不能将首个转角保持整整一秒。
+        self.dt = float(config.get('mpc',{}).get('step_s',.1))
         self.history_dt=1/float(config.get("clock",{}).get("history_hz",2))
         self.history_seconds=float(config.get("clock",{}).get("history_seconds",3))
         self.duration = float(config.get("duration", config.get("clock", {}).get("episode_seconds", 30)))
@@ -107,7 +123,6 @@ class HighwayAdapter:
         ego.MIN_SPEED, ego.MAX_SPEED = 0., mpc.get("maximum_speed_mps",33.3333333)
         others = [v for v in self.env.road.vehicles if v is not ego]
         if self.scenario in ("merge","roundabout") and count>len(others):
-            self.env.close();globals().pop(self._traffic_class_name,None)
             raise ValueError(f"{self.scenario} 原生模板最多支持 {len(others)} 辆初始交通车辆，收到 {count}；不会静默减少数量")
         # 固定车辆场景的原生构造不服从 vehicles_count；明确裁剪而非假空场。
         self.env.road.vehicles = [ego] + others[:count]
@@ -523,6 +538,23 @@ class HighwayAdapter:
         return {"terminated":collision or arrival or timeout,"collision":collision,"arrival":arrival,"offroad":offroad,
                 "timeout":timeout,"time":self._step*self.dt,"progress":progress+self._route_progress_offset,"reason":"collision" if collision else "arrival" if arrival else "timeout" if timeout else "running"}
 
+    def step_plan(self,plan):
+        """顺序执行1/2/10Hz对应的10/5/1条已验算控制；终态立即停止。"""
+        from .control_clock import execution_prefix_count
+        count=execution_prefix_count(self.config)
+        controls=np.asarray(plan.controls,float)
+        if not plan.valid or controls.ndim!=2 or controls.shape[1]!=2 or len(controls)<count:
+            raise ValueError('没有足够的有效规划控制前缀')
+        for index,control in enumerate(controls[:count]):
+            result=self.step(control)
+            if self._step*self.dt+1e-8>=self._next_history:
+                self.snapshot()  # 低频重规划仍按真实0.5秒保存已观测历史。
+            if result['terminated']:
+                break
+        result['last_applied_control']={'control':controls[index].tolist(),
+            'source':'highway连续控制段','executed_control_count':index+1}
+        return result
+
     def set_planned_trajectory(self,states):
         """保存世界坐标规划状态的副本；空或非法输入清除旧计划，不改变物理状态。"""
         self.env._planned_trajectory=None
@@ -555,6 +587,18 @@ class HighwayAdapter:
         return self._video_recorder
 
     def close(self):
-        if self._video_recorder is not None:self._video_recorder.close()
-        self.env.close()
-        globals().pop(self._traffic_class_name,None)
+        try:
+            if self._video_recorder is not None:
+                recorder = self._video_recorder
+                self._video_recorder = None
+                recorder.close()
+        finally:
+            try:
+                if self.env is not None:
+                    environment = self.env
+                    self.env = None
+                    environment.close()
+            finally:
+                if self._traffic_class_name:
+                    globals().pop(self._traffic_class_name, None)
+                    self._traffic_class_name = None

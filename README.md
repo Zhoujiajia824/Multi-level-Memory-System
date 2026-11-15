@@ -1,5 +1,7 @@
 # EP-Driver 运行指令与参数
 
+> 当前实现边界：正常行驶候选除软跟踪代价外，仍需满足窄跟踪带硬资格（允许误差为 `0.25m + 初始横向偏差 × exp(-路径进度/15m)`）；制动候选不使用此项硬资格。尚未实现“车道中心仅作为软偏好”的后续调整。CARLA物理仿真效果仍需服务器验证。
+
 开发分支为 `EP-Driver`。所有运行指令在项目根目录执行；配置和命令中的相对路径均以项目根目录为准。
 
 ## 0. 克隆分支、权重与个人配置
@@ -56,64 +58,33 @@ python scripts/check_environment.py
 `config/verified_dependencies.txt` 固定本机验证使用的核心依赖版本；本机实测 Python 3.12.13、CPU 推理。CUDA 服务器的驱动与 PyTorch 安装需单独验证。
 
 ## 2. 四场景：纯 MPC
-### 局部规划对象与纯基础路径（2026-11-12）
+### 当前基础规划：五次参考与安全优先MPC
 
-MPC 在完整可见场景的内部视图中选取对象，不再对所有可见实体逐一计算风险。`config/parameters.json` 中统一配置：
+参数版本 `development-1.1.0-safe-tracking`。常规保持车道中心；基础规划可以在合法、安全且有收益时左侧超车，右换道只主动用于公开导航需要。有效模型单目标决定五次参考的经过位置；不改变原帧Frenet语义，不吸附目标，不增加到达时间或停车要求。新目标立即替换旧目标，纵向经过后释放，实际状态再平滑归中。
 
-```json
-"planning_objects": {
-  "version": "frenet-eight-planning-1.0",
-  "front_m": 30.0,
-  "rear_m": 10.0,
-  "lateral_m": 25.0,
-  "include_attention": true,
-  "max_attention_objects": 3
-}
-```
+先从当前场景筛选，再运行动态EKF：常规前30米、后10米、横向25米，八向每格最近一个、同ID去重。前向范围按 `v*reaction_s + v*v/(2*braking_mps2) + stopping_margin_m` 必要扩展；进入候选道路走廊的横穿/切入、短时纵向冲突和后方快车单列安全例外。模型关注可再加最多3个有效范围内对象。**常规集最多8个不等于总集合永远8或11个。**静态障碍保留几何但不运行EKF；路外静止物体不加入道路规划。完整场景仍供BEV、模型、检索及回放，不改检索九宫格的范围和语义。
 
-范围按导航连续 Frenet 投影的对象中心判断，左正右负。八向每格选择一个最近对象，前后按车体纵向净距、侧方按真实几何净距；跨格同ID去重，因此基础规划至多8个对象。有效模型关注可以在**同一空间范围、当前可见集合内**额外加入至多3个，总数至多11个；关闭扩容可将 `include_attention` 设为 false。实线邻道不会因不能跨越而从物理候选中删除；行人、横穿来车和静态障碍物可按Frenet侧向补充归格。注意这与检索九宫格的范围和可跨越车道语义不同，没有修改检索特征或旧库解释。
+`config/parameters.json` 的 `planning_objects` 使用 `frenet-eight-planning-2.0`，新增开发默认值：`adaptive_front: true`、`reaction_s: 1`、`braking_mps2: 4`、`stopping_margin_m: 5`、`conflict_horizon_s: 3`、`conflict_margin_m: 0.5`。这些是计算范围及粗筛设置，不是全场景安全证明。
 
-当快模型、反思模型、检索、写入**四项同时关闭**时，自动进入 `pure_base`：
+MPC时域3秒、控制网格0.1秒、物理子步0.02秒。重规划频率可选1、2、10Hz，默认10Hz；同步模式计算完成后执行前10、5、1段控制。本分支在 `config/parameters.json` 改 `clock.planner_hz`，不提供CARLA运行入口。不要把1Hz误理解为第一项控制恒持1秒。
 
-- 不构建BEV、OCC和检索九宫格，不做DINO特征提取。
-- 不实例化参照MPC和反思worker，不做轨迹质量评分、语义采集或轨迹BEV绘制。
-- 继续使用同一MPC、导航、规则、EKF和基础风险场；保留原生实时画面、轨迹线与视频。
-- CARLA跳过OCC空区覆盖几何，但仍使用同帧深度进行对象可见性判断，不取消遮挡。
-- 质量计数为0，不生成虚假的质量分；开启四项中的任意一项则走完整功能路径。
+普通候选必须满足真实尺寸避碰、道路/实线/停止截面、限速、控制边界、控制变化率与跟踪带，并经0.02秒子步复核。未找到普通安全候选则重新计算并验收制动；日志分别保存 `normal`、`safe_brake`、`emergency_unverified`。最后一类按用户确定的实验策略仍执行，但仍可能碰撞，不是安全成功，也不作为合格经验。异常输入仍报错。求解名义预算冷启动2秒、后续1秒、最多10次SQP，不宣称实时达标；同步优先验证规划效果。本地CPU检查可出现数百毫秒单次求解，1、2、10Hz是仿真重规划节拍，整体墙钟耗时必须另测。
 
-每轮 `configuration.json` / `summary.json` 保存执行模式和跳过阶段，`plans.jsonl` 中的 `planning_object_selection` 保存每格代表、完整/范围内/选中数量、关注补充及排除原因。完整可见对象仍保存在帧日志和模型上下文；独立执行前审计保留完整集合，但不会把被排除对象的风险重新加入MPC。
-
-`timing.jsonl` 与汇总分别统计快照、预测、MPC求解、世界轨迹显示、表示、参照、评分、执行审计、物理步进、显示录像和整个控制周期；纯模式跳过阶段的样本数为0。MPC求解时长不再包含CARLA世界轨迹绘制RPC。`control_cycle` 不含初始化、收尾及该条计时日志自身的写入。
-
-30/10米是开发起点，不是停车安全距离；每向只选一个对象可能漏掉随后出现的第二个障碍物。此策略不保证对被排除对象的全时域避碰，也不保证整个控制周期达到10Hz。现有3秒时域、交通密度、车体尺寸、风险权重和控制频率保持不变。
+四个模型/记忆开关都关时默认仍在1Hz构建BEV、OCC、检索八向和真实DINO，并计算独立无语义参照MPC、质量分和轨迹BEV。`diagnostics.enabled / dino` 为显式诊断开关，默认均true；诊断不打开模型、不读写记忆。真实DINO权重须已下载，不能用随机特征替代。
 
 ```bash
-python scripts/run_highway.py --scenario highway --seed 1 --duration 30 --fast off --reflection off --live --video
-python scripts/run_highway.py --scenario merge --seed 1 --duration 30 --fast off --reflection off --live --video
-python scripts/run_highway.py --scenario roundabout --seed 1 --duration 30 --fast off --reflection off --live --video
-python scripts/run_highway.py --scenario intersection --seed 1 --duration 30 --fast off --reflection off --live --video
+python scripts/run_highway.py --scenario highway --seed 1 --duration 30 --fast off --reflection off --no-retrieve --no-write-memory --live --video
+python scripts/run_highway.py --scenario merge --seed 1 --duration 30 --fast off --reflection off --no-retrieve --no-write-memory --live --video
+python scripts/run_highway.py --scenario roundabout --seed 1 --duration 30 --fast off --reflection off --no-retrieve --no-write-memory --live --video
+python scripts/run_highway.py --scenario intersection --seed 1 --duration 30 --fast off --reflection off --no-retrieve --no-write-memory --live --video
 ```
 
-以上指令显式关闭两个模型；记忆检索和写入默认关闭。未指定`--fast / --reflection`时沿用`config/models.yaml`中的个人设置，可能调用模型。纯 MPC 仍使用地图、规则、EKF 和基础风险场。真实碰撞、到达目标会提前结束；30 秒是每轮上限。几何冲突、QP未收敛或预算耗尽时保留当前帧已验收的有界控制轨迹；非法输入或内部异常仍明确记录，不伪造轨迹。
+原生画面青色线为当前实际计划；轨迹BEV与原始检索图分开。`plans.jsonl`保存参考身份、活动目标、筛选与例外理由、约束残差、密集几何检查和执行分类；`summary.json`分别统计制动、紧急、实际碰撞、到达与异常。`timing.jsonl`分别记录EKF、MPC、表示、额外参照、质量、物理步进、显示录像和整体周期；配置10Hz不等于墙钟达到10Hz。新的有效目标可复用移位控制作为数值初值，必须重新积分、计价、验算；不能复用旧目标代价或旧状态轨迹。
 
-本版按仿真时间同步步进。MPC使用实时SQP与OSQP，后续求解目标预算100毫秒，每个规划器实例首次初始化预算500毫秒，控制执行0.1仿真秒。首次初始化、后续求解及超期均单独记录；这不是整个Python程序的硬实时保证，预测、表示、评分和同步模型调用另有耗时。
+本地确定性几何/协议和Highway检查不能代替真实模型或全部场景验收。未验证场景应查看紧急率、碰撞、违规、导航进度和计时，不以程序完成一轮认定规划成功。
 
-`config/parameters.json` 中的 `mpc.warm_start_recovery_speed_mps` 默认 `0.3` m/s，表示低于此速度、且无规则等待时允许比较导航初值；设为 `0` 关闭这项低速比较。所有初值都在当前帧按同一动力学、代价和控制边界重新验收，并共享本轮预算。
 
-`--live` 显示highway-env原生窗口，`--video` 保存相同原生视角的50FPS录像；两者可独立使用。青色线是当前MPC规划的未来轨迹，每0.1仿真秒更新，车辆仍显示真实状态。视频按仿真时间播放，不包含等待模型的停顿。自绘BEV另存于 `captures/`，不替代原生录像。
-
-当前参数版本为 `development-1.0.20`（本次仅改变检索选择）：硬约束仅保留动力学、加速度 `[-6,3]` m/s²、转角 `±0.6` rad 和非负速度。道路、实体避碰、不可跨越线、让行截面、限速及侧向加速度改为软惩罚；jerk和转角变化率保留平滑代价。`mpc.safety_penalties` 可分别调整软惩罚强度。`plans.jsonl` 的 `safety_feasible` 与 `soft_constraint_violations` 记录安全结果，`valid` 仅代表轨迹可执行；不能用持续输出轨迹证明没有碰撞。危险轨迹不作为合格经验入库。
-
-新有效目标在下一次MPC中立即替换旧目标。上一轮控制可按实际经过时间移位，作为新目标下的数值初值，重新按当前状态积分、计价和验算；旧目标吸引项、路径及车道锁不保留。目标通过、失效或控制缓存过期/非法时不继承该缓存。`plans.jsonl` 中 `warm_start_across_goal_update` 标记是否跨新目标使用热启动，`control_transition` 记录首控制相对实际上一控制的变化。首差分平滑项仍使用实际已执行控制；热启动不是硬连续性或无晃动保证。
-
-空交通检查（匝道原有静态障碍物仍保留）：
-
-```bash
-python scripts/run_highway.py --scenario highway --vehicles 0 --duration 30 --fast off --reflection off
-python scripts/run_highway.py --scenario merge --vehicles 0 --duration 30 --fast off --reflection off
-python scripts/run_highway.py --scenario roundabout --vehicles 0 --duration 30 --fast off --reflection off
-python scripts/run_highway.py --scenario intersection --vehicles 0 --spawn-probability 0 --duration 30 --fast off --reflection off
-```
+近停车制动使用 `stop_control.py` 的离散释放包络，避免将加速度直接截为 `-v/dt` 造成jerk跳变。若当前速度与上一实际制动已导致jerk和非倒退无法共同满足，记录 `braking_release_conflicts` 并归类紧急；不把该冲突伪装为正常可行。
 
 ## 3. 配置两个模型
 
@@ -191,9 +162,9 @@ python scripts/run_highway.py --scenario highway --fast server --reflection serv
 
 ## 4. 记忆采集、检索和冻结库实验
 
-检索或写记忆需要真实 DINOv2 Base 权重。默认使用仓库内的 `models/dinov2-base`，首次克隆后先执行 `git lfs pull`。使用其他本地目录时，在下列命令追加 `--dino-model "模型目录"`。关闭检索和写入时不加载 DINO 权重。
+检索或写记忆需要真实 DINOv2 Base 权重。默认使用仓库内的 `models/dinov2-base`，首次克隆后先执行 `git lfs pull`。使用其他本地目录时，在下列命令追加 `--dino-model "模型目录"`。纯基础诊断默认也加载DINO；只有显式关闭DINO诊断且检索、写入均关闭时才不加载。
 
-当前表示版本为 `bev-occ-grid-2.0`；NAVSIM白底、浅灰道路及对象配色，不绘制车道边界线和分割线，仅保留深灰虚线中心参考路径；历史轨迹采用鲜亮的同色系饱和度渐变。目标参考线与沿线距离标记只进入模型图和回放，不进入DINO特征图或OCC。模型文本含当前状态、八向区域、目标参考摘要与图像解释，命中时附历史情境和参考答案；不发送完整地图边界、历史状态列表或检索四矩阵。目标参考摘要另携带输入帧、仿真时间、参考身份、当前横偏、候选车道及相关导航规则，供正确解释Frenet目标。未入格的可见对象仍提供。
+当前表示版本为 `bev-occ-grid-2.1`；NAVSIM白底、浅灰道路及对象配色，不绘制车道边界线和分割线，仅保留深灰虚线中心参考路径；历史轨迹采用鲜亮的同色系饱和度渐变。目标参考线与沿线距离标记只进入模型图和回放，不进入DINO特征图或OCC。模型文本含当前状态、八向区域、目标参考摘要与图像解释，命中时附历史情境和参考答案；不发送完整地图边界、历史状态列表或检索四矩阵。目标参考摘要另携带输入帧、仿真时间、参考身份、当前横偏、候选车道及相关导航规则，供正确解释Frenet目标。未入格的可见对象仍提供。
 
 新经验须声明 `local-goal-frenet-1.0` 并保存原帧目标参考。本次三通道表示升级另要求道路存在/可跨越属性、观测掩码及完整运动状态。缺少这些证据的旧记录明确排除，原库保留，不补零、不自动迁移。被排除原因可在轮初 `memory_snapshot.jsonl` 和 `configuration.json` 查看，或使用下方 `memory_admin.py list`。
 

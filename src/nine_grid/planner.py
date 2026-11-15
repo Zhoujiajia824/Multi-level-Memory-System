@@ -1,4 +1,4 @@
-"""控制边界保持硬约束，安全冲突采用软代价；始终保留本帧可执行轨迹。"""
+"""参考走廊跟踪MPC：正常轨迹安全优先；无安全解时单列最小风险制动。"""
 from __future__ import annotations
 
 import time
@@ -10,19 +10,22 @@ from .contracts import PlanResult
 from .planning_objects import planning_view
 from .local_reference import LocalReferenceManager, LocalReferenceResult
 from .goals import GoalManager, goal_seed_path, first_arrival_residual
-from .realtime_solver import Dynamics, QuadraticSolver, rectangle_gap, circle_gap, rectangle_distance
+from .realtime_solver import Dynamics, QuadraticSolver, rectangle_gap, circle_gap, rectangle_distance, bicycle_geometry
+from .stop_control import brake_acceleration_limit
 from .geometry import (clean_polyline, ego_to_world, world_to_ego,
                        rectangle_corners, polyline_lengths, project_polyline, sample_polyline, wrap_angle)
 
 
-def propagate(state, control, length=5., dt=.1, substeps=5):
-    """与 highway Vehicle.step 同序的显式 Euler，含质心侧偏角。"""
+def propagate(state, control, length=5., dt=.1, substeps=5,
+              wheelbase_m=None,rear_axle_to_center_m=None):
+    """几何中心自行车模型显式Euler；未提供轴距时保持highway原公式。"""
     state=np.asarray(state,float).copy();a,delta=np.asarray(control,float)
-    beta=np.arctan(.5*np.tan(delta));step=dt/substeps
+    wheelbase,rear=bicycle_geometry(length,wheelbase_m,rear_axle_to_center_m)
+    beta=np.arctan(rear/wheelbase*np.tan(delta));step=dt/substeps
     for _ in range(substeps):
         x,y,psi,v=state
         state=np.array([x+v*np.cos(psi+beta)*step,y+v*np.sin(psi+beta)*step,
-                        psi+2*v/length*np.sin(beta)*step,v+a*step])
+                        psi+v/rear*np.sin(beta)*step,v+a*step])
     return state
 
 
@@ -152,7 +155,7 @@ class Planner:
         rules=self.config.get("rules",{})
         stop_margin=float(rules.get("stop_margin_m",1.))
         self.rule_evidence=[]
-        if scene.scenario=="intersection" and ego_lane and scene.rules.get("road_priority_available"):
+        if ego_lane and scene.rules.get("road_priority_available"):
             route=scene.route;route_shape=LineString(route)
             for identity,actor in predictions.actors.items():
                 other_lane=lanes.get(actor.lane_id)
@@ -226,19 +229,33 @@ class Planner:
                     stop_s=proposed;reason=f"向可见高优先级交通对象 {identity} 让行（公开通路首次入口）"
         return stop_s,reason
 
-    def solve(self,scene,predictions,answer=None):
+    def emergency_brake(self,scene,predictions,reason):
+        """执行前重审失败时，从当前物理状态单独生成制动，不借用旧控制。"""
+        braking_planner=Planner(self.config)
+        result=braking_planner.solve(scene,predictions,None,_brake_only=True)
+        result.diagnostics['emergency_request_reason']=str(reason)
+        result.diagnostics['emergency_generation']='fresh_current_state_braking'
+        return result
+
+    def solve(self,scene,predictions,answer=None,*,_brake_only=False):
         started=time.perf_counter();p=self.p;n=self.n;dt=self.dt
         _validate_prediction_input(scene,predictions,n*dt)
         # 完整输入必须先验明；局部MPC视图不污染模型、检索、反思和独立审计。
         scene,predictions,object_selection=planning_view(scene,predictions,self.config,answer)
+        wheelbase,rear=bicycle_geometry(scene.ego.length,scene.ego.wheelbase_m,scene.ego.rear_axle_to_center_m)
+        axle_ratio=rear/wheelbase
         cold_start=not getattr(self,'_has_solved',False);self._has_solved=True
         tolerance=float(p.get("body_constraint_tolerance_m",.001))
+        speed_tolerance=float(p.get('speed_numerical_tolerance_mps',1e-4))
+        if not np.isfinite(speed_tolerance) or speed_tolerance<0.:
+            raise ValueError('速度数值容差必须是有限非负m/s')
         braking=float(self.config.get("rules",{}).get("comfort_braking_mps2",3.))
         origin=scene.ego.position.copy();angle=scene.ego.heading
         speed=float(np.linalg.norm(scene.ego.velocity));initial=np.array([0.,0.,0.,speed])
         build_seconds=0.
-        if not hasattr(self,'dynamics') or self.dynamics_length!=scene.ego.length:
-            self.dynamics=Dynamics(n,dt,self.substeps,scene.ego.length);self.dynamics_length=scene.ego.length
+        dynamics_key=(n,dt,self.substeps,wheelbase,rear)
+        if not hasattr(self,'dynamics') or self.dynamics_key!=dynamics_key:
+            self.dynamics=Dynamics(n,dt,self.substeps,scene.ego.length,wheelbase,rear);self.dynamics_key=dynamics_key
             self.qp=QuadraticSolver(2*n,int(p.get('qp_max_iterations',600)),float(p.get('qp_tolerance',1e-6)))
             build_seconds=self.dynamics.build_seconds
         ego_s=project_polyline(origin,scene.route,scene.diagnostics.get("route_s"),angle)[0]
@@ -257,14 +274,25 @@ class Planner:
             self.references.reset_intent()
             if not new_goal_active:
                 self.previous=None
-        if active_goal is not None:
-            # 原参考仅用于坐标、必要导航速度与进度。目标只生成初值，
-            # 不把其几何再变成第二份contour/heading代价或永久换道承诺。
-            selection=LocalReferenceResult(np.asarray(scene.route,float).copy(),
+        if _brake_only:
+            lane_table={lane.id:lane for lane in scene.lanes}
+            own_lane=self.references._lane(scene,lane_table)
+            seed_world=scene.route if own_lane is None else self.references._continuation(scene,own_lane,lane_table)
+            selection=LocalReferenceResult(seed_world,0,{'phase':'brake_only','selected_source':'navigation_consistent_current_lane','maneuver_active':False})
+        elif active_goal is not None:
+            try:
+                seed_world=goal_seed_path(scene,active_goal)
+            except (ValueError,FloatingPointError) as error:
+                self.goals._end(active_goal,'invalid','当前物理状态无法连接原目标：'+str(error),scene)
+                self.references.reset_intent()
+                result=self.emergency_brake(scene,predictions,'目标几何连接失效：'+str(error))
+                result.diagnostics['goal_state']=self.goals.diagnostics()
+                result.diagnostics['goal_events']=self.goals.events
+                return result
+            selection=LocalReferenceResult(seed_world,
                 int(self.references.state['revision'])+self.goals.revision,
                 {'phase':'goal_active','selected_source':'local_goal','maneuver_active':False,
-                 'selection_wall_s':0.,'goal_geometry_role':'initialization_only'})
-            seed_world=goal_seed_path(scene,active_goal)
+                 'selection_wall_s':0.,'goal_geometry_role':'quintic_reference_before_first_crossing'})
         else:
             selection=self.references.select(scene,predictions)
             selection.revision+=self.goals.revision
@@ -302,7 +330,7 @@ class Planner:
         physical_lines={}
         for lane in scene.lanes:
             for line in lane.boundaries:
-                if line.get('crossable',True):continue
+                if line.get('crossable',True) or line.get('kind') in ('virtual_connection','virtual_lane_boundary'):continue
                 geom=LineString(world_to_ego(line['points'],origin,angle)).intersection(shapely.box(-reach,-reach,reach,reach))
                 if geom.is_empty:continue
                 item=physical_lines.setdefault(geom.normalize().wkb_hex,{'geometry':geom,'ids':[]});item['ids'].append(line['id'])
@@ -343,22 +371,82 @@ class Planner:
                    'yield_stop_line':100.,'speed_limit':10.,'lateral_acceleration':5.}
         penalties.update(p.get('safety_penalties',{}))
         scales={key:float(norm.get(key,default)) for key,default in [('position_m',3.5),('heading_rad',.5),('speed_mps',10),('acceleration_mps2',3),('steering_rad',.6),('jerk_mps3',8),('steering_rate_radps',.8),('progress_m',30)]}
+        # 同一几何参考上的前方实体包络。只使用已纳入规划的当前/预测信息。
+        headway=float(p.get('follow_time_headway_s',1.2));follow_gap=float(p.get('follow_min_gap_m',2.))
+        terminal_braking=float(p.get('terminal_braking_mps2',4.))
+        if headway<=0 or terminal_braking<=0 or follow_gap<0:
+            raise ValueError('跟驰时距、制动减速度必须为正，停车间距不得为负')
+        lead_rear=np.full(n+1,np.inf);lead_speed=np.zeros(n+1);lead_ids=[None]*(n+1)
+        for actor,sample,_ in targets:
+            actor_s,offset,actor_tangent,_=_path_projection(sample[:,:2],reference)
+            # 跟驰包络只用于当前位于自车前方的对象；后车驶过原帧原点，
+            # 不等于驶到了未来自车前方。后车仍完整参与逐时实体碰撞约束。
+            if actor_s[0]<=local_s0:
+                continue
+            axis=np.arctan2(actor_tangent[:,1],actor_tangent[:,0])
+            phi=sample[:,2]-axis
+            along=(actor.radius or actor.width/2) if actor.kind=='pedestrian' else actor.length/2*np.abs(np.cos(phi))+actor.width/2*np.abs(np.sin(phi))
+            across=(actor.radius or actor.width/2) if actor.kind=='pedestrian' else actor.length/2*np.abs(np.sin(phi))+actor.width/2*np.abs(np.cos(phi))
+            rear_s=actor_s-along
+            mask=(np.linalg.norm(offset,axis=1)<=across+scene.ego.width/2+clearance)&(actor_s>local_s0)&(rear_s<lead_rear)
+            lead_rear[mask]=rear_s[mask]
+            lead_speed[mask]=np.maximum(0.,sample[mask,3]*np.cos(phi[mask]))
+            for index in np.flatnonzero(mask):lead_ids[index]=actor.id
+        def following_speed(ss, indices):
+            gap=lead_rear[indices]-np.asarray(ss)-scene.ego.length/2-follow_gap
+            linear=np.maximum(0.,lead_speed[indices]+gap/headway)
+            stopping=np.sqrt(np.maximum(0.,lead_speed[indices]**2+2*terminal_braking*gap))
+            use_linear=linear<=stopping
+            desired=np.minimum(linear,stopping)
+            derivative=np.where(use_linear,np.where(linear>0.,-1/headway,0.),
+                np.divide(-terminal_braking,stopping,out=np.zeros_like(stopping),where=stopping>1e-6))
+            derivative=np.where(np.isfinite(gap),derivative,0.)
+            return desired,derivative
+        # 目标纵向截面之后，仅由预测位置所在的同向合法车道确定基础引导。
+        lane_references=[]
+        for lane in scene.lanes:
+            line=clean_polyline(world_to_ego(lane.center,origin,angle))
+            if len(line)>=2:lane_references.append((lane.id,line))
+        lane_widths={lane.id:lane.width for lane in scene.lanes}
+        def tracking_geometry(current):
+            ss,residual,tangent,interior=_path_projection(current[:,:2],reference)
+            progress_tangent=tangent.copy();progress_interior=interior.copy()
+            hd,hd_d=_interpolate_with_slope(ss,reference_arc,tangents)
+            goal_mask=np.ones(len(current),bool)
+            post_goal_corridor=np.zeros(len(current))
+            if active_goal is not None:
+                source_s=project_polyline(current[:,:2],goal_context[0],previous_s=active_goal['last_s'],window=120.)[0]
+                goal_mask=source_s<active_goal['s_goal_m']
+                for k in np.flatnonzero(~goal_mask):
+                    options=[]
+                    for identity,line in lane_references:
+                        ls,lr,lt,li=_path_projection(current[k:k+1,:2],line)
+                        direction=float(np.arctan2(lt[0,1],lt[0,0]))
+                        if abs(float(wrap_angle(direction-current[k,2])))>np.pi/2:continue
+                        options.append((float(lr[0]@lr[0]),identity,lr[0],lt[0],bool(li[0]),direction))
+                    if options:
+                        _,identity,residual[k],tangent[k],interior[k],hd[k]=min(options,key=lambda value:(value[0],value[1]))
+                        post_goal_corridor[k]=max(0.,(lane_widths[identity]-scene.ego.width)/2)
+                        hd_d[k]=0. # 分段直线投影内方向恒定，切段后重新线性化。
+            return ss,residual,tangent,interior,hd,hd_d,goal_mask,progress_tangent,progress_interior,post_goal_corridor
         difference=np.eye(n)-np.eye(n,k=-1);accel_selector=np.eye(2*n)[::2];steer_selector=np.eye(2*n)[1::2]
         def seed(scale=1.):
             controls=[];state=initial.copy();last=previous_control.copy()
-            for _ in range(n):
+            for step_index in range(n):
                 s,d,_=project_polyline(state[:2],seed_reference);kappa=float(np.interp(s,seed_arc,seed_curvature))
-                feed=np.arctan(scene.ego.length*kappa/np.sqrt(max(.01,1-(scene.ego.length*kappa/2)**2)))
-                heading=float(np.interp(s,seed_arc,seed_tangents))-np.arctan(.5*np.tan(feed))
+                feed=np.arctan(wheelbase*kappa/np.sqrt(max(.01,1-(rear*kappa)**2)))
+                heading=float(np.interp(s,seed_arc,seed_tangents))-np.arctan(axle_ratio*np.tan(feed))
                 steer=feed+1.2*float(wrap_angle(heading-state[2]))-.3*np.arctan(d/max(state[3],2.))
                 navigation_s=s if active_goal is None else project_polyline(state[:2],reference)[0]
-                desired=min(max_speed,float(scene.rules.get('desired_speed',25.))*scale,np.sqrt(max_lat*scene.ego.length/max(2*abs(np.sin(np.arctan(.5*np.tan(steer)))),.001))*.9,float(np.interp(navigation_s,reference_arc,speed_profile)))
+                desired=min(max_speed,float(scene.rules.get('desired_speed',25.))*scale,np.sqrt(max_lat*2*rear/max(2*abs(np.sin(np.arctan(axle_ratio*np.tan(steer)))),.001))*.9,float(np.interp(navigation_s,reference_arc,speed_profile)))
+                follow_speed,_=following_speed(np.array([navigation_s]),np.array([step_index]))
+                desired=min(desired,float(follow_speed[0]))
                 if stop_local is not None:
                     global_s=project_polyline(state[:2],global_reference)[0]
                     desired=min(desired,np.sqrt(max(0.,2*braking*(stop_local-global_s-scene.ego.length/2))))
                 control=np.clip([np.clip((desired-state[3])*1.2,last[0]-max_jerk*dt,last[0]+max_jerk*dt),np.clip(steer,last[1]-max_rate*dt,last[1]+max_rate*dt)],[min_a,-max_delta],[max_a,max_delta])
                 control[0]=max(control[0],-max(0.,state[3])/dt)
-                controls.append(control);state=propagate(state,control,scene.ego.length,dt,self.substeps);last=control
+                controls.append(control);state=propagate(state,control,scene.ego.length,dt,self.substeps,wheelbase,rear);last=control
             return np.asarray(controls)
         age=None if self.previous_time is None else scene.time-self.previous_time
         reference_changed=self.previous_reference_revision is not None and self.previous_reference_revision!=selection.revision
@@ -387,7 +475,7 @@ class Planner:
         controls=project(controls)
         initial_body=shapely.polygons(body_vertices(initial[None,:],scene.ego.length,scene.ego.width))[0]
         initial_safety={'on_road':bool(shapely.covers(accepted_road,initial_body)),
-                        'speed_limit':bool(speed<=max_speed+1e-8)}
+                        'speed_limit':bool(speed<=max_speed+speed_tolerance)}
         for actor,sample,_ in targets:
             if actor.kind=='pedestrian':
                 gap,_=circle_gap(initial[None,:],sample[:1,:2],actor.radius or actor.width/2,scene.ego.length,scene.ego.width)
@@ -403,13 +491,56 @@ class Planner:
         if stop_local is not None:labels.append('yield_stop_line')
         evaluations={'values':0,'linearizations':0,'value_seconds':0.,'linearization_seconds':0.,'geometry_seconds':0.}
 
-        def terms(controls):
+        def dense_check(controls):
+            """按物理子步重积分；周车仅在原预测样本之间插值，不读取真实未来。"""
+            dense=[initial.copy()]
+            sub_dt=dt/self.substeps
+            for command in controls:
+                for _ in range(self.substeps):
+                    dense.append(propagate(dense[-1],command,scene.ego.length,sub_dt,1,wheelbase,rear))
+            dense=np.asarray(dense);times=np.arange(len(dense))*sub_dt
+            bodies=shapely.polygons(body_vertices(dense,scene.ego.length,scene.ego.width))
+            inside=shapely.covers(accepted_road,bodies)
+            line_ok=np.ones(len(dense),bool)
+            for item in physical_lines.values():
+                line_ok &= shapely.distance(bodies,item['geometry'])>=clearance-tolerance
+            actor_ok=np.ones(len(dense),bool);contacts=[];minimum=np.inf
+            for actor,sample,_ in targets:
+                other=np.stack([np.interp(times,np.arange(n+1)*dt,sample[:,j]) for j in range(4)],axis=1)
+                if actor.kind=='pedestrian':
+                    distance,_=circle_gap(dense,other[:,:2],actor.radius or actor.width/2,scene.ego.length,scene.ego.width)
+                else:
+                    distance,_=rectangle_gap(dense,other,scene.ego.length,scene.ego.width,actor.length,actor.width)
+                minimum=min(minimum,float(np.min(distance-clearance)))
+                actor_ok &= distance>=clearance-tolerance
+                hit=np.flatnonzero(distance<0.)
+                if len(hit):
+                    index=int(hit[0]);normal=other[index,:2]-dense[index,:2]
+                    normal=normal/max(float(np.linalg.norm(normal)),1e-9)
+                    command_index=min(n-1,index//self.substeps)
+                    slip=np.arctan(axle_ratio*np.tan(controls[command_index,1]))
+                    own_velocity=dense[index,3]*np.array([np.cos(dense[index,2]+slip),np.sin(dense[index,2]+slip)])
+                    other_velocity=other[index,3]*np.array([np.cos(other[index,2]),np.sin(other[index,2])])
+                    contacts.append({'actor_id':actor.id,'time_s':float(times[index]),
+                        'closing_speed_mps':max(0.,float((own_velocity-other_velocity)@normal)),
+                        'ego_speed_mps':float(dense[index,3])})
+            stop_ok=True
+            if stop_local is not None:
+                front_s=project_polyline(body_vertices(dense,scene.ego.length,scene.ego.width).reshape(-1,2),global_reference)[0]
+                stop_ok=bool(np.max(front_s)<=stop_local+tolerance)
+            return {'valid':bool(inside.all() and line_ok.all() and actor_ok.all() and stop_ok),
+                'substep_s':sub_dt,'samples':len(dense),'actor_clearance_min_m':None if not np.isfinite(minimum) else minimum,
+                'offroad_samples':int((~inside).sum()),'line_violation_samples':int((~line_ok).sum()),
+                'stop_line_passed':not stop_ok,'predicted_contacts':contacts,
+                'limitation':'物理子步离散复核，不是连续时间碰撞证明；周车未来来自预测'}
+
+        def terms(controls,is_brake=False):
             value_started=time.perf_counter();evaluations['values']+=1
             # 线搜索只需真实原值；只有进入下一次QP的名义点才计算控制导数。
             states=self.dynamics.rollout(controls,initial);current=states[1:]
             geometry_started=time.perf_counter()
-            s,path_residual,tangent,path_interior=_path_projection(current[:,:2],reference)
-            heading,heading_derivative=_interpolate_with_slope(s,reference_arc,tangents)
+            s,path_residual,tangent,path_interior,heading,heading_derivative,goal_tracking_mask,s_tangent,s_interior,post_goal_corridor=tracking_geometry(current)
+            navigation_s,_,navigation_tangent,navigation_interior=_path_projection(current[:,:2],global_reference)
             vertices=body_vertices(current,scene.ego.length,scene.ego.width);polygons=shapely.polygons(vertices)
             probes=np.concatenate((vertices,(vertices+np.roll(vertices,-1,axis=1))/2),axis=1)
             points=shapely.points(probes.reshape(-1,2));closest=shapely.get_coordinates(shapely.get_point(shapely.shortest_line(boundary,points),0))
@@ -418,7 +549,7 @@ class Planner:
             normals=(signs[:,None]*offsets/np.maximum(distances[:,None],1e-10)).reshape(n,8,2)
             arms=probes-current[:,:2,None].transpose(0,2,1)
             road_partial=np.zeros((n,8,4));road_partial[:,:,:2]=normals;road_partial[:,:,2]=-normals[:,:,0]*arms[:,:,1]+normals[:,:,1]*arms[:,:,0]
-            # QP只保留非负速度及控制箱；几何、规则和舒适阈值不再产生不可行约束行。
+            # 正常模式的物理/道路/碰撞规则均进入当前线性化约束；最终仍做非线性复核。
             rows=[lambda c:c['sens'][:,3]]
             lower=[-current[:,3]];upper=[np.full(n,np.inf)]
             road_jac=lambda c:np.einsum('npi,nij->npj',road_partial,c['sens']).reshape(-1,2*n)
@@ -435,11 +566,16 @@ class Planner:
                 signed=-depth if depth>1e-10 else -np.sqrt(areas[local_index])
                 extra_road_minimum=min(extra_road_minimum,signed)
             delta=difference@controls;delta[0]-=previous_control
-            beta=np.arctan(.5*np.tan(controls[:,1]));bp=.5/(np.cos(controls[:,1])**2*(1+.25*np.tan(controls[:,1])**2))
-            lateral=states[:-1,3]**2*2/scene.ego.length*np.sin(beta)
-            lateral_factor=states[:-1,3,None]*4/scene.ego.length*np.sin(beta[:,None])
-            lateral_direct=states[:-1,3,None]**2*2/scene.ego.length*np.cos(beta[:,None])*bp[:,None]*steer_selector
-            lateral_jac=lambda c:lateral_factor*c['all'][:-1,3]+lateral_direct
+            beta=np.arctan(axle_ratio*np.tan(controls[:,1]));bp=axle_ratio/(np.cos(controls[:,1])**2*(1+axle_ratio**2*np.tan(controls[:,1])**2))
+            # 恒定加速度段的速度单调；分别约束首尾，覆盖段内峰值，避免max速度切换的导数歧义。
+            lateral_before=states[:-1,3]**2/rear*np.sin(beta)
+            lateral_after=current[:,3]**2/rear*np.sin(beta)
+            lateral=np.r_[lateral_before,lateral_after]
+            lateral_jac=lambda c:np.vstack((
+                states[:-1,3,None]*2/rear*np.sin(beta[:,None])*c['all'][:-1,3]
+                +states[:-1,3,None]**2/rear*np.cos(beta[:,None])*bp[:,None]*steer_selector,
+                current[:,3,None]*2/rear*np.sin(beta[:,None])*c['sens'][:,3]
+                +current[:,3,None]**2/rear*np.cos(beta[:,None])*bp[:,None]*steer_selector))
             minima=[min(float(road_distance.min()),extra_road_minimum),float(current[:,3].min()),float((max_speed-current[:,3]).min()),float((max_jerk*dt-np.abs(delta[:,0])).min()),float((max_rate*dt-np.abs(delta[:,1])).min()),float((max_lat-np.abs(lateral)).min())]
             evaluations['geometry_seconds']+=time.perf_counter()-geometry_started
             residuals=[];jacobians=[];components={}
@@ -451,7 +587,8 @@ class Planner:
                 # 正部平方在零点一阶连续；穿透时保留几何导数，不使用截断APF的零梯度。
                 margin=np.asarray(margin);active=margin<0.
                 derivative=lambda c:(jac(c) if callable(jac) else np.asarray(jac))*active[:,None]
-                residual('penalty_'+name,np.minimum(margin,0.),derivative,penalties[name],scale)
+                residual('penalty_'+name,np.minimum(margin,0.),derivative,penalties.get(name,100.),scale)
+                rows.append(jac);lower.append(-margin);upper.append(np.full(len(margin),np.inf))
             penalty('road_clearance',road_distance.ravel()+tolerance,road_jac)
             if len(uncovered):
                 # 完整车体越界面积覆盖孔洞和凹角。不能把随形状重选的见证点
@@ -470,11 +607,18 @@ class Planner:
             penalty('speed_limit',max_speed-current[:,3],lambda c:-c['sens'][:,3],scales['speed_mps'])
             penalty('lateral_acceleration',max_lat-np.abs(lateral),
                     lambda c:-np.sign(lateral)[:,None]*lateral_jac(c),max_lat)
+            rows.extend([difference@accel_selector,difference@steer_selector])
+            lower.extend([-max_jerk*dt-delta[:,0],-max_rate*dt-delta[:,1]])
+            upper.extend([max_jerk*dt-delta[:,0],max_rate*dt-delta[:,1]])
             target,target_derivative=_interpolate_with_slope(s,reference_arc,speed_profile)
-            # 限速已改软约束，速度参考也必须相容，不能仍主动追求高于限速的速度。
+            # 参考速度与法规硬限速相容；不能主动追求高于限速的速度。
             target_derivative=np.where(target>max_speed,0.,target_derivative)
             target=np.minimum(target,max_speed)
-            target_direction=target_derivative[:,None]*tangent*path_interior[:,None]
+            target_direction=target_derivative[:,None]*s_tangent*s_interior[:,None]
+            follow_target,follow_derivative=following_speed(s,np.arange(1,n+1))
+            following=follow_target<target
+            target=np.minimum(target,follow_target)
+            target_direction=np.where(following[:,None],follow_derivative[:,None]*s_tangent*s_interior[:,None],target_direction)
             if stop_local is not None:
                 global_s,_,global_tangent,global_interior=_path_projection(current[:,:2],global_reference)
                 stop_speed,stop_derivative=_stop_speed_with_slope(global_s,stop_local,scene.ego.length,braking)
@@ -485,13 +629,25 @@ class Planner:
             path_projectors=np.eye(2)[None,:,:]-tangent[:,:,None]*tangent[:,None,:]
             path_projectors[~path_interior]=np.eye(2)
             path_jac=lambda c:np.einsum('nij,njk->nik',path_projectors,c['sens'][:,:2]).reshape(2*n,2*n)
-            if active_goal is None:
-                residual('contour',path_residual.ravel(),path_jac,weights.get('contour',3),scales['position_m'])
+            residual('contour',path_residual.ravel(),path_jac,weights.get('contour',3),scales['position_m'])
             heading_error=wrap_angle(current[:,2]+beta-heading)
             heading_curvature=heading_derivative[:,None]
             heading_jac=lambda c:c['sens'][:,2]+bp[:,None]*steer_selector-heading_curvature*c['sj']
-            if active_goal is None:
-                residual('heading',heading_error,heading_jac,weights.get('heading',1),scales['heading_rad'])
+            residual('heading',heading_error,heading_jac,weights.get('heading',1),scales['heading_rad'])
+            # 正常巡航不靠车道内蛇形寻找低代价；实际偏心时给出随行程收敛的恢复包络。
+            initial_offset=float(np.linalg.norm(_path_projection(initial[None,:2],reference)[1]))
+            recovery_length=float(p.get('tracking_recovery_distance_m',15.))
+            base_error=float(p.get('tracking_max_error_m',.25))
+            recovery=initial_offset*np.exp(-np.maximum(s-local_s0,0.)/max(recovery_length,1e-6))
+            allowed=base_error+recovery
+            recovery_slope=np.where(s>local_s0,-recovery/max(recovery_length,1e-6),0.)
+            # 截面后的非中心目标不能强迫瞬时回中；此处只用实际车道可容纳范围，
+            # 中心跟踪代价保留。真实通过后，下周期从实际状态重新生成基础归中参考。
+            allowed=np.where(goal_tracking_mask,allowed,post_goal_corridor)
+            recovery_slope=np.where(goal_tracking_mask,recovery_slope,0.)
+            tracking_margin=allowed**2-np.sum(path_residual**2,axis=1)
+            tracking_jac=lambda c:2*allowed[:,None]*recovery_slope[:,None]*c['sj']-2*np.einsum('ni,nij->nj',path_residual,c['sens'][:,:2])
+            penalty('tracking_corridor',tracking_margin,tracking_jac)
             goal_evidence=None
             if goal_context is not None:
                 goal_ref,goal_position,sqrt_weight=goal_context
@@ -577,34 +733,56 @@ class Planner:
                 gap=stop_local-front_s
                 penalty('yield_stop_line',gap+tolerance,lambda c:-np.einsum('ni,nij->nj',front_partial,c['sens']))
                 minima.append(float(gap.min()))
+            # 时域末端仍保留停车空间。车体前缘而非中心到障碍物的距离。
+            terminal_margins=[]
+            if np.isfinite(lead_rear[-1]):
+                gap_end=lead_rear[-1]-s[-1]-scene.ego.length/2-follow_gap
+                stopping_difference=max(0.,(current[-1,3]**2-lead_speed[-1]**2)/(2*terminal_braking))
+                terminal_gap=gap_end-stopping_difference
+                def terminal_follow_jac(c):
+                    dv=current[-1,3]/terminal_braking if current[-1,3]>lead_speed[-1] else 0.
+                    return (-c['sj'][-1]-dv*c['sens'][-1,3])[None,:]
+                penalty('terminal_stopping',np.array([terminal_gap]),terminal_follow_jac)
+                terminal_margins.append(terminal_gap)
+            if stop_local is not None:
+                terminal_gap=float(gap[-1]-current[-1,3]**2/(2*terminal_braking))
+                def terminal_line_jac(c):
+                    return (-front_partial[-1]@c['sens'][-1]-current[-1,3]/terminal_braking*c['sens'][-1,3])[None,:]
+                penalty('terminal_stopping',np.array([terminal_gap]),terminal_line_jac)
+                terminal_margins.append(terminal_gap)
             evaluations['geometry_seconds']+=time.perf_counter()-geometry_started
-            # 活动目标时不施加原中心线横向/航向吸引；规则速度和进度不变。
-            progress=-float(weights.get('progress',1))*(s[-1]-local_s0)/scales['progress_m'];components['progress']=progress
+            # 进度属于导航，横向/航向跟踪属于局部参考，坐标用途不混用。
+            progress=-float(weights.get('progress',1))*(navigation_s[-1]-(ego_s-start_arc))/scales['progress_m'];components['progress']=progress
             residual_vector=np.concatenate(residuals)
             objective=float(residual_vector@residual_vector+progress)
             for key in ('actor_risk','line_risk','goal_attraction','contour','heading'):components.setdefault(key,0.)
             metrics={name:value for name,value in zip(labels,minima)}
+            metrics['tracking_corridor']=float(tracking_margin.min())
+            if terminal_margins:metrics['terminal_stopping']=float(min(terminal_margins))
             control_margin=float(min(np.min(controls[:,0]-min_a),np.min(max_a-controls[:,0]),
                                      np.min(max_delta-np.abs(controls[:,1]))))
             metrics['control_box']=control_margin
             valid=(np.isfinite(states).all() and np.isfinite(controls).all() and minima[1]>=-1e-8
                    and control_margin>=-1e-8 and np.isfinite(objective))
-            safety_feasible=(all(initial_safety.values()) and minima[0]>=-tolerance and minima[2]>=-1e-8
-                             and all(value>=-tolerance for value in minima[6:])
+            dense=dense_check(controls)
+            safety_feasible=(all(initial_safety.values()) and all(value>=-(speed_tolerance if key=='speed_limit' else tolerance) for key,value in metrics.items()
+                             if key!='tracking_corridor' or not is_brake)
+                             and dense['valid']
                              and bool(np.all(shapely.covers(accepted_road,polygons))))
             result=dict(states=states,controls=controls.copy(),objective=objective,components=components,
                 lower=np.concatenate(lower),upper=np.concatenate(upper),minima=metrics,valid=bool(valid),polygons=polygons,
-                safety_feasible=bool(safety_feasible),
-                violation=max(0.,-min(minima),-control_margin),goal_evidence=goal_evidence)
+                safety_feasible=bool(safety_feasible),dense_validation=dense,is_brake=bool(is_brake),
+                violation=max(0.,-min(metrics.values()),-control_margin),goal_evidence=goal_evidence)
             def linearize():
                 linearization_started=time.perf_counter();evaluations['linearizations']+=1
                 sensitivity=self.dynamics.sensitivity(controls,initial)
                 sens=sensitivity[1:]
-                sj=np.einsum('ni,nij->nj',tangent,sens[:,:2])
-                sj[~path_interior]=0.
+                sj=np.einsum('ni,nij->nj',s_tangent,sens[:,:2])
+                sj[~s_interior]=0.
                 context={'all':sensitivity,'sens':sens,'sj':sj}
                 jacobian=np.vstack([(jac(context) if callable(jac) else np.asarray(jac))*factor for jac,factor in jacobians])
-                gradient_extra=-float(weights.get('progress',1))*sj[-1]/scales['progress_m']
+                navigation_jac=navigation_tangent[-1]@sens[-1,:2] if navigation_interior[-1] else np.zeros(2*n)
+                gradient_extra=-float(weights.get('progress',1))*navigation_jac/scales['progress_m']
                 value=dict(hessian=2*jacobian.T@jacobian+np.eye(2*n)*float(p.get('sqp_regularization',1e-4)),
                            gradient=2*jacobian.T@residual_vector+gradient_extra,
                            matrix=np.vstack([row(context) if callable(row) else row for row in rows]))
@@ -615,6 +793,9 @@ class Planner:
             return result
 
         solver_started=time.perf_counter();budget=float(p.get('cold_start_budget_s',.5) if cold_start else p.get('solver_wall_budget_s',.1));deadline=started+budget
+        def preference(value):
+            # 正常安全解永远优于低成本不安全解；不可行名义点只用于寻找可行改进。
+            return (not value['safety_feasible'],0. if value['safety_feasible'] else value['violation'],value['objective'])
         qp_before=(self.qp.cache_builds,self.qp.cache_hits,self.qp.setup_seconds)
         statuses=[];last=None;initial_diagnostics=[];qp_seconds=0.;iterations=0
         nominal=terms(controls)
@@ -637,7 +818,7 @@ class Planner:
             feasible=[item for item in alternatives if item[1]['valid']]
             if not feasible:
                 raise ValueError('MPC输入或初值包含非法数值，无法形成有界控制轨迹')
-            chosen=min(feasible,key=lambda item:item[1]['objective'])
+            chosen=min(feasible,key=lambda item:preference(item[1]))
             initial_reselection.update(selected=chosen[0]!=nominal_source,selected_source=chosen[0],
                 selected_violation=chosen[1]['violation'],selected_executable=chosen[1]['valid'],
                 selected_safety_feasible=chosen[1]['safety_feasible'])
@@ -654,7 +835,7 @@ class Planner:
         recovery_speed=float(p.get('warm_start_recovery_speed_mps',.3))
         recovery={'eligible':bool(warm and stop_local is None and speed<recovery_speed),
                   'speed_threshold_mps':recovery_speed,'evaluated':False,'selected':False}
-        for iteration in range(int(p.get('solver_max_iterations',4))):
+        for iteration in range(0 if _brake_only else int(p.get('solver_max_iterations',4))):
             # 至少尝试一次QP；随后预算到期即返回已验收的本帧最佳候选。
             if iteration and time.perf_counter()>=deadline:
                 termination='wall_budget';break
@@ -683,13 +864,13 @@ class Planner:
                 candidate['initialization_source']=nominal_source
                 candidate['candidate_source']='optimized_qp_line_search'
                 exact=candidate['valid']
-                if exact and candidate['objective']<=accepted['objective']:accepted=candidate
+                if exact and preference(candidate)<preference(accepted):accepted=candidate
                 candidates.append(candidate)
                 evaluation_seconds=time.perf_counter()-evaluation_started
-                if exact and candidate['objective']<=nominal['objective']+1e-8:break
+                if exact and preference(candidate)<=preference(nominal):break
             if not candidates:
                 termination='control_projection_infeasible';break
-            next_nominal=min([accepted,*[value for value in candidates if value['valid']]],key=lambda value:value['objective'])
+            next_nominal=min([accepted,*[value for value in candidates if value['valid']]],key=preference)
             improvement=abs(next_nominal['objective']-nominal['objective'])
             step_norm=float(np.linalg.norm(step,np.inf))
             iteration_history.append({'iteration':iteration+1,'nominal_cost':nominal['objective'],
@@ -711,7 +892,7 @@ class Planner:
                     exact=alternative['valid']
                     recovery.update(navigation_seed_valid=bool(exact),navigation_seed_cost=alternative['objective'],
                                     warm_candidate_cost=accepted['objective'])
-                    if exact and alternative['objective']<accepted['objective']-1e-8:
+                    if exact and preference(alternative)<preference(accepted):
                         controls=alternative['controls'];nominal=alternative
                         nominal_source='navigation_seed_recovery';recovery['selected']=True
                         alternative['initialization_source']=nominal_source
@@ -723,9 +904,79 @@ class Planner:
             # 小优化步才允许提前结束；QP残差同时保存以便核查原因。
             if step_norm<1e-5:
                 termination='small_qp_step';break
+        emergency_candidates=[]
+        if _brake_only or not accepted['safety_feasible']:
+            # 与语义目标无关的本车道制动，重新积分本帧，不复用未经验收的旧控制。
+            brake_reference=global_reference
+            lane_table={lane.id:lane for lane in scene.lanes}
+            own=self.references._lane(scene,lane_table)
+            if own is not None:
+                # 交叉口几何最近标签可能是直行连接段。制动仍沿已知导航
+                # 相容中心延伸，不能突然跟随错误分支，也不继承VLM目标。
+                brake_reference=clean_polyline(world_to_ego(
+                    self.references._continuation(scene,own,lane_table),origin,angle))
+            def brake_controls(deceleration,follow_lane):
+                trajectory=[];state=initial.copy();last=previous_control.copy();release_conflicts=[]
+                for step_index in range(n):
+                    _,offset,target_heading=project_polyline(state[:2],brake_reference,heading=state[2])
+                    desired_steer=(1.2*float(wrap_angle(target_heading-state[2]))-.3*np.arctan(offset/max(state[3],2.))) if follow_lane else 0.
+                    acceleration=-min(deceleration,1.8*max(0.,state[3]))
+                    release_limit=brake_acceleration_limit(max(0.,state[3]),dt,max_jerk)
+                    lower=max(min_a,last[0]-max_jerk*dt,-release_limit)
+                    upper=min(max_a,last[0]+max_jerk*dt)
+                    conflict=lower>upper+1e-10
+                    # 从可行初态提前释放制动，不等到v/dt末步截断才破坏jerk。
+                    # 已无共同可行区间时优先非倒退和控制箱，明确记录初态冲突。
+                    if conflict:
+                        selected_acceleration=float(np.clip(upper,max(min_a,-release_limit),max_a))
+                        release_conflicts.append({'step':step_index,'speed_mps':float(state[3]),
+                            'previous_acceleration_mps2':float(last[0]),'release_lower_mps2':-release_limit,
+                            'jerk_upper_mps2':float(last[0]+max_jerk*dt),
+                            'selected_acceleration_mps2':selected_acceleration,
+                            'reason':'当前速度与前次加速度不能同时满足未来非倒退和jerk释放包络'})
+                    else:
+                        selected_acceleration=float(np.clip(acceleration,lower,max(lower,upper)))
+                    command=np.array([selected_acceleration,
+                        np.clip(desired_steer,last[1]-max_rate*dt,last[1]+max_rate*dt)])
+                    command=np.clip(command,[min_a,-max_delta],[max_a,max_delta])
+                    trajectory.append(command);state=propagate(state,command,scene.ego.length,dt,self.substeps,wheelbase,rear);last=command
+                return np.asarray(trajectory),release_conflicts
+            for label,deceleration,follow_lane in [('lane_service_brake',min(braking,-min_a),True),
+                    ('lane_maximum_brake',-min_a,True),('heading_maximum_brake',-min_a,False)]:
+                braking_controls,release_conflicts=brake_controls(deceleration,follow_lane)
+                value=terms(braking_controls,is_brake=True)
+                value['braking_release_conflicts']=release_conflicts
+                if release_conflicts:value['safety_feasible']=False
+                if not value['valid']:continue
+                value['initialization_source']=label;value['candidate_source']='current_state_braking'
+                evidence=value['dense_validation'];contacts=evidence['predicted_contacts']
+                # 仅有限制动集合内的风险排序，不声称全局最优或事故不可避免。
+                risk_order=(not value['safety_feasible'],len(contacts)>0,
+                    max([row['closing_speed_mps'] for row in contacts],default=0.),
+                    -min([row['time_s'] for row in contacts],default=n*dt),
+                    evidence['offroad_samples']+evidence['line_violation_samples'],value['violation'],value['states'][-1,3])
+                emergency_candidates.append((risk_order,value))
+            if not emergency_candidates:
+                raise RuntimeError('当前状态不能形成有限有界制动控制，拒绝伪造有效轨迹')
+            accepted=min(emergency_candidates,key=lambda item:item[0])[1]
+            termination='validated_brake' if accepted['safety_feasible'] else 'emergency_braking_no_certified_solution'
+        execution_mode=('safe_brake' if accepted.get('is_brake') else 'normal') if accepted['safety_feasible'] else 'emergency_unverified'
         elapsed=time.perf_counter()-started
         diagnostics={'solver_seconds':time.perf_counter()-solver_started,'planning_seconds':elapsed,'solver_status':statuses,
-            'planning_object_selection':object_selection,
+            'planning_object_selection':object_selection,'execution_mode':execution_mode,
+            'emergency':execution_mode=='emergency_unverified',
+            'braking_release_conflicts':accepted.get('braking_release_conflicts',[]),
+            'dense_validation':accepted['dense_validation'],
+            'following':{'lead_ids':lead_ids,'minimum_gap_m':follow_gap,'time_headway_s':headway,'terminal_braking_mps2':terminal_braking},
+            'tracking_policy':{'before_goal_or_no_goal_max_error_m':float(p.get('tracking_max_error_m',.25)),
+                'initial_offset_recovery_distance_m':float(p.get('tracking_recovery_distance_m',15.)),
+                'after_predicted_goal_crossing':'实际同向车道内车体可容纳范围，保留基础中心/方向代价，不保留目标吸引',
+                'after_actual_goal_pass':'GoalManager释放；下一周期从实际状态生成基础参考'},
+            'emergency_candidates':[{'source':value['initialization_source'],'safety_feasible':value['safety_feasible'],
+                'risk_order':list(order),'dense_validation':value['dense_validation'],
+                'braking_release_conflicts':value.get('braking_release_conflicts',[])} for order,value in emergency_candidates],
+            'vehicle_dynamics':{'reference_point':'geometric_center','wheelbase_m':wheelbase,
+                'rear_axle_to_center_m':rear,'geometry_source':'platform' if scene.ego.wheelbase_m is not None else 'highway_legacy'},
             'solver_backend':'casadi_osqp_realtime_sqp','symbolic_build_seconds':build_seconds,'qp_seconds':qp_seconds,'sqp_iterations':iterations,
             'optimizer_termination':termination,'iteration_history':iteration_history,
             'warm_start_recovery':recovery,
@@ -756,9 +1007,11 @@ class Planner:
             accepted_initialization_source=accepted['initialization_source'],
             minimum_constraint=min(accepted['minima'].values()),constraint_minima=accepted['minima'],semantic_enabled=answer is not None,
             active_goal=active_goal is not None,goal_evaluation=accepted.get('goal_evidence'),
-            constraint_policy='bounded_controls_soft_safety_v1',trajectory_available=True,
+            constraint_policy='safety_first_tracking_v2',trajectory_available=True,
             safety_feasible=accepted['safety_feasible'],initial_safety_checks=initial_safety,
-            hard_constraint_groups=['dynamics','acceleration','steering','nonnegative_speed'],
+            speed_numerical_tolerance_mps=speed_tolerance,
+            hard_constraint_groups=['dynamics','acceleration','steering','nonnegative_speed','jerk','steering_rate',
+                'road','noncrossable_line','actor_clearance','speed_limit','lateral_acceleration','stop_line','terminal_stopping','tracking_corridor'],
             soft_constraint_violations={key:max(0.,-value) for key,value in accepted['minima'].items()
                                         if key not in ('nonnegative_speed','control_box')},
             geometry_progress='closest_point_eliminated_free_progress')

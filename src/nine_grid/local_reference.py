@@ -10,6 +10,7 @@ from shapely.geometry import LineString, Point, Polygon
 
 from .geometry import (actor_shape, clean_polyline, polyline_lengths,
                        project_polyline, sample_polyline, wrap_angle)
+from .quintic_reference import quintic_offsets, initial_lateral_state, spatial_samples
 
 
 DEFAULTS = {
@@ -23,6 +24,7 @@ DEFAULTS = {
     "dwell_s": 3., "abort_lateral_m": .25,
     "candidate_period_s": .5,
     "geometry_margin_m": .001,
+    "allow_right_overtake": False,
 }
 
 
@@ -80,7 +82,19 @@ class LocalReferenceManager:
         known=(scene.ego.lane_id,scene.diagnostics.get('stable_navigation_lane_id'))
         for key in known:
             lane=lanes.get(key)
-            if distance(lane) is not None:return lane
+            if distance(lane) is not None:
+                # 路口多条连接车道覆盖同一点时，平台最近lane标签可能落到
+                # 直行分支。只有非平行邻道重叠才按公开已知导航消歧，不能把
+                # 正常完成的平行换道拉回旧车道。
+                if key not in scene.route_lane_ids:
+                    parallel=any(candidate.id in scene.route_lane_ids and
+                        (candidate.id in (lane.left,lane.right) or lane.id in (candidate.left,candidate.right))
+                        for candidate in lanes.values())
+                    if not parallel:
+                        route_choices=[(distance(candidate),candidate) for candidate in lanes.values()
+                                       if candidate.id in scene.route_lane_ids and distance(candidate) is not None]
+                        if route_choices:return min(route_choices,key=lambda item:(item[0],item[1].id))[1]
+                return lane
         candidates=[]
         for lane in lanes.values():
             if lane.id in known:continue
@@ -173,6 +187,11 @@ class LocalReferenceManager:
             return "目标车道剩余长度不足"
         return None
 
+    def _navigation_change_needed(self, scene, source, target, lanes):
+        """右换道只在公开导航分支要求时主动发起，不拿速度收益冒充导航。"""
+        return (not self._navigation_compatible(scene,source,source,lanes)
+                and self._navigation_compatible(scene,source,target,lanes))
+
     def _traffic(self, scene, predictions, lane, check_future=True):
         """可见当前净距及 EKF 未来占道检查，仅决定候选是否值得求解。"""
         ego_s, _, heading = project_polyline(scene.ego.position, lane.center)
@@ -259,8 +278,8 @@ class LocalReferenceManager:
         speed = float(np.linalg.norm(scene.ego.velocity))
         blend = max(self.p["blend_min_m"], speed*self.p["blend_time_s"])
         end = min(total, ego_s+self.p["lookahead_m"])
-        ss = np.arange(max(0., ego_s-15.), end, self.p["sample_m"])
-        ss = np.r_[ss, end]
+        ss = spatial_samples(max(0.,ego_s-15.),end,self.p['sample_m'],
+                             anchors=(ego_s,ego_s+blend))
         base = sample_polyline(reference, ss)
         headings = project_polyline(base, reference, previous_s=ego_s,
                                      heading=base_heading,
@@ -276,24 +295,16 @@ class LocalReferenceManager:
             target_points = sample_polyline(target_reference, target_s)
             target_d = np.sum((target_points-base)*normals, axis=1)
         relative = ss-ego_s
-        knots = [(0., float(d0))]
         terminal = blend
         terminal_d = float(np.interp(terminal, relative, target_d))
-        knots.append((terminal, terminal_d))
-        xx, yy = np.asarray(knots, float).T
-        slopes = np.zeros(len(xx))
-        slopes[0] = np.clip(np.tan(float(wrap_angle(scene.ego.heading-base_heading))), -.4, .4)
-        if len(xx)>2:
-            slopes[1:-1] = np.clip((yy[2:]-yy[:-2])/(xx[2:]-xx[:-2]), -.3, .3)
-        offsets = np.interp(relative, xx, yy)
-        for i in range(len(xx)-1):
-            mask = (relative >= xx[i]) & (relative < xx[i+1])
-            span = xx[i+1]-xx[i]
-            u = (relative[mask]-xx[i])/span
-            w = 10*u**3-15*u**4+6*u**5
-            a = u-6*u**3+8*u**4-3*u**5
-            b = -4*u**3+7*u**4-3*u**5
-            offsets[mask] = yy[i]*(1-w)+yy[i+1]*w+span*(slopes[i]*a+slopes[i+1]*b)
+        start=initial_lateral_state(scene,reference,ego_s,d0,base_heading)
+        first=np.gradient(target_d,ss);second=np.gradient(first,ss)
+        finish=(terminal_d,float(np.interp(ego_s+terminal,ss,first)),
+                float(np.interp(ego_s+terminal,ss,second)))
+        offsets=quintic_offsets(relative,terminal,start,finish)
+        # 身后点只支持参考投影，不能影响未来的边界状态与车体检查。
+        before=relative<0
+        offsets[before]=start[0]+relative[before]*start[1]+.5*relative[before]**2*start[2]
         # 车道宽度或弯道半径变化时，终端继续精确目标车道，而非固定横向偏移。
         after = relative >= terminal
         offsets[after] = target_d[after]
@@ -395,7 +406,8 @@ class LocalReferenceManager:
         cached_keep = self.state.get("keep_path")
         completed_target = (self.state["phase"] == "complete"
                             and self.state["target_lane_id"] == current.id)
-        if scene.scenario != "highway" and not completed_target:
+        same_navigation_road=any(self._segment(current.id)==self._segment(key) for key in scene.route_lane_ids)
+        if not same_navigation_road and not completed_target:
             # 路口车道关联可能暂指向重叠的另一分支。无主动换道承诺时，
             # 始终保留已知导航连接，不能把该关联自动变成局部转向意图。
             path = np.asarray(scene.route, float).copy()
@@ -426,19 +438,25 @@ class LocalReferenceManager:
                     continue
                 lane = lanes[key]
                 reason = self._legal(scene, current, lane, lanes)
+                navigation_required=self._navigation_change_needed(scene,current,lane,lanes)
+                if key==current.right and not self.p['allow_right_overtake'] and not navigation_required:
+                    reason=reason or '禁止主动右侧超车；当前右换道不是导航必需'
                 traffic = (self._traffic(scene, predictions, lane) if reason is None else
                            {"front": None, "rear": None, "estimated_speed_mps": 0.,
                             "predicted_min_gap_m": None, "rejection": reason})
                 gain = traffic["estimated_speed_mps"]-own_traffic["estimated_speed_mps"]
-                item = {"lane_id": key, "source": "base", **traffic, "gain_mps": float(gain)}
+                item = {"lane_id": key, "source": "base", **traffic, "gain_mps": float(gain),
+                        "navigation_required":navigation_required}
                 item["rejection"] = reason or traffic["rejection"]
                 proposed = None
-                if item["rejection"] is None and gain>=best_gain:
+                preferred=navigation_required or gain>best_gain+1e-9
+                if item["rejection"] is None and preferred:
                     proposed = self._path(scene, current, lane, lanes)
                     if not self._road_ok(scene, proposed):
                         item["rejection"] = "完整车体粗检超出合法走廊或跨越实线"
-                if item["rejection"] is None and gain>=best_gain and proposed is not None:
-                    selected = lane; path = proposed; best_gain = gain; chosen_source = "base_lane_change"
+                if item["rejection"] is None and preferred and proposed is not None:
+                    selected = lane; path = proposed; best_gain = gain
+                    chosen_source = "navigation_lane_change" if navigation_required else "base_lane_change"
                 elif item["rejection"] is None and gain<self.p["minimum_gain_mps"]:
                     item["rejection"] = "换道收益不足"
                 candidates.append(item)

@@ -9,6 +9,7 @@ from shapely.geometry import Point, Polygon, LineString
 
 from .geometry import (clean_polyline, polyline_lengths, project_polyline,
                        sample_polyline, rectangle_corners, wrap_angle)
+from .quintic_reference import quintic_offsets, initial_lateral_state, spatial_samples
 
 
 DEFAULTS = {
@@ -26,6 +27,7 @@ def _digest(value):
 
 def build_goal_reference(scene, config=None, request_version=0):
     """冻结已确认自车导航中心线。与九宫格参考分开命名，不改变检索语义。"""
+    from .local_reference import LocalReferenceManager
     parameters = {**DEFAULTS, **(config or {}).get('local_goal', {})}
     reference = clean_polyline(scene.route).copy()
     if len(reference) < 2 or not np.isfinite(reference).all():
@@ -34,6 +36,7 @@ def build_goal_reference(scene, config=None, request_version=0):
         previous_s=scene.diagnostics.get('route_s'), heading=scene.ego.heading)
     source_lane = scene.diagnostics.get('stable_navigation_lane_id', scene.ego.lane_id)
     reported_lane=source_lane;confirmation='平台已确认车道'
+    reference_valid=True;reference_rejection=None
     confirmed=next((lane for lane in scene.lanes if lane.id==source_lane),None)
     if confirmed is not None and source_lane not in scene.route_lane_ids:
         # 环道连接重叠区的原生lane_index可能短暂落入另一公开分支。
@@ -54,14 +57,27 @@ def build_goal_reference(scene, config=None, request_version=0):
             confirmed=min(choices,key=lambda value:value[:2])[2];source_lane=confirmed.id
             confirmation='连接重叠区按公开自车导航、实际位置及朝向确认；未读取周车路线'
     if confirmed is not None:
+        if source_lane not in scene.route_lane_ids and any(
+                lane.id in scene.route_lane_ids and
+                (lane.id in (confirmed.left, confirmed.right) or confirmed.id in (lane.left, lane.right))
+                for lane in scene.lanes):
+            # 换道已确认后，模型坐标参考随实际行驶车道更新；全局出口导航不变。
+            # 不能因全局路线保留原车道ID就继续把目标解释成原中心线的偏移。
+            manager = LocalReferenceManager(config or {})
+            reference = manager._continuation(scene, confirmed, {lane.id: lane for lane in scene.lanes})
+            s, d, _ = project_polyline(scene.ego.position, reference, heading=scene.ego.heading)
+            confirmation = '已确认邻道中心，沿原公开导航分支延伸'
         foot=sample_polyline(confirmed.center,project_polyline(scene.ego.position,confirmed.center,
             heading=scene.ego.heading)[0])
         # 导航包含道路内的平滑连接段，不能要求每个点与原始折线中心完全重合。
         # 此项只检查坐标参考身份；不修改道路、车体和实体碰撞验收容差。
         deviation_limit=max(.1,(confirmed.width-scene.ego.width)/2+.1)
-        if (source_lane not in scene.route_lane_ids or
-                LineString(reference).distance(Point(foot))>deviation_limit):
-            raise ValueError('平台已确认车道与导航中心参考不一致，不能改名冒充目标参考线')
+        if LineString(reference).distance(Point(foot))>deviation_limit:
+            reference_valid=False
+            reference_rejection='平台已确认车道与导航中心参考不一致；仅保留导航诊断，不接纳本帧语义目标'
+    else:
+        reference_valid=False
+        reference_rejection='当前已确认车道缺少公开几何；不接纳本帧语义目标'
     version = scene.diagnostics.get('reference_revision', 0)
     identity = _digest({'points': reference.tolist(), 'lanes': scene.route_lane_ids,
                         'stable_lane': source_lane, 'revision': version})
@@ -70,11 +86,15 @@ def build_goal_reference(scene, config=None, request_version=0):
         'request_version': int(request_version), 'points': reference.tolist(),
         's_ego_m': float(s), 'd_ego_m': float(d), 'source_lane_id': source_lane,
         'reported_lane_id':reported_lane,'lane_confirmation':confirmation,
+        'semantic_reference_valid':reference_valid,'reference_rejection':reference_rejection,
         'source_pose': [*scene.ego.position.tolist(), float(scene.ego.heading)],
         'vehicle_constraints': {'steering_abs_max_rad':float((config or {}).get('mpc',{}).get('steering_abs_max_rad',.6)),
-            'length_m':float(scene.ego.length),'width_m':float(scene.ego.width)},
+            'length_m':float(scene.ego.length),'width_m':float(scene.ego.width),
+            'wheelbase_m':scene.ego.wheelbase_m,'rear_axle_to_center_m':scene.ego.rear_axle_to_center_m},
         'limits': parameters, 'route_lane_ids': list(scene.route_lane_ids),
-        'definition': '已确认行驶车道中心线，沿已知自车导航连续延伸；s沿道路向前，d左正右负，米'}
+        'local_reference_parameters': deepcopy(LocalReferenceManager(config or {}).p),
+        'definition': ('已确认行驶车道中心线，沿已知自车导航连续延伸；s沿道路向前，d左正右负，米'
+                       if reference_valid else '仅供诊断的已知导航参考，当前车道身份核验未通过；不允许输出可执行目标')}
 
 
 def _source_lane(scene, reference):
@@ -87,14 +107,28 @@ def _source_lane(scene, reference):
 
 def _candidate_lanes(scene, reference):
     from .local_reference import LocalReferenceManager
+    if reference.get('semantic_reference_valid',True) is not True:
+        return []
     source, lanes = _source_lane(scene, reference)
     if source is None:
         return []
-    manager = LocalReferenceManager({})
+    if 'local_reference_parameters' not in reference:
+        raise ValueError('原帧目标参考缺少局部参考参数，不能用当前默认值重解释历史目标')
+    manager = LocalReferenceManager({'local_reference': reference['local_reference_parameters']})
     result = [(source, None)]
     for key in (source.left, source.right):
         if key in lanes:
-            result.append((lanes[key], manager._legal(scene, source, lanes[key], lanes)))
+            reason = manager._legal(scene, source, lanes[key], lanes)
+            if (reason is None and key == source.right and not manager.p['allow_right_overtake']
+                    and not manager._navigation_change_needed(scene, source, lanes[key], lanes)):
+                traffic = manager._traffic(scene, None, source, check_future=False)
+                front = traffic['front']
+                actor = next((obj for obj in scene.actors if front and obj.id == front['id']), None)
+                if (actor is not None and actor.kind in ('vehicle', 'bicycle')
+                        and front['speed_mps'] + manager.p['minimum_gain_mps']
+                        < float(scene.rules.get('desired_speed', np.linalg.norm(scene.ego.velocity)))):
+                    reason = '禁止为绕过本车道慢前车主动从右侧超车；此右换道非导航必需'
+            result.append((lanes[key], reason))
     return result
 
 
@@ -120,6 +154,8 @@ def goal_reference_context(scene, reference):
             samples.append({'delta_s_m': distance,
                 'reference_bev_xy_m': [float(c*delta[0]+s*delta[1]), float(-s*delta[0]+c*delta[1])]})
     return {'frame_id': reference['frame_id'], 'time_s': reference['time'],
+        'semantic_reference_valid':reference.get('semantic_reference_valid',True),
+        'reference_rejection':reference.get('reference_rejection'),
         'reference_id': reference['reference_id'], 'reference_version': reference['reference_version'],
         'request_version': reference['request_version'], 'definition': reference['definition'],
         'source_s_ego_m': reference['s_ego_m'], 'source_d_ego_m': reference['d_ego_m'],
@@ -134,23 +170,50 @@ def goal_reference_context(scene, reference):
 
 
 def goal_seed_path(scene, goal):
-    """目标只生成本次优化初值；该几何没有跨帧缓存，也不构成第二项跟踪代价。"""
+    """目标导出的五次空间参考，同时提供初值；不规定速度或到达时间。
+
+    原输入帧冻结参考解释目标，始终经过原世界目标，不吸附。目标之后沿
+    该处合法车道平稳归中，仅提供必要道路几何。真实通过后由GoalManager
+    释放，不能把本函数结果锁成下一帧仍有效的目标。
+    """
     reference = np.asarray(goal['goal_reference']['points'], float)
     s0, d0, heading = project_polyline(scene.ego.position, reference,
         previous_s=goal.get('last_s', goal['goal_reference']['s_ego_m']), heading=scene.ego.heading)
     end = min(polyline_lengths(reference)[-1], max(goal['s_goal_m']+20., s0+120.))
-    arc = np.arange(max(0., s0-5.), end, .5)
-    arc = np.unique(np.r_[arc,s0,end])
+    arc = spatial_samples(max(0.,s0-5.),end,.5,anchors=(s0,goal['s_goal_m']))
     base = sample_polyline(reference, arc)
     headings = project_polyline(base, reference, previous_s=s0, window=160.)[2]
     normal = np.c_[-np.sin(headings), np.cos(headings)]
-    span = max(goal['s_goal_m']-s0, 1e-6)
-    u = np.clip((arc-s0)/span, 0., 1.)
-    w = 10*u**3-15*u**4+6*u**5
-    a = u-6*u**3+8*u**4-3*u**5
-    slope = np.clip(np.tan(float(wrap_angle(scene.ego.heading-heading))), -.4, .4)
-    offset = d0*(1-w)+float(goal['local_goal']['d_m'])*w+span*slope*a
-    offset=np.where(arc<s0,d0+(arc-s0)*slope,offset)
+    span = float(goal['s_goal_m']-s0)
+    if span<=1e-6:
+        raise ValueError('已纵向通过的目标不能重新生成活动参考')
+    from .local_reference import LocalReferenceManager
+    manager=LocalReferenceManager({'local_reference':goal['goal_reference']['local_reference_parameters']})
+    lanes={lane.id:lane for lane in scene.lanes}
+    target=lanes.get(goal.get('target_lane_id'))
+    center_d=np.full(len(arc),float(goal['local_goal']['d_m']))
+    if target is not None:
+        target_path=manager._continuation(scene,target,lanes)
+        target_s=project_polyline(base,target_path,heading=heading)[0]
+        target_points=sample_polyline(target_path,target_s)
+        center_d=np.sum((target_points-base)*normal,axis=1)
+    first=np.gradient(center_d,arc);second=np.gradient(first,arc)
+    sg=float(goal['s_goal_m']);dg=float(goal['local_goal']['d_m'])
+    finish=(dg,float(np.interp(sg,arc,first)),float(np.interp(sg,arc,second)))
+    start=initial_lateral_state(scene,reference,s0,d0,heading)
+    offset=quintic_offsets(arc-s0,span,start,finish)
+    before=arc<s0
+    offset[before]=start[0]+(arc[before]-s0)*start[1]+.5*(arc[before]-s0)**2*start[2]
+    # 非中心目标可以是换道中间位置；后续回中不能跳变，也不改目标本身。
+    after=arc>sg
+    tail=min(end-sg,max(20.,float(np.linalg.norm(scene.ego.velocity))*2.))
+    if after.any() and tail>1e-6:
+        final_s=sg+tail
+        final=(float(np.interp(final_s,arc,center_d)),float(np.interp(final_s,arc,first)),
+               float(np.interp(final_s,arc,second)))
+        offset[after]=quintic_offsets(arc[after]-sg,tail,finish,final)
+        finished=arc>=final_s
+        offset[finished]=center_d[finished]
     return clean_polyline(base+normal*offset[:, None])
 
 
@@ -158,6 +221,8 @@ def validate_local_goal(scene, reference, value):
     """严格原帧解释，不夹紧、不吸附、不按新帧重新加 delta_s。"""
     if not isinstance(reference, dict) or reference.get('frame_id') != scene.frame_id or reference.get('time') != scene.time:
         raise ValueError('目标参考与原模型输入帧不一致')
+    if reference.get('semantic_reference_valid',True) is not True:
+        raise ValueError(reference.get('reference_rejection') or '本帧语义目标参考无效')
     if not isinstance(value, dict) or set(value) != {'delta_s_m', 'd_m'}:
         raise ValueError('local_goal 必须且仅包含 delta_s_m 和 d_m')
     import math
@@ -182,13 +247,15 @@ def validate_local_goal(scene, reference, value):
     if abs(d-reference['d_ego_m']) > delta*limits['maximum_lateral_slope']:
         raise ValueError('目标横向位移与前向距离不满足几何可达性')
     candidates = _candidate_lanes(scene, reference)
-    target = None
+    target = None;rejected_reasons=[]
     from .local_reference import LocalReferenceManager
-    manager = LocalReferenceManager({})
+    manager = LocalReferenceManager({'local_reference': reference['local_reference_parameters']})
     _, lanes = _source_lane(scene, reference)
     best = float('inf')
     for lane, reason in candidates:
         if reason is not None:
+            if Polygon(lane.polygon).covers(Point(world)):
+                rejected_reasons.append(reason)
             continue
         # 当前车道的已核查导航含连接段；邻道只能沿相容公开后继。
         path = line if lane.id == reference['source_lane_id'] else manager._continuation(scene, lane, lanes)
@@ -201,6 +268,8 @@ def validate_local_goal(scene, reference, value):
         if abs(lateral) < best:
             best = abs(lateral); target = lane
     if target is None:
+        if rejected_reasons:
+            raise ValueError('目标被拒绝：'+'；'.join(dict.fromkeys(rejected_reasons)))
         raise ValueError('目标车体不属于合法且导航相容的车道走廊')
     payload = {'local_goal': dict(value), 'goal_reference': deepcopy(reference),
         'world_goal': world, 'target_lane_id': target.id, 's_goal_m': sg}
@@ -216,7 +285,11 @@ def validate_local_goal(scene, reference, value):
     if len(headings)>1:
         curvature=np.abs(np.diff(headings))/np.maximum((lengths[:-1]+lengths[1:])/2,1e-9)
         # 仅排除方向盘极限下也无法通过的几何弯曲；不指定通过速度或到达时间。
-        maximum=2*np.sin(np.arctan(.5*np.tan(reference['vehicle_constraints']['steering_abs_max_rad'])))/scene.ego.length
+        from .realtime_solver import bicycle_geometry
+        constraints=reference['vehicle_constraints']
+        wheelbase,rear=bicycle_geometry(constraints['length_m'],constraints.get('wheelbase_m'),
+                                       constraints.get('rear_axle_to_center_m'))
+        maximum=np.sin(np.arctan(rear/wheelbase*np.tan(constraints['steering_abs_max_rad'])))/rear
         if np.any(curvature>maximum+1e-6):
             raise ValueError('目标连接曲率超过车辆转弯几何能力')
     payload['goal_id'] = _digest({'frame_id': scene.frame_id, 'source_time': scene.time,
