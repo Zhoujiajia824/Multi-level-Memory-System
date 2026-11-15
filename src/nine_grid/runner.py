@@ -494,11 +494,15 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
                 quality=evaluate(planning_input,plan,reference,predictions,config)
                 timing['quality_s']=time.perf_counter()-stage_started
                 timing_samples['quality'].append(timing['quality_s'])
-                logger.info('仿真 %.1fs：轨迹可执行=%s，安全条件满足=%s，候选=%s，主求解=%.1fms（%s），预测=%.1fms，表示=%.1fms，参照=%.1fms，评分=%.1fms，质量=%s，预碰撞=%s，可见对象=%d',
+                logger.info('仿真 %.1fs：轨迹可执行=%s，安全条件满足=%s，候选=%s，主求解=%.1fms（%s），预测=%.1fms，表示=%.1fms，参照=%.1fms，评分=%.1fms，质量=%s，预碰撞=%s，完整场景对象=%d，实际规划对象=%d',
                     scene.time,plan.valid,plan.diagnostics.get('safety_feasible'),plan.diagnostics.get('candidate_source'),
                     timing['mpc_s']*1000,'首次' if timing['mpc_cold_start'] else '后续',
                     timing['prediction_s']*1000,timing['representations_s']*1000,timing['reference_s']*1000,
-                    timing['quality_s']*1000,quality.score,quality.precollision,len(scene.actors))
+                    timing['quality_s']*1000,quality.score,quality.precollision,len(scene.actors),len(planning_input.actors))
+                initial_failures=plan.diagnostics.get('optimizer_skipped_initial_failures',[])
+                if initial_failures:
+                    logger.warning('初态不合格项=%s；跳过无法改写初态的QP迭代，制动仍独立验收；速度证据=%s',
+                        initial_failures,plan.diagnostics.get('speed_limit_evidence'))
                 summary['quality_total']+=1
                 summary['quality_valid']+=int(quality.valid)
                 summary['safety_alarms']+=int(quality.precollision or quality.collision)
@@ -591,6 +595,8 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
                 break
     except Exception as exc:
         summary.update(termination_reason='runtime_error',error=f'{type(exc).__name__}: {exc}')
+        if adapter is not None and hasattr(adapter,'runtime_failure_report'):
+            summary['runtime_failure']=adapter.runtime_failure_report()
         logger.exception('本轮运行失败，保留现场')
     finally:
         cleanup_errors=[]

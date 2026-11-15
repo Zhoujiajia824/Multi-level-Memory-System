@@ -6,6 +6,8 @@ carla:
   host: 127.0.0.1
   port: 2000
   timeout_s: 30
+  # 显式开启后每轮都重新加载世界（同图也reload），保留50Hz同步设置。
+  # 不接管已有车辆/行人/脚本道具或同步运行的他人世界。
   allow_world_reset: false
   # sync等待本次计算后推进；async由独立时钟推进，模型在后台返回。
   runtime_mode: sync

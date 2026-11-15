@@ -302,7 +302,8 @@ class ScriptedExperiment:
         preset=getattr(self.carla.WeatherParameters,self.settings.get('weather','ClearNoon'),None)
         if preset is None:raise ValueError('CARLA不存在指定天气预设')
         self._weather=self.world.get_weather();self.world.set_weather(preset)
-        self.ego=self._spawn(self.settings['ego_blueprint'],wp,'ego',self.settings['initial_speed_mps'])
+        # 与五个基础模板相同：桥完成注册tick后按真实地图限速设置初速。
+        self.ego=self._spawn(self.settings['ego_blueprint'],wp,'ego',0.)
         behind=[];previous=wp
         for _ in range(30):
             options=[p for p in previous.previous(2.) if str(p.lane_type)=='Driving'

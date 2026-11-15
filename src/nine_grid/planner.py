@@ -835,7 +835,10 @@ class Planner:
         recovery_speed=float(p.get('warm_start_recovery_speed_mps',.3))
         recovery={'eligible':bool(warm and stop_local is None and speed<recovery_speed),
                   'speed_threshold_mps':recovery_speed,'evaluated':False,'selected':False}
-        for iteration in range(0 if _brake_only else int(p.get('solver_max_iterations',4))):
+        # 初态是已测量常量，优化未来控制不能改写它。若现有安全契约已因初态
+        # 不满足而否决所有正常候选，直接比较本帧制动，避免无意义地耗尽QP预算。
+        initial_failures=[name for name,passed in initial_safety.items() if not passed]
+        for iteration in range(0 if _brake_only or initial_failures else int(p.get('solver_max_iterations',4))):
             # 至少尝试一次QP；随后预算到期即返回已验收的本帧最佳候选。
             if iteration and time.perf_counter()>=deadline:
                 termination='wall_budget';break
@@ -963,6 +966,11 @@ class Planner:
         execution_mode=('safe_brake' if accepted.get('is_brake') else 'normal') if accepted['safety_feasible'] else 'emergency_unverified'
         elapsed=time.perf_counter()-started
         diagnostics={'solver_seconds':time.perf_counter()-solver_started,'planning_seconds':elapsed,'solver_status':statuses,
+            'optimizer_skipped_initial_failures':initial_failures,
+            'speed_limit_evidence':{'initial_speed_mps':speed,'map_rule_limit_mps':float(scene.rules.get('speed_limit',33.3333333)),
+                'configured_maximum_mps':float(p.get('maximum_speed_mps',33.3333333)),
+                'effective_hard_limit_mps':max_speed,'numerical_tolerance_mps':speed_tolerance,
+                'curvature_profile_is_hard_speed_limit':False},
             'planning_object_selection':object_selection,'execution_mode':execution_mode,
             'emergency':execution_mode=='emergency_unverified',
             'braking_release_conflicts':accepted.get('braking_release_conflicts',[]),

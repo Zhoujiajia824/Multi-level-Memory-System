@@ -6,6 +6,7 @@
 import math
 import random
 import json
+import sys
 
 
 SCENARIOS = ('slow_lead', 'hard_brake', 'cut_in', 'parked_obstacle', 'occluded_pedestrian', 'scripted_traffic')
@@ -17,6 +18,45 @@ REQUIRED_EXPERIMENT_FIELDS = frozenset(('name', 'seed', 'spawn_index', 'route_le
 OPTIONAL_EXPERIMENT_DEFAULTS = {'interaction_length_m': None, 'navigation_step_yaw_limit_deg': 30.}
 EXPERIMENT_FIELDS = REQUIRED_EXPERIMENT_FIELDS | frozenset(OPTIONAL_EXPERIMENT_DEFAULTS)
 ROUTE_SELECTION_VERSION = 'carla-local-corridor-navigation-1.1'
+
+
+def finalize_ego_initial_speed(experiment, carla):
+    """注册物理帧后初始化合法自车速度；本函数不推进世界时钟。
+
+    spawn时自车保持静止。桥在一次注册tick之后调用本函数，再以随后的
+    同步帧建立t0。地图限速尚未注册时不能拿零或自造默认值继续实验。
+    YAML的请求值不变，实际采用值和限速单独审计；不改变NPC速度策略。
+    """
+    if getattr(experiment, 'initial_speed_audit', None) is not None:
+        raise RuntimeError('自车初始速度已经初始化；禁止在运行中重复设置目标速度')
+    requested = experiment.settings.get('initial_speed_mps', 10.)
+    if type(requested) not in (int, float) or not math.isfinite(requested) or requested < 0:
+        raise ValueError('自车请求初始速度必须为有限非负m/s')
+    limit_kmh = experiment.ego.get_speed_limit()
+    if type(limit_kmh) not in (int, float) or not math.isfinite(limit_kmh) or limit_kmh <= 0:
+        raise ValueError('自车注册帧后的CARLA地图限速未就绪或非法：{}；不补默认限速'.format(limit_kmh))
+    limit_mps = float(limit_kmh) / 3.6
+    applied = min(float(requested), limit_mps)
+    forward = experiment.ego.get_transform().get_forward_vector()
+    values = (forward.x, forward.y, forward.z)
+    norm = math.sqrt(sum(value*value for value in values))
+    if not all(math.isfinite(value) for value in values) or not math.isfinite(norm) or norm <= 0:
+        raise ValueError('自车注册帧的前向向量非法，不能初始化速度')
+    experiment.ego.set_target_velocity(carla.Vector3D(
+        x=applied*forward.x/norm, y=applied*forward.y/norm, z=applied*forward.z/norm))
+    audit = {'version': 'carla-legal-initial-speed-1.0',
+        'requested_initial_speed_mps': float(requested),
+        'applied_initial_speed_mps': applied,
+        'map_speed_limit_mps': limit_mps, 'map_speed_limit_kmh': float(limit_kmh),
+        'limited_by_map': applied < float(requested),
+        'source': 'CARLA.Vehicle.get_speed_limit_after_registration_tick',
+        'policy': 'min(requested_initial_speed,map_speed_limit);yaml_unchanged',
+        'scope': 'initialization_only;not_an_online_control_or_speed_recovery'}
+    experiment.initial_speed_audit = audit
+    experiment.events.append(dict(audit, event='ego_initial_speed_applied'))
+    print('自车初始速度：请求{:.6f}m/s，地图限速{:.6f}m/s，实际设置{:.6f}m/s；YAML请求值保留。'.format(
+        requested, limit_mps, applied), file=sys.stderr, flush=True)
+    return dict(audit)
 
 
 def _distance(a, b):
@@ -317,7 +357,8 @@ class Experiment:
         idx, wp, self.forward_route, lead_wp = selected
         self.selected_spawn_index = idx
         self.ego = self._spawn(self.settings.get('ego_blueprint', 'vehicle.tesla.model3'), wp,
-                               float(self.settings.get('initial_speed_mps', 10.)), role='ego')
+                               0., role='ego')
+        # 初速必须等桥完成注册tick、获得当前地图限速后再统一设置。
         # 自车已知导航参考延伸到后方；不读取周车目标车道或私有路线。
         behind, prev = [], wp
         for _ in range(30):

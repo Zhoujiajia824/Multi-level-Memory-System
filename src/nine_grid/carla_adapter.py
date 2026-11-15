@@ -32,6 +32,8 @@ class BridgeProcess:
         self.queue = queue.Queue()
         self.counter = 0
         self.closed = False
+        self.failed = False
+        self.last_error = None
         self.stderr = open(Path(output_dir) / 'carla_bridge.log', 'a', encoding='utf-8')
         script = Path(bridge_script) if bridge_script else Path(__file__).with_name('carla_bridge.py')
         try:
@@ -52,6 +54,8 @@ class BridgeProcess:
     def call(self, method, **params):
         if self.closed:
             raise RuntimeError('CARLA 桥已关闭')
+        if self.failed:
+            raise RuntimeError('CARLA 桥已失败，不能继续提交操作；等待独立进程清理')
         self.counter += 1
         identity = self.counter
         try:
@@ -60,16 +64,26 @@ class BridgeProcess:
             self.process.stdin.flush()
             response = self.queue.get(timeout=self.timeout)
         except (OSError, queue.Empty) as exc:
+            self.failed = True
+            self.last_error = {'method': method, 'error': type(exc).__name__}
             raise RuntimeError('CARLA 桥通信失败或超时；详见 carla_bridge.log') from exc
         if response is None:
+            self.failed = True
+            self.last_error = {'method': method, 'error': 'SDK桥提前退出'}
             raise RuntimeError('CARLA SDK 桥提前退出；请检查 SDK 环境与 carla_bridge.log')
         try:
             result = json.loads(response)
         except ValueError as exc:
+            self.failed = True
+            self.last_error = {'method': method, 'error': 'SDK桥响应JSON无效'}
             raise RuntimeError('CARLA 桥输出不是有效 JSON') from exc
-        if result.get('id') != identity:
+        if not isinstance(result, dict) or result.get('id') != identity:
+            self.failed = True
+            self.last_error = {'method': method, 'error': 'SDK桥响应序号不一致'}
             raise RuntimeError('CARLA 桥响应序号不一致，拒绝混用迟到结果')
         if 'error' in result:
+            self.failed = True
+            self.last_error = {'method': method, 'error': result['error']}
             raise RuntimeError('CARLA 适配失败：' + result['error'])
         return result['result']
 
@@ -412,11 +426,30 @@ class CarlaAdapter:
 
     def pause_runtime(self):
         """轮末先暂停世界，再等待已接纳模型/反思任务收尾。"""
-        if self.bridge is not None and not self.closed:
-            raw = self.bridge.call('pause')
-            self._ingest_display_frames(raw)
+        try:
+            if self.bridge is not None and not self.closed and not getattr(self.bridge, 'closed', False):
+                if getattr(self.bridge, 'failed', False):
+                    # SDK桥报错后会退出请求循环并在finally释放世界，不能再向它发pause。
+                    self.bridge.close()
+                else:
+                    raw = self.bridge.call('pause')
+                    self._ingest_display_frames(raw)
+        finally:
+            # 即使最后一次步进失败，初始化时已经收到的真实RGB也必须归档为录像。
             if self._recorder is not None and self._display_frames:
                 self._recorder._capture_frame()
+
+    def runtime_failure_report(self):
+        """失败帧单独报告，不将未完成控制周期冒充成功执行步。"""
+        report = {'bridge_error': copy.deepcopy(getattr(self.bridge, 'last_error', None))}
+        path = self.output_dir / 'camera_sync_failure.json' if self.output_dir is not None else None
+        if path is not None and path.is_file():
+            try:
+                report['camera_sync'] = json.loads(path.read_text(encoding='utf-8'))
+                report['diagnostic_path'] = str(path)
+            except (OSError, ValueError) as exc:
+                report['diagnostic_read_error'] = type(exc).__name__
+        return report
 
     def _initialize(self):
         if self.output_dir is None:
