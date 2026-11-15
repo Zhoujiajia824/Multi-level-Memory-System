@@ -16,12 +16,13 @@ import zlib
 
 import numpy as np
 from PIL import Image, ImageDraw
-from shapely.geometry import Polygon, Point, LineString, box
+from shapely.geometry import Polygon, Point, LineString
 from shapely.ops import unary_union
 
 from .contracts import Actor, Lane, SceneSnapshot, plain
+from .paths import filesystem_path
 from .carla_bridge import camera_storage_due
-from .geometry import actor_shape, clean_polyline, ego_to_world, polyline_lengths, project_polyline, sample_polyline
+from .geometry import actor_shape, clean_polyline, polyline_lengths, project_polyline, sample_polyline
 
 
 class BridgeProcess:
@@ -98,13 +99,6 @@ class BridgeProcess:
             raise RuntimeError('CARLA SDK桥未正常收尾（退出码{}）；请检查carla_bridge.log及独立世界残留资源'.format(self.process.returncode))
 
 
-def decode_depth(path):
-    """兼容读取已有原始深度资产；新运行不再写入或依赖深度图片。"""
-    with Image.open(path) as source:
-        rgb = np.asarray(source.convert('RGB'), dtype=np.float64)
-    return (rgb[:, :, 0] + 256 * rgb[:, :, 1] + 65536 * rgb[:, :, 2]) * (1000. / 16777215.)
-
-
 def _camera_bgra(camera, key, label):
     """严格解码单帧临时图像；控制长度并检查标定、帧号及时间戳。"""
     payload = camera[key]
@@ -135,19 +129,6 @@ def _camera_bgra(camera, key, label):
     return np.frombuffer(raw,dtype=np.uint8).reshape(height,width,4)
 
 
-def camera_depth(camera):
-    """同帧临时BGRA深度解码；缺证据/损坏不静默回退旧文件。"""
-    if 'depth_transport' not in camera:
-        if 'depth_path' not in camera:
-            raise ValueError('相机缺少临时深度观测证据')
-        depth = decode_depth(camera['depth_path'])
-        if depth.shape != (camera['height'], camera['width']):
-            raise ValueError('已有深度资产尺寸与相机不一致')
-        return depth
-    bgra = _camera_bgra(camera, 'depth_transport', '深度').astype(np.float64)
-    return (bgra[:,:,2]+256*bgra[:,:,1]+65536*bgra[:,:,0])*(1000./16777215.)
-
-
 def camera_rgb(camera):
     """原始BGRA只换通道为RGB，不拉伸/调色；显式旧路径仅供旧资产和fixture读取。"""
     if 'rgb_transport' in camera:
@@ -162,70 +143,18 @@ def camera_rgb(camera):
 
 
 def retained_camera_metadata(camera):
-    """只保留RGB路径及标定/观测来源；RGB/深度临时载荷均不进入落盘资产。"""
+    """只保留RGB路径及标定；临时传输载荷不进入落盘资产。"""
     keys = ('view','rgb_path','width','height','fov_deg','frame','timestamp',
-            'world_to_camera_ue','camera_to_world_ue','depth_frame','depth_timestamp','depth_encoding',
+            'world_to_camera_ue','camera_to_world_ue',
             'rgb_saved','rgb_postprocess_effects')
     result = {key:copy.deepcopy(camera[key]) for key in keys if key in camera}
-    result['depth_retention'] = 'not_saved_by_current_run'
     return result
-
-
-def observed_geometry(ego, cameras, cfg):
-    """多个高度和格角均有相机深度支持才确认空区，保留盲区孔洞。"""
-    resolution = float(cfg.get('observation_resolution_m', 1.0))
-    if not np.isfinite(resolution) or resolution <= .02 or resolution > 2:
-        raise ValueError('观测掩码网格边长必须位于 (0,2] 米')
-    # 检索画布固定；画布之外当前可见实体仍留在规划集合。
-    xs, ys = np.arange(-30., 70., resolution), np.arange(-25., 25., resolution)
-    xx, yy = np.meshgrid(xs, ys, indexing='ij')
-    centers = np.stack((xx.ravel(), yy.ravel()), axis=1)
-    all_known = np.ones(len(centers), dtype=bool)
-    heights = cfg.get('observation_heights_m', [.2, .8])
-    tolerance = float(cfg.get('depth_empty_tolerance_m', .05))
-    if not isinstance(heights, list) or not heights or not all(np.isfinite(h) and h >= 0 for h in heights):
-        raise ValueError('观测高度必须是非空的有限非负米值列表')
-    if not np.isfinite(tolerance) or tolerance < 0:
-        raise ValueError('深度空区容差必须为有限非负米值')
-    world_origin_z = float(ego['origin_z'])
-    prepared = [(c, camera_depth(c)) for c in cameras]
-    for offset in ([.01, .01], [resolution - .01, .01], [.01, resolution - .01], [resolution - .01, resolution - .01]):
-        world = ego_to_world(centers + offset, np.asarray(ego['position']), float(ego['heading']))
-        for height in heights:
-            points = np.c_[world[:, 0], -world[:, 1], np.full(len(world), world_origin_z + height), np.ones(len(world))]
-            visible = np.zeros(len(points), dtype=bool)
-            for camera, depth in prepared:
-                transformed = points @ np.asarray(camera['world_to_camera_ue'], float).T
-                forward = transformed[:, 0]
-                focal = camera['width'] / (2 * np.tan(np.deg2rad(camera['fov_deg']) / 2))
-                safe_forward = np.maximum(forward, .001)
-                u = camera['width'] / 2 + focal * transformed[:, 1] / safe_forward
-                v = camera['height'] / 2 - focal * transformed[:, 2] / safe_forward
-                valid = (forward > .05) & (u >= 1) & (u < camera['width'] - 1) & (v >= 1) & (v < camera['height'] - 1)
-                indexes = np.flatnonzero(valid)
-                measured = depth[v[indexes].astype(int), u[indexes].astype(int)]
-                # 不把天际饱和/无有效深度当作确认空，深度容差仅消除编码误差。
-                visible[indexes] |= (measured >= forward[indexes] + tolerance) & (measured < 999.)
-            all_known &= visible
-    known = all_known.reshape(len(xs), len(ys))
-    parts = []
-    for i, row in enumerate(known):
-        starts = np.flatnonzero(np.diff(np.r_[False, row].astype(int)) == 1)
-        ends = np.flatnonzero(np.diff(np.r_[row, False].astype(int)) == -1)
-        for start, end in zip(starts, ends):
-            corners = np.array([[xs[i], ys[start]], [xs[i] + resolution, ys[start]],
-                                [xs[i] + resolution, ys[end] + resolution], [xs[i], ys[end] + resolution]])
-            parts.append(Polygon(ego_to_world(corners, np.asarray(ego['position']), ego['heading'])))
-    return unary_union(parts), {'method': 'same_frame_depth_multiple_height_cell_corners',
-        'resolution_m': resolution, 'height_above_actor_origin_m': heights,
-        'confirmed_fraction': float(known.mean()), 'depth_tolerance_m': tolerance,
-        'limitation': '平面道路深度几何近似；保守盲区不补空，需真实传感器验证'}
 
 
 class CameraVideoRecorder:
     """六相机拼图录像；完成后实际解码核查，不把write调用数当成有效视频证据。"""
     def __init__(self, adapter, path):
-        self.adapter, self.path = adapter, Path(path)
+        self.adapter, self.path = adapter, filesystem_path(path)
         self.requested_path = self.path
         self.writer = None
         self.frames = 0
@@ -241,7 +170,7 @@ class CameraVideoRecorder:
         self.first_frame = None
         self.encoder_attempts = []
         self.status_path = self.path.parent / 'video_recording.json'
-        if not math.isfinite(float(adapter.planner_hz)) or adapter.planner_hz <= 0:
+        if not math.isfinite(float(adapter.camera_hz)) or adapter.camera_hz <= 0:
             raise ValueError('CARLA录像帧率必须为有限正数')
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._save_status()
@@ -258,7 +187,7 @@ class CameraVideoRecorder:
                 raise RuntimeError('CARLA录像路径已存在，拒绝覆盖：'+str(path))
             try:
                 candidate = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*codec),
-                                            self.adapter.planner_hz, size)
+                                            self.adapter.camera_hz, size)
             except cv2.error as exc:
                 self.encoder_attempts.append({'codec': codec, 'path': str(path), 'opened': False,
                                               'error': str(exc)})
@@ -270,7 +199,7 @@ class CameraVideoRecorder:
                 self.writer, self.path, self.codec, self.size = candidate, path, codec, size
                 self.status = 'recording'
                 logging.getLogger(__name__).info('CARLA录像开始：%s，编码=%s，%s，%.1f帧/秒',
-                    self.path, codec, size, self.adapter.planner_hz)
+                    self.path, codec, size, self.adapter.camera_hz)
                 self._save_status()
                 return
             candidate.release()
@@ -281,9 +210,26 @@ class CameraVideoRecorder:
         if self.closed:
             raise RuntimeError('CARLA录像已关闭，不能继续写帧')
         try:
+            packets = self.adapter._take_display_frames()
+            if not packets:
+                return False
+            captured = False
+            for packet in packets:
+                image, display = self.adapter._render_packet(packet)
+                captured = self._write_frame(image, packet['frame'], display) or captured
+            return captured
+        except Exception as exc:
+            self.status, self.error = 'failed', str(exc)
+            self._save_status()
+            raise
+
+    def _write_frame(self, image, frame, display):
+        try:
             import cv2
-            image = self.adapter.render()
             if image is None:
+                # 非RGB终止帧允许没有图像，不能重复旧图伪装新采集。
+                if self.adapter._raw.get('runtime',{}).get('terminal_reason'):
+                    return False
                 raise RuntimeError('CARLA未提供录像RGB画面')
             image = np.asarray(image)
             if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
@@ -291,8 +237,6 @@ class CameraVideoRecorder:
             size = (image.shape[1], image.shape[0])
             if any(length <= 0 or length % 2 for length in size):
                 raise ValueError('CARLA录像尺寸必须为正偶数')
-            raw = self.adapter._raw
-            frame = raw.get('frame') if isinstance(raw, dict) else None
             if type(frame) is not int:
                 raise ValueError('CARLA录像帧缺少有效仿真帧号')
             if self.last_frame is not None:
@@ -307,11 +251,10 @@ class CameraVideoRecorder:
                 raise ValueError('同一轮CARLA录像不能改变画面尺寸')
             self.writer.write(cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
             self.frames += 1
-            display = getattr(self.adapter, 'display_metadata', lambda: {})()
             self.frames_with_plan += int(bool(display.get('plan_overlay', False)))
             self.first_frame = frame if self.first_frame is None else self.first_frame
             self.last_frame = frame
-            if self.frames == 1 or self.frames % max(1, round(self.adapter.planner_hz)) == 0:
+            if self.frames == 1 or self.frames % max(1, round(self.adapter.camera_hz)) == 0:
                 self._save_status()
             return True
         except Exception as exc:
@@ -339,8 +282,8 @@ class CameraVideoRecorder:
                 if not capture.isOpened():
                     raise RuntimeError('CARLA录像文件无法打开，未通过可播放检查')
                 fps = float(capture.get(cv2.CAP_PROP_FPS))
-                if not math.isfinite(fps) or abs(fps-self.adapter.planner_hz) > .01:
-                    raise RuntimeError('CARLA录像帧率与仿真规划频率不一致')
+                if not math.isfinite(fps) or abs(fps-self.adapter.camera_hz) > .01:
+                    raise RuntimeError('CARLA录像帧率与RGB采集频率不一致')
                 while True:
                     okay, image = capture.read()
                     if not okay:
@@ -361,16 +304,17 @@ class CameraVideoRecorder:
             self._save_status()
 
     def metadata(self):
-        return {'path': str(self.path), 'frames': self.frames, 'fps': self.adapter.planner_hz,
+        return {'path': str(self.path), 'frames': self.frames, 'fps': self.adapter.camera_hz,
                 'requested_path': str(self.requested_path), 'status': self.status, 'error': self.error,
                 'size': self.size, 'codec': self.codec, 'decoded_frames': self.decoded_frames,
                 'playback_verified': self.status == 'complete', 'duplicate_frames_skipped': self.duplicate_frames,
                 'first_carla_frame': self.first_frame, 'last_carla_frame': self.last_frame,
                 'encoder_attempts': self.encoder_attempts, 'status_path': str(self.status_path),
-                'source': 'CARLA_synchronized_six_camera_mosaic',
-                'encoded_duration_s': self.frames / self.adapter.planner_hz,
+                'source': 'CARLA_same_frame_six_rgb_10hz',
+                'encoded_duration_s': self.frames / self.adapter.camera_hz,
                 'plan_overlay': self.frames_with_plan > 0, 'frames_with_plan': self.frames_with_plan,
-                'note': '六相机RGB拼图显示副本可叠加MPC规划线；原始模型图像不被修改；播放时长按仿真时间，不包含模型等待耗时'}
+                'display_frames_dropped': self.adapter._display_frames_dropped,
+                'note': '实际10Hz六相机RGB；规划1/2/10Hz均消费独立图像队列；不补帧。丢帧单列，编码时长不代替仿真时长；原始图片1Hz归档'}
 
 
 class CarlaAdapter:
@@ -381,12 +325,25 @@ class CarlaAdapter:
         self.cfg = copy.deepcopy(config.get('carla', {}))
         self.seed, self.episode_id, self.live = seed, episode_id, live
         self.planner_hz = float(config.get('clock', {}).get('planner_hz', 10))
+        if self.planner_hz not in (1., 2., 10.):
+            raise ValueError('CARLA规划频率只支持1、2、10Hz')
+        self.camera_hz = float(self.cfg.get('camera_hz',10))
+        self.runtime_mode = self.cfg.get('runtime_mode','sync')
+        if self.runtime_mode not in ('sync','async'):
+            raise ValueError('CARLA运行模式必须为sync或async')
         self.dt = 1. / self.planner_hz
         self.cfg.update(physics_hz=int(config.get('clock', {}).get('physics_hz', 50)), planner_hz=int(self.planner_hz))
-        for key in ('acceleration_min_mps2', 'acceleration_max_mps2', 'steering_abs_max_rad'):
+        for key in ('acceleration_min_mps2', 'acceleration_max_mps2', 'steering_abs_max_rad', 'steering_rate_abs_max_radps'):
             if key in config.get('mpc', {}):
                 self.cfg[key] = config['mpc'][key]
         self.cfg['perception_radius_m'] = config.get('perception', {}).get('radius_m', 120.)
+        self.cfg['duration_s'] = float(config.get('duration',config.get('clock',{}).get('episode_seconds',30)))
+        from .carla_sensor_policy import sensor_policy
+        self._sensor_policy=sensor_policy(
+            fast_enabled=config.get('models',{}).get('fast_backend','off')!='off',
+            reflection_enabled=config.get('models',{}).get('reflection_backend','off')!='off',
+            live=bool(live))
+        self.cfg.update(self._sensor_policy)
         self.bridge_factory = bridge_factory
         self.bridge = None
         self.output_dir = None
@@ -399,9 +356,13 @@ class CarlaAdapter:
         self._planned = None
         self._recorder = None
         self._mosaic = None
+        self._display_frames = []
+        self._display_frames_dropped = 0
         self._representation_capture_enabled = True
         self._display_info = {'plan_overlay':False,'plan_segments':0}
         self._step = 0
+        self._last_cycle_frame = None
+        self._observation_wait_s = 0.
         self._confirmed_lane = None
         self._pending_lane = None
         self._pending_since = None
@@ -412,16 +373,50 @@ class CarlaAdapter:
     def set_output_directory(self, path):
         if self.bridge is not None:
             raise RuntimeError('CARLA 连接后不能更换资产目录')
-        self.output_dir = Path(path).resolve()
+        self.output_dir = filesystem_path(path)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def set_representation_capture_enabled(self, enabled):
-        """只控制检索用完整空区证据；对象可见性仍由同帧深度逐实体确认。"""
+        """纯基础规划不构建OCC证据；对象输入始终采用范围真值。"""
         if type(enabled) is not bool:
             raise ValueError('表示采集开关必须为布尔值')
         if self.bridge is not None:
             raise RuntimeError('必须在CARLA初始化前确定表示采集模式')
         self._representation_capture_enabled = enabled
+
+    def set_sensor_policy(self, policy):
+        """相机由实际消费者启用；必须早于SDK连接，禁止运行时偷偷扩充。"""
+        if self.bridge is not None:
+            raise RuntimeError('必须在CARLA初始化前确定相机消费者')
+        if not isinstance(policy,dict) or policy.get('depth_enabled') is not False:
+            raise ValueError('传感器策略必须明确禁用深度')
+        self._sensor_policy=copy.deepcopy(policy)
+        self.cfg.update(self._sensor_policy)
+        self.camera_hz=float(policy['rgb_hz'])
+
+    def begin_cycle(self):
+        """异步循环只在入口取得一次冻结观测；同轮其他读取不拼接新状态。"""
+        if self.bridge is None:
+            self._initialize()
+        self._observation_wait_s=0.
+        if self.runtime_mode=='async' and self._last_cycle_frame is not None:
+            started=time.perf_counter()
+            raw=self.bridge.call('observe',after_frame=self._last_cycle_frame)
+            self._ingest_display_frames(raw)
+            self._observation_wait_s=time.perf_counter()-started
+            self._raw,self._snapshot=raw,None
+        result=self.snapshot()
+        result.diagnostics.setdefault('adapter_timing',{})['observation_wait_s']=self._observation_wait_s
+        self._last_cycle_frame=self._raw['frame']
+        return result
+
+    def pause_runtime(self):
+        """轮末先暂停世界，再等待已接纳模型/反思任务收尾。"""
+        if self.bridge is not None and not self.closed:
+            raw = self.bridge.call('pause')
+            self._ingest_display_frames(raw)
+            if self._recorder is not None and self._display_frames:
+                self._recorder._capture_frame()
 
     def _initialize(self):
         if self.output_dir is None:
@@ -430,6 +425,7 @@ class CarlaAdapter:
             timeout_s=float(self.cfg.get('timeout_s', 30)) * 2 + 10)
         try:
             raw = self.bridge.call('init', config=self.cfg, directory=str(self.output_dir), seed=int(self.seed))
+            self._ingest_display_frames(raw)
             mapping = raw.pop('map')
             self.lanes = [Lane(**{**item, 'center': np.asarray(item['center'], float), 'polygon': np.asarray(item['polygon'], float),
                 'boundaries': [{**b, 'points': np.asarray(b['points'], float)} for b in item.get('boundaries', [])]}) for item in mapping['lanes']]
@@ -453,6 +449,38 @@ class CarlaAdapter:
             except Exception as cleanup:
                 original.add_note('另有清理异常：' + str(cleanup))
             raise
+
+    def _ingest_display_frames(self, raw):
+        """图像批次从RPC抽离，不进入场景真值/记忆资产或无限堆积。"""
+        packets = raw.pop('display_frames', [])
+        if not isinstance(packets, list):
+            raise ValueError('CARLA显示帧批次必须为列表')
+        if self._recorder is None:
+            # 独立observer持续取流；主线程预览显示本轮最新冻结图像。
+            return
+        self._display_frames.extend(packets)
+        capacity = int(self.cfg.get('display_queue_frames', 50))
+        if len(self._display_frames) > capacity:
+            count = len(self._display_frames)-capacity
+            self._display_frames_dropped += count
+            del self._display_frames[:count]
+        bridge_count = raw.get('runtime', {}).get('live', {}).get('display_frames_dropped', 0)
+        self._display_frames_dropped = max(self._display_frames_dropped, int(bridge_count))
+
+    def _take_display_frames(self):
+        self.snapshot()
+        packets, self._display_frames = self._display_frames, []
+        return packets
+
+    def _render_packet(self, packet):
+        from .carla_display import plan_mosaic_overlay
+        mosaic = np.asarray(self._build_mosaic(packet['cameras']))
+        visualization = packet.get('plan_visualization', {})
+        image, segments = (plan_mosaic_overlay(mosaic, packet['cameras'], visualization)
+            if self.cfg.get('display_plan_overlay', True) else (mosaic, 0))
+        display = {'plan_overlay': segments > 0, 'plan_segments': segments,
+                   'capture_carla_frame': packet['frame']}
+        return image, display
 
     def _convert_actor(self, value):
         fields = {key: value[key] for key in ('id', 'kind', 'heading', 'length', 'width', 'lane_id', 'visible', 'radius')}
@@ -535,6 +563,7 @@ class CarlaAdapter:
             self._initialize()
         if self._snapshot is not None:
             return self._snapshot
+        build_started=time.perf_counter()
         raw = self._raw
         ego = self._convert_actor(raw['ego'])
         actors = [self._convert_actor(a) for a in raw['actors']]
@@ -542,7 +571,10 @@ class CarlaAdapter:
         self._confirm_lane(ego, timestamp)
         history_cfg = self.config.get('clock', {})
         history_window = float(history_cfg.get('history_seconds', 3.))
-        if timestamp + 1e-8 >= self._next_history:
+        if 'observed_history' in raw:
+            # SDK物理tick采集的2Hz因果历史，不用1Hz规划快照补造中间样本。
+            self._history=copy.deepcopy(raw['observed_history'])
+        elif timestamp + 1e-8 >= self._next_history:
             for actor in [ego] + actors:
                 self._history.setdefault(actor.id, []).append({'time': timestamp, 'position': actor.position.tolist(),
                     'velocity': actor.velocity.tolist(), 'acceleration': actor.acceleration.tolist(),
@@ -555,30 +587,42 @@ class CarlaAdapter:
         for actor in [ego] + actors:
             actor.history = copy.deepcopy(self._history.get(actor.id, []))
         self._route_s = project_polyline(ego.position, self.route, self._route_s, ego.heading)[0]
+        applied_evidence=raw.get('last_applied_control')
+        if isinstance(applied_evidence,dict):
+            applied_evidence=applied_evidence.get('control')
+        if applied_evidence is not None:
+            applied=np.asarray(applied_evidence,float)
+            if applied.shape!=(2,) or not np.isfinite(applied).all():
+                raise ValueError('实际执行控制必须是有限[a,delta]')
+            self._previous_control=applied.copy()
+        policy='range_limited_ground_truth_no_occlusion-1.0'
         if self._representation_capture_enabled:
-            observed, observation_audit = observed_geometry(raw['ego'], raw['cameras'], self.cfg)
-            observation_audit['depth_storage'] = 'runtime_only; retained_RGB_and_observation_mask'
-            # 已确认部分可见对象按既定权限提供完整框；框外遮挡仍为未知。
+            radius=float(self.cfg['perception_radius_m'])
+            observed=Point(ego.position).buffer(radius,quad_segs=128)
+            # 范围内真值对象提供完整框，范围之外保持未知；没有遮挡计算。
             observed = unary_union([observed, actor_shape(ego)] + [actor_shape(a) for a in actors])
-            observation_audit['visible_body_support'] = '允许部分可见对象的完整几何框；不填补框外遮挡'
+            observation_audit={'method':policy,'version':policy,'radius_m':radius,
+                'valid':True,'occlusion_tested':False,'depth_sensor_count':0,
+                'limitation':'规定范围内完整真值输入，不能等同于真实相机可见或感知系统输出'}
             observed_wkt = observed.wkt
         else:
             # 纯基础规划不消费OCC空区证据。None表示未计算，不能伪造为空或满覆盖。
             observed_wkt = None
             observation_audit = {'method':'not_computed_for_pure_base', 'valid':False,
-                'reason':'纯基础规划未构建检索空区掩码；对象同帧深度可见性保持不变',
-                'depth_storage':'runtime_only; no_occupancy_observation_geometry'}
-        frame_id = '{}:{:06d}'.format(self.episode_id, self._step)
-        mosaic = self._build_mosaic(raw['cameras'])
-        self._mosaic = np.asarray(mosaic)
-        saved = camera_storage_due(timestamp, self.cfg.get('camera_save_hz', 1))
+                'reason':'纯基础规划不消费空区掩码；对象按范围真值提供，不判断遮挡',
+                'input_policy':policy,'occlusion_tested':False,'depth_sensor_count':0}
+        frame_id = '{}:{:06d}'.format(self.episode_id, raw['frame'])
+        cameras=raw.get('cameras',[])
+        mosaic = self._build_mosaic(cameras) if cameras else None
+        self._mosaic = np.asarray(mosaic) if mosaic is not None else None
+        saved = bool(cameras) and camera_storage_due(timestamp, self.cfg.get('camera_save_hz', 1))
         for camera in raw['cameras']:
             if 'rgb_saved' in camera and camera['rgb_saved'] is not saved:
                 raise ValueError('SDK桥RGB落盘时刻与快模型原帧时钟不一致')
         camera_images, originals = [], []
         manifest_path, state_path = None, None
         if saved:
-            # 仅t=0,1,2…源帧留下核查资产；当前RGB/深度载荷始终只在内存使用。
+            # 只保存实际1Hz源帧，不重复旧图，也不创建深度资产。
             originals = [camera.get('rgb_path') for camera in raw['cameras']]
             if not all(isinstance(path,str) and Path(path).is_file() for path in originals):
                 raise ValueError('源帧缺少完整的六路原始RGB资产')
@@ -589,11 +633,12 @@ class CarlaAdapter:
             retained_cameras = [retained_camera_metadata(camera) for camera in raw['cameras']]
             manifest = {'frame_id': frame_id, 'time': timestamp, 'carla_frame': raw['frame'],
                 'carla_timestamp': raw['timestamp'], 'cameras': retained_cameras,
-                'calibration_version': 'carla-pinhole-rgb-depth-1.0',
-                'storage_version': 'carla-rgb-sampled-1.1', 'camera_save_hz': 1}
+                'calibration_version': 'carla-pinhole-rgb-2.0',
+                'storage_version': 'carla-rgb-source-1hz-2.0', 'camera_save_hz': 1,
+                'sensor_policy':self._sensor_policy,'observation_policy':policy}
             manifest_path = folder / 'manifest.json'
             manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, allow_nan=False), encoding='utf-8')
-            retained_raw = {**raw, 'cameras': retained_cameras, 'storage_version': 'carla-rgb-sampled-1.1',
+            retained_raw = {**raw, 'cameras': retained_cameras, 'storage_version': 'carla-rgb-source-1hz-2.0',
                 'camera_save_hz': 1, 'observed_support_wkt': observed_wkt, 'observation_evidence': observation_audit}
             state_path = folder / 'current_observed_state.json'
             state_path.write_text(json.dumps(retained_raw, ensure_ascii=False, allow_nan=False), encoding='utf-8')
@@ -638,11 +683,16 @@ class CarlaAdapter:
             'actual_actuation': raw.get('actual_actuation'), 'control_response': raw.get('control_response'),
             'scenario_events': raw.get('events', []), 'acceleration_source': raw['ego'].get('state_sources'),
             'scenario_template': raw.get('scenario', 'custom'),
+            'observation_policy':policy,'sensor_policy':copy.deepcopy(self._sensor_policy),
+            'runtime':copy.deepcopy(raw.get('runtime',{})),
+            'bridge_timing':copy.deepcopy(raw.get('bridge_timing',{})),
+            'cycle_result':self._result(raw),
             'environment_obstacles': raw.get('environment_obstacles', {}),
             'weather': raw.get('weather', {}), 'weather_source': raw.get('weather_source', 'unknown'),
-            'camera_storage': {'version': 'carla-rgb-sampled-1.1', 'save_hz': 1, 'saved': saved,
+            'camera_storage': {'version': 'carla-rgb-source-1hz-2.0', 'save_hz': 1, 'saved': saved,
                                'runtime_frame': raw['frame'], 'runtime_time': timestamp},
-            'platform_limitations': ['同层平面道路；不推断未提供的路权', '深度几何可见性近似，未执行真实服务器验证']}
+            'platform_limitations': ['同层平面道路；不推断未提供的路权',
+                '范围内真值输入，不判断遮挡，不等同于真实传感器感知；尚待服务器实测']}
         self._snapshot = SceneSnapshot(frame_id, timestamp, ego, actors, self.lanes, self.route,
             self.route_lane_ids, self.drivable, 'carla', rules=rules,
             assets={'camera_images': camera_images,
@@ -652,6 +702,9 @@ class CarlaAdapter:
                     'current_state_json': str(state_path.resolve()) if state_path else None,
                     'physical_lane_centers': {l.id: l.center for l in self.lanes}, 'bev_drivable': self.drivable},
             diagnostics=diagnostics)
+        self._snapshot.diagnostics['adapter_timing']={
+            'snapshot_build_s':time.perf_counter()-build_started,
+            'observation_wait_s':self._observation_wait_s}
         return self._snapshot
 
     @staticmethod
@@ -673,29 +726,61 @@ class CarlaAdapter:
             draw.text((x + 4, y + 3), name, fill='white')
         return mosaic
 
-    def step(self, control):
-        current = self.snapshot()
-        values = np.asarray(control, float)
-        if values.shape != (2,) or not np.isfinite(values).all():
-            raise ValueError('CARLA 控制必须是有限的[a,delta]')
-        raw = self.bridge.call('step', control=values.tolist(), plan=self._planned)
-        expected = current.time + self.dt
-        if abs(raw['time'] - expected) > 1e-5 or raw['frame'] <= self._raw['frame']:
-            raise RuntimeError('CARLA 世界步进时间或帧号不符合固定步长')
-        self._previous_control = values.copy()
-        self._raw, self._snapshot = raw, None
-        self._step += 1
+    def _result(self,raw):
+        """控制提交和独立时钟观测采用相同的终态与导航审计。"""
         ego = self._convert_actor(raw['ego'])
         progress, lateral, _ = project_polyline(ego.position, self.route, self._route_s, ego.heading)
         offroad = not self.drivable.buffer(float(self.config.get('mpc', {}).get('body_constraint_tolerance_m', .001))).covers(actor_shape(ego))
         collision = bool(raw['collision'])
         arrival = progress >= self._goal_s and abs(lateral) < 2.5 and not collision and not offroad
-        timeout = raw['time'] >= float(self.config.get('duration', self.config.get('clock', {}).get('episode_seconds', 30))) - 1e-8
-        return {'terminated': collision or arrival or timeout, 'collision': collision, 'arrival': arrival,
-            'offroad': offroad, 'timeout': timeout, 'time': raw['time'], 'progress': progress+self._progress_offset,
-            'reason': 'collision' if collision else 'arrival' if arrival else 'timeout' if timeout else 'running',
+        timeout = raw['time'] >= self.cfg['duration_s'] - 1e-8
+        runtime=raw.get('runtime',{})
+        runtime_reason=runtime.get('terminal_reason')
+        reason='collision' if collision else 'arrival' if arrival else 'timeout' if timeout else runtime_reason or 'running'
+        return {'terminated': bool(collision or arrival or timeout or runtime_reason),
+            'collision': collision, 'arrival': arrival,'offroad': offroad, 'timeout': timeout,
+            'time': raw['time'], 'progress': progress+self._progress_offset,'reason':reason,
             'carla_frame': raw['frame'], 'control_response': raw.get('control_response'), 'events': raw.get('events', []),
+            'runtime':copy.deepcopy(runtime),'bridge_timing':copy.deepcopy(raw.get('bridge_timing',{})),
+            'last_applied_control':copy.deepcopy(raw.get('last_applied_control')),
             'plan_visualization':raw.get('plan_visualization',{})}
+
+    def step_plan(self, plan):
+        """传递已验算完整序列，由同步前缀或异步源时标执行器消费。"""
+        current=self.snapshot()
+        controls=np.asarray(plan.controls,float)
+        if not plan.valid or plan.frame_id!=current.frame_id or abs(plan.time-current.time)>1e-7:
+            raise ValueError('只能提交当前冻结帧通过验收的规划')
+        if controls.ndim!=2 or controls.shape[1]!=2 or not len(controls) or not np.isfinite(controls).all():
+            raise ValueError('CARLA控制序列必须为有限(N,2)')
+        raw=self.bridge.call('step',controls=controls.tolist(),
+            control_step_s=float(self.config['mpc']['step_s']),source_time=float(plan.time),plan=self._planned,
+            source_speed_mps=float(np.linalg.norm(current.ego.velocity)))
+        self._ingest_display_frames(raw)
+        if self.runtime_mode=='sync':
+            # 非整秒轮长也只推进到首个达到上限的物理tick，不误报同步时钟错误。
+            physics=float(self.cfg['physics_hz'])
+            end_tick=math.ceil(self.cfg['duration_s']*physics-1e-8)/physics
+            expected=min(current.time+self.dt,end_tick)
+            if abs(raw['time']-expected)>1e-5 or raw['frame']<=self._raw['frame']:
+                raise RuntimeError('CARLA同步步进时间或帧号不符合执行前缀')
+        elif raw['frame']<self._raw['frame'] or raw['time']+1e-8<current.time:
+            raise RuntimeError('CARLA异步观测时间倒退')
+        self._raw,self._snapshot=raw,None
+        self._step+=1
+        return self._result(raw)
+
+    def step(self, control):
+        """兼容单控制调用；主程序使用step_plan，禁止把首控制维持整秒。"""
+        current=self.snapshot()
+        values = np.asarray(control, float)
+        if values.shape != (2,) or not np.isfinite(values).all():
+            raise ValueError('CARLA 控制必须是有限的[a,delta]')
+        # 仅允许一个轨迹采样间隔等于重规划周期的旧调用者使用。
+        if abs(float(self.config['mpc']['step_s'])-self.dt)>1e-8:
+            raise ValueError('重规划周期包含多个控制段，必须提交完整step_plan')
+        from .contracts import PlanResult
+        return self.step_plan(PlanResult(current.frame_id,current.time,True,np.empty((0,4)),values[None,:]))
 
     def set_planned_trajectory(self, states):
         try:
@@ -707,11 +792,18 @@ class CarlaAdapter:
     def start_recording(self, path):
         if self._recorder is not None:
             raise RuntimeError('CARLA 录像已经启动')
+        if self.bridge is None and not self._sensor_policy['rgb_enabled']:
+            from .carla_sensor_policy import sensor_policy
+            self.set_sensor_policy(sensor_policy(video=True,live=bool(self.live)))
+        if not self._sensor_policy['rgb_enabled']:
+            raise RuntimeError('相机已关闭，不能在SDK连接后临时开始录像')
         self._recorder = CameraVideoRecorder(self, path)
         return self._recorder
 
     def render(self):
         self.snapshot()
+        if self._mosaic is None:
+            return None
         from .carla_display import plan_mosaic_overlay
         visualization = self._raw.get('plan_visualization', {})
         image, segments = (plan_mosaic_overlay(self._mosaic, self._raw['cameras'], visualization)

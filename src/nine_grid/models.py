@@ -306,6 +306,8 @@ def scene_text(scene,representations):
     data={'自车':_current_actor(scene.ego),'八向图':context,'其他可见对象':others,
         '规划参考':goal_reference_context(scene,_goal_reference(scene)),
         '图像解释':'自车固定朝上，横纵轴为米。非行驶区白色，道路为NAVSIM浅灰，人行横道为30%透明紫色；车道边界线和分割线不绘制，细深灰短虚线表示虚拟车道中心线及连接参考路径，不得将其视作交通标线。模型图的绿色虚线是本次固定Frenet参考，s+距离标签表示从原帧自车投影开始的道路弧长，不等于BEV前向x距离；这些参考标签不进入DINO特征图。颜色不是风险或关注度。自车红色、其他车辆蓝色、自行车橙色、行人紫色、静态障碍黄色；图中历史轨迹保持类别色相和高亮度，速度越高饱和度越高，固定范围0至120km/h。历史只含已观测样本。未被八向图选中的可见对象列于其他可见对象，同样可以被关注。'}
+    if scene.diagnostics.get('observation_policy')=='range_limited_ground_truth_no_occlusion-1.0':
+        data['输入权限']='规定感知范围内的完整对象真值，不判断遮挡；“可见对象”为程序沿用的集合名称，不表示RGB中必然可见。不得依据图像遮挡编造或删除给定状态。'
     cameras=_camera_entries(scene)
     if cameras:
         data['图像解释']+=' 当前输入图像依次为：'+ '、'.join(item['view'] for item in cameras)+'、当前BEV。相机图像与上述状态属于同一冻结帧；摄像头视角不能按BEV坐标直接读数。'
@@ -314,7 +316,7 @@ def scene_text(scene,representations):
 
 def _historical_situation(situation):
     """历史经验保留情境与当前态示例，不附带帧标识、时间或坐标元数据。"""
-    result={key:situation[key] for key in ('scenario','情境','自车速度','可见对象') if key in situation}
+    result={key:situation[key] for key in ('scenario','情境','自车速度','可见对象','观测来源') if key in situation}
     if '可见对象' in result:
         fields=('id','类型','世界位置','速度','尺寸')
         result['可见对象']=[{key:obj[key] for key in fields if key in obj} for obj in result['可见对象']]

@@ -1,5 +1,7 @@
 # EP-Driver 运行指令与参数
 
+> 当前实现边界：正常行驶候选除软跟踪代价外，仍需满足窄跟踪带硬资格（允许误差为 `0.25m + 初始横向偏差 × exp(-路径进度/15m)`）；制动候选不使用此项硬资格。尚未实现“车道中心仅作为软偏好”的后续调整。CARLA物理仿真效果仍需服务器验证。
+
 当前工作分支为 `EP-Driver-CARLA`，由 `EP-Driver` 创建。下文高速环境的克隆示例使用 `EP-Driver`；运行CARLA请使用远程同名分支 `EP-Driver-CARLA` 的独立工作区。配置和命令中的相对路径均以项目根目录为准。
 
 ## 0. 克隆分支、权重与个人配置
@@ -56,64 +58,33 @@ python scripts/check_environment.py
 `config/verified_dependencies.txt` 固定本机验证使用的核心依赖版本；本机实测 Python 3.12.13、CPU 推理。CUDA 服务器的驱动与 PyTorch 安装需单独验证。
 
 ## 2. 四场景：纯 MPC
-### 局部规划对象与纯基础路径（2026-11-12）
+### 当前基础规划：五次参考与安全优先MPC
 
-MPC 在完整可见场景的内部视图中选取对象，不再对所有可见实体逐一计算风险。`config/parameters.json` 中统一配置：
+参数版本 `development-1.1.0-safe-tracking`。常规保持车道中心；基础规划可以在合法、安全且有收益时左侧超车，右换道只主动用于公开导航需要。有效模型单目标决定五次参考的经过位置；不改变原帧Frenet语义，不吸附目标，不增加到达时间或停车要求。新目标立即替换旧目标，纵向经过后释放，实际状态再平滑归中。
 
-```json
-"planning_objects": {
-  "version": "frenet-eight-planning-1.0",
-  "front_m": 30.0,
-  "rear_m": 10.0,
-  "lateral_m": 25.0,
-  "include_attention": true,
-  "max_attention_objects": 3
-}
-```
+先从当前场景筛选，再运行动态EKF：常规前30米、后10米、横向25米，八向每格最近一个、同ID去重。前向范围按 `v*reaction_s + v*v/(2*braking_mps2) + stopping_margin_m` 必要扩展；进入候选道路走廊的横穿/切入、短时纵向冲突和后方快车单列安全例外。模型关注可再加最多3个有效范围内对象。**常规集最多8个不等于总集合永远8或11个。**静态障碍保留几何但不运行EKF；路外静止物体不加入道路规划。完整场景仍供BEV、模型、检索及回放，不改检索九宫格的范围和语义。
 
-范围按导航连续 Frenet 投影的对象中心判断，左正右负。八向每格选择一个最近对象，前后按车体纵向净距、侧方按真实几何净距；跨格同ID去重，因此基础规划至多8个对象。有效模型关注可以在**同一空间范围、当前可见集合内**额外加入至多3个，总数至多11个；关闭扩容可将 `include_attention` 设为 false。实线邻道不会因不能跨越而从物理候选中删除；行人、横穿来车和静态障碍物可按Frenet侧向补充归格。注意这与检索九宫格的范围和可跨越车道语义不同，没有修改检索特征或旧库解释。
+`config/parameters.json` 的 `planning_objects` 使用 `frenet-eight-planning-2.0`，新增开发默认值：`adaptive_front: true`、`reaction_s: 1`、`braking_mps2: 4`、`stopping_margin_m: 5`、`conflict_horizon_s: 3`、`conflict_margin_m: 0.5`。这些是计算范围及粗筛设置，不是全场景安全证明。
 
-当快模型、反思模型、检索、写入**四项同时关闭**时，自动进入 `pure_base`：
+MPC时域3秒、控制网格0.1秒、物理子步0.02秒。重规划频率可选1、2、10Hz，默认10Hz；同步模式计算完成后执行前10、5、1段控制。CARLA在 `config/carla.yaml` 改 `carla.planner_hz`，Highway在 `config/parameters.json` 改 `clock.planner_hz`。不要把1Hz误理解为第一项控制恒持1秒。
 
-- 不构建BEV、OCC和检索九宫格，不做DINO特征提取。
-- 不实例化参照MPC和反思worker，不做轨迹质量评分、语义采集或轨迹BEV绘制。
-- 继续使用同一MPC、导航、规则、EKF和基础风险场；保留原生实时画面、轨迹线与视频。
-- CARLA跳过OCC空区覆盖几何，但仍使用同帧深度进行对象可见性判断，不取消遮挡。
-- 质量计数为0，不生成虚假的质量分；开启四项中的任意一项则走完整功能路径。
+普通候选必须满足真实尺寸避碰、道路/实线/停止截面、限速、控制边界、控制变化率与跟踪带，并经0.02秒子步复核。未找到普通安全候选则重新计算并验收制动；日志分别保存 `normal`、`safe_brake`、`emergency_unverified`。最后一类按用户确定的实验策略仍执行，但仍可能碰撞，不是安全成功，也不作为合格经验。异常输入仍报错。求解名义预算冷启动2秒、后续1秒、最多10次SQP，不宣称实时达标；同步优先验证规划效果。本地CPU检查可出现数百毫秒单次求解，1、2、10Hz是仿真重规划节拍，整体墙钟耗时必须另测。
 
-每轮 `configuration.json` / `summary.json` 保存执行模式和跳过阶段，`plans.jsonl` 中的 `planning_object_selection` 保存每格代表、完整/范围内/选中数量、关注补充及排除原因。完整可见对象仍保存在帧日志和模型上下文；独立执行前审计保留完整集合，但不会把被排除对象的风险重新加入MPC。
-
-`timing.jsonl` 与汇总分别统计快照、预测、MPC求解、世界轨迹显示、表示、参照、评分、执行审计、物理步进、显示录像和整个控制周期；纯模式跳过阶段的样本数为0。MPC求解时长不再包含CARLA世界轨迹绘制RPC。`control_cycle` 不含初始化、收尾及该条计时日志自身的写入。
-
-30/10米是开发起点，不是停车安全距离；每向只选一个对象可能漏掉随后出现的第二个障碍物。此策略不保证对被排除对象的全时域避碰，也不保证整个控制周期达到10Hz。现有3秒时域、交通密度、车体尺寸、风险权重和控制频率保持不变。
+四个模型/记忆开关都关时默认仍在1Hz构建BEV、OCC、检索八向和真实DINO，并计算独立无语义参照MPC、质量分和轨迹BEV。`diagnostics.enabled / dino` 为显式诊断开关，默认均true；诊断不打开模型、不读写记忆。真实DINO权重须已下载，不能用随机特征替代。
 
 ```bash
-python scripts/run_highway.py --scenario highway --seed 1 --duration 30 --fast off --reflection off --live --video
-python scripts/run_highway.py --scenario merge --seed 1 --duration 30 --fast off --reflection off --live --video
-python scripts/run_highway.py --scenario roundabout --seed 1 --duration 30 --fast off --reflection off --live --video
-python scripts/run_highway.py --scenario intersection --seed 1 --duration 30 --fast off --reflection off --live --video
+python scripts/run_highway.py --scenario highway --seed 1 --duration 30 --fast off --reflection off --no-retrieve --no-write-memory --live --video
+python scripts/run_highway.py --scenario merge --seed 1 --duration 30 --fast off --reflection off --no-retrieve --no-write-memory --live --video
+python scripts/run_highway.py --scenario roundabout --seed 1 --duration 30 --fast off --reflection off --no-retrieve --no-write-memory --live --video
+python scripts/run_highway.py --scenario intersection --seed 1 --duration 30 --fast off --reflection off --no-retrieve --no-write-memory --live --video
 ```
 
-以上指令显式关闭两个模型；记忆检索和写入默认关闭。未指定`--fast / --reflection`时沿用`config/models.yaml`中的个人设置，可能调用模型。纯 MPC 仍使用地图、规则、EKF 和基础风险场。真实碰撞、到达目标会提前结束；30 秒是每轮上限。几何冲突、QP未收敛或预算耗尽时保留当前帧已验收的有界控制轨迹；非法输入或内部异常仍明确记录，不伪造轨迹。
+原生画面青色线为当前实际计划；轨迹BEV与原始检索图分开。`plans.jsonl`保存参考身份、活动目标、筛选与例外理由、约束残差、密集几何检查和执行分类；`summary.json`分别统计制动、紧急、实际碰撞、到达与异常。`timing.jsonl`分别记录EKF、MPC、表示、额外参照、质量、物理步进、显示录像和整体周期；配置10Hz不等于墙钟达到10Hz。新的有效目标可复用移位控制作为数值初值，必须重新积分、计价、验算；不能复用旧目标代价或旧状态轨迹。
 
-本版按仿真时间同步步进。MPC使用实时SQP与OSQP，后续求解目标预算100毫秒，每个规划器实例首次初始化预算500毫秒，控制执行0.1仿真秒。首次初始化、后续求解及超期均单独记录；这不是整个Python程序的硬实时保证，预测、表示、评分和同步模型调用另有耗时。
+本地确定性几何/协议和Highway检查不能代替真实CARLA动力学、真实模型或全部场景验收。未验证场景应查看紧急率、碰撞、违规、导航进度和计时，不以程序完成一轮认定规划成功。
 
-`config/parameters.json` 中的 `mpc.warm_start_recovery_speed_mps` 默认 `0.3` m/s，表示低于此速度、且无规则等待时允许比较导航初值；设为 `0` 关闭这项低速比较。所有初值都在当前帧按同一动力学、代价和控制边界重新验收，并共享本轮预算。
 
-`--live` 显示highway-env原生窗口，`--video` 保存相同原生视角的50FPS录像；两者可独立使用。青色线是当前MPC规划的未来轨迹，每0.1仿真秒更新，车辆仍显示真实状态。视频按仿真时间播放，不包含等待模型的停顿。自绘BEV另存于 `captures/`，不替代原生录像。
-
-当前参数版本为 `development-1.0.20`（本次仅改变检索选择）：硬约束仅保留动力学、加速度 `[-6,3]` m/s²、转角 `±0.6` rad 和非负速度。道路、实体避碰、不可跨越线、让行截面、限速及侧向加速度改为软惩罚；jerk和转角变化率保留平滑代价。`mpc.safety_penalties` 可分别调整软惩罚强度。`plans.jsonl` 的 `safety_feasible` 与 `soft_constraint_violations` 记录安全结果，`valid` 仅代表轨迹可执行；不能用持续输出轨迹证明没有碰撞。危险轨迹不作为合格经验入库。
-
-新有效目标在下一次MPC中立即替换旧目标。上一轮控制可按实际经过时间移位，作为新目标下的数值初值，重新按当前状态积分、计价和验算；旧目标吸引项、路径及车道锁不保留。目标通过、失效或控制缓存过期/非法时不继承该缓存。`plans.jsonl` 中 `warm_start_across_goal_update` 标记是否跨新目标使用热启动，`control_transition` 记录首控制相对实际上一控制的变化。首差分平滑项仍使用实际已执行控制；热启动不是硬连续性或无晃动保证。
-
-空交通检查（匝道原有静态障碍物仍保留）：
-
-```bash
-python scripts/run_highway.py --scenario highway --vehicles 0 --duration 30 --fast off --reflection off
-python scripts/run_highway.py --scenario merge --vehicles 0 --duration 30 --fast off --reflection off
-python scripts/run_highway.py --scenario roundabout --vehicles 0 --duration 30 --fast off --reflection off
-python scripts/run_highway.py --scenario intersection --vehicles 0 --spawn-probability 0 --duration 30 --fast off --reflection off
-```
+近停车制动使用 `stop_control.py` 的离散释放包络，避免将加速度直接截为 `-v/dt` 造成jerk跳变。若当前速度与上一实际制动已导致jerk和非倒退无法共同满足，记录 `braking_release_conflicts` 并归类紧急；不把该冲突伪装为正常可行。
 
 ## 3. 配置两个模型
 
@@ -191,7 +162,7 @@ python scripts/run_highway.py --scenario highway --fast server --reflection serv
 
 ## 4. 记忆采集、检索和冻结库实验
 
-检索或写记忆需要真实 DINOv2 Base 权重。默认使用仓库内的 `models/dinov2-base`，首次克隆后先执行 `git lfs pull`。使用其他本地目录时，在下列命令追加 `--dino-model "模型目录"`。关闭检索和写入时不加载 DINO 权重。
+检索或写记忆需要真实 DINOv2 Base 权重。默认使用仓库内的 `models/dinov2-base`，首次克隆后先执行 `git lfs pull`。使用其他本地目录时，在下列命令追加 `--dino-model "模型目录"`。纯基础诊断默认也加载DINO；只有显式关闭DINO诊断且检索、写入均关闭时才不加载。
 
 当前表示版本为 `bev-occ-grid-2.1`：方向箭头仅用于自车、机动车、自行车及行人；静态障碍物继续绘制真实轮廓并参与规划。该变化也影响无字BEV和DINO特征，因此旧2.0库原样保留、明确排除混检，需要单独重建特征后再使用；OCC和八向公式未改。NAVSIM白底、浅灰道路及对象配色，不绘制车道边界线和分割线，仅保留深灰虚线中心参考路径；历史轨迹采用鲜亮的同色系饱和度渐变。目标参考线与沿线距离标记只进入模型图和回放，不进入DINO特征图或OCC。模型文本含当前状态、八向区域、目标参考摘要与图像解释，命中时附历史情境和参考答案；不发送完整地图边界、历史状态列表或检索四矩阵。目标参考摘要另携带输入帧、仿真时间、参考身份、当前横偏、候选车道及相关导航规则，供正确解释Frenet目标。未入格的可见对象仍提供。
 
@@ -393,8 +364,8 @@ python scripts/memory_admin.py --memory-dir outputs/memory_db/experiment_01 inva
 
 ```bash
 /home/zjj/miniconda3/envs/carla37/bin/python -c "import carla; print(carla.__file__)"
-conda activate ep-driver-highway
-cd /data/zjj/code/EP-Driver/实际CARLA分支目录
+conda activate ep-driver-carla
+cd /data/zjj/code/EP-Driver/EP-Driver-CARLA
 python scripts/run_carla.py --list-scenarios
 python scripts/run_carla.py --scenario slow_lead --dry-run
 ```
@@ -404,7 +375,7 @@ python scripts/run_carla.py --scenario slow_lead --dry-run
 用户先在独立端口启动CARLA 0.9.15服务。该端口不得有其他人的车辆、行人或同步控制程序；关闭已有CARLA观察脚本中主动调用`world.tick()`的功能。程序不自动启动CARLA服务器，也不会接管已有同步世界。首次无模型冒烟运行：
 
 ```bash
-python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin/python --host 127.0.0.1 --port 2000 --map Town05 --scenario slow_lead --exclusive-world --duration 3 --fast off --reflection off --no-retrieve --no-write-memory --video --episodes-dir outputs/carla/smoke
+python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin/python --host 127.0.0.1 --port 22000 --scenario-config config/carla_scenarios/slow_lead.yaml --runtime-mode sync --exclusive-world --allow-world-reset --duration 3 --fast off --reflection off --no-retrieve --no-write-memory --video --episodes-dir outputs/carla/smoke
 ```
 
 `--exclusive-world`是每次真实运行的明确确认。当前空世界地图与`--map`不同时默认拒绝；确认该服务专用后，另外加`--allow-world-reset`才允许切换地图。两项开关不允许清理其他人的车辆或接管其他同步客户端。结束时只销毁本轮创建的对象并恢复本轮修改前的世界设置；被切换的地图不自动切回。
@@ -460,7 +431,7 @@ python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin
 python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin/python --exclusive-world --scenario slow_lead --duration 3 --fast server --reflection server --no-retrieve --no-write-memory --video --episodes-dir outputs/carla/model_smoke
 ```
 
-六个当前相机视角拼为一张图，相机拼图在前、同帧BEV在后，共同发送给快模型和原帧反思。模型提示词仍在`config/prompts.yaml`修改。六路RGB和六路深度每个物理tick（50Hz）渲染，仅消费控制末帧（10Hz）；仅在本轮仿真时间0、1、2…秒持久保存六路RGB、RGB拼图、标定和当前状态（`camera_save_hz: 1`，当前要求`clock.fast_hz: 1`，其他频率在启动前明确拒绝）；其余控制帧通过内存传输当前RGB用于实时显示/录像，不重复上一秒图像，不写相机图片目录。深度只在内存中用于当前可见性和观测掩码计算，不再保存深度图片或把临时深度载荷写进日志/经验资产。存储版本为`carla-rgb-sampled-1.1`，当前状态JSON保留已计算观测区域与依据；已保存的深度阈值结果可核查，调整阈值后重新计算需要重新采集。RGB默认启用CARLA原生后处理（`rgb_postprocess_effects: true`），深度保持关闭；程序只将BGRA换成RGB，不额外拉伸或调色。原有实验文件保留。真实GPU渲染和内存传输耗时尚待服务器实测。两种平台保持现有单Frenet目标协议。反思只做原帧验收，不接管当前控制。
+六个当前RGB视角拼为一张图，相机拼图在前、同帧BEV在后，送给快模型和原帧反思。提示词在`config/prompts.yaml`修改。只有模型、`--video`或`--live`需要图像时，才创建六路RGB，相机`sensor_tick=0.1`，真实采集和录像10Hz，原图及模型源帧归档1Hz；不创建任何深度相机。纯基础且无录像/显示时为零相机。对象输入采用同层120米范围内真值，不判断遮挡，来源版本`range_limited_ground_truth_no_occlusion-1.0`；BEV/OCC/八向仍沿用各自范围和评分含义。该输入不等同于相机可见性或真实感知输出。`camera_frames/`只含真实RGB、拼图、标定和源帧状态，存储版本`carla-rgb-source-1hz-2.0`；不重复旧图补帧，不修改原实验资产。RGB保持原生后处理，只转换BGRA到RGB。单Frenet目标协议及反思仅审查原帧的职责不变。
 
 CARLA规划轨迹显示与录像（只影响显示，不改变MPC）：
 
@@ -472,11 +443,29 @@ python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin
 python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin/python --host 127.0.0.1 --port 22000 --scenario-config config/carla_scenarios/slow_lead.yaml --exclusive-world --allow-world-reset --duration 30 --fast off --reflection off --no-retrieve --no-write-memory --world-plan --video --episodes-dir outputs/carla/world_plan_video
 ```
 
-`config/carla.yaml`的`world_plan_debug`默认false，命令行`--world-plan/--no-world-plan`优先；打开后在每次控制前用世界坐标绘制当前有效MPC折线，线宽0.08米、沿地图路面抬高0.15米、青色、寿命为1.1个控制周期（10Hz时0.11秒），不生成永久线。新计划每周期刷新，无有效计划不画线。它是CARLA世界图元，可能被原始RGB/深度或外部旁观相机拍到；不能声称与传感器隔离，严格输入审计请关闭。外部观察脚本仍应连接同一22000端口，不推进世界时钟。程序不修改外部观察脚本、不接管其摄像机或spectator。
+CARLA运行时钟（`carla-range-clock-3.0`）：在`config/carla.yaml`设置`runtime_mode: sync`或`async`，也可用`--runtime-mode`覆盖。CARLA重规划在YAML中可选1、2、10Hz（默认10Hz），MPC内部30段×0.1秒，物理50Hz；Highway通过通用时钟配置选择同样频率。
+
+- `sync`：当前状态冻结，完成本次模型与规划后，按1/2/10Hz分别执行前10/5/1段控制，每段5个物理步；不会将首控制保持整个周期。
+- `async`：第一条有效基础规划后启动独立世界时钟；后台快模型最多一个在途任务及一个最新待处理帧。等待模型时MPC继续依据当前有效目标或基础输入规划；返回目标绑定原参考线，不能随车漂移。延迟原帧的质量、反思和入库验收在后台重新规划，不能冒用当前帧分数。
+- 异步由专用线程以固定物理步驱动，CARLA底层仍保持`synchronous_mode=True`以对齐状态与RGB；这里的异步指世界不等待主程序或模型，并不表示取消固定步长。初始化到首个计划前的暂停、墙钟落后、过期控制段、跳过的源帧均记录。硬件太慢时只能报告落后，不能据此宣称实时。
+- 有限控制序列按源时标消费；若新计划长期未返回，3秒序列耗尽则明确结束本轮，不无限保持最后控制。轮末先停止世界推进，再排空已接纳快模型、原帧验收和反思任务，最后清理传感器。
+
+以下两条分别运行同步与异步纯基础实验，主程序使用`ep-driver-carla`环境；`--carla-python`仅指定独立SDK子进程解释器。去掉`--video`即可不创建本程序RGB相机；外部观察器仍可独立显示。
+
+```bash
+conda activate ep-driver-carla
+cd /data/zjj/code/EP-Driver/EP-Driver-CARLA
+python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin/python --host 127.0.0.1 --port 22000 --scenario-config config/carla_scenarios/slow_lead.yaml --exclusive-world --allow-world-reset --duration 30 --runtime-mode sync --fast off --reflection off --no-retrieve --no-write-memory --world-plan --episodes-dir outputs/carla/base_sync_safe_tracking
+python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin/python --host 127.0.0.1 --port 22000 --scenario-config config/carla_scenarios/slow_lead.yaml --exclusive-world --allow-world-reset --duration 30 --runtime-mode async --fast off --reflection off --no-retrieve --no-write-memory --world-plan --episodes-dir outputs/carla/base_async_safe_tracking
+```
+
+异步模型实验将对应指令改为`--fast server --reflection server`；检索、写入开关仍独立。`timing.jsonl`保留前台阶段计时，`snapshot_s`包含等待新观测和状态构建，另列`observation_wait_s`及`snapshot_build_s`，避免把刻意等待下一1Hz源帧算成构建开销。`bridge_timing.jsonl`分别记录物理tick、传感器等待、状态读取、图像处理和节拍等待；后台原帧验收耗时另列，不计作控制MPC。规划频率是配置与调度目标，实际以源时间间隔、墙钟间隔和deadline统计为准。本地只验证了确定性SDK/模型替身及真实Highway回归；CARLA渲染、服务器吞吐和真实模型效果仍需实测。
+
+`config/carla.yaml`的`world_plan_debug`默认false，命令行`--world-plan/--no-world-plan`优先。开启后在CARLA世界绘制当前有效MPC折线：线宽0.08米、抬高0.15米、青色、寿命为1.1个重规划周期（1Hz时1.1秒）。它可能被RGB或外部旁观相机拍到，严格原图实验请关闭。外部观察脚本连接同一22000端口，只观察、不调用`world.tick()`。
 
 `display_plan_overlay`默认true：本机`--live`和`--video`在六相机RGB拼图的副本上投影青色规划线，并裁剪镜头后方、画布外的线段；该投影不改写原始RGB、模型相机拼图、BEV或DINO图。服务器无桌面时不要加`--live`；通过原有端口转发观察世界，录像不依赖桌面或浏览器窗口。世界线关闭时，录像仍可显示投影轨迹。摄像头视野外的规划段自然不可见，不用虚构图像显示它。
 
-每轮在`--episodes-dir/<episode_id>/`生成`video.mp4`及`video_recording.json`。首个编码器不可用时显式尝试`video.avi`，以日志、状态文件和`summary.json`中的实际`path`为准。按控制末帧10fps录制，30秒最多300帧；视频播放时间按仿真时间，不含模型等待。轮末释放编码器并实际逐帧解码核对帧数、尺寸和帧率，`status=complete`且`playback_verified=true`才表示录制核查通过；解码检查增加收尾耗时。`status=no_frames`表示初始化或规划等阶段没有产生可录像画面，应查看同轮`run.log`和`summary.json`；编码/解码失败明确记录为`failed`。运行中MP4可能尚未封装完成，正常退出后再播放；强制杀进程不能保证尾部封装成功。
+每轮在`--episodes-dir/<episode_id>/`生成`video.mp4`及`video_recording.json`。首个编码器不可用时显式尝试`video.avi`，以日志、状态文件和`summary.json`中的实际`path`为准。仅编码真实取得的10Hz源帧，编码帧率为10fps，不重复旧图补帧；异步前台落后时可能跳过源帧，此时视频时长不代表完整仿真时间，应结合源帧时间戳核查。终态没有对应RGB时不复用上一张图。轮末释放编码器并实际逐帧解码核对帧数、尺寸和帧率，`status=complete`且`playback_verified=true`才表示录制核查通过；解码检查增加收尾耗时。`status=no_frames`表示初始化或规划等阶段没有产生可录像画面，应查看同轮`run.log`和`summary.json`；编码/解码失败明确记录为`failed`。运行中MP4可能尚未封装完成，正常退出后再播放；强制杀进程不能保证尾部封装成功。
 
 BEV文字上限在`config/parameters.json`的`bev.labels`修改：
 
@@ -488,7 +477,7 @@ BEV文字上限在`config/parameters.json`的`bev.labels`修改：
 }
 ```
 
-三个上限均为0至16的整数。默认在BEV内按车体净距选择最近5辆机动车、最近3个行人/自行车，总动态标签最多8个；自车单独标注。静态环境物和历史残影不写ID，全部实体与轨迹仍绘制，全部可见对象仍提供给模型文本和物理规划。标签避让实体和其他文字，无安全空位或ID过长时省略；不截断ID或生成别名。Frenet参考线每20米标一次弧长，BEV米制刻度保留。DINO继续读取无字底图，标签调整不要求重建原记忆库的DINO特征。
+三个上限均为0至16的整数。默认在BEV内按车体净距选择最近5辆机动车、最近3个行人/自行车，总动态标签最多8个；自车单独标注。静态环境物和历史残影不写ID，全部实体与轨迹仍绘制，完整范围对象仍提供给模型文本；MPC按常规前30米、后10米的八向代表筛选，并保留可停止距离扩展及直接冲突安全例外。标签避让实体和其他文字，无安全空位或ID过长时省略；不截断ID或生成别名。Frenet参考线每20米标一次弧长，BEV米制刻度保留。DINO继续读取无字底图，标签调整不要求重建原记忆库的DINO特征。
 
 批量20轮，seed21至40；只读指定经验库，新增合格反思经验另写一个库：
 
@@ -496,7 +485,7 @@ BEV文字上限在`config/parameters.json`的`bev.labels`修改：
 python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin/python --exclusive-world --scenario cut_in --episodes 20 --seed 21 --seed-mode increment --duration 30 --fast server --reflection server --retrieve --write-memory --memory-mode formal --memory-read-dir /data/zjj/memory/frozen_carla --memory-write-dir /data/zjj/memory/new_carla_reflections --episodes-dir outputs/carla/cut_in_21_40 --video
 ```
 
-检索和写入默认都关闭，独立开关与highway一致。`--memory-dir`是同库读写简写，独立读写路径优先。启用任一记忆功能需要真实DINO权重；当前轮新增经验仍到下一轮快照才可见。CARLA原始RGB和拼图按1Hz模型源帧归档；可见性、规划和录像仍使用10Hz当前帧。必要BEV、无字特征图和观测证据保持原1Hz源帧频率。
+检索和写入默认关闭、相互独立；`--memory-dir`为同库读写简写，独立路径优先。启用记忆功能仍需真实DINO权重，当前轮新增经验下一轮快照才可见。RGB真实采集与录像10Hz、原图归档1Hz；BEV、检索与诊断源帧1Hz；纯基础默认也构建表示和参照评分。旧库不迁移或改写，新记录在情境与核查资产记录观测来源，旧深度权限记录不能冒称为本次范围真值设置；跨权限使用须在实验中报告。
 
 | CARLA参数 | 含义 |
 |---|---|
@@ -510,7 +499,7 @@ python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin
 | `--video` | 录制六相机RGB显示拼图；保存实际路径、帧数与可播放核查状态 |
 | `--allow-world-reset` | 专用空世界中允许切换到请求地图，默认禁止；不是强制清空现有世界 |
 | `--list-scenarios / --dry-run` | 分别列出配置场景、校验运行清单，均不连接服务 |
-| `--live / --video` | 显示或录制同一六相机拼图；需GUI时使用`--live`，无显示服务器用`--video`；录像10FPS，每个控制帧一帧 |
+| `--live / --video` | 显示或录制同一六相机拼图；需GUI时使用`--live`，无显示服务器用`--video`；录像10FPS，每个实际RGB采样帧一帧 |
 | `--fast / --reflection` | CARLA入口默认均为off，显式选择server或api才调用；与highway入口沿用YAML默认的行为不同 |
 | 其他批量及记忆参数 | `--episodes --seed --seed-mode --duration --retrieve --write-memory --memory-mode --memory-dir --memory-read-dir --memory-write-dir --dino-model --episodes-dir --prefix --models-config --prompts-config --config`与上文同名定义一致 |
 
@@ -535,10 +524,10 @@ python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin
 
 | 公共平台参数 | 含义与开发默认值 |
 |---|---|
-| `carla.camera_save_hz` | 当前固定1Hz；仅图片归档频率，不降低规划/录像频率 |
-| `carla.rgb_postprocess_effects` | 默认true，恢复CARLA原生RGB显示处理；深度独立关闭 |
-| `carla.camera_width / camera_height / camera_fov` | 单相机640×360、水平FOV100度；六视角RGB及对应深度同步 |
-| `carla.observation_resolution_m / observation_heights_m` | 确认空区的网格1米、多高度0.2/0.8米；未确认与遮挡区域保留unknown，尚需真实传感器验证 |
+| `carla.camera_hz / camera_save_hz` | 10Hz采集、1Hz归档；录像10FPS，不补帧 |
+| `carla.rgb_postprocess_effects` | 默认true，保留CARLA原生RGB处理；本版本没有深度传感器 |
+| `carla.camera_width / camera_height / camera_fov` | 单相机640×360、FOV100度；按消费者创建六路10Hz RGB或零相机 |
+| `perception.radius_m` | 当前同层范围真值的半径120米；范围外未知，不做遮挡判断。MPC另按局部八向、可停止距离扩展及直接冲突例外筛选 |
 
 每轮沿用第7节的核心日志，另有`carla_bridge.log`、`carla_map.json`、`carla_environment_audit.json`、`camera_frames/`及相机资产清单；`--video`保存真实相机拼图录像。`carla_environment_audit.json`记录地图环境框的读取范围、数量及镜像网格半尺寸规范化明细。CARLA 0.9.15的组件负缩放可能产生负半尺寸，程序只对有限非零半尺寸取绝对值，保持原世界中心、旋转及八角点集合，不删除障碍物、不修改地图；零半尺寸或非有限值仍拒绝，并报告ID、名称、类别及原始框数值。录像可在RGB显示副本投影MPC轨迹；世界调试线由独立开关控制，计划另存BEV诊断图与`plans.jsonl`。当前验证仅包括接口、配置、几何与测试替身，不能据此宣称已在CARLA实现无碰撞或实时运行。
 
@@ -547,7 +536,7 @@ python scripts/run_carla.py --carla-python /home/zjj/miniconda3/envs/carla37/bin
 
 每个场景仍是一份独立的 `config/carla_scenarios/*.yaml`。保留旧五场景，新增16份主体场景及8份 `_opt` 地图变体，共覆盖12个Town、20个公开地图资源名称。Town08/09/14等挑战赛保留地图不在本地已安装公开地图清单中，不虚构可用配置。
 
-**验证边界：道路和布置使用本机CARLA 0.9.15 SDK读取真实OpenDRIVE进行离线检查；没有代替服务器执行物理闭环。** 检查不证明道具蓝图可生成、动态避碰成功或MPC实时。此前制动执行偏差、OCC几何及导航偏离后的异常不在本次场景扩展中修复，应在实验日志中区分，不能将它们全部解释为场景难度。
+**验证边界：道路和布置使用本机CARLA 0.9.15 SDK读取真实OpenDRIVE进行离线检查；没有代替服务器执行物理闭环。** 检查不证明道具蓝图可生成、动态避碰成功或MPC实时。场景配置验收与本轮规划器改动应分别验证；初始化失败、执行误差、碰撞与正常等待须在实验日志中分开，不能全部解释为场景难度。
 
 | YAML文件名（不含.yaml） | 地图 | 路线/m | 时限/s | 交互 |
 |---|---|---:|---:|---|
@@ -572,7 +561,7 @@ Town01、02、03、04、05、06、07、10HD各有一份文件名以`_opt`结尾�
 
 ### 10.1 无模型运行
 
-在代码更新至本次版本后，使用现有环境与已启动的专用CARLA服务。以下指令不启动模型、不加载DINO、不检索也不写记忆；不会关闭CARLA进程。
+在代码更新至本次版本后，使用现有环境与已启动的专用CARLA服务。以下指令不调用VLM、不检索也不写记忆；默认仍构建BEV、OCC、八向表示和真实DINO特征，并运行参照规划与质量诊断。不会关闭CARLA进程。
 
 ```bash
 conda activate ep-driver-carla
@@ -591,7 +580,7 @@ python scripts/run_carla.py \
   --episodes-dir outputs/carla/long_routes/town01_urban_follow
 ```
 
-未传`--duration`时使用该场景的`duration_s`，而非统一30秒；传入则显式覆盖。`--world-plan`使旁观窗口可看世界中的规划线，但线也可能被相机拍到；正式无叠加采集使用`--no-world-plan`。图片仍按1Hz保存，录像10Hz。
+未传`--duration`时使用该场景的`duration_s`，而非统一30秒；传入则显式覆盖。`--world-plan`使旁观窗口可看世界中的规划线，但线也可能被相机拍到；正式无叠加采集使用`--no-world-plan`。RGB采集及录像10Hz，原图和模型源帧1Hz归档；以实际帧号核查，不重复旧图填帧。
 
 可先分场景运行，再串行批量运行选定场景。切勿并行控制同一个CARLA世界。下面批次总共16轮，每轮各用seed1；`BATCH_DIR`保留完整输出和终端日志。单场景返回非零时仍进入下一场景，并单独记录返回码。
 

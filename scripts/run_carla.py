@@ -145,18 +145,31 @@ def platform_configuration(data,args,scene_path):
         raise ValueError('平台YAML必须且仅包含carla对象；实验参数请放到独立场景YAML')
     allowed={'python','host','port','timeout_s','allow_world_reset','camera_width','camera_height',
         'camera_fov','camera_height_m','arrival_margin_m','map_resolution_m',
-        'map_speed_cap_mps','same_level_tolerance_m','observation_resolution_m','observation_heights_m',
-        'depth_empty_tolerance_m','visibility_surface_tolerance_m','visibility_min_samples',
-        'world_plan_debug','display_plan_overlay','camera_save_hz','rgb_postprocess_effects'}
+        'map_speed_cap_mps','same_level_tolerance_m','runtime_mode','planner_hz','camera_hz',
+        'world_plan_debug','display_plan_overlay','camera_save_hz','rgb_postprocess_effects','display_queue_frames'}
     if set(data['carla'])-allowed:
         raise ValueError('carla包含未实现字段：'+str(sorted(set(data['carla'])-allowed)))
     scene,experiment,source=scene_configuration(scene_path,args.seed)
     cfg=copy.deepcopy(data['carla'])
+    cfg.setdefault('runtime_mode','sync')
+    if getattr(args,'runtime_mode',None) is not None:
+        cfg['runtime_mode']=args.runtime_mode
+    if cfg['runtime_mode'] not in ('sync','async'):
+        raise ValueError('carla.runtime_mode必须为sync或async')
+    cfg.setdefault('planner_hz',10)
+    cfg.setdefault('camera_hz',10)
+    if type(cfg['planner_hz']) is not int or cfg['planner_hz'] not in (1,2,10):
+        raise ValueError('carla.planner_hz必须为1、2或10Hz整数')
+    if type(cfg['camera_hz']) not in (int,float) or cfg['camera_hz']!=10:
+        raise ValueError('carla.camera_hz必须为10Hz；原始图片按camera_save_hz=1归档')
     for key,default in (('world_plan_debug',False),('display_plan_overlay',True),
                         ('rgb_postprocess_effects',True)):
         cfg.setdefault(key,default)
         if type(cfg[key]) is not bool:raise ValueError('carla.'+key+'必须为布尔值')
     cfg.setdefault('camera_save_hz',1)
+    cfg.setdefault('display_queue_frames',50)
+    if type(cfg['display_queue_frames']) is not int or cfg['display_queue_frames']<10:
+        raise ValueError('carla.display_queue_frames必须为至少10的整数')
     if type(cfg['camera_save_hz']) not in (int,float) or cfg['camera_save_hz']!=1:
         raise ValueError('carla.camera_save_hz当前固定为1Hz，与1Hz模型源帧同步')
     if getattr(args,'world_plan',None) is not None:
@@ -176,18 +189,12 @@ def platform_configuration(data,args,scene_path):
     for key in ('camera_width','camera_height'):
         if type(cfg.get(key)) is not int or cfg[key]<64 or cfg[key]%2:
             raise ValueError(key+'必须为不小于64的偶数')
-    if type(cfg.get('visibility_min_samples')) is not int or not 1<=cfg['visibility_min_samples']<=36:
-        raise ValueError('visibility_min_samples必须为1至36的整数')
     for key in ('timeout_s','camera_fov','camera_height_m','arrival_margin_m','map_resolution_m','map_speed_cap_mps',
-                'same_level_tolerance_m','observation_resolution_m','depth_empty_tolerance_m','visibility_surface_tolerance_m'):
+                'same_level_tolerance_m'):
         positive(cfg.get(key),'carla.'+key)
     positive(cfg.get('desired_speed_mps'),'carla.desired_speed_mps',True)
-    if not 20<cfg['camera_fov']<150 or cfg['observation_resolution_m']>2:
-        raise ValueError('相机FOV须位于(20,150)度，观测网格边长须位于(0,2]米')
-    heights=cfg.get('observation_heights_m')
-    if not isinstance(heights,list) or not heights:
-        raise ValueError('observation_heights_m必须为非空高度列表')
-    for height in heights:positive(height,'观测高度',True)
+    if not 20<cfg['camera_fov']<150:
+        raise ValueError('相机FOV须位于(20,150)度')
     if cfg.get('python') is not None:
         python=Path(cfg['python']).expanduser()
         if not python.is_absolute():raise ValueError('--carla-python必须是SDK解释器的绝对路径')
@@ -214,6 +221,7 @@ def main(argv=None):
     parser.add_argument('--carla-config',default='config/carla.yaml')
     parser.add_argument('--carla-python',help='CARLA SDK Python 3.7/3.8解释器绝对路径')
     parser.add_argument('--host');parser.add_argument('--port',type=int);parser.add_argument('--map')
+    parser.add_argument('--runtime-mode',choices=['sync','async'],help='同步步进或世界与模型均异步；默认读取CARLA平台YAML')
     selection=parser.add_mutually_exclusive_group()
     selection.add_argument('--scenario',choices=sorted(p.stem for p in (ROOT/SCENE_DIRECTORY).glob('*.yaml')),help='选择内置独立场景YAML，默认slow_lead')
     selection.add_argument('--scenario-config',help='指定独立场景YAML；相对路径以项目根为准')
@@ -265,6 +273,12 @@ def main(argv=None):
             return 0
         config=json.loads(project_path(args.config).read_text(encoding='utf-8-sig'))
         config.update(platform='carla',scenario=cfg['scenario_source']['name'],carla=cfg)
+        # 重规划间隔与优化轨迹离散步长分离，保留0.1秒×30段的MPC。
+        config['clock']['planner_hz']=cfg['planner_hz']
+        cfg['runtime_version']='carla-range-clock-3.0'
+        cfg['observation_policy']='range_limited_ground_truth_no_occlusion-1.0'
+        config['perception'].update(fully_occluded_in_current_planning=True,
+            occlusion_tested=False,input_policy=cfg['observation_policy'])
         if cfg['scenario_source']['duration_s'] is not None:config['duration']=cfg['scenario_source']['duration_s']
         if args.duration is not None:config['duration']=args.duration
         if args.dino_model:
@@ -305,10 +319,15 @@ def main(argv=None):
                'write':project_path(args.memory_write_dir or args.memory_dir)}
         seeds=[args.seed if args.seed_mode=='fixed' else args.seed+i for i in range(args.episodes)]
         if args.dry_run:
+            from nine_grid.carla_sensor_policy import sensor_policy
             print(json.dumps({'模式':'只检查配置；未连接CARLA、模型服务或DINO',
                 '平台':config['platform'],'场景':cfg['experiment'],'场景实例':cfg['scenario_source']['name'],'场景文件':str(scene_path),'平台配置':cfg,
                 'seeds':seeds,'最长仿真秒':config.get('duration',config['clock']['episode_seconds']),
                 'fast':args.fast,'reflection':args.reflection,'检索':args.retrieve,'写入':args.write_memory,
+                '运行时钟':{'runtime_mode':cfg['runtime_mode'],'physics_hz':config['clock']['physics_hz'],
+                    'planner_hz':config['clock']['planner_hz'],'mpc_step_s':config['mpc']['step_s'],
+                    'mpc_horizon_s':config['mpc']['step_s']*config['mpc']['horizon_steps']},
+                '传感器策略':sensor_policy(fast_enabled=args.fast!='off',reflection_enabled=args.reflection!='off',video=args.video,live=args.live),
                 '输出与库路径':{k:str(v) for k,v in paths.items()},'模型配置文件':str(model_file),
                 '提示词SHA256':{role:model_settings[role]['system_prompt_sha256'] for role in ('fast','reflection')},
                 '真实运行待满足':['已启动CARLA 0.9.15专用空世界','--exclusive-world','有效--carla-python及SDK','启用模型时需可用服务']},ensure_ascii=False,indent=2))
@@ -342,7 +361,10 @@ def main(argv=None):
     from nine_grid.runner import run_episode
     try:
         fast=VisionClient('fast',model_settings['fast']);reflection=VisionClient('reflection',model_settings['reflection'])
-        extractor=DINOExtractor(config['dino']['model']) if args.retrieve or args.write_memory else None
+        diagnostics=config.get('diagnostics',{})
+        extractor=(DINOExtractor(config['dino']['model'],device=config['dino'].get('device'),
+                   local_files_only=config['dino'].get('local_files_only',True))
+                   if args.retrieve or args.write_memory or (diagnostics.get('enabled',True) and diagnostics.get('dino',True)) else None)
     except (ValueError,RuntimeError,OSError) as exc:
         parser.error(str(exc))
     summaries=[]

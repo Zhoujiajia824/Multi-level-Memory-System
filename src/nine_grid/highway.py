@@ -79,7 +79,9 @@ class HighwayAdapter:
             raise ValueError(f"未知场景：{self.scenario}")
         self.settings = highway_settings(config,self.scenario)
         self.episode_id = episode_id
-        self.dt = 1 / config.get("clock", {}).get("planner_hz", 10)
+        # 原生连续控制每段仍为MPC采样间隔；低频重规划须执行多段，
+        # 不能将首个转角保持整整一秒。
+        self.dt = float(config.get('mpc',{}).get('step_s',.1))
         self.history_dt=1/float(config.get("clock",{}).get("history_hz",2))
         self.history_seconds=float(config.get("clock",{}).get("history_seconds",3))
         self.duration = float(config.get("duration", config.get("clock", {}).get("episode_seconds", 30)))
@@ -535,6 +537,23 @@ class HighwayAdapter:
         timeout=self._step*self.dt>=self.duration-1e-8
         return {"terminated":collision or arrival or timeout,"collision":collision,"arrival":arrival,"offroad":offroad,
                 "timeout":timeout,"time":self._step*self.dt,"progress":progress+self._route_progress_offset,"reason":"collision" if collision else "arrival" if arrival else "timeout" if timeout else "running"}
+
+    def step_plan(self,plan):
+        """顺序执行1/2/10Hz对应的10/5/1条已验算控制；终态立即停止。"""
+        from .control_clock import execution_prefix_count
+        count=execution_prefix_count(self.config)
+        controls=np.asarray(plan.controls,float)
+        if not plan.valid or controls.ndim!=2 or controls.shape[1]!=2 or len(controls)<count:
+            raise ValueError('没有足够的有效规划控制前缀')
+        for index,control in enumerate(controls[:count]):
+            result=self.step(control)
+            if self._step*self.dt+1e-8>=self._next_history:
+                self.snapshot()  # 低频重规划仍按真实0.5秒保存已观测历史。
+            if result['terminated']:
+                break
+        result['last_applied_control']={'control':controls[index].tolist(),
+            'source':'highway连续控制段','executed_control_count':index+1}
+        return result
 
     def set_planned_trajectory(self,states):
         """保存世界坐标规划状态的副本；空或非法输入清除旧计划，不改变物理状态。"""

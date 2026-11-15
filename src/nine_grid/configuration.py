@@ -136,12 +136,12 @@ FIXED_CONTRACT = {
     "occupancy_distance":{"metric":"observed_soft_iou_with_confirmed_empty"},
     "risk":{"rank_weight":"1/rank"},
     "mpc":{"state":["x","y","psi","v"],"control":["a","delta"],"minimum_speed_mps":0,
-           "constraint_policy":"bounded_controls_soft_safety_v1"},
+           "constraint_policy":"safety_first_tracking_v2"},
     "models":{"max_total_attempts":6,"sdk_max_retries":0,"retry_backoff_s":[1,2,4,8,16],
               "attention_max_count":3,"answer_protocol_version":"local-goal-frenet-1.0","experience_max_characters":10000,
               "reflection_workers":1,"reflection_waiting_capacity":2},
     "memory":{"snapshot_scope":"episode","drain_before_next_episode":True,"auto_seed":False,"admit_requires_all_checks":True},
-    "execution":{"no_feasible_plan":"return_current_bounded_candidate","independent_risk_alarm_with_feasible_plan":"execute_current_candidate",
+    "execution":{"no_feasible_plan":"minimum_risk_brake_emergency","independent_risk_alarm_with_feasible_plan":"recompute_brake_before_execution",
                  "invalid_fast_answer":"clear_entire_semantics_same_mpc_base","network_failure_without_answer":"same_mpc_base_audit_only",
                  "reflection_control_effect":"none","reflection_failed_admission":"reject_no_second_reflection"},
 }
@@ -279,7 +279,12 @@ def validate_config(config):
     for group in FIXED_CONTRACT:
         if isinstance(FIXED_CONTRACT[group],dict) and group in result and not isinstance(result[group],dict):
             raise ValueError(f'{group} 必须为对象')
-    _check_fixed(result,FIXED_CONTRACT)
+    fixed=FIXED_CONTRACT
+    if result.get('platform')=='carla':
+        # CARLA按本轮明确授权采用范围真值，不继续套用highway的遮挡权限。
+        fixed=copy.deepcopy(FIXED_CONTRACT)
+        fixed['perception']['fully_occluded_in_current_planning']=True
+    _check_fixed(result,fixed)
     from .planning_objects import validate_planning_object_config
     result['planning_objects']=validate_planning_object_config(result.get('planning_objects'))
     if 'bev' in result:
@@ -293,7 +298,7 @@ def validate_config(config):
     if 'dynamics_tolerance' in mpc:
         raise ValueError('mpc.dynamics_tolerance 已取消：状态由同一动力学积分直接生成')
     if 'qp_stopline_margin_factor' in mpc:
-        raise ValueError('mpc.qp_stopline_margin_factor 已取消：停止截面改为软惩罚，不再生成QP硬预留')
+        raise ValueError('mpc.qp_stopline_margin_factor 已取消：停止截面使用真实前车体和停车裕量')
     penalty_names={'actor_clearance','road_clearance','noncrossable_line_clearance','yield_stop_line','speed_limit','lateral_acceleration'}
     if not isinstance(mpc.get('safety_penalties',{}),dict) or set(mpc.get('safety_penalties',{}))-penalty_names:
         raise ValueError('mpc.safety_penalties 包含未实现的软惩罚项')
@@ -304,6 +309,15 @@ def validate_config(config):
     for key,value in difference.items():_positive(value,'mpc.geometry_difference_steps.'+key)
     clock=result.get('clock',{})
     physics=clock.get('physics_hz',50);planner=clock.get('planner_hz',10);fast=clock.get('fast_hz',1)
+    if planner not in (1,2,10):
+        raise ValueError('规划频率只支持1、2或10Hz')
+    diagnostics=result.get('diagnostics',{})
+    if not isinstance(diagnostics,dict):raise ValueError('diagnostics必须为对象')
+    for key in ('enabled','dino'):
+        if key in diagnostics and type(diagnostics[key]) is not bool:
+            raise ValueError('diagnostics.'+key+'必须为布尔值')
+    if result.get('planner',{}).get('backend','mpc') not in ('mpc','pdm'):
+        raise ValueError('planner.backend必须是mpc或pdm')
     for name,value in (('physics_hz',physics),('planner_hz',planner),('fast_hz',fast)):
         _positive(value,'clock.'+name)
     if 'episode_seconds' in clock:_positive(clock['episode_seconds'],'clock.episode_seconds')
@@ -311,10 +325,11 @@ def validate_config(config):
         raise ValueError('物理频率必须是规划频率的整数倍，规划频率必须是模型频率的整数倍')
     dt=mpc.get('step_s',.1)
     _positive(dt,'mpc.step_s')
-    if not math.isclose(dt*planner,1.,abs_tol=1e-8):raise ValueError('MPC 步长必须等于规划周期')
-    if mpc.get('physics_substeps',5)!=round(physics/planner):raise ValueError('MPC 子步数必须与物理时钟一致')
     n=mpc.get('horizon_steps',30)
     if type(n) is not int or n<2:raise ValueError('MPC 时域步数必须为至少 2 的整数')
+    # 重规划可以低于优化采样频率；执行器必须消费整数个已优化控制段。
+    from .control_clock import execution_prefix_count
+    execution_prefix_count(result)
     prediction=result.get('prediction',{})
     if not math.isclose(prediction.get('step_s',dt),dt,abs_tol=1e-8):raise ValueError('预测采样间隔必须与 MPC 步长一致')
     if not math.isclose(prediction.get('horizon_s',n*dt),n*dt,abs_tol=1e-8):
@@ -330,7 +345,12 @@ def validate_config(config):
     local=result.get('local_reference',{})
     if not isinstance(local,dict) or set(local)-set(reference_defaults):
         raise ValueError('local_reference 必须为已实现的局部参考参数对象')
-    for key,value in local.items():_positive(value,'local_reference.'+key)
+    for key,value in local.items():
+        if key == 'allow_right_overtake':
+            if type(value) is not bool:
+                raise ValueError('local_reference.allow_right_overtake必须为布尔值')
+        else:
+            _positive(value,'local_reference.'+key)
     if local.get('prediction_check_s',3.)>prediction.get('horizon_s',n*dt)+1e-8:
         raise ValueError('局部候选检查不能超出基础预测时域')
     if local.get('geometry_margin_m',.001)>mpc.get('body_constraint_tolerance_m',.001)+1e-10:
@@ -346,9 +366,11 @@ def validate_config(config):
         raise ValueError('目标纵向最小距离必须小于最大距离')
     if goal.get('projection_window_m',120.)<goal.get('maximum_delta_s_m',70.):
         raise ValueError('目标连续投影窗口不能小于目标纵向范围')
-    for key in ('maximum_speed_mps','steering_abs_max_rad','jerk_abs_max_mps3','steering_rate_abs_max_radps','lateral_acceleration_abs_max_mps2','solver_wall_budget_s','cold_start_budget_s'):
+    for key in ('maximum_speed_mps','steering_abs_max_rad','jerk_abs_max_mps3','steering_rate_abs_max_radps','lateral_acceleration_abs_max_mps2','solver_wall_budget_s','cold_start_budget_s',
+                'tracking_max_error_m','tracking_recovery_distance_m','follow_time_headway_s','follow_min_gap_m','terminal_braking_mps2'):
         if key in mpc:_positive(mpc[key],'mpc.'+key)
     if 'body_constraint_tolerance_m' in mpc:_nonnegative(mpc['body_constraint_tolerance_m'],'mpc.body_constraint_tolerance_m')
+    if 'speed_numerical_tolerance_mps' in mpc:_nonnegative(mpc['speed_numerical_tolerance_mps'],'mpc.speed_numerical_tolerance_mps')
     if 'warm_start_recovery_speed_mps' in mpc:
         _nonnegative(mpc['warm_start_recovery_speed_mps'],'mpc.warm_start_recovery_speed_mps')
     if mpc.get('acceleration_min_mps2',-6)>=0 or mpc.get('acceleration_max_mps2',3)<=0:
