@@ -241,7 +241,8 @@
       "noncrossable_line_clearance": 100,
       "yield_stop_line": 100,
       "speed_limit": 10,
-      "lateral_acceleration": 5
+      "lateral_acceleration": 5,
+      "following_headway": 20
     },
     "geometry_difference_steps": {
       "position_m": 1e-05,

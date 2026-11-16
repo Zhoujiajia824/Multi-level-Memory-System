@@ -299,7 +299,7 @@ def validate_config(config):
         raise ValueError('mpc.dynamics_tolerance 已取消：状态由同一动力学积分直接生成')
     if 'qp_stopline_margin_factor' in mpc:
         raise ValueError('mpc.qp_stopline_margin_factor 已取消：停止截面使用真实前车体和停车裕量')
-    penalty_names={'actor_clearance','road_clearance','noncrossable_line_clearance','yield_stop_line','speed_limit','lateral_acceleration'}
+    penalty_names={'actor_clearance','road_clearance','noncrossable_line_clearance','yield_stop_line','speed_limit','lateral_acceleration','following_headway'}
     if not isinstance(mpc.get('safety_penalties',{}),dict) or set(mpc.get('safety_penalties',{}))-penalty_names:
         raise ValueError('mpc.safety_penalties 包含未实现的软惩罚项')
     for key,value in mpc.get('safety_penalties',{}).items():_positive(value,'mpc.safety_penalties.'+key)

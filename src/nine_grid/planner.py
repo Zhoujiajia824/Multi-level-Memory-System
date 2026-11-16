@@ -6,8 +6,8 @@ import numpy as np
 import shapely
 from shapely.geometry import Polygon
 from shapely.geometry import LineString
-from .contracts import PlanResult
-from .planning_objects import planning_view
+from .contracts import Actor, PlanResult
+from .planning_objects import planning_view, road_rule_observations
 from .local_reference import LocalReferenceManager, LocalReferenceResult
 from .goals import GoalManager, goal_seed_path, first_arrival_residual
 from .realtime_solver import Dynamics, QuadraticSolver, rectangle_gap, circle_gap, rectangle_distance, bicycle_geometry
@@ -71,6 +71,19 @@ def _stop_speed_with_slope(s,stop_local,length,braking):
     speed=np.sqrt(np.maximum(0.,2*braking*(stop_local-s-length/2)))
     derivative=np.divide(-braking,speed,out=np.zeros_like(speed),where=speed>0.)
     return speed,derivative
+
+
+def _following_speed_with_slope(net_gap, lead_speed, minimum_gap, headway, braking):
+    """净车距的时距速度包络；同速平衡车距为minimum_gap+headway*v。"""
+    gap=np.asarray(net_gap,float)-minimum_gap
+    linear=np.maximum(0.,gap/headway)
+    stopping=np.sqrt(np.maximum(0.,np.asarray(lead_speed,float)**2+2*braking*gap))
+    use_linear=linear<=stopping
+    desired=np.minimum(linear,stopping)
+    # 对自车沿参考弧长s求导：净车距随s增加而缩短。
+    derivative=np.where(use_linear,np.where(linear>0.,-1/headway,0.),
+        np.divide(-braking,stopping,out=np.zeros_like(stopping),where=stopping>1e-6))
+    return desired,np.where(np.isfinite(gap),derivative,0.)
 
 
 def _project_executable_controls(controls,speed,dt,min_a,max_a,max_delta):
@@ -146,7 +159,7 @@ class Planner:
         self.previous=None
 
     def _rules(self,scene,predictions):
-        """公共道路优先级和可见预测确定让行，不能用自身停车解释应该等待。"""
+        """当前观测和公开道路优先级确定让行，不能用自身停车解释应该等待。"""
         stop_s=scene.rules.get("stop_s")
         ego_s=project_polyline(scene.ego.position,scene.route,scene.diagnostics.get("route_s"),scene.ego.heading)[0]
         lanes={lane.id:lane for lane in scene.lanes}
@@ -155,11 +168,26 @@ class Planner:
         rules=self.config.get("rules",{})
         stop_margin=float(rules.get("stop_margin_m",1.))
         self.rule_evidence=[]
+        observations=road_rule_observations(scene)
+        rule_actors=[] if observations is None else [Actor(
+            id=row['id'],kind=row['kind'],position=np.asarray(row['position'],float),
+            velocity=np.asarray(row['velocity'],float),acceleration=np.zeros(2),
+            heading=row['heading'],length=row['length'],width=row['width'],lane_id=row['lane_id'])
+            for row in observations['actors']]
+        self.rule_observation_scope={'frame_id':scene.frame_id,'time':float(scene.time),
+            'coordinates':scene.coordinates,'source':'current_visible_public_lane_observations_before_mpc_selection',
+            'rule_actor_ids':[actor.id for actor in rule_actors],'rule_actor_count':len(rule_actors),
+            'mpc_actor_ids':sorted(predictions.actors),'mpc_actor_count':len(predictions.actors),
+            'extra_ekf_predictions':0,'public_path_range_m':55.,
+            'path_selection_source':'observed_motion_public_successor_geometry'}
         if ego_lane and scene.rules.get("road_priority_available"):
             route=scene.route;route_shape=LineString(route)
-            for identity,actor in predictions.actors.items():
+            for actor in rule_actors:
+                identity=actor.id
                 other_lane=lanes.get(actor.lane_id)
-                audit={"actor_id":identity,"source":"visible_public_lane_geometry","active":False}
+                audit={"actor_id":identity,"source":"visible_public_lane_geometry","active":False,
+                    "in_mpc_prediction_set":identity in predictions.actors,
+                    "path_selection_source":"observed_motion_public_successor_geometry"}
                 self.rule_evidence.append(audit)
                 if not actor.visible or not other_lane:
                     audit["reason"]="对象不可见或缺少公开车道";continue
@@ -168,25 +196,19 @@ class Planner:
                 if actor.lane_id in scene.route_lane_ids:
                     audit["reason"]="已在自车同一公开路段，按跟驰处理";continue
                 line=other_lane.center.copy();lane=other_lane;visited={lane.id};path_ids=[lane.id]
-                inferred=list(predictions.diagnostics.get(identity,{}).get("successors",[]))
                 actor_s=project_polyline(actor.position,line,heading=actor.heading)[0]
                 while polyline_lengths(line)[-1]-actor_s<55.:
                     options=[lanes[key] for key in lane.successors if key in lanes and key not in visited]
                     if not options:break
-                    next_id=inferred.pop(0) if inferred else None
-                    # 优先复用本帧预测器已经推断的公开合法后继。停车时
-                    # 预测可能没有后继，按已观察运动朝向选最一致者；这只
-                    # 定义公开路权通路，不生成额外恒速轨迹或读取隐藏路线。
-                    candidates={candidate.id:candidate for candidate in options}
-                    if next_id in candidates:
-                        lane=candidates[next_id]
-                    else:
-                        low_speed=float(self.config.get("prediction",{}).get("low_speed_mps",.3))
-                        motion=actor.heading if np.linalg.norm(actor.velocity)<low_speed else np.arctan2(actor.velocity[1],actor.velocity[0])
-                        def alignment(candidate):
-                            direction=candidate.center[-1]-candidate.center[0]
-                            return abs(float(wrap_angle(np.arctan2(direction[1],direction[0])-motion))),candidate.id
-                        lane=min(options,key=alignment)
+                    # 规则入口只依赖当前观测和公开几何，不继承EKF短时
+                    # 后继假设；否则微小滤波变化会反复撤销/重建停车入口。
+                    # EKF动态轨迹仍完整用于实体避碰；这里不另做运动预测。
+                    low_speed=float(self.config.get("prediction",{}).get("low_speed_mps",.3))
+                    motion=actor.heading if np.linalg.norm(actor.velocity)<low_speed else np.arctan2(actor.velocity[1],actor.velocity[0])
+                    def alignment(candidate):
+                        direction=candidate.center[-1]-candidate.center[0]
+                        return abs(float(wrap_angle(np.arctan2(direction[1],direction[0])-motion))),candidate.id
+                    lane=min(options,key=alignment)
                     visited.add(lane.id)
                     path_ids.append(lane.id)
                     line=clean_polyline(np.vstack((line,lane.center)))
@@ -368,7 +390,7 @@ class Planner:
         max_speed=min(float(p.get('maximum_speed_mps',33.3333333)),float(scene.rules.get('speed_limit',33.3333333)))
         weights=p.get('weights',{});norm=p.get('normalization',{})
         penalties={'actor_clearance':2000.,'road_clearance':500.,'noncrossable_line_clearance':100.,
-                   'yield_stop_line':100.,'speed_limit':10.,'lateral_acceleration':5.}
+                   'yield_stop_line':100.,'speed_limit':10.,'lateral_acceleration':5.,'following_headway':20.}
         penalties.update(p.get('safety_penalties',{}))
         scales={key:float(norm.get(key,default)) for key,default in [('position_m',3.5),('heading_rad',.5),('speed_mps',10),('acceleration_mps2',3),('steering_rad',.6),('jerk_mps3',8),('steering_rate_radps',.8),('progress_m',30)]}
         # 同一几何参考上的前方实体包络。只使用已纳入规划的当前/预测信息。
@@ -377,31 +399,40 @@ class Planner:
         if headway<=0 or terminal_braking<=0 or follow_gap<0:
             raise ValueError('跟驰时距、制动减速度必须为正，停车间距不得为负')
         lead_rear=np.full(n+1,np.inf);lead_speed=np.zeros(n+1);lead_ids=[None]*(n+1)
+        lead_classification=[]
+        stationary_speed=float(self.config.get('prediction',{}).get('low_speed_mps',.3))
         for actor,sample,_ in targets:
             actor_s,offset,actor_tangent,_=_path_projection(sample[:,:2],reference)
             # 跟驰包络只用于当前位于自车前方的对象；后车驶过原帧原点，
             # 不等于驶到了未来自车前方。后车仍完整参与逐时实体碰撞约束。
             if actor_s[0]<=local_s0:
+                lead_classification.append({'id':actor.id,'current_front':False,'eligible_steps':[],
+                    'excluded_moving_conflict_steps':[]})
                 continue
             axis=np.arctan2(actor_tangent[:,1],actor_tangent[:,0])
             phi=sample[:,2]-axis
             along=(actor.radius or actor.width/2) if actor.kind=='pedestrian' else actor.length/2*np.abs(np.cos(phi))+actor.width/2*np.abs(np.sin(phi))
             across=(actor.radius or actor.width/2) if actor.kind=='pedestrian' else actor.length/2*np.abs(np.sin(phi))+actor.width/2*np.abs(np.cos(phi))
             rear_s=actor_s-along
-            mask=(np.linalg.norm(offset,axis=1)<=across+scene.ego.width/2+clearance)&(actor_s>local_s0)&(rear_s<lead_rear)
+            longitudinal_speed=sample[:,3]*np.cos(phi)
+            lateral_speed=sample[:,3]*np.sin(phi)
+            stationary=(sample[:,3]<=stationary_speed)|(actor.kind=='static_obstacle')
+            same_direction=longitudinal_speed>np.abs(lateral_speed)
+            # 横穿/对向仍参与逐时实体避碰和路权，让行不等于同向跟驰。
+            # 预测切入后同向的阶段、已停在通道内的实体才进入跟车包络。
+            spatial=(np.linalg.norm(offset,axis=1)<=across+scene.ego.width/2+clearance)&(actor_s>local_s0)
+            eligible=spatial&(stationary|same_direction)
+            lead_classification.append({'id':actor.id,'current_front':True,
+                'eligible_steps':np.flatnonzero(eligible).tolist(),
+                'stationary_blocker_steps':np.flatnonzero(spatial&stationary).tolist(),
+                'excluded_moving_conflict_steps':np.flatnonzero(spatial&~(stationary|same_direction)).tolist()})
+            mask=eligible&(rear_s<lead_rear)
             lead_rear[mask]=rear_s[mask]
             lead_speed[mask]=np.maximum(0.,sample[mask,3]*np.cos(phi[mask]))
             for index in np.flatnonzero(mask):lead_ids[index]=actor.id
         def following_speed(ss, indices):
-            gap=lead_rear[indices]-np.asarray(ss)-scene.ego.length/2-follow_gap
-            linear=np.maximum(0.,lead_speed[indices]+gap/headway)
-            stopping=np.sqrt(np.maximum(0.,lead_speed[indices]**2+2*terminal_braking*gap))
-            use_linear=linear<=stopping
-            desired=np.minimum(linear,stopping)
-            derivative=np.where(use_linear,np.where(linear>0.,-1/headway,0.),
-                np.divide(-terminal_braking,stopping,out=np.zeros_like(stopping),where=stopping>1e-6))
-            derivative=np.where(np.isfinite(gap),derivative,0.)
-            return desired,derivative
+            net_gap=lead_rear[indices]-np.asarray(ss)-scene.ego.length/2
+            return _following_speed_with_slope(net_gap,lead_speed[indices],follow_gap,headway,terminal_braking)
         # 目标纵向截面之后，仅由预测位置所在的同向合法车道确定基础引导。
         lane_references=[]
         for lane in scene.lanes:
@@ -619,6 +650,12 @@ class Planner:
             following=follow_target<target
             target=np.minimum(target,follow_target)
             target_direction=np.where(following[:,None],follow_derivative[:,None]*s_tangent*s_interior[:,None],target_direction)
+            # 时距是舒适跟驰目标而非初态可行性门槛；近距/切入时允许连续减速恢复。
+            # 单独惩罚欠距，避免导航进度收益长期抵消速度跟踪而再次贴近前车。
+            headway_margin=lead_rear[1:]-s-scene.ego.length/2-follow_gap-headway*current[:,3]
+            residual('penalty_following_headway',np.minimum(headway_margin,0.),
+                lambda c:(-c['sj']-headway*c['sens'][:,3])*(headway_margin<0.)[:,None],
+                penalties['following_headway'],scales['position_m'])
             if stop_local is not None:
                 global_s,_,global_tangent,global_interior=_path_projection(current[:,:2],global_reference)
                 stop_speed,stop_derivative=_stop_speed_with_slope(global_s,stop_local,scene.ego.length,braking)
@@ -771,6 +808,7 @@ class Planner:
                              and bool(np.all(shapely.covers(accepted_road,polygons))))
             result=dict(states=states,controls=controls.copy(),objective=objective,components=components,
                 lower=np.concatenate(lower),upper=np.concatenate(upper),minima=metrics,valid=bool(valid),polygons=polygons,
+                following_headway_minimum=(float(np.min(headway_margin)) if np.isfinite(headway_margin).any() else None),
                 safety_feasible=bool(safety_feasible),dense_validation=dense,is_brake=bool(is_brake),
                 violation=max(0.,-min(metrics.values()),-control_margin),goal_evidence=goal_evidence)
             def linearize():
@@ -915,11 +953,19 @@ class Planner:
                 # 相容中心延伸，不能突然跟随错误分支，也不继承VLM目标。
                 brake_reference=clean_polyline(world_to_ego(
                     self.references._continuation(scene,own,lane_table),origin,angle))
+            brake_arc=polyline_lengths(brake_reference)
+            brake_tangents=np.unwrap(np.arctan2(np.gradient(brake_reference[:,1]),np.gradient(brake_reference[:,0])))
+            brake_curvature=np.gradient(brake_tangents,brake_arc+np.arange(len(brake_arc))*1e-9)
             def brake_controls(deceleration,follow_lane):
                 trajectory=[];state=initial.copy();last=previous_control.copy();release_conflicts=[]
                 for step_index in range(n):
-                    _,offset,target_heading=project_polyline(state[:2],brake_reference,heading=state[2])
-                    desired_steer=(1.2*float(wrap_angle(target_heading-state[2]))-.3*np.arctan(offset/max(state[3],2.))) if follow_lane else 0.
+                    s,offset,_=project_polyline(state[:2],brake_reference,heading=state[2])
+                    # 弯中制动仍需曲率前馈和质心侧偏补偿；仅反馈航向误差会
+                    # 在已对齐切向时把转角拉回零，使制动轨迹驶向弯道外缘。
+                    kappa=float(np.interp(s,brake_arc,brake_curvature))
+                    feed=np.arctan(wheelbase*kappa/np.sqrt(max(.01,1-(rear*kappa)**2)))
+                    target_heading=float(np.interp(s,brake_arc,brake_tangents))-np.arctan(axle_ratio*np.tan(feed))
+                    desired_steer=(feed+1.2*float(wrap_angle(target_heading-state[2]))-.3*np.arctan(offset/max(state[3],2.))) if follow_lane else 0.
                     acceleration=-min(deceleration,1.8*max(0.,state[3]))
                     release_limit=brake_acceleration_limit(max(0.,state[3]),dt,max_jerk)
                     lower=max(min_a,last[0]-max_jerk*dt,-release_limit)
@@ -950,11 +996,24 @@ class Planner:
                 if not value['valid']:continue
                 value['initialization_source']=label;value['candidate_source']='current_state_braking'
                 evidence=value['dense_validation'];contacts=evidence['predicted_contacts']
-                # 仅有限制动集合内的风险排序，不声称全局最优或事故不可避免。
+                _,lateral,route_heading=project_polyline(value['states'][:,:2],brake_reference)
+                # 用实际动力学的速度积分比较制动行程；不能用沿导航投影，
+                # 否则拉直偏离弯道反而会因“少前进”获得更低的停止线亏量。
+                travel=float(dt*np.sum(value['states'][:-1,3]+.5*(1.-1./self.substeps)*dt*braking_controls[:,0]))
+                beta=np.r_[np.arctan(axle_ratio*np.tan(braking_controls[:,1])),np.arctan(axle_ratio*np.tan(braking_controls[-1,1]))]
+                braking_metrics={'distance_m':travel,'terminal_speed_mps':float(value['states'][-1,3]),
+                    'navigation_lateral_rms_m':float(np.sqrt(np.mean(lateral**2))),
+                    'navigation_direction_rms_rad':float(np.sqrt(np.mean(wrap_angle(route_heading-value['states'][:,2]-beta)**2))),
+                    'distance_comparison_resolution_m':.001,'speed_comparison_resolution_mps':.001}
+                value['braking_risk_metrics']=braking_metrics
+                # 仅有限制动集合内排序：物理危险优先，再比较停车能力，
+                # 同级才保持导航；不让毫米以下积分噪声压过转向连续性。
                 risk_order=(not value['safety_feasible'],len(contacts)>0,
                     max([row['closing_speed_mps'] for row in contacts],default=0.),
                     -min([row['time_s'] for row in contacts],default=n*dt),
-                    evidence['offroad_samples']+evidence['line_violation_samples'],value['violation'],value['states'][-1,3])
+                    evidence['offroad_samples']+evidence['line_violation_samples'],evidence['stop_line_passed'],
+                    round(travel,3),round(braking_metrics['terminal_speed_mps'],3),
+                    braking_metrics['navigation_lateral_rms_m'],braking_metrics['navigation_direction_rms_rad'],value['violation'])
                 emergency_candidates.append((risk_order,value))
             if not emergency_candidates:
                 raise RuntimeError('当前状态不能形成有限有界制动控制，拒绝伪造有效轨迹')
@@ -966,14 +1025,27 @@ class Planner:
             'planning_object_selection':object_selection,'execution_mode':execution_mode,
             'emergency':execution_mode=='emergency_unverified',
             'braking_release_conflicts':accepted.get('braking_release_conflicts',[]),
+            'braking_risk_metrics':accepted.get('braking_risk_metrics'),
+            'braking_risk_order_fields':['not_safety_feasible','predicted_contact','maximum_contact_closing_speed_mps',
+                'negative_first_contact_time_s','offroad_plus_line_violation_samples','stop_line_passed',
+                'speed_integral_distance_m_rounded_3','terminal_speed_mps_rounded_3',
+                'navigation_lateral_rms_m','navigation_direction_rms_rad','maximum_constraint_deficit'],
             'dense_validation':accepted['dense_validation'],
-            'following':{'lead_ids':lead_ids,'minimum_gap_m':follow_gap,'time_headway_s':headway,'terminal_braking_mps2':terminal_braking},
+            'following':{'lead_ids':lead_ids,'minimum_gap_m':follow_gap,'time_headway_s':headway,'terminal_braking_mps2':terminal_braking,
+                'version':'bumper-gap-time-headway-1.0','headway_is_soft_target':True,
+                'initial_net_gap_m':float(lead_rear[0]-local_s0-scene.ego.length/2) if np.isfinite(lead_rear[0]) else None,
+                'desired_initial_net_gap_m':follow_gap+headway*speed if np.isfinite(lead_rear[0]) else None,
+                'minimum_predicted_headway_margin_m':accepted['following_headway_minimum'],
+                'eligibility_rule':'moving_longitudinal_velocity_gt_abs_lateral_velocity_or_stationary_corridor_blocker',
+                'stationary_speed_threshold_mps':stationary_speed,'candidate_classification':lead_classification,
+                'entity_collision_target_ids':[actor.id for actor,_,_ in targets]},
             'tracking_policy':{'before_goal_or_no_goal_max_error_m':float(p.get('tracking_max_error_m',.25)),
                 'initial_offset_recovery_distance_m':float(p.get('tracking_recovery_distance_m',15.)),
                 'after_predicted_goal_crossing':'实际同向车道内车体可容纳范围，保留基础中心/方向代价，不保留目标吸引',
                 'after_actual_goal_pass':'GoalManager释放；下一周期从实际状态生成基础参考'},
             'emergency_candidates':[{'source':value['initialization_source'],'safety_feasible':value['safety_feasible'],
                 'risk_order':list(order),'dense_validation':value['dense_validation'],
+                'braking_risk_metrics':value.get('braking_risk_metrics'),
                 'braking_release_conflicts':value.get('braking_release_conflicts',[])} for order,value in emergency_candidates],
             'vehicle_dynamics':{'reference_point':'geometric_center','wheelbase_m':wheelbase,
                 'rear_axle_to_center_m':rear,'geometry_source':'platform' if scene.ego.wheelbase_m is not None else 'highway_legacy'},
@@ -995,7 +1067,8 @@ class Planner:
             'warm_start_across_goal_update':bool(warm and new_goal_active),
             'warm_start_rejection_reason':warm_rejection,
             'deadline_missed':elapsed>budget,'deadline_budget_seconds':budget,'must_wait':stop_s is not None,'wait_reason':wait_reason,'stop_s':stop_s,
-            'rule_evidence':self.rule_evidence,'initial_constraints':initial_diagnostics,
+            'rule_evidence':self.rule_evidence,'rule_observation_scope':self.rule_observation_scope,
+            'initial_constraints':initial_diagnostics,
             'map_rejections':[{'actor_id':identity,'reason':info.get('reason'),
                                'trajectory_source':info.get('trajectory_source'),'kinematic_valid':info.get('kinematic_valid')}
                               for identity,info in predictions.diagnostics.items() if info.get('valid') is False],

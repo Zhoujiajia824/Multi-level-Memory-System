@@ -119,15 +119,7 @@ def _candidate_lanes(scene, reference):
     for key in (source.left, source.right):
         if key in lanes:
             reason = manager._legal(scene, source, lanes[key], lanes)
-            if (reason is None and key == source.right and not manager.p['allow_right_overtake']
-                    and not manager._navigation_change_needed(scene, source, lanes[key], lanes)):
-                traffic = manager._traffic(scene, None, source, check_future=False)
-                front = traffic['front']
-                actor = next((obj for obj in scene.actors if front and obj.id == front['id']), None)
-                if (actor is not None and actor.kind in ('vehicle', 'bicycle')
-                        and front['speed_mps'] + manager.p['minimum_gain_mps']
-                        < float(scene.rules.get('desired_speed', np.linalg.norm(scene.ego.velocity)))):
-                    reason = '禁止为绕过本车道慢前车主动从右侧超车；此右换道非导航必需'
+            reason = reason or manager._right_overtake_reason(scene, source, lanes[key], lanes)
             result.append((lanes[key], reason))
     return result
 
