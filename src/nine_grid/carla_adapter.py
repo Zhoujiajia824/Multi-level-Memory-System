@@ -22,6 +22,7 @@ from shapely.ops import unary_union
 from .contracts import Actor, Lane, SceneSnapshot, plain
 from .paths import filesystem_path
 from .carla_bridge import camera_storage_due
+from .carla_execution import duration_tick_limit
 from .geometry import actor_shape, clean_polyline, polyline_lengths, project_polyline, sample_polyline
 
 
@@ -766,10 +767,15 @@ class CarlaAdapter:
         offroad = not self.drivable.buffer(float(self.config.get('mpc', {}).get('body_constraint_tolerance_m', .001))).covers(actor_shape(ego))
         collision = bool(raw['collision'])
         arrival = progress >= self._goal_s and abs(lateral) < 2.5 and not collision and not offroad
-        timeout = raw['time'] >= self.cfg['duration_s'] - 1e-8
         runtime=raw.get('runtime',{})
+        ticks=runtime.get('physical_ticks')
+        if type(ticks) is not int or ticks < 0:
+            raise RuntimeError('CARLA冻结观测缺少有效的本轮物理帧计数')
+        # 只用该观测冻结的计数；异步runtime.live可能属于更晚的世界状态。
+        timeout = ticks >= duration_tick_limit(self.cfg['duration_s'], self.cfg['physics_hz'])
         runtime_reason=runtime.get('terminal_reason')
-        reason='collision' if collision else 'arrival' if arrival else 'timeout' if timeout else runtime_reason or 'running'
+        runtime_failure=runtime_reason if runtime_reason not in (None,'duration') else None
+        reason=runtime_failure or ('collision' if collision else 'arrival' if arrival else 'timeout' if timeout else 'running')
         return {'terminated': bool(collision or arrival or timeout or runtime_reason),
             'collision': collision, 'arrival': arrival,'offroad': offroad, 'timeout': timeout,
             'time': raw['time'], 'progress': progress+self._progress_offset,'reason':reason,
@@ -786,16 +792,25 @@ class CarlaAdapter:
             raise ValueError('只能提交当前冻结帧通过验收的规划')
         if controls.ndim!=2 or controls.shape[1]!=2 or not len(controls) or not np.isfinite(controls).all():
             raise ValueError('CARLA控制序列必须为有限(N,2)')
+        if self.runtime_mode=='sync':
+            physics=self.cfg['physics_hz']
+            current_ticks=self._raw.get('runtime',{}).get('physical_ticks')
+            if type(current_ticks) is not int or current_ticks < 0:
+                raise RuntimeError('CARLA冻结观测缺少有效的本轮物理帧计数')
+            remaining=duration_tick_limit(self.cfg['duration_s'],physics)-current_ticks
+            if remaining<=0:
+                raise RuntimeError('本轮已达到时长上限，不能继续提交控制')
+            expected_ticks=min(physics//self.cfg['planner_hz'],remaining)
         raw=self.bridge.call('step',controls=controls.tolist(),
             control_step_s=float(self.config['mpc']['step_s']),source_time=float(plan.time),plan=self._planned,
             source_speed_mps=float(np.linalg.norm(current.ego.velocity)))
         self._ingest_display_frames(raw)
         if self.runtime_mode=='sync':
-            # 非整秒轮长也只推进到首个达到上限的物理tick，不误报同步时钟错误。
-            physics=float(self.cfg['physics_hz'])
-            end_tick=math.ceil(self.cfg['duration_s']*physics-1e-8)/physics
-            expected=min(current.time+self.dt,end_tick)
-            if abs(raw['time']-expected)>1e-5 or raw['frame']<=self._raw['frame']:
+            # 校验本次真实帧差和时间增量；不把累计时间强行截到理想结束秒数。
+            # 部分周期只消费剩余物理帧，外部额外tick仍必须报错。
+            if (raw['frame']-self._raw['frame']!=expected_ticks or
+                    raw.get('runtime',{}).get('physical_ticks')!=current_ticks+expected_ticks or
+                    abs((raw['time']-current.time)-expected_ticks/physics)>1e-5):
                 raise RuntimeError('CARLA同步步进时间或帧号不符合执行前缀')
         elif raw['frame']<self._raw['frame'] or raw['time']+1e-8<current.time:
             raise RuntimeError('CARLA异步观测时间倒退')

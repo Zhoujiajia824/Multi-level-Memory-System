@@ -335,7 +335,8 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
                 writer.append('terminal_observation',dict(frame_id=scene.frame_id,time=scene.time,
                     actual=cycle_result,video_display_s=display_seconds))
                 break
-            if scene.time-first_time>=duration-1e-8:
+            # CARLA终态由冻结观测的物理帧计数给出，不另用浮点秒数截断。
+            if config.get('platform','highway')!='carla' and scene.time-first_time>=duration-1e-8:
                 summary.update(simulated_seconds=scene.time,termination_reason='timeout')
                 break
             # 按实际规划帧推进投影；完整实体归格仅由检索源帧消费。

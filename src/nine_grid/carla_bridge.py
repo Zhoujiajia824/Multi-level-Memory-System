@@ -14,9 +14,9 @@ import zlib
 from pathlib import Path
 
 try:
-    from .carla_execution import ControlTimeline
+    from .carla_execution import ControlTimeline, duration_tick_limit
 except ImportError:
-    from carla_execution import ControlTimeline
+    from carla_execution import ControlTimeline, duration_tick_limit
 
 
 def validate_camera_source_clock(clock):
@@ -1084,6 +1084,8 @@ class CarlaSession:
             carla_native_synchronous=True, physics_hz=self.physics_hz, planner_hz=self.planner_hz,
             control_step_s=self.control_step_s, camera_hz=10. if self.rgb_enabled else 0.,
             rgb_enabled=self.rgb_enabled, depth_sensor_count=0,
+            duration_s=self.duration_s,
+            duration_target_ticks=duration_tick_limit(self.duration_s, self.physics_hz),
             terminal_reason=self._terminal_reason,
             sequence_exhausted=self._terminal_reason == 'sequence_exhausted',
             paused=self._paused, realtime_started=self._ticker is not None,
@@ -1349,7 +1351,10 @@ class CarlaSession:
 
     def _duration_reached(self):
         with self._condition:
-            if self.duration_s is not None and self._sim_time >= self.duration_s-1e-8:
+            target = duration_tick_limit(self.duration_s, self.physics_hz)
+            # 初始化帧不计入轮长。3秒=150个正式物理tick，即使CARLA报告
+            # 2.9999999329秒也已结束；原始时间戳仍原样保留在快照与日志中。
+            if target is not None and self._runtime_metrics['physical_ticks'] >= target:
                 self._terminal_reason = 'duration'
                 return True
             return False
@@ -1398,7 +1403,19 @@ class CarlaSession:
                 self._condition.notify_all()
 
     def step(self, controls, control_step_s, source_time, plan=None, source_speed_mps=None):
-        self._install(controls, control_step_s, source_time, plan, source_speed_mps)
+        with self._condition:
+            if self.runtime_mode == 'async' and self._terminal_reason is not None:
+                # 规划期间后台可能已到轮末。等终态与真实最终状态一起发布，
+                # 不把旧快照当终态，也不为这条迟到的规划追加物理推进。
+                deadline = time.monotonic()+self.timeout
+                while not self._terminal_published:
+                    remaining = deadline-time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError('等待CARLA最终观测发布超时')
+                    self._condition.wait(remaining)
+                return self._latest_result()
+            # 与_duration_reached共用锁，避免检查结束后、安装计划前再到达轮末。
+            self._install(controls, control_step_s, source_time, plan, source_speed_mps)
         if self._started_at is None:
             self._started_at = time.monotonic()
         if self.runtime_mode == 'async':

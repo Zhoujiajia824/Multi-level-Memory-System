@@ -1,5 +1,25 @@
 """CARLA控制序列的源时标消费；Python 3.7标准库实现。"""
 import math
+import sys
+
+
+def duration_tick_limit(duration_s, physics_hz):
+    """轮长向上对齐名义物理网格；不对带float32累计误差的世界时间取整。"""
+    if type(physics_hz) is not int or physics_hz <= 0:
+        raise ValueError('物理频率必须为正整数')
+    if duration_s is None:
+        return None
+    if (type(duration_s) not in (int, float) or
+            not math.isfinite(duration_s) or duration_s <= 0):
+        raise ValueError('轮长必须为有限正数')
+    ticks = duration_s * physics_hz
+    if not math.isfinite(ticks):
+        raise ValueError('轮长超出物理帧计数范围')
+    nearest = round(ticks)
+    # 仅消除十进制配置乘法的机器精度误差，不把实际部分物理步向下截断。
+    if abs(ticks - nearest) <= 8 * sys.float_info.epsilon * max(1., abs(ticks)):
+        ticks = nearest
+    return max(1, int(math.ceil(ticks)))
 
 
 class ControlTimeline:
