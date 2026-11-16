@@ -110,6 +110,11 @@ class LocalReferenceManager:
 
     def _continuation(self, scene, lane, lanes):
         """只沿导航声明的有序道路分支，不能从 successors 任挑一个出口。"""
+        if lane.id in scene.route_lane_ids:
+            # 平台导航已处理路口/环岛入口出口的几何连接。重新拼原始车道中心
+            # 会丢掉连接曲线，甚至因端点间隙提前截断，使车停在入口或出口前。
+            # 邻道不在导航序列时仍使用下方拓扑核验，不能强行拉回旧车道。
+            return clean_polyline(scene.route).copy()
         path = np.asarray(lane.center, float).copy()
         ordered = scene.route_lane_ids
         own_segment = self._segment(lane.id)
@@ -188,9 +193,24 @@ class LocalReferenceManager:
         return None
 
     def _navigation_change_needed(self, scene, source, target, lanes):
-        """右换道只在公开导航分支要求时主动发起，不拿速度收益冒充导航。"""
+        """当前车道无法继续既定导航时，优先选择可接入的合法邻道。"""
         return (not self._navigation_compatible(scene,source,source,lanes)
                 and self._navigation_compatible(scene,source,target,lanes))
+
+    def _right_overtake_reason(self, scene, source, target, lanes, traffic=None):
+        """限制绕过慢前车的右侧超车，不把普通右变道或归右一并禁止。"""
+        if (target.id != source.right or self.p['allow_right_overtake']
+                or self._navigation_change_needed(scene, source, target, lanes)):
+            return None
+        traffic = traffic if traffic is not None else self._traffic(scene, None, source, check_future=False)
+        front = traffic['front']
+        actor = next((obj for obj in scene.actors if front and obj.id == front['id']), None)
+        desired = float(scene.rules.get('desired_speed', np.linalg.norm(scene.ego.velocity)))
+        if (actor is not None and actor.kind in ('vehicle', 'bicycle')
+                and front['speed_mps'] + self.p['minimum_gain_mps'] < desired
+                and traffic['estimated_speed_mps'] < desired-1e-9):
+            return '禁止为绕过本车道慢前车主动从右侧超车；此右换道非导航必需'
+        return None
 
     def _traffic(self, scene, predictions, lane, check_future=True):
         """可见当前净距及 EKF 未来占道检查，仅决定候选是否值得求解。"""
@@ -272,6 +292,12 @@ class LocalReferenceManager:
     def _path(self, scene, source, target, lanes):
         """五次分段横向插值，终端沿目标中心线延伸，不指定到达时刻。"""
         reference = self._continuation(scene, source, lanes)
+        if target is source:
+            # 普通循道沿已连接的导航中心线。按瞬时转角再生成长距离五次
+            # “归中”会把入弯时的曲率差放大成外鼓路径，甚至指向出口实线。
+            # 实际初始偏差由 MPC 的恢复包络处理，jerk/转角速率保持控制连续。
+            # 主动换道以及模型局部引导点仍使用各自的五次参考。
+            return reference
         ego_s, d0, base_heading = project_polyline(scene.ego.position, reference,
                                                   heading=scene.ego.heading)
         total = polyline_lengths(reference)[-1]
@@ -433,31 +459,38 @@ class LocalReferenceManager:
             own_traffic = self._traffic(scene, predictions, current, check_future=False)
             candidates.append({"lane_id": current.id, "source": "keep", **own_traffic})
             best_gain = self.p["minimum_gain_mps"]
+            selected_priority = 0
             for key in (current.left, current.right):
                 if key not in lanes:
                     continue
                 lane = lanes[key]
                 reason = self._legal(scene, current, lane, lanes)
                 navigation_required=self._navigation_change_needed(scene,current,lane,lanes)
-                if key==current.right and not self.p['allow_right_overtake'] and not navigation_required:
-                    reason=reason or '禁止主动右侧超车；当前右换道不是导航必需'
+                reason = reason or self._right_overtake_reason(scene, current, lane, lanes, own_traffic)
                 traffic = (self._traffic(scene, predictions, lane) if reason is None else
                            {"front": None, "rear": None, "estimated_speed_mps": 0.,
                             "predicted_min_gap_m": None, "rejection": reason})
                 gain = traffic["estimated_speed_mps"]-own_traffic["estimated_speed_mps"]
+                # 无收益的返回不应被“超车收益”门槛卡住。安全等效时允许归右，
+                # 无须先有左变道历史；但不能覆盖导航必需或更好的合法超车候选。
+                keep_right = key == current.right and gain >= -1e-9
+                priority = (3 if navigation_required else 2 if gain > self.p['minimum_gain_mps']+1e-9
+                            else 1 if keep_right else 0)
                 item = {"lane_id": key, "source": "base", **traffic, "gain_mps": float(gain),
-                        "navigation_required":navigation_required}
+                        "navigation_required":navigation_required, "keep_right": keep_right}
                 item["rejection"] = reason or traffic["rejection"]
                 proposed = None
-                preferred=navigation_required or gain>best_gain+1e-9
+                preferred = priority > selected_priority or (priority == selected_priority == 2 and gain > best_gain+1e-9)
                 if item["rejection"] is None and preferred:
                     proposed = self._path(scene, current, lane, lanes)
                     if not self._road_ok(scene, proposed):
                         item["rejection"] = "完整车体粗检超出合法走廊或跨越实线"
                 if item["rejection"] is None and preferred and proposed is not None:
                     selected = lane; path = proposed; best_gain = gain
-                    chosen_source = "navigation_lane_change" if navigation_required else "base_lane_change"
-                elif item["rejection"] is None and gain<self.p["minimum_gain_mps"]:
+                    selected_priority = priority
+                    chosen_source = ("navigation_lane_change" if navigation_required else
+                                     "base_keep_right" if priority == 1 else "base_lane_change")
+                elif item["rejection"] is None and priority == 0:
                     item["rejection"] = "换道收益不足"
                 candidates.append(item)
             self.state["candidate_diagnostics"] = deepcopy(candidates)
@@ -484,6 +517,8 @@ class LocalReferenceManager:
             "source_lane_id": self.state["source_lane_id"],
             "target_lane_id": self.state["target_lane_id"],
             "selected_source": self.state["selected_source"],
+            "reference_geometry": ("quintic_lane_change" if self.state["phase"] in ("initiate", "hold")
+                                   else "connected_lane_center_with_mpc_offset_recovery"),
             "candidates": candidates,
             "candidate_evaluated_at": self.state.get("last_candidate_time"),
             "event": event, "selection_wall_s": perf_counter()-started})

@@ -35,6 +35,52 @@ DEFAULTS = {
 ROLES = ('left_front', 'front', 'right_front', 'left_side', 'right_side',
          'left_rear', 'rear', 'right_rear')
 KINDS = ('vehicle', 'bicycle', 'pedestrian', 'static_obstacle')
+RULE_OBSERVATION_VERSION = 'road-rule-current-observations-1.0'
+
+
+def road_rule_observations(scene):
+    """冻结筛选前当前公开车道交通；路权审计不为这些对象增加EKF预测。"""
+    if not scene.rules.get('road_priority_available'):
+        return None
+    lane_ids={lane.id for lane in scene.lanes}
+    current={actor.id:actor for actor in scene.actors
+        if actor.visible and actor.kind in ('vehicle','bicycle') and actor.lane_id in lane_ids}
+    def record(actor):
+        return dict(id=actor.id,kind=actor.kind,position=np.asarray(actor.position,float).tolist(),
+            velocity=np.asarray(actor.velocity,float).tolist(),heading=float(actor.heading),
+            length=float(actor.length),width=float(actor.width),lane_id=actor.lane_id)
+    existing=scene.diagnostics.get('road_rule_observations')
+    if existing is None:
+        if scene.diagnostics.get('planning_scope') is not None:
+            raise ValueError('已筛选规划场景缺少原帧路权观测快照，不能以局部对象冒充完整规则输入')
+        existing=dict(version=RULE_OBSERVATION_VERSION,scene_version=scene.version,
+            frame_id=scene.frame_id,time=float(scene.time),coordinates=scene.coordinates,
+            actors=[record(current[key]) for key in sorted(current)])
+    if (not isinstance(existing,dict) or existing.get('version')!=RULE_OBSERVATION_VERSION
+            or existing.get('scene_version')!=scene.version or existing.get('frame_id')!=scene.frame_id
+            or existing.get('coordinates')!=scene.coordinates or scene.coordinates!='world_xy_m'
+            or not isinstance(existing.get('time'),(int,float))
+            or not np.isclose(existing['time'],scene.time,rtol=0.,atol=1e-8)
+            or not isinstance(existing.get('actors'),list)):
+        raise ValueError('路权当前观测快照的版本、帧、时间或坐标与规划输入不一致')
+    seen={}
+    fields={'id','kind','position','velocity','heading','length','width','lane_id'}
+    for row in existing['actors']:
+        if (not isinstance(row,dict) or set(row)!=fields or not isinstance(row['id'],str)
+                or not row['id'] or row['id'] in seen or row['kind'] not in ('vehicle','bicycle')
+                or row['lane_id'] not in lane_ids):
+            raise ValueError('路权当前观测对象身份、类型或公开车道非法')
+        position=np.asarray(row['position'],float);velocity=np.asarray(row['velocity'],float)
+        numeric=np.asarray([row['heading'],row['length'],row['width']],float)
+        if (position.shape!=(2,) or velocity.shape!=(2,) or not np.isfinite(position).all()
+                or not np.isfinite(velocity).all() or not np.isfinite(numeric).all()
+                or min(numeric[1:])<=0):
+            raise ValueError('路权当前观测对象几何或运动数值非法')
+        seen[row['id']]=row
+    if ((scene.diagnostics.get('planning_scope') is None and set(seen)!=set(current))
+            or any(key not in seen or seen[key]!=record(actor) for key,actor in current.items())):
+        raise ValueError('路权快照遗漏或不匹配本帧当前观测，禁止静默使用旧对象状态')
+    return deepcopy(existing)
 
 
 def validate_planning_object_config(options=None):
@@ -345,8 +391,11 @@ def select_planning_objects(scene, config=None, answer=None):
 
 def planning_scene(scene, config=None, answer=None):
     """在EKF之前建立局部浅拷贝；原场景仍供BEV、模型、检索与回放。"""
+    rule_observations=road_rule_observations(scene)
     selected,diagnostic=select_planning_objects(scene,config,answer)
-    scoped=replace(scene,actors=selected,diagnostics={**scene.diagnostics,'planning_scope':deepcopy(diagnostic)})
+    diagnostics={**scene.diagnostics,'planning_scope':deepcopy(diagnostic)}
+    if rule_observations is not None:diagnostics['road_rule_observations']=rule_observations
+    scoped=replace(scene,actors=selected,diagnostics=diagnostics)
     return scoped,diagnostic
 
 
