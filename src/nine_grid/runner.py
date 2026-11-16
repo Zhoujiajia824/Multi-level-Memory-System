@@ -25,6 +25,7 @@ from .runtime import EpisodeWriter, ReflectionWorker, make_record
 from .async_inference import AsyncInferenceTask, AsyncFastModelWorker
 from .async_admission import AsyncAdmissionTask, AsyncAdmissionWorker
 from .carla_sensor_policy import sensor_policy
+from .carla_execution import CarlaSourceClock
 from .control_clock import execution_prefix_count
 
 logger=logging.getLogger(__name__)
@@ -116,6 +117,8 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
     asynchronous=runtime_mode=='async'
     planning_period=1./float(config['clock']['planner_hz'])
     source_period=1./float(config['clock']['fast_hz'])
+    carla_source_clock=(CarlaSourceClock(config['clock'].get('physics_hz',50),config['clock']['fast_hz'])
+                        if config.get('platform','highway')=='carla' else None)
     execution_count=execution_prefix_count(config)
     diagnostic_config=config.get('diagnostics',{})
     diagnostics_enabled=bool(diagnostic_config.get('enabled',True))
@@ -349,11 +352,19 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
                     ))
             scene.assets['global_map_json']=str((writer.path/'map.json').resolve())
             scene.assets['configuration_json']=str((writer.path/'configuration.json').resolve())
-            source_due=scene.time>=next_source_time-1e-7
-            if source_due:
-                missed=max(0,int(math.floor((scene.time-next_source_time)/source_period+1e-7)))
-                summary['source_periods_skipped']+=missed
-                next_source_time+=(missed+1)*source_period
+            if carla_source_clock is not None:
+                source_clock=carla_source_clock.consume(scene.diagnostics.get('runtime'))
+                scene.diagnostics['source_clock']=source_clock
+                source_due=source_clock['due']
+                summary['source_periods_skipped']+=source_clock['missed']
+                if source_due or source_clock['missed']:
+                    writer.append('source_clock',dict(frame_id=scene.frame_id,time=scene.time,**source_clock))
+            else:
+                source_due=scene.time>=next_source_time-1e-7
+                if source_due:
+                    missed=max(0,int(math.floor((scene.time-next_source_time)/source_period+1e-7)))
+                    summary['source_periods_skipped']+=missed
+                    next_source_time+=(missed+1)*source_period
             source_frame=representations_enabled and source_due
             raw,answer_errors=None,[]
             reps=None
@@ -628,6 +639,15 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
             close_resource('录像统计',lambda: summary.update(video=video_recorder.metadata()))
         if adapter is not None:
             close_resource('仿真适配器',adapter.close)
+            if hasattr(adapter,'runtime_failure_report'):
+                # SDK在EOF/finally完成销毁核验，必须在等待其退出之后读取。
+                def record_cleanup_evidence():
+                    report=adapter.runtime_failure_report()
+                    if 'cleanup' in report:
+                        summary['world_cleanup']=report['cleanup']
+                    if cleanup_errors or summary['termination_reason']=='runtime_error':
+                        summary['runtime_failure']=report
+                close_resource('轮间清理记录',record_cleanup_evidence)
         if cleanup_errors:
             summary['cleanup_errors']=cleanup_errors
             summary['termination_reason_before_cleanup']=summary['termination_reason']

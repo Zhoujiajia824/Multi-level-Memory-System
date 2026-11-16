@@ -26,13 +26,17 @@ def validate_camera_source_clock(clock):
         raise ValueError('CARLA相机按1Hz归档，clock.fast_hz当前也必须为1；不复用旧图调用模型')
 
 
-def camera_storage_due(sim_time, camera_save_hz=1):
+def camera_storage_due(sim_time, camera_save_hz=1, physical_ticks=None, physics_hz=50):
     """从真实10Hz采集帧中选择1Hz原始图片归档，不影响显示/录像时钟。"""
     if isinstance(camera_save_hz, bool) or camera_save_hz != 1:
         raise ValueError('camera_save_hz当前必须为1，与快模型原帧采样对齐')
     if isinstance(sim_time, bool) or not isinstance(sim_time, (int, float)) or not math.isfinite(sim_time) or sim_time < -1e-5:
         raise ValueError('相机落盘需要有限非负仿真时间')
-    # 只容忍物理时钟的浮点误差，不把相邻控制帧舍入成源帧。
+    if physical_ticks is not None:
+        if type(physical_ticks) is not int or physical_ticks < 0 or type(physics_hz) is not int or physics_hz <= 0:
+            raise ValueError('相机落盘需要非负整数物理帧计数及正整数物理频率')
+        return physical_ticks % physics_hz == 0
+    # 兼容离线旧记录；在线桥和适配器使用冻结物理帧，不累计float32时间误差。
     return abs(sim_time-round(sim_time)) <= 1e-5
 
 
@@ -317,6 +321,9 @@ class CarlaSession:
     def __init__(self):
         self.world = None
         self.saved_settings = None
+        self._settings_change_attempted = False
+        self.world_ownership = None
+        self.cleanup_report = None
         self.experiment = None
         self.sensors = []
         self.queues = {}
@@ -410,11 +417,7 @@ class CarlaSession:
             raise ValueError('仅支持 CARLA 0.9.15；客户端={}，服务端={}'.format(client_version, server_version))
         self.world = client.get_world()
         initial = self.world.get_settings()
-        existing = (list(self.world.get_actors().filter('vehicle.*')) +
-                    list(self.world.get_actors().filter('walker.pedestrian.*')) +
-                    list(self.world.get_actors().filter('static.prop.*')))
-        if initial.synchronous_mode or existing:
-            raise RuntimeError('拒绝接管正在同步运行或已有车辆/行人/脚本道具的世界；请为实验启动独立 CARLA 服务')
+        self._check_world_ownership(initial)
         requested_map = str(config.get('map', 'Town05'))
         if type(config.get('physics_hz', 50)) is not int or type(config.get('planner_hz', 10)) is not int:
             raise ValueError('CARLA物理与规划频率必须为整数')
@@ -565,6 +568,7 @@ class CarlaSession:
         if root is None:
             return
         report = {'error': type(error).__name__+': '+str(error), 'frame': self.frame,
+            'world_ownership': self.world_ownership,
             'rgb_initialization': self._rgb_initialization,
             'initialization_ticks': self._initialization_ticks,
             'initial_motion': getattr(self.experiment, 'initial_motion_audit', None),
@@ -576,6 +580,38 @@ class CarlaSession:
                             encoding='utf-8')
         except Exception as exc:
             print('初始化失败诊断保存异常：'+str(exc), file=sys.stderr, flush=True)
+
+    @staticmethod
+    def _settings_record(settings):
+        fields = ('synchronous_mode', 'fixed_delta_seconds', 'no_rendering_mode',
+                  'substepping', 'max_substep_delta_time', 'max_substeps')
+        return {key: getattr(settings, key) for key in fields}
+
+    @staticmethod
+    def _actor_record(actor):
+        return {'id': int(actor.id), 'type_id': actor.type_id,
+                'role_name': actor.attributes.get('role_name', '')}
+
+    def _check_world_ownership(self, settings):
+        actors = self.world.get_actors()
+        existing = [actor for pattern in ('vehicle.*', 'walker.pedestrian.*', 'static.prop.*')
+                    for actor in actors.filter(pattern)]
+        reasons = []
+        if settings.synchronous_mode:
+            reasons.append('world_already_synchronous')
+        if existing:
+            reasons.append('existing_experiment_actor_types')
+        self.world_ownership = {'version': 'carla-world-ownership-1.0',
+            'map': self.world.get_map().name, 'frame': int(self.world.get_snapshot().frame),
+            'settings': self._settings_record(settings), 'rejection_reasons': reasons,
+            'blocking_actors': [self._actor_record(actor) for actor in existing],
+            'accepted': not reasons, 'policy': '不接管同步世界，不删除既有演员'}
+        path = self.root / 'carla_world_ownership.json'
+        path.write_text(json.dumps(self.world_ownership, ensure_ascii=False, allow_nan=False, indent=2),
+                        encoding='utf-8')
+        if reasons:
+            raise RuntimeError('拒绝接管正在同步运行或已有车辆/行人/脚本道具的世界；'
+                '原因={}，阻塞演员数={}；详细身份见{}'.format(','.join(reasons), len(existing), path))
 
     def _align_initial_camera_phase(self):
         """测量启动相位，不假设创建后的首张图就是稳态10Hz时钟原点。"""
@@ -641,6 +677,8 @@ class CarlaSession:
         settings.substepping = True
         settings.max_substep_delta_time = .01
         settings.max_substeps = max(1, int(math.ceil(settings.fixed_delta_seconds/.01)))
+        # RPC异常也可能发生在服务端已应用设置之后，收尾仍需尝试恢复并核验。
+        self._settings_change_attempted = True
         self.world.apply_settings(settings)
         operation = 'keep_current_world'
         if allow_reset:
@@ -847,7 +885,7 @@ class CarlaSession:
             if self.t0 is None or 'front_rgb' not in self.frames:
                 raise ValueError('RGB源帧未就绪')
             saved = camera_storage_due(float(self.frames['front_rgb'].timestamp)-self.t0,
-                                       self.cfg.get('camera_save_hz', 1))
+                self.cfg.get('camera_save_hz', 1), self._runtime_metrics['physical_ticks'], self.physics_hz)
             cameras = []
             for view in ('front', 'front_left', 'front_right', 'back', 'back_left', 'back_right'):
                 rgb = self.frames[view + '_rgb']
@@ -1315,7 +1353,7 @@ class CarlaSession:
         if self.rgb_enabled and self._at_frequency(10.):
             self._collect(self.frame)
             # 录像/观看独立消费10Hz；模型及归档仍只消费整秒原帧。
-            if self._display_enabled or camera_storage_due(self._sim_time):
+            if self._display_enabled or self._at_frequency(1.):
                 self._queue_display_frame(self._camera_payload())
 
     def _queue_display_frame(self, cameras):
@@ -1346,8 +1384,11 @@ class CarlaSession:
         return self._at_frequency(self.planner_hz)
 
     def _at_frequency(self, frequency):
-        phase = self._sim_time*frequency
-        return abs(phase-round(phase)) < 1e-4
+        # t0对齐的是相机正式源帧；运行期采样和规划只按已推进的真实帧计数。
+        period = self.physics_hz / frequency
+        if period < 1 or not period.is_integer():
+            raise ValueError('采样周期必须与物理帧整除对齐')
+        return self._runtime_metrics['physical_ticks'] % int(period) == 0
 
     def _duration_reached(self):
         with self._condition:
@@ -1468,21 +1509,84 @@ class CarlaSession:
             return self._latest_result()
         return {'paused': True}
 
+    def _verify_world_cleanup(self, report, destroyed_after_frame, owned_ids):
+        """只读新快照核验；不以Actor描述缓存或旧帧判断销毁成功。"""
+        expected = self._settings_record(self.saved_settings)
+        actual = self._settings_record(self.world.get_settings())
+        report['expected_settings'] = expected
+        report['restored_settings'] = actual
+        report['settings_mismatches'] = [key for key in expected if actual[key] != expected[key]]
+        if actual['synchronous_mode']:
+            raise RuntimeError('收尾后世界仍为同步模式；不主动tick或等待外来同步世界')
+        if report['settings_mismatches']:
+            raise RuntimeError('收尾世界设置回读不一致：'+','.join(report['settings_mismatches']))
+        started = time.monotonic()
+        deadline = started+5.
+        snapshot = self.world.get_snapshot()
+        while True:
+            report['observed_frame'] = int(snapshot.frame)
+            report['fresh_snapshot'] = snapshot.frame > destroyed_after_frame
+            report['remaining_owned_ids'] = sorted(owned_ids & {int(actor.id) for actor in snapshot})
+            if report['fresh_snapshot'] and not report['remaining_owned_ids']:
+                break
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError('5秒内未确认自建演员消失/销毁后新快照；残留ID={}'.format(
+                    report['remaining_owned_ids']))
+            try:
+                snapshot = self.world.wait_for_tick(remaining)
+            finally:
+                report['passive_wait_seconds'] = time.monotonic()-started
+        # 等待期间有其他客户端改设置时，不把本轮恢复记为成功。
+        actual = self._settings_record(self.world.get_settings())
+        report['restored_settings'] = actual
+        report['settings_mismatches'] = [key for key in expected if actual[key] != expected[key]]
+        if report['settings_mismatches']:
+            raise RuntimeError('清理核验期间世界设置改变：'+','.join(report['settings_mismatches']))
+        report['verified'] = True
+
+    def _save_cleanup_report(self, report, errors):
+        report['errors'] = list(errors)
+        report['status'] = 'failed' if errors else ('complete' if report.get('verified') else 'not_acquired')
+        self.cleanup_report = report
+        root = getattr(self, 'root', None)
+        if root is not None:
+            try:
+                (Path(root)/'carla_cleanup.json').write_text(
+                    json.dumps(report, ensure_ascii=False, allow_nan=False, indent=2), encoding='utf-8')
+            except Exception as exc:
+                errors.append('清理审计保存失败：'+str(exc))
+                report['status'] = 'failed'
+                report['errors'] = list(errors)
+        self.cleanup_errors = list(errors)
+
     def close(self):
         if self.closed:
             return
         # join成功后才允许销毁演员和恢复原世界设置。
         errors = []
+        report = {'version': 'carla-world-cleanup-1.0', 'verified': False,
+                  'settings_change_attempted': self._settings_change_attempted,
+                  'owned_actors': [], 'passive_wait_budget_seconds': 5.,
+                  'passive_wait_seconds': 0., 'policy': '仅销毁本轮自建演员；核验不主动tick'}
         try:
             self.pause()
         except Exception as exc:
             errors.append('停止推进/终态快照：'+type(exc).__name__+': '+str(exc))
         if self._ticker is not None and self._ticker.is_alive():
             message = 'CARLA后台推进仍活跃；拒绝并发销毁传感器或恢复设置'
-            self.cleanup_errors = errors+[message]
+            errors.append(message)
+            self._save_cleanup_report(report, errors)
             raise RuntimeError(message)
         # 暂停后的快照失败不能阻止已停止世界的资源清理。
         self.closed = True
+        owned_ids = set()
+        for actor in list(self.sensors)+list(getattr(self.experiment, 'actors', [])):
+            try:
+                owned_ids.add(int(actor.id))
+                report['owned_actors'].append(self._actor_record(actor))
+            except Exception as exc:
+                errors.append('记录自建演员身份：'+str(exc))
         for sensor in reversed(self.sensors):
             try:
                 sensor.stop()
@@ -1500,13 +1604,24 @@ class CarlaSession:
                               if event.get('event') == 'cleanup_error')
             except Exception as exc:
                 errors.append('experiment.close：'+str(exc))
-        if self.world is not None and self.saved_settings is not None:
+        if self.world is not None and self.saved_settings is not None and self._settings_change_attempted:
+            destroyed_after_frame = None
+            try:
+                destroyed_after_frame = int(self.world.get_snapshot().frame)
+                report['destroyed_after_frame'] = destroyed_after_frame
+            except Exception as exc:
+                errors.append('记录销毁完成时世界帧：'+str(exc))
             try:
                 self.world.apply_settings(self.saved_settings)
             except Exception as exc:
                 errors.append('world.apply_settings：'+str(exc))
+            if destroyed_after_frame is not None:
+                try:
+                    self._verify_world_cleanup(report, destroyed_after_frame, owned_ids)
+                except Exception as exc:
+                    errors.append('清理后状态核验：'+type(exc).__name__+': '+str(exc))
+        self._save_cleanup_report(report, errors)
         if errors:
-            self.cleanup_errors = errors
             raise RuntimeError('CARLA 资源收尾异常，请检查独立世界：' + '; '.join(errors))
 
 

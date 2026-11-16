@@ -22,6 +22,50 @@ def duration_tick_limit(duration_s, physics_hz):
     return max(1, int(math.ceil(ticks)))
 
 
+class CarlaSourceClock:
+    """按冻结观测的物理帧消费源周期；错过的源帧不能由晚到快照冒充。"""
+    def __init__(self, physics_hz, source_hz=1):
+        if type(physics_hz) is not int or physics_hz <= 0:
+            raise ValueError('源时钟物理频率必须为正整数')
+        if (type(source_hz) not in (int, float) or
+                not math.isfinite(source_hz) or source_hz <= 0):
+            raise ValueError('源时钟频率必须为有限正数')
+        period = physics_hz / source_hz
+        if (not math.isfinite(period) or period < 1 or
+                abs(period - round(period)) > 8 * sys.float_info.epsilon * max(1., period)):
+            raise ValueError('源周期必须是完整物理帧数')
+        self.physics_hz = physics_hz
+        self.period_ticks = int(round(period))
+        self.next_source_tick = 0
+        self.previous_tick = None
+
+    def consume(self, runtime):
+        # runtime.live 是异步世界的后续状态，不能决定当前冻结图像的源身份。
+        if not isinstance(runtime, dict) or runtime.get('physics_hz') != self.physics_hz:
+            raise ValueError('源时钟缺少一致的冻结观测物理频率')
+        tick = runtime.get('physical_ticks')
+        if type(tick) is not int or tick < 0:
+            raise ValueError('源时钟需要冻结观测的非负整数物理帧计数')
+        if self.previous_tick is not None and tick < self.previous_tick:
+            raise ValueError('源时钟冻结观测的物理帧计数倒退')
+        self.previous_tick = tick
+        due, missed = False, 0
+        first_skipped_tick, last_skipped_tick = None, None
+        if tick >= self.next_source_tick:
+            boundary = tick - tick % self.period_ticks
+            due = tick == boundary
+            periods = (boundary - self.next_source_tick) // self.period_ticks + 1
+            missed = periods - int(due)
+            if missed:
+                first_skipped_tick = self.next_source_tick
+                last_skipped_tick = self.next_source_tick + (missed - 1) * self.period_ticks
+            self.next_source_tick = boundary + self.period_ticks
+        return dict(clock='frozen_carla_physical_ticks', physical_ticks=tick,
+            physics_hz=self.physics_hz, period_ticks=self.period_ticks,
+            due=due, missed=missed, next_source_tick=self.next_source_tick,
+            first_skipped_tick=first_skipped_tick, last_skipped_tick=last_skipped_tick)
+
+
 class ControlTimeline:
     """只执行已经规划的控制；耗尽后显式报告，不无限保持末项。"""
     def __init__(self, acceleration_min=-6., acceleration_max=3., steering_max=.6):

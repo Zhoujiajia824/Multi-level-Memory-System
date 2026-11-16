@@ -443,13 +443,22 @@ class CarlaAdapter:
     def runtime_failure_report(self):
         """失败帧单独报告，不将未完成控制周期冒充成功执行步。"""
         report = {'bridge_error': copy.deepcopy(getattr(self.bridge, 'last_error', None))}
-        path = self.output_dir / 'camera_sync_failure.json' if self.output_dir is not None else None
-        if path is not None and path.is_file():
+        if self.output_dir is None:
+            return report
+        for key, filename in (('camera_sync', 'camera_sync_failure.json'),
+                              ('initialization', 'carla_initialization_failure.json'),
+                              ('world_ownership', 'carla_world_ownership.json'),
+                              ('cleanup', 'carla_cleanup.json')):
+            path = self.output_dir / filename
+            if not path.is_file():
+                continue
             try:
-                report['camera_sync'] = json.loads(path.read_text(encoding='utf-8'))
-                report['diagnostic_path'] = str(path)
+                report[key] = json.loads(path.read_text(encoding='utf-8'))
+                report.setdefault('diagnostic_paths', {})[key] = str(path)
+                if key == 'camera_sync':
+                    report['diagnostic_path'] = str(path)
             except (OSError, ValueError) as exc:
-                report['diagnostic_read_error'] = type(exc).__name__
+                report.setdefault('diagnostic_read_errors', {})[key] = type(exc).__name__
         return report
 
     def _initialize(self):
@@ -649,7 +658,12 @@ class CarlaAdapter:
         cameras=raw.get('cameras',[])
         mosaic = self._build_mosaic(cameras) if cameras else None
         self._mosaic = np.asarray(mosaic) if mosaic is not None else None
-        saved = bool(cameras) and camera_storage_due(timestamp, self.cfg.get('camera_save_hz', 1))
+        runtime = raw.get('runtime', {})
+        if cameras and (type(runtime.get('physical_ticks')) is not int or
+                        runtime.get('physics_hz') != self.cfg['physics_hz']):
+            raise ValueError('RGB归档缺少一致的冻结观测物理时钟')
+        saved = bool(cameras) and camera_storage_due(timestamp, self.cfg.get('camera_save_hz', 1),
+            runtime.get('physical_ticks'), self.cfg['physics_hz'])
         for camera in raw['cameras']:
             if 'rgb_saved' in camera and camera['rgb_saved'] is not saved:
                 raise ValueError('SDK桥RGB落盘时刻与快模型原帧时钟不一致')
