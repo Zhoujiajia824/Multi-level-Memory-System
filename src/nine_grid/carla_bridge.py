@@ -355,6 +355,10 @@ class CarlaSession:
         self.world_reset = None
         self._initialization_warmup = None
         self._initial_speed_audit = None
+        self._initial_source_frame = None
+        self._initialization_ticks = []
+        self._rgb_initialization = None
+        self._rgb_initialization_deadline = None
         self._display_frames = []
         self._timing = dict((name, 0.) for name in
             ('tick_s', 'sensor_wait_s', 'snapshot_state_s', 'image_s', 'pacing_s', 'scenario_s'))
@@ -390,7 +394,7 @@ class CarlaSession:
             if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or value <= 0:
                 raise ValueError('CARLA 参数必须为有限正数：' + key)
         import carla
-        from carla_scenarios import create_experiment, finalize_ego_initial_speed
+        from carla_scenarios import create_experiment, hold_initial_motion, release_initial_motion
         self.carla = carla
         self.cfg = config
         if config.get('world_plan_debug',False):
@@ -461,16 +465,12 @@ class CarlaSession:
             raise
         # 新spawn演员须先注册到世界，get_speed_limit才能读取真实地图限速。
         # 此时尚未创建RGB；仅属初始化，不计入本轮控制或相机采集时间。
-        previous_frame = self.world.get_snapshot().frame
-        warmup_frame = self.world.tick(self.timeout)
-        warmup = self.world.get_snapshot()
-        if warmup_frame != previous_frame+1 or warmup.frame != warmup_frame:
-            raise RuntimeError('自车注册时检测到额外世界推进：推进前{}，tick返回{}，世界{}'.format(
-                previous_frame, warmup_frame, warmup.frame))
-        self._initialization_warmup = {'frame': warmup_frame,
+        warmup = self._initialization_tick('actor_registration')
+        self._initialization_warmup = {'frame': warmup.frame,
             'timestamp': warmup.timestamp.elapsed_seconds,
             'purpose': '注册静止自车并读取地图限速，尚未创建RGB传感器'}
-        self._initial_speed_audit = finalize_ego_initial_speed(self.experiment, carla)
+        # get_control读取最近ActorSnapshot；注册后再保存parked等演员的原手刹。
+        hold_initial_motion(self.experiment, carla)
         selection = getattr(self.experiment,'selection_report',None)
         if selection is not None:
             selection_path.write_text(json.dumps(selection,ensure_ascii=False,
@@ -489,37 +489,143 @@ class CarlaSession:
         if self.width < 64 or self.height < 64 or not 20 < self.fov < 150:
             raise ValueError('相机尺寸或视场配置非法')
         self._create_sensors()
-        started = time.monotonic()
-        previous_frame = self.world.get_snapshot().frame
-        self.frame = self.world.tick(self.timeout)
-        self._add_timing('tick_s', time.monotonic()-started)
-        snap = self.world.get_snapshot()
-        if self.frame != previous_frame+1 or snap.frame != self.frame:
-            raise RuntimeError('初始化检测到额外世界推进：推进前{}，tick返回{}，世界{}；只能有一个tick客户端'.format(
-                previous_frame, self.frame, snap.frame))
-        self.t0 = snap.timestamp.elapsed_seconds
+        if self.rgb_enabled:
+            # 首张RGB是启动采样，实测第一间隔为6帧、此后才为5帧。
+            # 校准期间演员保持制动，未调用场景脚本、发布观测或开始实验计时。
+            self._align_initial_camera_phase()
+            # 下一稳态相机帧之前的四帧仍保持，最后一帧才激活初速。
+            for _ in range(self.physics_hz // 10 - 1):
+                self._initialization_tick('camera_phase_hold')
+        self._initial_speed_audit = release_initial_motion(self.experiment, carla)
+        snap = self._initialization_tick('initial_motion_activation')
         self._collect(self.frame)
+        self._initial_source_frame = self.frame
+        self.t0 = snap.timestamp.elapsed_seconds
+        if self._rgb_initialization is not None:
+            self._rgb_initialization.update(source_frame=self.frame, source_timestamp=self.t0,
+                activation_frame_gap=self.frame-self._rgb_initialization['stable_frame'])
+        if self.collision:
+            raise RuntimeError('初始化期间发生碰撞，保留初始化事件并拒绝作为正常实验起点')
         self._sample_history(force=True)
         result = self.snapshot()
         self._queue_display_frame(result.get('cameras', []))
         self._publish(result)
         result = self._latest_result()
         result['map'] = self._map_payload()
-        result['bridge_version'] = 'carla-0.9.15-range-runtime-3.1'
+        result['bridge_version'] = 'carla-0.9.15-range-runtime-3.2'
         result['sdk_version'] = client_version
         result['world_reset'] = copy.deepcopy(self.world_reset)
         result['initialization_warmup'] = copy.deepcopy(self._initialization_warmup)
         result['initial_speed_audit'] = copy.deepcopy(self._initial_speed_audit)
+        result['rgb_initialization'] = copy.deepcopy(self._rgb_initialization)
         initialization = {'bridge_version': result['bridge_version'],
             'world_reset': result['world_reset'], 'initialization_warmup': result['initialization_warmup'],
             'initial_speed_audit': result['initial_speed_audit'], 'source_frame': self.frame, 't0': self.t0,
             'physics_hz': self.physics_hz, 'planner_hz': self.planner_hz,
             'rgb_enabled': self.rgb_enabled, 'camera_hz': 10., 'sensor_tick_s': .1,
-            'note': '同步加载与单tick检查改进初始化可复现性；不保证修复真实RGB超时，需实机核查相机帧。'}
+            'rgb_initialization': copy.deepcopy(self._rgb_initialization),
+            'initialization_ticks': copy.deepcopy(self._initialization_ticks),
+            'initial_motion': copy.deepcopy(self.experiment.initial_motion_audit),
+            'initialization_events': copy.deepcopy(self.events),
+            'traffic_lights_at_source': [
+                {'id': str(actor.id), 'state': str(actor.get_state()),
+                 'elapsed_s': float(actor.get_elapsed_time())}
+                for actor in self.world.get_actors().filter('traffic.traffic_light*')],
+            'note': '先制动预热确认六路RGB稳态五帧相位，再于最后一帧激活初速并建立t0；'
+                    '初始化推进与事件单列，交通灯按世界时间推进；运行中不补tick或混用旧图。'}
         (self.root/'carla_initialization.json').write_text(json.dumps(initialization, ensure_ascii=False,
             allow_nan=False, indent=2), encoding='utf-8')
         self._initialized_at = time.monotonic()
         return result
+
+    def _initialization_tick(self, stage):
+        """单独记账的初始化推进；不运行控制时间线或触发场景交互。"""
+        previous = self.world.get_snapshot().frame
+        if self.frame is not None and previous != self.frame:
+            raise RuntimeError('初始化阶段检测到其他客户端推进世界')
+        timeout = self.timeout
+        if self._rgb_initialization_deadline is not None:
+            timeout = min(timeout, self._rgb_initialization_deadline-time.monotonic())
+            if timeout <= 0:
+                raise TimeoutError('RGB初始化相位对齐超过总墙钟预算')
+        started = time.monotonic()
+        self.frame = self.world.tick(timeout)
+        self._add_timing('tick_s', time.monotonic()-started)
+        snap = self.world.get_snapshot()
+        if self.frame != previous+1 or snap.frame != self.frame:
+            raise RuntimeError('初始化单次tick帧不连续；只能有一个tick客户端')
+        self._initialization_ticks.append({'stage': stage, 'frame': self.frame,
+            'timestamp': float(snap.timestamp.elapsed_seconds)})
+        if self.collision:
+            raise RuntimeError('初始化期间发生碰撞，拒绝继续；事件保留在诊断文件中')
+        return snap
+
+    def _save_initialization_failure(self, error):
+        root = getattr(self, 'root', None)
+        if root is None:
+            return
+        report = {'error': type(error).__name__+': '+str(error), 'frame': self.frame,
+            'rgb_initialization': self._rgb_initialization,
+            'initialization_ticks': self._initialization_ticks,
+            'initial_motion': getattr(self.experiment, 'initial_motion_audit', None),
+            'sensor_events': self.events,
+            'scenario_events': getattr(self.experiment, 'events', [])}
+        try:
+            path = Path(root)/'carla_initialization_failure.json'
+            path.write_text(json.dumps(report, ensure_ascii=False, allow_nan=False, indent=2),
+                            encoding='utf-8')
+        except Exception as exc:
+            print('初始化失败诊断保存异常：'+str(exc), file=sys.stderr, flush=True)
+
+    def _align_initial_camera_phase(self):
+        """测量启动相位，不假设创建后的首张图就是稳态10Hz时钟原点。"""
+        period = self.physics_hz // 10
+        audit = {'version': 'carla-rgb-startup-phase-1.0', 'status': 'calibrating',
+            'expected_period_frames': period, 'required_stable_intervals': 2,
+            'sample_frames': [], 'intervals_frames': [], 'initialization_only': True}
+        self._rgb_initialization = audit
+        self._rgb_initialization_deadline = time.monotonic()+self.timeout
+        try:
+            self._initialization_tick('camera_bootstrap')
+            self._collect(self.frame)
+            audit['sample_frames'].append(self.frame)
+            previous, stable = self.frame, 0
+            # 最多0.6s初始化物理推进；每帧留出回调时间，不在缺图帧冻结30s。
+            # 仅用于启动相位探测；运行期仍严格等待指定当前帧，不继续推进找图。
+            front_key = next(iter(self.queues))
+            for _ in range(6*period):
+                self._initialization_tick('camera_phase_probe')
+                deadline = min(time.monotonic()+.2, self._rgb_initialization_deadline)
+                image = None
+                while time.monotonic() < deadline:
+                    try:
+                        item = self.queues[front_key].get(timeout=max(0., deadline-time.monotonic()))
+                    except queue.Empty:
+                        break
+                    if item.frame < self.frame:
+                        self._record_camera_event(front_key, 'discarded_startup_delayed', item)
+                        continue
+                    image = item
+                    break
+                if image is None:
+                    continue
+                self._collect(self.frame, prefetched={front_key: image})
+                gap = self.frame-previous
+                audit['sample_frames'].append(self.frame)
+                audit['intervals_frames'].append(gap)
+                stable = stable+1 if gap == period else 0
+                previous = self.frame
+                if stable >= 2:
+                    audit.update(status='aligned', stable_frame=self.frame,
+                        stable_timestamp=float(image.timestamp))
+                    return
+            raise RuntimeError('RGB初始化未形成六相机共同的10Hz五帧节拍；实际间隔{}'.format(
+                audit['intervals_frames']))
+        except Exception as exc:
+            audit.update(status='failed', error=type(exc).__name__+': '+str(exc))
+            # _collect可能已经保存部分成功相机；不能被外层异常覆盖为空。
+            self._save_camera_sync_failure(self.frame, exc, None)
+            raise
 
     def _configure_experiment_world(self, client, requested_map, allow_reset):
         """先设同步固定步长再加载本轮世界；重载许可不等于接管已有实验。"""
@@ -584,13 +690,20 @@ class CarlaSession:
         def collision(event):
             self.collision = True
             self.events.append({'kind': 'collision', 'frame': event.frame,
+                                'phase': self._event_phase(event.frame),
                                 'other_id': event.other_actor.id, 'other_type': event.other_actor.type_id})
         sensor.listen(collision)
         bp = self.world.get_blueprint_library().find('sensor.other.lane_invasion')
         sensor = self.world.spawn_actor(bp, c.Transform(), attach_to=self.ego)
         self.sensors.append(sensor)
         sensor.listen(lambda event: self.events.append({'kind': 'lane_invasion', 'frame': event.frame,
+            'phase': self._event_phase(event.frame),
             'markings': [str(mark.type) for mark in event.crossed_lane_markings]}))
+
+    def _event_phase(self, frame):
+        # 事件可能延迟回调；按发生帧分类，不按回调抵达墙钟时间分类。
+        return ('initialization' if self._initial_source_frame is None or
+                frame <= self._initial_source_frame else 'runtime')
 
     def _add_timing(self, name, elapsed):
         self._timing[name] = self._timing.get(name, 0.) + float(elapsed)
@@ -635,17 +748,25 @@ class CarlaSession:
                                  is_listening=bool(sensor.is_listening))
                 except Exception as exc:
                     audit['actor_status_error'] = type(exc).__name__+': '+str(exc)
+        previous = self.camera_sync_failure or {}
+        accepted = (copy.deepcopy(previous.get('accepted_for_request', {}))
+                    if selected is None and previous.get('requested_frame') == frame else
+                    {key: {'frame': image.frame, 'timestamp': image.timestamp}
+                     for key, image in (selected or {}).items()})
         report = {'version': 'carla-rgb-sync-diagnostic-1.0',
             'error': type(error).__name__+': '+str(error), 'requested_frame': frame,
             'bridge_frame': self.frame, 'sim_time': self._sim_time,
             't0': self.t0, 'runtime_metrics': copy.deepcopy(self._runtime_metrics),
             'requested_camera_hz': 10., 'sensor_tick_s': .1,
-            'accepted_for_request': {key: {'frame': image.frame, 'timestamp': image.timestamp}
-                                     for key, image in selected.items()},
+            'accepted_for_request': accepted,
             'cameras': cameras, 'world_reset': copy.deepcopy(self.world_reset),
             'initialization_warmup': copy.deepcopy(self._initialization_warmup),
             'initial_speed_audit': copy.deepcopy(self._initial_speed_audit),
-            'note': '此诊断不认定相机节拍或外部tick为根因；未使用旧图、未追加物理推进。'}
+            'rgb_initialization': copy.deepcopy(self._rgb_initialization),
+            'initialization_ticks': copy.deepcopy(self._initialization_ticks),
+            'initial_motion': copy.deepcopy(getattr(self.experiment, 'initial_motion_audit', None)),
+            'initialization_events': copy.deepcopy(self.events) if self.t0 is None else [],
+            'note': '相机帧与世界帧严格对应；初始化相位推进单独记录，运行期不追加补图tick。'}
         try:
             snap = self.world.get_snapshot()
             report['world_frame'] = snap.frame
@@ -669,7 +790,7 @@ class CarlaSession:
             except Exception as exc:
                 print('RGB同步诊断保存失败：'+type(exc).__name__+': '+str(exc), file=sys.stderr, flush=True)
 
-    def _collect(self, frame):
+    def _collect(self, frame, prefetched=None):
         # 无图像消费者时绝不访问front_rgb，也不等待不存在的传感器。
         if not self.queues:
             self.frames = {}
@@ -678,8 +799,11 @@ class CarlaSession:
             return
         started = time.monotonic()
         result = {}
+        prefetched = dict(prefetched or {})
         try:
             deadline = time.monotonic() + self.timeout
+            if self.t0 is None and self._rgb_initialization_deadline is not None:
+                deadline = min(deadline, self._rgb_initialization_deadline)
             for key, q in self.queues.items():
                 while True:
                     remaining = deadline - time.monotonic()
@@ -688,7 +812,7 @@ class CarlaSession:
                     try:
                         if self._stop.is_set() and threading.current_thread() is self._ticker:
                             raise RuntimeError('RGB等待被运行暂停中断')
-                        item = q.get(timeout=min(remaining, .1))
+                        item = prefetched.pop(key) if key in prefetched else q.get(timeout=min(remaining, .1))
                     except queue.Empty:
                         continue
                     if item.frame == frame:
@@ -1394,6 +1518,8 @@ def main():
                     raise ValueError('未知桥接操作：' + str(method))
                 reply = {'id': request['id'], 'result': result}
             except Exception as exc:
+                if request.get('method') == 'init':
+                    session._save_initialization_failure(exc)
                 reply = {'id': request.get('id'), 'error': '{}: {}'.format(type(exc).__name__, exc)}
             print(json.dumps(reply, ensure_ascii=False, allow_nan=False), flush=True)
             if request.get('method') == 'close' or 'error' in reply:

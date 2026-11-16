@@ -269,6 +269,7 @@ class ScriptedExperiment:
         self.name=validate_scripted_experiment(settings)
         self.world,self.settings,self.carla=world,dict(settings),carla
         self.actors,self.events,self.controllers=[],[],[]
+        self._pending_initial_velocities=[]
         self.ego=None;self.route_waypoints=[];self._closed=False
         self._weather=None;self._rows=[];self._stops=[]
         try:self._setup()
@@ -287,7 +288,8 @@ class ScriptedExperiment:
         self.actors.append(actor)
         if speed>0:
             forward=t.get_forward_vector()
-            actor.set_target_velocity(self.carla.Vector3D(x=speed*forward.x,y=speed*forward.y,z=speed*forward.z))
+            self._pending_initial_velocities.append((actor,float(speed*forward.x),
+                float(speed*forward.y),float(speed*forward.z)))
         return actor
 
     def _setup(self):

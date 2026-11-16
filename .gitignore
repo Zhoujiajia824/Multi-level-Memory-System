@@ -28,6 +28,7 @@
 # 只发布环境检查、实验入口和记忆管理，不上传验收/临时脚本。
 /scripts/*
 !/scripts/check_environment.py
+!/scripts/check_carla_camera_clock.py
 !/scripts/run_highway.py
 !/scripts/run_carla.py
 !/scripts/memory_admin.py
