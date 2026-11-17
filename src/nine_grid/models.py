@@ -13,6 +13,7 @@ import numpy as np
 import yaml
 from shapely.geometry import LineString,box
 from .contracts import ModelAnswer, plain
+from .decision_protocol import normalize_model_output
 
 logger=logging.getLogger(__name__)
 
@@ -135,7 +136,7 @@ class VisionClient:
 
 def attention_ids(scene):
     # 只接受实际提供给模型的当前对象ID；地图边界不再进入模型输入。
-    return {a.id for a in scene.actors if a.visible}
+    return {a.id for a in scene.actors if a.visible and a.id != scene.ego.id}
 
 
 def _camera_entries(scene):
@@ -202,38 +203,19 @@ def parse_answer(raw,scene,source='fast',max_characters=6000,reference=None,conf
         data=json.loads(serialized,object_pairs_hook=_unique_answer_object)
     except (ValueError,TypeError):
         raise ValueError('回答不是单个有效 JSON') from None
-    if not isinstance(data,dict) or set(data)!= {'attention','local_goal','explanation'}:
-        raise ValueError('回答必须且仅包含 attention、local_goal、explanation；旧多点协议不受支持')
-    attention=data['attention']
-    if not isinstance(attention,list) or len(attention)>3:
-        raise ValueError('关注列表应包含 0 至 3 项')
+    attention,goal,explanation,output_protocol=normalize_model_output(data)
     ids=attention_ids(scene)
     seen=set()
-    for rank,item in enumerate(attention,1):
-        if not isinstance(item,dict) or set(item)!= {'id','rank','reason'}:
-            raise ValueError('关注项字段错误')
-        if not isinstance(item['id'],str) or item['id'] not in ids or item['id'] in seen:
-            raise ValueError('关注 ID 不存在、不可见或重复')
-        if type(item['rank']) is not int or item['rank']!=rank or not isinstance(item['reason'],str) or not item['reason'].strip():
-            raise ValueError('关注排序或依据非法')
+    for item in attention:
+        if item['id'] not in ids or item['id'] in seen:
+            raise ValueError('关注 ID 不存在、不可用、自车或重复')
         seen.add(item['id'])
-    goal=data['local_goal']
-    try:
-        finite_goal=(isinstance(goal,dict) and set(goal)=={'delta_s_m','d_m'}
-                     and all(type(value) in (int,float) and math.isfinite(value) for value in goal.values()))
-    except OverflowError:
-        finite_goal=False
-    if not finite_goal:
-        raise ValueError('local_goal必须且仅包含有限数值 delta_s_m、d_m')
     from .goals import validate_local_goal
     selected=validate_local_goal(scene,_goal_reference(scene,config) if reference is None else reference,goal)
-    explanation=data['explanation']
-    required={'情境','依据','参考答案','适用条件'}
-    if not isinstance(explanation,dict) or set(explanation)!=required or any(not isinstance(x,str) or not x.strip() for x in explanation.values()):
-        raise ValueError('四段说明不完整')
     return ModelAnswer(scene.frame_id,scene.time,attention,selected['local_goal'],explanation,
                        selected['world_goal'],selected['goal_reference'],selected['goal_id'],raw,source,
-                       target_lane_id=selected['target_lane_id'])
+                       target_lane_id=selected['target_lane_id'],
+                       output_protocol_version=output_protocol,model_output=data)
 
 
 def local_line(points,origin,radius=120.):

@@ -7,6 +7,8 @@ import numpy as np
 
 VERSION = "nine-grid-v1.0"
 ANSWER_PROTOCOL_VERSION = "local-goal-frenet-1.0"
+MODEL_OUTPUT_PROTOCOL_VERSION = "driving-decision-2.0"
+LEGACY_MODEL_OUTPUT_PROTOCOL_VERSION = "attention-goal-explanation-1.0"
 
 
 @dataclass
@@ -104,6 +106,9 @@ class ModelAnswer:
     protocol_version: str = ANSWER_PROTOCOL_VERSION
     coordinates: str = "local_goal:source_reference_delta_s_and_absolute_d_m;world_goal:world_xy_m"
     target_lane_id: str | None = None
+    # 输出文本协议与Frenet几何协议分开版本化；旧记忆不需要迁移。
+    output_protocol_version: str = LEGACY_MODEL_OUTPUT_PROTOCOL_VERSION
+    model_output: dict = field(default_factory=dict)
 
 
 @dataclass
