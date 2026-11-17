@@ -1,0 +1,50 @@
+schema_version: carla-experiment-2.0
+name: town04_overtake_return
+family: overtake_return
+description: 慢车与邻道交通；允许合法超越和归右，具体换道许可由地图校验。
+map: Town04
+status: candidate
+split: development
+desired_speed_mps: 9
+duration_s: 240
+experiment:
+  ego_blueprint: vehicle.tesla.model3
+  initial_speed_mps: 9
+  weather: ClearNoon
+  route:
+    file: ../carla_routes/town04_overtake_return.json
+  actors:
+  - role: slow_lead
+    type: vehicle
+    blueprint: vehicle.audi.a2
+    placement:
+      route:
+        file: ../carla_routes/town04_overtake_return_slow_lead.json
+      offset_m: 0
+    behavior: follow
+    speed_mps: 5
+  - role: adjacent_front
+    type: vehicle
+    blueprint: vehicle.audi.a2
+    placement:
+      s_m: 100.0
+      lane: left
+      offset_m: 0
+    behavior: follow
+    speed_mps: 9
+  signals:
+    green_ticks: 500
+    yellow_ticks: 150
+    all_red_ticks: 50
+    offset_ticks: 0
+  variations:
+  - path: actors.0.speed_mps
+    min: 4.5
+    max: 5.5
+  - path: actors.1.speed_mps
+    min: 8.1
+    max: 9.9
+  public_rules: []
+  evaluation:
+    arrival_margin_m: 3
+    stall_seconds: 45

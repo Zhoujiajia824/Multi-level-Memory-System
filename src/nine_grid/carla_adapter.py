@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import binascii
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -23,6 +24,7 @@ from .contracts import Actor, Lane, SceneSnapshot, plain
 from .paths import filesystem_path
 from .carla_bridge import camera_storage_due
 from .carla_execution import duration_tick_limit
+from .carla_public_priority import PublicPriorityTracker
 from .geometry import actor_shape, clean_polyline, polyline_lengths, project_polyline, sample_polyline
 
 
@@ -185,6 +187,8 @@ class CameraVideoRecorder:
         self.first_frame = None
         self.encoder_attempts = []
         self.status_path = self.path.parent / 'video_recording.json'
+        self.frame_manifest_path = self.path.parent / 'video_frames.jsonl'
+        self.frame_manifest_path.write_text('', encoding='utf-8')
         if not math.isfinite(float(adapter.camera_hz)) or adapter.camera_hz <= 0:
             raise ValueError('CARLA录像帧率必须为有限正数')
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -265,6 +269,12 @@ class CameraVideoRecorder:
             if size != self.size:
                 raise ValueError('同一轮CARLA录像不能改变画面尺寸')
             self.writer.write(cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+            with self.frame_manifest_path.open('a', encoding='utf-8') as stream:
+                stream.write(json.dumps({'video_index': self.frames, 'carla_frame': frame,
+                    'physical_tick': display.get('physical_tick'), 'sim_time': display.get('sim_time'),
+                    'active_plan_source_frame': display.get('active_plan_source_frame'),
+                    'source_cameras': display.get('source_cameras', []),
+                    'plan_overlay': bool(display.get('plan_overlay', False))}, allow_nan=False)+'\n')
             self.frames += 1
             self.frames_with_plan += int(bool(display.get('plan_overlay', False)))
             self.first_frame = frame if self.first_frame is None else self.first_frame
@@ -325,6 +335,7 @@ class CameraVideoRecorder:
                 'playback_verified': self.status == 'complete', 'duplicate_frames_skipped': self.duplicate_frames,
                 'first_carla_frame': self.first_frame, 'last_carla_frame': self.last_frame,
                 'encoder_attempts': self.encoder_attempts, 'status_path': str(self.status_path),
+                'frame_manifest_path': str(self.frame_manifest_path),
                 'source': 'CARLA_same_frame_six_rgb_10hz',
                 'encoded_duration_s': self.frames / self.adapter.camera_hz,
                 'plan_overlay': self.frames_with_plan > 0, 'frames_with_plan': self.frames_with_plan,
@@ -339,6 +350,9 @@ class CarlaAdapter:
         self.config = copy.deepcopy(config)
         self.cfg = copy.deepcopy(config.get('carla', {}))
         self.seed, self.episode_id, self.live = seed, episode_id, live
+        # Goal/reference IDs enter the VLM prompt. Keep their source binding,
+        # while withholding the semantic scenario name from the observation.
+        self._observation_namespace = 'carla-'+hashlib.sha256(episode_id.encode('utf-8')).hexdigest()[:24]
         self.planner_hz = float(config.get('clock', {}).get('planner_hz', 10))
         if self.planner_hz not in (1., 2., 10.):
             raise ValueError('CARLA规划频率只支持1、2、10Hz')
@@ -365,6 +379,7 @@ class CarlaAdapter:
         self._snapshot = None
         self._raw = None
         self._history = {}
+        self._public_priority = PublicPriorityTracker()
         self._next_history = 0.
         self._route_s = None
         self._previous_control = np.zeros(2)
@@ -461,6 +476,14 @@ class CarlaAdapter:
                 report.setdefault('diagnostic_read_errors', {})[key] = type(exc).__name__
         return report
 
+    def evaluation_report(self):
+        """Read the physical evaluator after SDK cleanup and late-event merging."""
+        if self.output_dir is not None:
+            path = self.output_dir/'evaluation.json'
+            if path.is_file():
+                return json.loads(path.read_text(encoding='utf-8'))
+        return copy.deepcopy((self._raw or {}).get('evaluation'))
+
     def _initialize(self):
         if self.output_dir is None:
             raise RuntimeError('CARLA 采集必须先绑定本轮输出目录')
@@ -522,7 +545,11 @@ class CarlaAdapter:
         image, segments = (plan_mosaic_overlay(mosaic, packet['cameras'], visualization)
             if self.cfg.get('display_plan_overlay', True) else (mosaic, 0))
         display = {'plan_overlay': segments > 0, 'plan_segments': segments,
-                   'capture_carla_frame': packet['frame']}
+                   'capture_carla_frame': packet['frame'], 'sim_time': packet['time'],
+                   'physical_tick': packet.get('physical_tick'),
+                   'active_plan_source_frame': packet.get('plan_source_frame'),
+                   'source_cameras': [{key: camera[key] for key in ('view', 'frame', 'timestamp')}
+                                      for camera in packet['cameras']]}
         return image, display
 
     def _convert_actor(self, value):
@@ -599,6 +626,25 @@ class CarlaAdapter:
         self._pending_lane = self._pending_since = None
         self._reference_revision += 1
 
+    def _project_public_stop(self, position):
+        """Project public stop geometry onto the upcoming navigation, without a 40m cap.
+
+        A lateral residual alone is insufficient at a clipped polyline endpoint:
+        a point 100m ahead can otherwise look like a stop at the 40m search edge.
+        """
+        position = np.asarray(position, float)
+        arc = polyline_lengths(self.route)
+        start = max(0., float(self._route_s)-3.)
+        remaining = self.route[arc > start+1e-8]
+        if not len(remaining):
+            return None
+        path = clean_polyline(np.vstack((sample_polyline(self.route, start), remaining)))
+        s, _, _ = project_polyline(position, path)
+        if np.linalg.norm(position-sample_polyline(path, s)) >= 3.:
+            return None
+        s += start
+        return float(s) if s >= self._route_s-.1 else None
+
     def snapshot(self):
         if self.closed:
             raise RuntimeError('CARLA 适配器已关闭')
@@ -654,7 +700,7 @@ class CarlaAdapter:
             observation_audit = {'method':'not_computed_for_pure_base', 'valid':False,
                 'reason':'纯基础规划不消费空区掩码；对象按范围真值提供，不判断遮挡',
                 'input_policy':policy,'occlusion_tested':False,'depth_sensor_count':0}
-        frame_id = '{}:{:06d}'.format(self.episode_id, raw['frame'])
+        frame_id = '{}:{:06d}'.format(self._observation_namespace, raw['frame'])
         cameras=raw.get('cameras',[])
         mosaic = self._build_mosaic(cameras) if cameras else None
         self._mosaic = np.asarray(mosaic) if mosaic is not None else None
@@ -686,7 +732,8 @@ class CarlaAdapter:
                 'sensor_policy':self._sensor_policy,'observation_policy':policy}
             manifest_path = folder / 'manifest.json'
             manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, allow_nan=False), encoding='utf-8')
-            retained_raw = {**raw, 'cameras': retained_cameras, 'storage_version': 'carla-rgb-source-1hz-2.0',
+            retained_raw = {**{key: value for key, value in raw.items() if key != 'evaluation'},
+                'cameras': retained_cameras, 'storage_version': 'carla-rgb-source-1hz-2.0',
                 'camera_save_hz': 1, 'observed_support_wkt': observed_wkt, 'observation_evidence': observation_audit}
             state_path = folder / 'current_observed_state.json'
             state_path.write_text(json.dumps(retained_raw, ensure_ascii=False, allow_nan=False), encoding='utf-8')
@@ -698,8 +745,8 @@ class CarlaAdapter:
             for stop in light['stops']:
                 if stop['lane_id'] not in self.route_lane_ids:
                     continue
-                s, d, _ = project_polyline(np.asarray(stop['position']), self.route)
-                if s >= self._route_s - .1 and abs(d) < 3.:
+                s = self._project_public_stop(stop['position'])
+                if s is not None:
                     relevant.append(s)
             if not relevant:
                 continue
@@ -708,12 +755,51 @@ class CarlaAdapter:
             if light['state'] in ('red', 'yellow'):
                 stop_s = s if stop_s is None else min(stop_s, s)
         desired = float(self.cfg.get('desired_speed_mps', 10.))
+        public = raw.get('public_road_rules') or {'rules': []}
+        if public.get('rules') or public.get('stop_obligations'):
+            if (public.get('frame') != raw['frame'] or
+                    public.get('physical_tick') != raw.get('runtime', {}).get('physical_ticks')):
+                raise ValueError('公共道路规则与冻结场景帧不一致')
+        known_lanes = {lane.id for lane in self.lanes}
+        for lane in self.lanes:
+            lane.priority = 0
+        priority_complete = True
+        for rule in public.get('rules', []):
+            controlled = set(rule['controlled_lane_ids'])
+            priority = set(rule['priority_lane_ids'])
+            if not (controlled | priority).issubset(known_lanes):
+                priority_complete = False
+            # Only public lane priority is supplied, never actor-script intent.
+            for lane in self.lanes:
+                if lane.id in priority:
+                    lane.priority = max(lane.priority, 1)
+        stop_reasons = []
+        for obligation in public.get('stop_obligations', []):
+            if not obligation.get('must_stop') or obligation.get('lane_id') not in self.route_lane_ids:
+                continue
+            s = self._project_public_stop(obligation['position'])
+            if s is not None:
+                stop_s = s if stop_s is None else min(stop_s, s)
+                stop_reasons.append(obligation['id'])
+        priority_state = self._public_priority.update(public, raw['ego'], raw['actors'],
+            self._navigation_route, timestamp,
+            lane_paths={lane.id: {'center': lane.center, 'successors': lane.successors}
+                        for lane in self.lanes})
+        priority_stop = priority_state.get('stop_position')
+        if priority_stop is not None:
+            s = self._project_public_stop(priority_stop)
+            if s is not None:
+                stop_s = s if stop_s is None else min(stop_s, s)
+                stop_reasons.append('公共优先通行对象尚未清空冲突区')
         rules = {'desired_speed': desired, 'speed_limit': float(raw['speed_limit_mps']),
             'must_wait': stop_s is not None, 'stop_s': stop_s,
-            'wait_reason': '当前导航车道交通灯要求停车' if stop_s is not None else None,
+            'wait_reason': ('公共道路停止或让行义务：'+','.join(map(str, stop_reasons)) if stop_reasons
+                            else '当前导航车道交通灯要求停车') if stop_s is not None else None,
             'traffic_lights': light_records, 'crosswalks': self.crosswalks or [],
             'map_available': {'crosswalk': self.crosswalks is not None, 'traffic_light': True, 'stop_line': True},
-            'road_priority_available': False, 'goal_s': self._goal_s}
+            'road_priority_available': bool(public.get('rules')) and priority_complete and priority_state['available'],
+            'goal_s': self._goal_s, 'public_road_rules': copy.deepcopy(public),
+            'priority_map_complete': priority_complete, 'public_priority_screen': priority_state}
         evidence = raw.get('current_road_evidence')
         identities = {lane.id for lane in self.lanes}
         map_complete = bool(evidence is not None and evidence.get('lane_id') == ego.lane_id and
@@ -721,6 +807,8 @@ class CarlaAdapter:
         if map_complete:
             current_lane = next(lane for lane in self.lanes if lane.id == ego.lane_id)
             current_lane.left, current_lane.right = evidence['left'], evidence['right']
+        cycle_result = self._result(raw)
+        cycle_result.pop('evaluation', None)
         diagnostics = {'route_s': self._route_s, 'reference_anchor_s': self._route_s,
             'navigation_progress_m': self._route_s+self._progress_offset, 'stable_navigation_lane_id': self._confirmed_lane,
             'previous_control': self._previous_control.tolist(), 'reference_revision': self._reference_revision,
@@ -729,17 +817,16 @@ class CarlaAdapter:
             'historical_only_objects': {k: v for k, v in self._history.items() if k not in {a.id for a in [ego] + actors}},
             'platform': 'carla', 'carla_frame': raw['frame'], 'carla_timestamp': raw['timestamp'],
             'actual_actuation': raw.get('actual_actuation'), 'control_response': raw.get('control_response'),
-            'scenario_events': raw.get('events', []), 'acceleration_source': raw['ego'].get('state_sources'),
-            'scenario_template': raw.get('scenario', 'custom'),
+            'physical_events': raw.get('events', []), 'acceleration_source': raw['ego'].get('state_sources'),
             'observation_policy':policy,'sensor_policy':copy.deepcopy(self._sensor_policy),
             'runtime':copy.deepcopy(raw.get('runtime',{})),
             'bridge_timing':copy.deepcopy(raw.get('bridge_timing',{})),
-            'cycle_result':self._result(raw),
+            'cycle_result':cycle_result,
             'environment_obstacles': raw.get('environment_obstacles', {}),
             'weather': raw.get('weather', {}), 'weather_source': raw.get('weather_source', 'unknown'),
             'camera_storage': {'version': 'carla-rgb-source-1hz-2.0', 'save_hz': 1, 'saved': saved,
                                'runtime_frame': raw['frame'], 'runtime_time': timestamp},
-            'platform_limitations': ['同层平面道路；不推断未提供的路权',
+            'platform_limitations': ['同层平面道路；路权仅来自已声明的公共道路规则',
                 '范围内真值输入，不判断遮挡，不等同于真实传感器感知；尚待服务器实测']}
         self._snapshot = SceneSnapshot(frame_id, timestamp, ego, actors, self.lanes, self.route,
             self.route_lane_ids, self.drivable, 'carla', rules=rules,
@@ -781,6 +868,10 @@ class CarlaAdapter:
         offroad = not self.drivable.buffer(float(self.config.get('mpc', {}).get('body_constraint_tolerance_m', .001))).covers(actor_shape(ego))
         collision = bool(raw['collision'])
         arrival = progress >= self._goal_s and abs(lateral) < 2.5 and not collision and not offroad
+        measured = raw.get('evaluation')
+        if measured:
+            collision = bool(measured.get('collision')) or collision
+            arrival = bool(measured.get('arrival'))
         runtime=raw.get('runtime',{})
         ticks=runtime.get('physical_ticks')
         if type(ticks) is not int or ticks < 0:
@@ -788,13 +879,14 @@ class CarlaAdapter:
         # 只用该观测冻结的计数；异步runtime.live可能属于更晚的世界状态。
         timeout = ticks >= duration_tick_limit(self.cfg['duration_s'], self.cfg['physics_hz'])
         runtime_reason=runtime.get('terminal_reason')
-        runtime_failure=runtime_reason if runtime_reason not in (None,'duration') else None
+        runtime_failure=runtime_reason if runtime_reason not in (None,'duration','arrival','collision') else None
         reason=runtime_failure or ('collision' if collision else 'arrival' if arrival else 'timeout' if timeout else 'running')
         return {'terminated': bool(collision or arrival or timeout or runtime_reason),
             'collision': collision, 'arrival': arrival,'offroad': offroad, 'timeout': timeout,
             'time': raw['time'], 'progress': progress+self._progress_offset,'reason':reason,
             'carla_frame': raw['frame'], 'control_response': raw.get('control_response'), 'events': raw.get('events', []),
             'runtime':copy.deepcopy(runtime),'bridge_timing':copy.deepcopy(raw.get('bridge_timing',{})),
+            'evaluation': copy.deepcopy(measured),
             'last_applied_control':copy.deepcopy(raw.get('last_applied_control')),
             'plan_visualization':raw.get('plan_visualization',{})}
 
@@ -817,14 +909,17 @@ class CarlaAdapter:
             expected_ticks=min(physics//self.cfg['planner_hz'],remaining)
         raw=self.bridge.call('step',controls=controls.tolist(),
             control_step_s=float(self.config['mpc']['step_s']),source_time=float(plan.time),plan=self._planned,
+            source_frame=int(self._raw['frame']),
             source_speed_mps=float(np.linalg.norm(current.ego.velocity)))
         self._ingest_display_frames(raw)
         if self.runtime_mode=='sync':
             # 校验本次真实帧差和时间增量；不把累计时间强行截到理想结束秒数。
             # 部分周期只消费剩余物理帧，外部额外tick仍必须报错。
-            if (raw['frame']-self._raw['frame']!=expected_ticks or
-                    raw.get('runtime',{}).get('physical_ticks')!=current_ticks+expected_ticks or
-                    abs((raw['time']-current.time)-expected_ticks/physics)>1e-5):
+            actual_ticks=raw['frame']-self._raw['frame']
+            terminal=raw.get('runtime',{}).get('terminal_reason') is not None
+            if ((actual_ticks!=expected_ticks and not (terminal and 0<=actual_ticks<=expected_ticks)) or
+                    raw.get('runtime',{}).get('physical_ticks')!=current_ticks+actual_ticks or
+                    abs((raw['time']-current.time)-actual_ticks/physics)>1e-5):
                 raise RuntimeError('CARLA同步步进时间或帧号不符合执行前缀')
         elif raw['frame']<self._raw['frame'] or raw['time']+1e-8<current.time:
             raise RuntimeError('CARLA异步观测时间倒退')

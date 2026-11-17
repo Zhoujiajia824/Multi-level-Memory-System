@@ -1,0 +1,49 @@
+schema_version: carla-experiment-2.0
+name: town07_rural_curve
+family: rural_curve
+description: 固定长路线与前车交互；几何、坡度、跟驰及恢复分别计量。
+map: Town07
+status: candidate
+split: development
+desired_speed_mps: 8
+duration_s: 240
+experiment:
+  ego_blueprint: vehicle.tesla.model3
+  initial_speed_mps: 8
+  weather: ClearNoon
+  route:
+    file: ../carla_routes/town07_rural_curve.json
+  actors:
+  - role: lead
+    type: vehicle
+    blueprint: vehicle.audi.a2
+    placement:
+      route:
+        file: ../carla_routes/town07_rural_curve_lead.json
+      offset_m: 0
+    behavior: stop_resume
+    speed_mps: 6
+    trigger:
+      ego_s_m:
+      - 30.0
+      - 129.999878838
+      earliest_tick: 100
+    required: true
+    duration_ticks: 200
+    hold_ticks: 150
+  signals:
+    green_ticks: 500
+    yellow_ticks: 150
+    all_red_ticks: 50
+    offset_ticks: 0
+  variations:
+  - path: actors.0.speed_mps
+    min: 5.4
+    max: 6.6
+  - path: actors.0.duration_ticks
+    min: 200
+    max: 240
+  public_rules: []
+  evaluation:
+    arrival_margin_m: 3
+    stall_seconds: 45

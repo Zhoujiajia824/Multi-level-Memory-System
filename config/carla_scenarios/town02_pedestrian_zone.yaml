@@ -1,0 +1,85 @@
+schema_version: carla-experiment-2.0
+name: town02_pedestrian_zone
+family: pedestrian_crossing
+description: 低速行人区，两批横穿；范围内真值输入，不声称遮挡感知或真实学校POI。
+map: Town02
+status: candidate
+split: development
+desired_speed_mps: 5
+duration_s: 240
+experiment:
+  ego_blueprint: vehicle.tesla.model3
+  initial_speed_mps: 5
+  weather: ClearNoon
+  route:
+    file: ../carla_routes/town02_pedestrian_zone.json
+  actors:
+  - role: walker_first
+    type: pedestrian
+    blueprint: walker.pedestrian.0001
+    placement:
+      s_m: 45.0
+      lane: sidewalk_right
+      offset_m: 0
+    behavior: cross
+    speed_mps: 1.2
+    trigger:
+      ego_s_m:
+      - 15.0
+      - 85.0
+      earliest_tick: 50
+    required: true
+    duration_ticks: 200
+    hold_ticks: 150
+  - role: walker_second
+    type: pedestrian
+    blueprint: walker.pedestrian.0001
+    placement:
+      s_m: 55.0
+      lane: sidewalk_right
+      offset_m: 0
+    behavior: cross
+    speed_mps: 1.2
+    trigger:
+      ego_s_m:
+      - 25.0
+      - 100.0
+      earliest_tick: 150
+    required: true
+    duration_ticks: 200
+    hold_ticks: 150
+  signals:
+    green_ticks: 500
+    yellow_ticks: 150
+    all_red_ticks: 50
+    offset_ticks: 0
+  variations:
+  - path: actors.0.speed_mps
+    min: 1.08
+    max: 1.32
+  - path: actors.0.duration_ticks
+    min: 200
+    max: 240
+  - path: actors.1.speed_mps
+    min: 1.08
+    max: 1.32
+  - path: actors.1.duration_ticks
+    min: 200
+    max: 240
+  public_rules: []
+  evaluation:
+    arrival_margin_m: 3
+    stall_seconds: 45
+    conflict_zones:
+    - id: walker_first_crossing
+      route_s_m:
+      - 42.0
+      - 48.0
+      half_width_m: 3
+      pet_window_s: 10
+    - id: walker_second_crossing
+      route_s_m:
+      - 52.0
+      - 58.0
+      half_width_m: 3
+      pet_window_s: 10

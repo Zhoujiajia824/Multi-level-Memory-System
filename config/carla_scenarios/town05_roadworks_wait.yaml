@@ -1,0 +1,86 @@
+schema_version: carla-experiment-2.0
+name: town05_roadworks_wait
+family: roadworks
+description: 施工占道时邻道两车占据初始可用间隙；自车应依实际车距等待或合法绕行，记录实际等待。
+map: Town05
+status: candidate
+split: development
+desired_speed_mps: 6
+duration_s: 240
+experiment:
+  ego_blueprint: vehicle.tesla.model3
+  initial_speed_mps: 6
+  weather: ClearNoon
+  route:
+    file: ../carla_routes/town05_roadworks.json
+  actors:
+  - role: works_truck
+    type: vehicle
+    blueprint: vehicle.carlamotors.carlacola
+    placement:
+      s_m: 79.999272183
+      lane: current
+      offset_m: 0
+    behavior: parked
+    speed_mps: 0
+  - role: adjacent_flow
+    type: vehicle
+    blueprint: vehicle.audi.a2
+    placement:
+      s_m: 19.999551906
+      lane: left
+      offset_m: 0
+    behavior: follow
+    speed_mps: 4
+  - role: cone_0
+    type: prop
+    blueprint: static.prop.trafficcone01
+    placement:
+      s_m: 61.999280499
+      lane: current
+      offset_m: 1.0
+    behavior: parked
+    speed_mps: 0
+  - role: cone_1
+    type: prop
+    blueprint: static.prop.trafficcone01
+    placement:
+      s_m: 66.999275735
+      lane: current
+      offset_m: 0.65
+    behavior: parked
+    speed_mps: 0
+  - role: cone_2
+    type: prop
+    blueprint: static.prop.trafficcone01
+    placement:
+      s_m: 71.999273263
+      lane: current
+      offset_m: 0.30000000000000004
+    behavior: parked
+    speed_mps: 0
+  - role: adjacent_second
+    type: vehicle
+    blueprint: vehicle.audi.a2
+    placement:
+      s_m: 35.999370965
+      lane: left
+      offset_m: 0
+    behavior: follow
+    speed_mps: 4
+  signals:
+    green_ticks: 500
+    yellow_ticks: 150
+    all_red_ticks: 50
+    offset_ticks: 0
+  variations:
+  - path: actors.1.speed_mps
+    min: 3.5
+    max: 4.5
+  - path: actors.5.speed_mps
+    min: 3.5
+    max: 4.5
+  public_rules: []
+  evaluation:
+    arrival_margin_m: 3
+    stall_seconds: 45

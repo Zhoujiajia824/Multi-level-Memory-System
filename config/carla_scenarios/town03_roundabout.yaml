@@ -1,0 +1,68 @@
+schema_version: carla-experiment-2.0
+name: town03_roundabout
+family: roundabout
+description: Town03中心环岛入口、环行与指定出口；公共让行规则及环内演员需服务器验收。
+map: Town03
+status: candidate
+split: development
+desired_speed_mps: 6
+duration_s: 240
+experiment:
+  ego_blueprint: vehicle.tesla.model3
+  initial_speed_mps: 6
+  weather: ClearNoon
+  route:
+    file: ../carla_routes/town03_roundabout.json
+  actors:
+  - role: circulating_vehicle
+    type: vehicle
+    blueprint: vehicle.audi.a2
+    placement:
+      route:
+        file: ../carla_routes/town03_roundabout_circulating_vehicle.json
+      offset_m: 0
+    behavior: follow
+    speed_mps: 5
+  signals:
+    green_ticks: 500
+    yellow_ticks: 150
+    all_red_ticks: 50
+    offset_ticks: 0
+  variations:
+  - path: actors.0.speed_mps
+    min: 4.5
+    max: 5.5
+  public_rules:
+  - id: town03_roundabout_yield
+    kind: yield
+    source: published_road_rule
+    controlled_lane_ids:
+    - 1018|0|1
+    - 61|0|1
+    - 1566|2|1
+    priority_lane_ids:
+    - 1566|1|2
+    - 1566|0|5
+    - 13|0|-5
+    - 1655|0|-5
+    - 14|0|-5
+    - 1786|0|-5
+    - 10|0|-5
+    - 1206|0|-5
+    - 11|0|-5
+    - 1100|0|-5
+    - 36|0|-5
+    - 1624|0|-5
+    - 12|0|-5
+    - 1470|0|-5
+    - 9|0|-5
+    - 1214|0|-4
+    - 1214|1|-4
+    stop_route_s_m: 60.472512983
+    conflict_route_s_m:
+    - 65.472512983
+    - 79.472512983
+    description: 公开规则：入口车辆让行环内/主路车流，各方法获得相同规则。
+  evaluation:
+    arrival_margin_m: 3
+    stall_seconds: 45

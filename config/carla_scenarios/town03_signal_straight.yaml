@@ -1,0 +1,26 @@
+schema_version: carla-experiment-2.0
+name: town03_signal_straight
+family: signal_junction
+description: 固定信号程序与明确straight出口；按实际停止线和出口检查。
+map: Town03
+status: candidate
+split: development
+desired_speed_mps: 6
+duration_s: 240
+experiment:
+  ego_blueprint: vehicle.tesla.model3
+  initial_speed_mps: 6
+  weather: ClearNoon
+  route:
+    file: ../carla_routes/town03_signal_straight.json
+  actors: []
+  signals:
+    green_ticks: 500
+    yellow_ticks: 150
+    all_red_ticks: 50
+    offset_ticks: 0
+  variations: []
+  public_rules: []
+  evaluation:
+    arrival_margin_m: 3
+    stall_seconds: 45

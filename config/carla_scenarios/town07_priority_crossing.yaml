@@ -1,0 +1,52 @@
+schema_version: carla-experiment-2.0
+name: town07_priority_crossing
+family: priority_junction
+description: 无交通信号灯的真实交叉口；公开让行规则、横向来车和指定出口。
+map: Town07
+status: candidate
+split: development
+desired_speed_mps: 6
+duration_s: 240
+experiment:
+  ego_blueprint: vehicle.tesla.model3
+  initial_speed_mps: 6
+  weather: ClearNoon
+  route:
+    file: ../carla_routes/town07_priority_crossing.json
+  actors:
+  - role: cross_traffic
+    type: vehicle
+    blueprint: vehicle.audi.a2
+    placement:
+      route:
+        file: ../carla_routes/town07_priority_crossing_npc.json
+    behavior: follow
+    speed_mps: 6
+  signals:
+    green_ticks: 500
+    yellow_ticks: 150
+    all_red_ticks: 50
+    offset_ticks: 0
+  variations:
+  - path: actors.0.speed_mps
+    min: 5.4
+    max: 6.6
+  public_rules:
+  - id: unsignal_cross_priority
+    kind: yield
+    source: published_road_rule
+    controlled_lane_ids:
+    - 1|0|-1
+    - 153|0|-1
+    priority_lane_ids:
+    - 60|0|1
+    - 167|0|1
+    - 59|0|1
+    stop_route_s_m: 32.79090333
+    conflict_route_s_m:
+    - 36.79090333
+    - 46.79090333
+    description: 公开实验规则：支路让行横向来车。
+  evaluation:
+    arrival_margin_m: 3
+    stall_seconds: 45

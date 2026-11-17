@@ -639,6 +639,20 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
             close_resource('录像统计',lambda: summary.update(video=video_recorder.metadata()))
         if adapter is not None:
             close_resource('仿真适配器',adapter.close)
+            if hasattr(adapter,'evaluation_report'):
+                def record_physical_evaluation():
+                    measured=adapter.evaluation_report()
+                    if measured is not None:
+                        summary['evaluation']=measured
+                        summary['driving_outcome']=measured.get('driving_outcome')
+                        summary['route_completed']=bool(measured.get('route_completed'))
+                        summary['strict_success']=bool(measured.get('strict_success'))
+                        summary['strict_success_status']=measured.get('strict_success_status')
+                        summary['measurement_complete']=bool(measured.get('measurement_complete'))
+                        summary['infrastructure_valid']=bool(measured.get('infrastructure_valid'))
+                        summary['collision']=summary['collision'] or bool(measured.get('collision'))
+                        summary['arrival']=bool(measured.get('arrival'))
+                close_resource('独立物理评价',record_physical_evaluation)
             if hasattr(adapter,'runtime_failure_report'):
                 # SDK在EOF/finally完成销毁核验，必须在等待其退出之后读取。
                 def record_cleanup_evidence():

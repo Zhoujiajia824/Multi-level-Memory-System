@@ -1,0 +1,50 @@
+schema_version: carla-experiment-2.0
+name: town05_lead_hard_brake
+family: emergency_braking
+description: 可调初始条件下的前车制动与恢复；实测净间距，不把紧急状态等同碰撞。
+map: Town05
+status: candidate
+split: development
+desired_speed_mps: 8
+duration_s: 240
+experiment:
+  ego_blueprint: vehicle.tesla.model3
+  initial_speed_mps: 8
+  weather: ClearNoon
+  route:
+    file: ../carla_routes/town05_lead_hard_brake.json
+  actors:
+  - role: braking_lead
+    type: vehicle
+    blueprint: vehicle.audi.a2
+    placement:
+      route:
+        file: ../carla_routes/town05_lead_hard_brake_braking_lead.json
+      offset_m: 0
+    behavior: hard_brake
+    speed_mps: 7
+    trigger:
+      ego_s_m:
+      - 19.841876415
+      - 119.632696711
+      earliest_tick: 50
+    deceleration_mps2: 4
+    hold_ticks: 100
+    required: true
+    duration_ticks: 200
+  signals:
+    green_ticks: 500
+    yellow_ticks: 150
+    all_red_ticks: 50
+    offset_ticks: 0
+  variations:
+  - path: actors.0.speed_mps
+    min: 6.3
+    max: 7.7
+  - path: actors.0.duration_ticks
+    min: 200
+    max: 240
+  public_rules: []
+  evaluation:
+    arrival_margin_m: 3
+    stall_seconds: 45

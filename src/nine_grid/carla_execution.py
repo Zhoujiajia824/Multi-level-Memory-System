@@ -68,7 +68,7 @@ class CarlaSourceClock:
 
 class ControlTimeline:
     """只执行已经规划的控制；耗尽后显式报告，不无限保持末项。"""
-    def __init__(self, acceleration_min=-6., acceleration_max=3., steering_max=.6):
+    def __init__(self, acceleration_min=-6., acceleration_max=3., steering_max=.6, physics_hz=None):
         values = (acceleration_min, acceleration_max, steering_max)
         if (any(type(value) not in (int, float) or not math.isfinite(value) for value in values)
                 or acceleration_min >= acceleration_max or steering_max <= 0):
@@ -81,8 +81,13 @@ class ControlTimeline:
         self.step_s = None
         self.revision = 0
         self.endpoint_speeds = []
+        if physics_hz is not None and (type(physics_hz) is not int or physics_hz <= 0):
+            raise ValueError('控制时钟物理频率必须为正整数')
+        self.physics_hz = physics_hz
+        self.source_tick = None
+        self.step_ticks = None
 
-    def install(self, controls, source_time, step_s, source_speed_mps=None):
+    def install(self, controls, source_time, step_s, source_speed_mps=None, source_tick=None):
         if (isinstance(source_time, bool) or not isinstance(source_time, (int, float))
                 or not math.isfinite(source_time) or source_time < -1e-5):
             raise ValueError('控制序列需要有限非负源仿真时间')
@@ -103,6 +108,18 @@ class ControlTimeline:
             checked.append([acceleration, steering])
         if self.source_time is not None and source_time < self.source_time - 1e-8:
             raise ValueError('旧源帧控制不能覆盖新控制序列')
+        step_ticks = None
+        if self.physics_hz is not None:
+            if type(source_tick) is not int or source_tick < 0:
+                raise ValueError('在线控制必须绑定非负整数源物理帧')
+            ticks = step_s * self.physics_hz
+            if abs(ticks-round(ticks)) > 1e-8 or ticks < 1:
+                raise ValueError('控制段必须覆盖完整物理帧')
+            step_ticks = int(round(ticks))
+            if self.source_tick is not None and source_tick < self.source_tick:
+                raise ValueError('旧源物理帧不能覆盖新控制序列')
+        elif source_tick is not None:
+            raise ValueError('源物理帧需要同时配置物理频率')
         endpoints = []
         if source_speed_mps is not None:
             if (type(source_speed_mps) not in (int, float) or
@@ -117,21 +134,36 @@ class ControlTimeline:
         self.endpoint_speeds = endpoints
         self.source_time = float(source_time)
         self.step_s = float(step_s)
+        self.source_tick = source_tick
+        self.step_ticks = step_ticks
         self.revision += 1
 
-    def at(self, sim_time):
+    def at(self, sim_time, physical_tick=None):
         if isinstance(sim_time, bool) or not isinstance(sim_time, (int, float)) or not math.isfinite(sim_time):
             raise ValueError('控制消费需要真实有限仿真时间')
         if self.source_time is None:
             return {'available': False, 'reason': 'no_plan', 'index': None, 'control': None}
-        age = float(sim_time) - self.source_time
+        raw_age = float(sim_time) - self.source_time
+        age = raw_age
+        age_ticks = None
+        if self.physics_hz is not None:
+            if type(physical_tick) is not int or physical_tick < 0:
+                raise ValueError('在线控制消费必须提供整数物理帧')
+            age_ticks = physical_tick-self.source_tick
+            age = age_ticks / float(self.physics_hz)
         if age < -1e-6:
             return {'available': False, 'reason': 'future_source', 'index': None, 'control': None, 'age_s': age}
-        index = int(math.floor((max(0., age) + 1e-8) / self.step_s))
+        # 秒数接口仅用于旧离线记录；在线执行完全由整数帧决定控制段。
+        index = (age_ticks // self.step_ticks if age_ticks is not None else
+                 int(math.floor((max(0., age) + 1e-8) / self.step_s)))
         if index >= len(self.controls):
             return {'available': False, 'reason': 'sequence_exhausted', 'index': index,
                     'control': None, 'age_s': age, 'revision': self.revision}
         return {'available': True, 'reason': None, 'index': index,
                 'control': list(self.controls[index]), 'age_s': age,
+                'raw_age_s': raw_age, 'source_tick': self.source_tick,
+                'physical_tick': physical_tick,
+                'remaining_segment_s': (((index+1)*self.step_ticks-age_ticks)/float(self.physics_hz)
+                    if age_ticks is not None else (index+1)*self.step_s-age),
                 'target_speed_mps': self.endpoint_speeds[index] if self.endpoint_speeds else None,
                 'revision': self.revision, 'remaining_s': len(self.controls)*self.step_s-max(0., age)}

@@ -1,35 +1,38 @@
-# 独立场景；距离m、速度m/s、时间s，offset_m沿车道左正。
-# route_anchors固定道路地点；修改actor距离/速度/触发条件可构造相似变体。
-schema_version: carla-scene-1.2
+schema_version: carla-experiment-2.0
 name: town06_ramp_exit
-template: scripted_traffic
+family: ramp_exit
+description: 实际匝道连接与主路交通；锁定路线终点及公开拓扑证据。
 map: Town06
-description: 公路驶出：已知导航沿公开出口连接驶离多车道主路。
-desired_speed_mps: 14
-duration_s: 180
+status: candidate
+split: development
+desired_speed_mps: 10
+duration_s: 240
 experiment:
-  spawn_index: null
-  route_length_m: 1000
-  route_anchors:
-  - road_id: 29
-    lane_id: -3
-    s_m: 80.000000
-  route_requirements:
-    kind: diverge
-    min_junctions: 0
-    min_same_direction_lanes: 2
-    search_limit: 10000
-  navigation_step_yaw_limit_deg: 30
-  initial_speed_mps: 14
   ego_blueprint: vehicle.tesla.model3
+  initial_speed_mps: 10
   weather: ClearNoon
+  route:
+    file: ../carla_routes/town06_ramp_exit.json
   actors:
-  - role: exit_lead
+  - role: adjacent_flow
     type: vehicle
     blueprint: vehicle.audi.a2
     placement:
-      s_m: 40
-      lane: current
+      s_m: 10.0
+      lane: right
       offset_m: 0
     behavior: follow
-    speed_mps: 11
+    speed_mps: 10
+  signals:
+    green_ticks: 500
+    yellow_ticks: 150
+    all_red_ticks: 50
+    offset_ticks: 0
+  variations:
+  - path: actors.0.speed_mps
+    min: 9.0
+    max: 11.0
+  public_rules: []
+  evaluation:
+    arrival_margin_m: 3
+    stall_seconds: 45

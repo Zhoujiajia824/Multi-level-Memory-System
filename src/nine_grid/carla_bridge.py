@@ -79,7 +79,10 @@ def map_identity(road_map):
 def inspect_scene(config, seed):
     """只读场景选址：不换地图、不设置同步、不创建或销毁演员、不推进时钟。"""
     import carla
-    from carla_scenarios import select_route
+    try:
+        from .carla_experiment_routes import inspect_instance
+    except ImportError:
+        from carla_experiment_routes import inspect_instance
     client = carla.Client(config.get('host','127.0.0.1'),int(config.get('port',2000)))
     client.set_timeout(float(config.get('timeout_s',30.)))
     if (client.get_client_version().split('-')[0] != '0.9.15' or
@@ -91,7 +94,7 @@ def inspect_scene(config, seed):
     if road_map.name.rstrip('/').split('/')[-1] != requested:
         raise ValueError('只读检查不切换地图：当前{}，场景要求{}'.format(road_map.name,requested))
     settings = dict(config.get('experiment',{})); settings['seed'] = int(seed)
-    _, report = select_route(road_map,settings,carla,audit_all=True)
+    _, _, report = inspect_instance(road_map,settings,carla)
     report.update(map_identity(road_map))
     report['read_only'] = True
     return report
@@ -367,6 +370,9 @@ class CarlaSession:
         self._rgb_initialization = None
         self._rgb_initialization_deadline = None
         self._display_frames = []
+        self._published_sources = {}
+        self.evaluation_probe = None
+        self._evaluation = None
         self._timing = dict((name, 0.) for name in
             ('tick_s', 'sensor_wait_s', 'snapshot_state_s', 'image_s', 'pacing_s', 'scenario_s'))
         self._runtime_metrics = {'physical_ticks': 0, 'wall_pacing_wait_s': 0.,
@@ -401,7 +407,14 @@ class CarlaSession:
             if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or value <= 0:
                 raise ValueError('CARLA 参数必须为有限正数：' + key)
         import carla
-        from carla_scenarios import create_experiment, hold_initial_motion, release_initial_motion
+        try:
+            from .carla_experiments import create_experiment
+            from .carla_initialization import hold_initial_motion, release_initial_motion
+            from .carla_evaluation import CarlaEvaluationProbe
+        except ImportError:
+            from carla_experiments import create_experiment
+            from carla_initialization import hold_initial_motion, release_initial_motion
+            from carla_evaluation import CarlaEvaluationProbe
         self.carla = carla
         self.cfg = config
         if config.get('world_plan_debug',False):
@@ -442,7 +455,7 @@ class CarlaSession:
                 not math.isfinite(self.duration_s) or self.duration_s <= 0):
             raise ValueError('duration_s必须为有限正数')
         self.timeline = ControlTimeline(config.get('acceleration_min_mps2', -6),
-            config.get('acceleration_max_mps2', 3), config.get('steering_abs_max_rad', .6))
+            config.get('acceleration_max_mps2', 3), config.get('steering_abs_max_rad', .6), self.physics_hz)
         self._configure_experiment_world(client, requested_map, config.get('allow_world_reset', False))
         self.environment_objects, self.environment_audit = environment_catalogue(self.world, carla)
         audit_path = self.root / 'carla_environment_audit.json'
@@ -466,6 +479,8 @@ class CarlaSession:
                 selection_path.write_text(json.dumps(exc.report,ensure_ascii=False,
                     allow_nan=False,indent=2),encoding='utf-8')
             raise
+        (self.root/'resolved_instance.json').write_text(json.dumps(self.experiment.manifest,
+            ensure_ascii=False, allow_nan=False, indent=2), encoding='utf-8')
         # 新spawn演员须先注册到世界，get_speed_limit才能读取真实地图限速。
         # 此时尚未创建RGB；仅属初始化，不计入本轮控制或相机采集时间。
         warmup = self._initialization_tick('actor_registration')
@@ -504,6 +519,11 @@ class CarlaSession:
         self._collect(self.frame)
         self._initial_source_frame = self.frame
         self.t0 = snap.timestamp.elapsed_seconds
+        self.experiment.after_tick(self.frame, 0, snap)
+        self.evaluation_probe = CarlaEvaluationProbe(self.world, carla, self.ego, self.route_wps,
+            settings=experiment, directory=self.root, physics_hz=self.physics_hz)
+        self._evaluation = self.evaluation_probe.observe(snap, 0, events=list(self.events),
+            scenario_events=self.experiment.evaluation_state())
         if self._rgb_initialization is not None:
             self._rgb_initialization.update(source_frame=self.frame, source_timestamp=self.t0,
                 activation_frame_gap=self.frame-self._rgb_initialization['stable_frame'])
@@ -517,11 +537,19 @@ class CarlaSession:
         result['map'] = self._map_payload()
         result['bridge_version'] = 'carla-0.9.15-range-runtime-3.2'
         result['sdk_version'] = client_version
+        result['server_version'] = server_version
         result['world_reset'] = copy.deepcopy(self.world_reset)
         result['initialization_warmup'] = copy.deepcopy(self._initialization_warmup)
         result['initial_speed_audit'] = copy.deepcopy(self._initial_speed_audit)
         result['rgb_initialization'] = copy.deepcopy(self._rgb_initialization)
         initialization = {'bridge_version': result['bridge_version'],
+            'client_version': client_version, 'server_version': server_version,
+            'map_identity': map_identity(self.map),
+            'instance_hash': experiment.get('instance_hash'),
+            'actors_at_source': [dict(self._actor(actor, actor.id == self.ego.id),
+                carla_actor_id=str(actor.id),
+                role=next((role for role, identity in self.experiment.evaluation_state()['actor_roles'].items()
+                           if str(actor.id) == str(identity)), 'unassigned')) for actor in self.experiment.actors],
             'world_reset': result['world_reset'], 'initialization_warmup': result['initialization_warmup'],
             'initial_speed_audit': result['initial_speed_audit'], 'source_frame': self.frame, 't0': self.t0,
             'physics_hz': self.physics_hz, 'planner_hz': self.planner_hz,
@@ -532,10 +560,13 @@ class CarlaSession:
             'initialization_events': copy.deepcopy(self.events),
             'traffic_lights_at_source': [
                 {'id': str(actor.id), 'state': str(actor.get_state()),
+                 'opendrive_id': str(actor.get_opendrive_id()) if hasattr(actor, 'get_opendrive_id') else None,
+                 'pose': [actor.get_transform().location.x, actor.get_transform().location.y,
+                          actor.get_transform().location.z, actor.get_transform().rotation.yaw],
                  'elapsed_s': float(actor.get_elapsed_time())}
                 for actor in self.world.get_actors().filter('traffic.traffic_light*')],
-            'note': '先制动预热确认六路RGB稳态五帧相位，再于最后一帧激活初速并建立t0；'
-                    '初始化推进与事件单列，交通灯按世界时间推进；运行中不补tick或混用旧图。'}
+            'note': '先制动预热确认六路RGB稳态五帧相位，再激活初速并建立t0；'
+                    '初始化推进与事件单列，灯态由冻结实例的整数帧程序控制。'}
         (self.root/'carla_initialization.json').write_text(json.dumps(initialization, ensure_ascii=False,
             allow_nan=False, indent=2), encoding='utf-8')
         self._initialized_at = time.monotonic()
@@ -736,7 +767,9 @@ class CarlaSession:
         self.sensors.append(sensor)
         sensor.listen(lambda event: self.events.append({'kind': 'lane_invasion', 'frame': event.frame,
             'phase': self._event_phase(event.frame),
-            'markings': [str(mark.type) for mark in event.crossed_lane_markings]}))
+            'markings': [str(mark.type) for mark in event.crossed_lane_markings],
+            'marking_evidence': [{'type': str(mark.type), 'lane_change': str(mark.lane_change)}
+                                 for mark in event.crossed_lane_markings]}))
 
     def _event_phase(self, frame):
         # 事件可能延迟回调；按发生帧分类，不按回调抵达墙钟时间分类。
@@ -1090,15 +1123,18 @@ class CarlaSession:
 
     def _sample_history(self, force=False):
         elapsed = self.world.get_snapshot().timestamp.elapsed_seconds-self.t0
-        index = int(round(elapsed*2.))
-        if not force and (abs(elapsed-index*.5) > 1e-5 or index <= self._history_sample_index):
+        tick = self._runtime_metrics['physical_ticks']
+        period = self.physics_hz // 2
+        index = tick // period
+        if not force and (tick % period or index <= self._history_sample_index):
             return
         started = time.monotonic()
         ego, actors, _ = self._entities()
         for actor in [ego]+actors:
             if actor['kind'] == 'static_obstacle':
                 continue
-            sample = {'time': float(elapsed), 'position': list(actor['position']),
+            sample = {'time': float(elapsed), 'physical_tick': tick, 'frame': self.frame,
+                'position': list(actor['position']),
                 'velocity': list(actor['velocity']), 'acceleration': list(actor['acceleration']),
                 'heading': actor['heading'], 'observed': True}
             samples = self._history.setdefault(actor['id'], [])
@@ -1179,7 +1215,10 @@ class CarlaSession:
             'timestamp': snap.timestamp.elapsed_seconds, 'ego': ego, 'actors': actors,
             'cameras': cameras, 'traffic_lights': lights,
             'speed_limit_mps': self.ego.get_speed_limit() / 3.6,
-            'collision': self.collision, 'events': list(self.events) + list(self.experiment.events),
+            # Script transitions and hidden actor intent stay in the independent
+            # scenario/evaluation channel, never in the planner observation.
+            'collision': any(event.get('kind') == 'collision' and event.get('phase') == 'runtime'
+                             for event in self.events), 'events': list(self.events),
             'actual_actuation': {'throttle': actual.throttle, 'brake': actual.brake, 'steer_normalized_right': actual.steer},
             'current_road_evidence': road_evidence,
             'environment_obstacles': dict(self.environment_audit, in_range_count=static_count),
@@ -1195,7 +1234,9 @@ class CarlaSession:
             'observed_history': copy.deepcopy(self._history),
             'last_applied_control': copy.deepcopy(self._last_applied_control),
             'runtime': self._runtime_payload(), 'bridge_timing': dict(self._timing),
-            'scenario': self.experiment.name}
+            'evaluation': copy.deepcopy(self._evaluation),
+            'public_road_rules': self.experiment.public_rule_payload(),
+            'scenario': 'carla'}
 
     def _show_plan(self, plan):
         """显示层使用真实世界坐标；不参与感知/控制。debug可能进入相机，不能声称原图隔离。"""
@@ -1241,6 +1282,11 @@ class CarlaSession:
             runtime.update(source_frame=result['frame'], source_time=result['time'],
                 current_sim_time=result['time'], observation_age_s=0., observation_wall_age_s=0.)
             self._latest = copy.deepcopy(result)
+            self._published_sources[result['frame']] = (result['time'], runtime['physical_ticks'])
+            # 控制地平线只有3秒；保留8秒冻结源记录供异步提交校验。
+            cutoff = runtime['physical_ticks']-8*self.physics_hz
+            self._published_sources = {frame: source for frame, source in self._published_sources.items()
+                                       if source[1] >= cutoff}
             self._terminal_published = result.get('runtime', {}).get('terminal_reason') is not None
             self._latest_published_at = time.monotonic()
             self._condition.notify_all()
@@ -1257,17 +1303,24 @@ class CarlaSession:
         result['display_frames'] = display_frames
         return result
 
-    def _install(self, controls, control_step_s, source_time, plan, source_speed_mps):
+    def _install(self, controls, control_step_s, source_time, plan, source_speed_mps, source_frame=None):
         if self.closed or self._terminal_reason is not None:
             raise RuntimeError('CARLA执行已终止：{}'.format(self._terminal_reason or 'closed'))
         if (type(control_step_s) not in (int, float) or not math.isfinite(control_step_s) or
                 abs(control_step_s-self.control_step_s) > 1e-8):
             raise ValueError('控制网格必须保持0.1秒')
         # 校验完整批次，失败不能损坏当前正在执行的序列。
-        candidate = ControlTimeline(self.timeline.minimum, self.timeline.maximum, self.timeline.steering_max)
+        candidate = ControlTimeline(self.timeline.minimum, self.timeline.maximum, self.timeline.steering_max,
+                                    self.physics_hz)
         if source_speed_mps is None:
             raise ValueError('必须传递规划原帧自车速度，不按每段实测速误差重新生成目标速度')
-        candidate.install(controls, source_time, control_step_s, source_speed_mps)
+        recorded_source = self._published_sources.get(source_frame) if type(source_frame) is int else None
+        if recorded_source is None:
+            raise ValueError('控制必须引用本轮已发布的冻结世界帧')
+        recorded_time, source_tick = recorded_source
+        if abs(recorded_time-source_time) > 1e-7:
+            raise ValueError('控制源帧与源时间不匹配')
+        candidate.install(controls, source_time, control_step_s, source_speed_mps, source_tick=source_tick)
         if len(candidate.controls) != 30:
             raise ValueError('CARLA必须提交完整30段MPC控制序列')
         if plan is not None and (not isinstance(plan, list) or len(plan) > 1000 or
@@ -1280,19 +1333,19 @@ class CarlaSession:
                 raise RuntimeError('CARLA执行已终止：{}'.format(self._terminal_reason or 'closed'))
             if self.timeline.source_time is not None and source_time < self.timeline.source_time-1e-8:
                 raise ValueError('旧源帧控制不能覆盖新控制序列')
-            state = candidate.at(self._sim_time)
+            state = candidate.at(self._sim_time, self._runtime_metrics['physical_ticks'])
             if not state['available']:
                 raise ValueError('新控制序列无法用于当前仿真时间：'+state['reason'])
             candidate.revision = self.timeline.revision+1
             self.timeline = candidate
             self._runtime_metrics['submitted_sequences'] = self._runtime_metrics.get('submitted_sequences', 0)+1
             self._runtime_metrics['last_submission_skipped_segments'] = state['index']
-            self._pending_plan = (candidate.revision, copy.deepcopy(plan))
+            self._pending_plan = (candidate.revision, copy.deepcopy(plan), source_frame)
             self._paused = False
 
     def _apply_current(self):
         with self._condition:
-            state = self.timeline.at(self._sim_time)
+            state = self.timeline.at(self._sim_time, self._runtime_metrics['physical_ticks'])
             if not state['available']:
                 self._terminal_reason = state['reason']
                 if state['reason'] == 'sequence_exhausted':
@@ -1304,14 +1357,14 @@ class CarlaSession:
         if pending is not None:
             self._visualization = self._show_plan(pending[1])
             self._visualization['sequence_revision'] = pending[0]
+            self._visualization['source_carla_frame'] = pending[2]
         key = (state['revision'], state['index'])
         if key != self._applied_key:
             acceleration, steering = state['control']
             velocity = self.ego.get_velocity()
             speed = math.sqrt(velocity.x**2+velocity.y**2+velocity.z**2)
             # 源时标中途接纳的段只执行剩余部分，过期段不重放。
-            remaining = min(self.control_step_s,
-                source_time+(state['index']+1)*self.control_step_s-self._sim_time)
+            remaining = state['remaining_segment_s']
             # CARLA0.9.15 Ackermann控制器将speed作为跟踪目标，acceleration的绝对值
             # 是内部速度PID的加速度上限，并非直接加速度命令。每段目标速度必须
             # 从源帧按已规划a序列累计，不能每段重新锚定滞后的实测速。
@@ -1327,6 +1380,7 @@ class CarlaSession:
                 'actuation_mapping': 'source_speed_plus_planned_acceleration_integral-1.0'}
             self._last_applied_control = dict(self._last_command, sequence_index=state['index'],
                 sequence_revision=state['revision'], source_time=source_time,
+                source_tick=self.timeline.source_tick, applied_tick=self._runtime_metrics['physical_ticks'],
                 applied_time=self._sim_time, frame=self.frame,
                 control=[acceleration, steering], remaining_segment_s=remaining)
             self._applied_key = key
@@ -1338,7 +1392,7 @@ class CarlaSession:
             raise RuntimeError('本次tick之前世界已被额外推进：桥接帧{}，世界帧{}；只能有一个tick客户端'.format(
                 self.frame, previous_frame))
         started = time.monotonic()
-        self.experiment.before_tick(self._sim_time, 1./self.physics_hz)
+        self.experiment.before_tick_tick(self._runtime_metrics['physical_ticks'], 1./self.physics_hz)
         self._add_timing('scenario_s', time.monotonic()-started)
         started = time.monotonic()
         self.frame = self.world.tick(self.timeout)
@@ -1350,6 +1404,19 @@ class CarlaSession:
             raise RuntimeError('单次tick检测到额外世界推进：推进前{}，tick返回{}，世界{}；只能有一个tick客户端'.format(
                 previous_frame, self.frame, snap.frame))
         self._sample_history()
+        self.experiment.after_tick(self.frame, self._runtime_metrics['physical_ticks'], snap)
+        if self.evaluation_probe is not None:
+            self._evaluation = self.evaluation_probe.observe(snap, self._runtime_metrics['physical_ticks'],
+                events=list(self.events), scenario_events=self.experiment.evaluation_state())
+            if any(item.get('kind') == 'initialization_collision'
+                   for item in self._evaluation.get('infrastructure_errors', [])):
+                self._terminal_reason = 'initialization_collision'
+            elif self._evaluation.get('collision'):
+                self._terminal_reason = 'collision'
+            elif self._evaluation.get('arrival'):
+                self._terminal_reason = 'arrival'
+            elif self._evaluation.get('stalled'):
+                self._terminal_reason = 'stall'
         if self.rgb_enabled and self._at_frequency(10.):
             self._collect(self.frame)
             # 录像/观看独立消费10Hz；模型及归档仍只消费整秒原帧。
@@ -1360,6 +1427,9 @@ class CarlaSession:
         if not cameras or not self._display_enabled:
             return
         packet = {'frame': self.frame, 'time': self._sim_time, 'cameras': cameras,
+                  'physical_tick': self._runtime_metrics['physical_ticks'],
+                  'plan_source_frame': (None if self.timeline.source_tick is None else
+                                        self._initial_source_frame+self.timeline.source_tick),
                   'plan_visualization': copy.deepcopy(self._visualization or {})}
         with self._condition:
             if self._display_frames and self._display_frames[-1]['frame'] == self.frame:
@@ -1392,6 +1462,8 @@ class CarlaSession:
 
     def _duration_reached(self):
         with self._condition:
+            if self._terminal_reason is not None:
+                return True
             target = duration_tick_limit(self.duration_s, self.physics_hz)
             # 初始化帧不计入轮长。3秒=150个正式物理tick，即使CARLA报告
             # 2.9999999329秒也已结束；原始时间戳仍原样保留在快照与日志中。
@@ -1443,7 +1515,7 @@ class CarlaSession:
             with self._condition:
                 self._condition.notify_all()
 
-    def step(self, controls, control_step_s, source_time, plan=None, source_speed_mps=None):
+    def step(self, controls, control_step_s, source_time, plan=None, source_speed_mps=None, source_frame=None):
         with self._condition:
             if self.runtime_mode == 'async' and self._terminal_reason is not None:
                 # 规划期间后台可能已到轮末。等终态与真实最终状态一起发布，
@@ -1456,7 +1528,7 @@ class CarlaSession:
                     self._condition.wait(remaining)
                 return self._latest_result()
             # 与_duration_reached共用锁，避免检查结束后、安装计划前再到达轮末。
-            self._install(controls, control_step_s, source_time, plan, source_speed_mps)
+            self._install(controls, control_step_s, source_time, plan, source_speed_mps, source_frame)
         if self._started_at is None:
             self._started_at = time.monotonic()
         if self.runtime_mode == 'async':
@@ -1597,11 +1669,32 @@ class CarlaSession:
                     errors.append('sensor.destroy返回False')
             except Exception as exc:
                 errors.append('sensor.destroy：'+str(exc))
+        # 世界已经暂停，传感器已停止；只让已排队的事件回调归并，不额外tick。
+        if self.evaluation_probe is not None:
+            try:
+                drain_started = time.monotonic()
+                previous_count, quiet_since = len(self.events), drain_started
+                while time.monotonic()-drain_started < .5:
+                    time.sleep(.025)
+                    count = len(self.events)
+                    if count != previous_count:
+                        previous_count, quiet_since = count, time.monotonic()
+                    if time.monotonic()-quiet_since >= .15:
+                        break
+                self.evaluation_probe.ingest_events(list(self.events))
+                if self._worker_error:
+                    self.evaluation_probe.infrastructure_error('bridge_worker', self._worker_error)
+                report['event_drain'] = {'elapsed_wall_s': time.monotonic()-drain_started,
+                    'event_count': len(self.events), 'extra_physics_ticks': 0,
+                    'policy': 'bounded_passive_callback_drain_after_sensor_stop'}
+                self._evaluation = self.evaluation_probe.report(self._terminal_reason, save=True)
+            except Exception as exc:
+                errors.append('独立评价收尾：'+type(exc).__name__+': '+str(exc))
         if self.experiment is not None:
             try:
                 self.experiment.close()
                 errors.extend(str(event) for event in getattr(self.experiment, 'events', [])
-                              if event.get('event') == 'cleanup_error')
+                              if event.get('event') in ('cleanup_error', 'scenario_cleanup_error'))
             except Exception as exc:
                 errors.append('experiment.close：'+str(exc))
         if self.world is not None and self.saved_settings is not None and self._settings_change_attempted:
@@ -1621,6 +1714,9 @@ class CarlaSession:
                 except Exception as exc:
                     errors.append('清理后状态核验：'+type(exc).__name__+': '+str(exc))
         self._save_cleanup_report(report, errors)
+        if self.evaluation_probe is not None and errors:
+            self.evaluation_probe.infrastructure_error('cleanup', list(errors))
+            self._evaluation = self.evaluation_probe.report(self._terminal_reason, save=True)
         if errors:
             raise RuntimeError('CARLA 资源收尾异常，请检查独立世界：' + '; '.join(errors))
 
@@ -1650,6 +1746,9 @@ def main():
                     raise ValueError('未知桥接操作：' + str(method))
                 reply = {'id': request['id'], 'result': result}
             except Exception as exc:
+                if session.evaluation_probe is not None:
+                    session.evaluation_probe.infrastructure_error('bridge_'+str(request.get('method')),
+                        type(exc).__name__+': '+str(exc))
                 if request.get('method') == 'init':
                     session._save_initialization_failure(exc)
                 reply = {'id': request.get('id'), 'error': '{}: {}'.format(type(exc).__name__, exc)}

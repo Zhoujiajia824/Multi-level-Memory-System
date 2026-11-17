@@ -1,0 +1,52 @@
+schema_version: carla-experiment-2.0
+name: town06_cut_in_right
+family: cut_in
+description: right侧相邻车辆在允许换道区连续切入，记录动作是否真正完成。
+map: Town06
+status: candidate
+split: development
+desired_speed_mps: 9
+duration_s: 240
+experiment:
+  ego_blueprint: vehicle.tesla.model3
+  initial_speed_mps: 9
+  weather: ClearNoon
+  route:
+    file: ../carla_routes/town06_cut_in_right.json
+  actors:
+  - role: cutting_vehicle
+    type: vehicle
+    blueprint: vehicle.audi.a2
+    placement:
+      s_m: 45.0
+      lane: right
+      offset_m: 0
+    behavior: cut_in
+    speed_mps: 8
+    trigger:
+      ego_s_m:
+      - 15.0
+      - 100.0
+      earliest_tick: 50
+      gap_m:
+      - 8
+      - 40
+    duration_ticks: 200
+    required: true
+    hold_ticks: 150
+  signals:
+    green_ticks: 500
+    yellow_ticks: 150
+    all_red_ticks: 50
+    offset_ticks: 0
+  variations:
+  - path: actors.0.speed_mps
+    min: 7.2
+    max: 8.8
+  - path: actors.0.duration_ticks
+    min: 200
+    max: 240
+  public_rules: []
+  evaluation:
+    arrival_margin_m: 3
+    stall_seconds: 45

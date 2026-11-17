@@ -1,0 +1,49 @@
+schema_version: carla-experiment-2.0
+name: town01_follow_stop_go
+family: following
+description: 固定城市路线；前车减速停车后恢复，评价跟驰间距与起步恢复。
+map: Town01
+status: candidate
+split: development
+desired_speed_mps: 8
+duration_s: 240
+experiment:
+  ego_blueprint: vehicle.tesla.model3
+  initial_speed_mps: 8
+  weather: ClearNoon
+  route:
+    file: ../carla_routes/town01_follow_stop_go.json
+  actors:
+  - role: lead
+    type: vehicle
+    blueprint: vehicle.audi.a2
+    placement:
+      route:
+        file: ../carla_routes/town01_follow_stop_go_lead.json
+      offset_m: 0
+    behavior: stop_resume
+    speed_mps: 5.5
+    trigger:
+      ego_s_m:
+      - 20.0
+      - 130.0
+      earliest_tick: 50
+    hold_ticks: 200
+    required: true
+    duration_ticks: 200
+  signals:
+    green_ticks: 500
+    yellow_ticks: 150
+    all_red_ticks: 50
+    offset_ticks: 0
+  variations:
+  - path: actors.0.speed_mps
+    min: 4.95
+    max: 6.05
+  - path: actors.0.duration_ticks
+    min: 200
+    max: 240
+  public_rules: []
+  evaluation:
+    arrival_margin_m: 3
+    stall_seconds: 45

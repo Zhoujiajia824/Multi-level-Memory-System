@@ -1,0 +1,72 @@
+schema_version: carla-experiment-2.0
+name: town10hd_queue
+family: multi_vehicle
+description: 两辆前车与分阶段停车恢复，固定长路线；分别记录两次交互与最终到达。
+map: Town10HD
+status: candidate
+split: development
+desired_speed_mps: 8
+duration_s: 240
+experiment:
+  ego_blueprint: vehicle.tesla.model3
+  initial_speed_mps: 8
+  weather: ClearNoon
+  route:
+    file: ../carla_routes/town10hd_queue.json
+  actors:
+  - role: lead
+    type: vehicle
+    blueprint: vehicle.audi.a2
+    placement:
+      route:
+        file: ../carla_routes/town10hd_queue_lead.json
+      offset_m: 0
+    behavior: stop_resume
+    speed_mps: 6
+    trigger:
+      ego_s_m:
+      - 30.0
+      - 130.0
+      earliest_tick: 100
+    required: true
+    duration_ticks: 200
+    hold_ticks: 150
+  - role: second_lead
+    type: vehicle
+    blueprint: vehicle.audi.a2
+    placement:
+      route:
+        file: ../carla_routes/town10hd_queue_second_lead.json
+      offset_m: 0
+    behavior: stop_resume
+    speed_mps: 7
+    trigger:
+      ego_s_m:
+      - 120.0
+      - 250.0
+      earliest_tick: 500
+    required: true
+    duration_ticks: 200
+    hold_ticks: 150
+  signals:
+    green_ticks: 500
+    yellow_ticks: 150
+    all_red_ticks: 50
+    offset_ticks: 0
+  variations:
+  - path: actors.0.speed_mps
+    min: 5.4
+    max: 6.6
+  - path: actors.0.duration_ticks
+    min: 200
+    max: 240
+  - path: actors.1.speed_mps
+    min: 6.5
+    max: 7.5
+  - path: actors.1.hold_ticks
+    min: 150
+    max: 200
+  public_rules: []
+  evaluation:
+    arrival_margin_m: 3
+    stall_seconds: 45
