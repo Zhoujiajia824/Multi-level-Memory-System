@@ -98,24 +98,36 @@ python scripts/run_highway.py --scenario intersection --seed 1 --duration 30 --f
 
 ## 3. 配置两个模型
 
-系统提示词在 `config/prompts.yaml` 中修改：`fast.system` 用于快模型，`reflection.system` 用于反思模型，两者独立。使用 YAML 多行文本 `system: |` 编写有长度限制的结构化说明；程序不对大括号作模板替换。最终回答必须且仅包含 `attention`、`local_goal`、`explanation`，协议版本为 `local-goal-frenet-1.0`。修改后重新启动生效，实际提示词原文及SHA256保存在每轮 `configuration.json` 的 `models` 中。
+系统提示词在 `config/prompts.yaml` 中修改：`fast.system` 用于快模型，`reflection.system` 用于反思模型，两者独立。使用 YAML 多行文本 `system: |`；程序不对大括号作模板替换。默认回答包含 `scene`、`decision`、`attention`、`local_goal` 四部分，输出协议为 `driving-decision-2.0`；单点Frenet坐标协议仍为 `local-goal-frenet-1.0`。修改后重新启动生效，实际提示词原文及SHA256保存在每轮 `configuration.json` 的 `models` 中。
 
-单目标回答格式（以下数值仅示意，仍须通过当前道路和交通校验）：
+四部分回答格式（以下是空交通直路示意，数值仍须通过本帧道路校验）：
 
 ```json
 {
+  "scene": {
+    "description": "自车沿直路行驶，当前输入没有其他交通对象。",
+    "reason": "本车道可通行，已知导航要求继续前进。"
+  },
+  "decision": {
+    "lateral": {"action": "保持车道", "reason": "当前没有换道需求。"},
+    "longitudinal": {"action": "维持速度", "reason": "当前速度符合给定速度要求，前方没有已知通行约束。"}
+  },
   "attention": [],
-  "local_goal": {"delta_s_m": 40.0, "d_m": 3.5},
-  "explanation": {
-    "情境": "输入中可验证的事实和关键交互。",
-    "依据": "道路、导航、规则约束及目标选择依据。",
-    "参考答案": "该目标表达的行驶意图及选择理由。",
-    "适用条件": "结论成立的条件。"
+  "local_goal": {
+    "delta_s_m": 40.0,
+    "d_m": 0.0,
+    "reason": "沿当前直路中心参考向前引导，保持现有行驶方向。"
   }
 }
 ```
 
 `delta_s_m` 从输入原帧自车投影开始沿冻结参考线向前，`d_m` 相对同一参考线左正右负，均为米；`d_m`不是相对自车的横移。新有效目标在下一次MPC立即替换旧目标；自车中心纵向经过原目标截面后全部释放，即使横向未完成。目标没有到达时间或目标速度，不是停车终点。解释目标所需的参考、合法候选车道及导航规则摘要由程序随原帧提供，不能用BEV直角坐标替代Frenet弧长。
+
+`attention` 每项只含 `id`、`reason`，最多3项；数组顺序由程序转为内部 `rank=1,2,3`。场景、行动和目标理由均不可为空。横纵向行动采用提示词列出的枚举值；这些行动文字用于解释和核查，不直接设定速度、加速度或制动，规划仍使用关注对象与一个几何引导点。完整四部分保存在模型日志的 `answer.model_output`，并记录 `answer.output_protocol_version`。
+
+为读取既有经验，内部 `explanation` 及在线经验写入保留旧存储契约：场景、决策及选点理由由程序映射，适用条件明确标注为程序兼容说明；模型不再被要求生成旧四段说明。已冻结旧提示词仍可返回完整旧三部分回答，日志会标记 `attention-goal-explanation-1.0`，不接受两种协议混合。既有记忆库不自动改写。
+
+本轮修改不自动覆盖实验目录中的配置副本。若命令使用 `--prompts-config "$EXP_ROOT/config/prompts.yaml"`，加载的仍是该实验副本；开始新的实验批次时明确选用新版，B/C等对比组保持同一提示词与协议版本。
 
 指定另一份提示词文件（相对路径以项目根目录为准）：
 
