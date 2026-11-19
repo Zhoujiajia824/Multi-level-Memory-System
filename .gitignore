@@ -31,6 +31,9 @@
 # 发布运行入口、记忆管理及下列CARLA场景检查和验收工具；其余临时脚本仅留本地。
 /scripts/*
 !/scripts/check_environment.py
+!/scripts/check_frenet_apf.py
+!/scripts/check_planner_lane_potential.py
+!/scripts/plot_lane_potential.py
 !/scripts/check_carla_camera_clock.py
 !/scripts/check_carla_camera_alignment.py
 !/scripts/check_carla_camera_clock_metadata.py

@@ -1,6 +1,6 @@
 {
   "theory_version": "nine-grid-rag-mpc-1.0",
-  "parameter_version": "development-1.1.0-safe-tracking",
+  "parameter_version": "development-1.2.0-lane-frenet-apf",
   "status": "initial_validation_values_not_optimal",
   "clock": {
     "physics_hz": 50,
@@ -156,30 +156,32 @@
     "map_successor_heading_scale_rad": 0.5235987755982988
   },
   "risk": {
-    "clearance_floor_m": 0.25,
+    "coordinates": "lane_frenet",
+    "kernel": "compact_quintic",
+    "outside_domain": "undefined",
     "body_clearance_margin_m": 0.05,
     "attention_increment": 1.0,
     "rank_weight": "1/rank",
     "classes": {
       "vehicle": {
-        "eta": 1.0,
-        "influence_m": 20
+        "longitudinal_m": 20.0,
+        "lateral_m": 6.0,
+        "peak": 8.0
       },
       "bicycle": {
-        "eta": 1.5,
-        "influence_m": 10
+        "longitudinal_m": 10.0,
+        "lateral_m": 3.0,
+        "peak": 12.0
       },
       "pedestrian": {
-        "eta": 2.0,
-        "influence_m": 10
+        "longitudinal_m": 10.0,
+        "lateral_m": 10.0,
+        "peak": 16.0
       },
       "static_obstacle": {
-        "eta": 1.0,
-        "influence_m": 12
-      },
-      "noncrossable_line": {
-        "eta": 0.03,
-        "influence_m": 1.5
+        "longitudinal_m": 12.0,
+        "lateral_m": 4.0,
+        "peak": 8.0
       }
     }
   },
@@ -382,7 +384,8 @@
     "projection_window_m": 120.0,
     "attraction_weight": 3.0,
     "longitudinal_scale_m": 30.0,
-    "lateral_scale_m": 3.5
+    "lateral_scale_m": 15.0,
+    "potential_shift": 6.0
   },
   "grid_observation": {
     "empty_min_coverage": 0.95,

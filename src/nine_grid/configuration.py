@@ -360,7 +360,8 @@ def validate_config(config):
     goal=result.get('local_goal',{})
     if not isinstance(goal,dict) or set(goal)-set(goal_defaults):
         raise ValueError('local_goal 必须为已实现的目标参数对象')
-    for key,value in goal.items():_positive(value,'local_goal.'+key)
+    for key,value in goal.items():
+        (_nonnegative if key=='potential_shift' else _positive)(value,'local_goal.'+key)
     if goal.get('passed_tolerance_m',.001)>.005:
         raise ValueError('纵向到达容差不能大于5毫米，不能提前释放目标')
     if goal.get('minimum_delta_s_m',2.)>=goal.get('maximum_delta_s_m',70.):
@@ -421,12 +422,22 @@ def validate_config(config):
         if key in result.get('coordinates',{}):_positive(result['coordinates'][key],'coordinates.'+key)
     if 'lane_switch_overlap_fraction' in result.get('coordinates',{}):
         _unit_interval(result['coordinates']['lane_switch_overlap_fraction'],'coordinates.lane_switch_overlap_fraction')
-    for name,settings in result.get('risk',{}).get('classes',{}).items():
-        _nonnegative(settings.get('eta',1),'risk.classes.'+name+'.eta')
-        _positive(settings.get('influence_m',1),'risk.classes.'+name+'.influence_m')
+    risk=result.get('risk',{})
+    for key,value in (('coordinates','lane_frenet'),('kernel','compact_quintic'),('outside_domain','undefined')):
+        if risk.get(key,value)!=value:
+            raise ValueError('risk.'+key+' 只支持 '+value)
+    if 'clearance_floor_m' in risk:
+        raise ValueError('旧净距APF参数clearance_floor_m已取消；使用Frenet中心椭圆longitudinal_m/lateral_m/peak')
+    for name,settings in risk.get('classes',{}).items():
+        if name not in ('vehicle','bicycle','pedestrian','static_obstacle'):
+            raise ValueError('势场对象只接受vehicle/bicycle/pedestrian/static_obstacle；车道线由几何约束处理')
+        if set(settings)-{'longitudinal_m','lateral_m','peak'}:
+            raise ValueError('risk.classes.'+name+' 含旧版或未知参数；使用longitudinal_m/lateral_m/peak')
+        for key in ('longitudinal_m','lateral_m'):_positive(settings.get(key,1),'risk.classes.'+name+'.'+key)
+        _nonnegative(settings.get('peak',1),'risk.classes.'+name+'.peak')
     if 'hard_body_margin_m' in result.get('risk',{}):
         raise ValueError('risk.hard_body_margin_m 已改名 body_clearance_margin_m；该余量用于软惩罚与审计，不是硬避碰约束')
-    for key in ('clearance_floor_m','body_clearance_margin_m'):
+    for key in ('body_clearance_margin_m',):
         if key in result.get('risk',{}):_positive(result['risk'][key],'risk.'+key)
     if 'attention_increment' in result.get('risk',{}):_nonnegative(result['risk']['attention_increment'],'risk.attention_increment')
     for key in ('radius_m','visibility_angular_step_deg'):

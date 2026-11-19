@@ -16,7 +16,7 @@ DEFAULTS = {
     'minimum_delta_s_m': 2., 'maximum_delta_s_m': 70.,
     'maximum_lateral_slope': .35, 'passed_tolerance_m': .001,
     'projection_window_m': 120., 'attraction_weight': 3.,
-    'longitudinal_scale_m': 30., 'lateral_scale_m': 3.5,
+    'longitudinal_scale_m': 30., 'lateral_scale_m': 15., 'potential_shift': 6.,
 }
 
 
@@ -314,7 +314,8 @@ def _project_sequence(positions, reference, initial_s):
     return np.asarray(values), np.asarray(gradients)
 
 
-def first_arrival_residual(positions, reference, goal_s, world_goal, sqrt_weight, initial_s=None):
+def first_arrival_residual(positions, reference, goal_s, world_goal, sqrt_weight, initial_s=None,
+                           *, frenet_geometry=None):
     """首次纵向截面线性插值；返回二维残差、全部位置Jacobian和离散事件证据。"""
     positions=np.asarray(positions,float); reference=np.asarray(reference,float)
     goal=np.asarray(world_goal,float); root=np.asarray(sqrt_weight,float)
@@ -332,11 +333,30 @@ def first_arrival_residual(positions, reference, goal_s, world_goal, sqrt_weight
     else:
         k=len(positions)-1;point=positions[-1];jac[:,k]=np.eye(2)
         mode='terminal_approach';fraction=None
-    residual=root@(point-goal)
+    potential_valid=True
+    if frenet_geometry is None:
+        residual=root@(point-goal)
+    else:
+        # 旧折线弧长仅用于已冻结目标的到达事件；势能的两个位置都重新
+        # 投影到同一条光滑车道参考，不能将折线弧长当成样条几何弧长。
+        event_s=goal_s if mode=='first_crossing' else ss[-1]
+        anchors=frenet_geometry.chart_arc_from_polyline_s(np.array([event_s,goal_s]))
+        projected=frenet_geometry.project(np.stack((point,goal)),anchors=anchors,window_m=10.)
+        potential_valid=bool(np.all(projected['valid']))
+        if potential_valid:
+            delta=np.array([projected['s'][0]-projected['s'][1],projected['d'][0]-projected['d'][1]])
+            residual=root@delta
+            jac=np.einsum('ij,jnk->ink',projected['jacobian'][0],jac)
+        else:
+            # 不可行的SQP试探不应使整轮崩溃；此处不是定义域外势能为零。
+            # 屏蔽数值残差槽，并由调用方明确拒绝该候选的安全认证。
+            residual=np.zeros(2);jac[:]=0.
     jac=np.einsum('ij,jnk->ink',root,jac)
     return residual,jac,{'mode':mode,'interval_index':k,'alpha':fraction,
         'evaluation_point':point.tolist(),'s_samples':ss.tolist(),
-        'goal_s_m':float(goal_s),'discretization':'首次弧长截面相邻0.1秒状态线性插值；非连续动力学精确事件'}
+        'goal_s_m':float(goal_s),'potential_valid':potential_valid,
+        'potential_coordinates':'lane_frenet' if frenet_geometry is not None else 'legacy_goal_frame',
+        'discretization':'冻结折线首次弧长截面相邻控制状态线性插值；非连续动力学精确事件'}
 
 
 class GoalManager:
