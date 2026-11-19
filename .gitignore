@@ -24,6 +24,9 @@
 # 只发布环境检查、实验入口和记忆管理，不上传验收/临时脚本。
 /scripts/*
 !/scripts/check_environment.py
+!/scripts/check_frenet_apf.py
+!/scripts/check_planner_lane_potential.py
+!/scripts/plot_lane_potential.py
 !/scripts/check_highway_model_camera.py
 !/scripts/check_model_object_scope.py
 !/scripts/check_lane_object_scope.py

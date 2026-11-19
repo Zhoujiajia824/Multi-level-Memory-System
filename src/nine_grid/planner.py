@@ -10,7 +10,9 @@ from .contracts import Actor, PlanResult
 from .planning_objects import planning_view, road_rule_observations
 from .local_reference import LocalReferenceManager, LocalReferenceResult
 from .goals import GoalManager, goal_seed_path, first_arrival_residual
-from .realtime_solver import Dynamics, QuadraticSolver, rectangle_gap, circle_gap, rectangle_distance, bicycle_geometry
+from .lane_potential import LanePotentialGeometry
+from .potential_domain import build_lane_potential_domain
+from .realtime_solver import Dynamics, QuadraticSolver, rectangle_gap, circle_gap, bicycle_geometry
 from .stop_control import brake_acceleration_limit
 from .geometry import (clean_polyline, ego_to_world, world_to_ego,
                        rectangle_corners, polyline_lengths, project_polyline, sample_polyline, wrap_angle)
@@ -336,8 +338,7 @@ class Planner:
         stop_local=None if stop_s is None else stop_s-start_arc
         previous_control=np.asarray(scene.diagnostics.get('previous_control',[0.,0.]),float)
         horizon=n*dt;risk_cfg=self.config.get('risk',{})
-        line_extent=float(risk_cfg.get('classes',{}).get('noncrossable_line',{}).get('influence_m',1.5))
-        reach=speed*horizon+.5*max(0.,float(p.get('acceleration_max_mps2',3.)))*horizon**2+np.hypot(scene.ego.length,scene.ego.width)/2+line_extent+.01
+        reach=speed*horizon+.5*max(0.,float(p.get('acceleration_max_mps2',3.)))*horizon**2+np.hypot(scene.ego.length,scene.ego.width)/2+.01
         local_world=scene.drivable.intersection(shapely.box(origin[0]-reach,origin[1]-reach,origin[0]+reach,origin[1]+reach))
         if local_world.is_empty:
             # 已离开局部地图时仍向真实道路计算软距离，不能构造空边界后返回空轨迹。
@@ -370,11 +371,19 @@ class Planner:
             frozen=np.asarray(active_goal['goal_reference']['points'],float)
             goal_ref=world_to_ego(frozen,origin,angle)
             goal_position=world_to_ego(np.asarray(active_goal['world_goal']),origin,angle)
-            goal_heading=project_polyline(sample_polyline(frozen,active_goal['s_goal_m']),frozen,
-                previous_s=active_goal['s_goal_m'],window=5.)[2]-angle
-            rotation=np.array([[np.cos(goal_heading),np.sin(goal_heading)],[-np.sin(goal_heading),np.cos(goal_heading)]])
-            sqrt_weight=np.diag([1/self.goals.p['longitudinal_scale_m'],1/self.goals.p['lateral_scale_m']])@rotation
+            sqrt_weight=np.diag([1/self.goals.p['longitudinal_scale_m'],1/self.goals.p['lateral_scale_m']])
             goal_context=(goal_ref,goal_position,sqrt_weight)
+        domain_world,domain_evidence=build_lane_potential_domain(scene,front_m=max(120.,reach),rear_m=20.)
+        potential_domain=shapely.transform(domain_world,lambda xy:world_to_ego(xy,origin,angle))
+        domain_boundary=potential_domain.boundary
+        shapely.prepare(potential_domain)
+        # 换道五次参考是跟踪目标；势场坐标始终沿导航车道，不随避让轨迹摆动。
+        potential_reference=goal_context[0] if goal_context is not None else clean_polyline(world_to_ego(scene.route,origin,angle))
+        potential_geometry=LanePotentialGeometry(potential_reference,potential_domain)
+        potential_old_s=(active_goal['last_s'] if active_goal is not None else
+            project_polyline(origin,scene.route,scene.diagnostics.get('route_s'),angle)[0])
+        potential_s0=float(potential_geometry.chart_arc_from_polyline_s(potential_old_s))
+        potential_geometry.anchor_s=potential_s0
         targets=[]
         for identity,trajectory in predictions.trajectories.items():
             actor=predictions.actors.get(identity)
@@ -383,8 +392,19 @@ class Planner:
             sample=np.stack([np.interp(np.arange(n+1)*dt,predictions.times,trajectory[:,j]) for j in range(4)],axis=1)
             sample[:,:2]=world_to_ego(sample[:,:2],origin,angle);sample[:,2]-=angle
             targets.append((actor,sample,body_vertices(sample[1:],actor.length,actor.width)))
+        source_projections={}
+        for actor,sample,_ in targets:
+            matched=object_selection['selected_state'][actor.id]['memberships']
+            membership=min(matched.values(),key=lambda row:abs(row['delta_s_m']))
+            offset=float(membership['delta_s_m'])
+            source_projections[actor.id]=potential_geometry.project_sequence(sample[:,:2],
+                np.clip(potential_s0+offset,0.,potential_geometry.length),require_domain=False,
+                initial_window_m=min(20.,max(10.,5.+.25*abs(offset))))
+        source_coverage={key:int((~value['coordinate_valid']).sum()) for key,value in source_projections.items()
+                         if not np.all(value['coordinate_valid'])}
         attention={str(a.get('id',a.get('entity_id',''))):1/max(1,int(a.get('rank',i+1))) for i,a in enumerate(answer.attention)} if answer else {}
         clearance=float(risk_cfg.get('body_clearance_margin_m',.05))
+        increment=float(risk_cfg.get('attention_increment',1.))
         max_a=float(p.get('acceleration_max_mps2',3));min_a=float(p.get('acceleration_min_mps2',-6))
         max_delta=float(p.get('steering_abs_max_rad',.6));max_jerk=float(p.get('jerk_abs_max_mps3',8));max_rate=float(p.get('steering_rate_abs_max_radps',.8));max_lat=float(p.get('lateral_acceleration_abs_max_mps2',4.89))
         max_speed=min(float(p.get('maximum_speed_mps',33.3333333)),float(scene.rules.get('speed_limit',33.3333333)))
@@ -507,6 +527,7 @@ class Planner:
         initial_body=shapely.polygons(body_vertices(initial[None,:],scene.ego.length,scene.ego.width))[0]
         initial_safety={'on_road':bool(shapely.covers(accepted_road,initial_body)),
                         'speed_limit':bool(speed<=max_speed+speed_tolerance)}
+        initial_safety['potential_domain']=bool(shapely.covers(potential_domain,shapely.Point(initial[:2])))
         for actor,sample,_ in targets:
             if actor.kind=='pedestrian':
                 gap,_=circle_gap(initial[None,:],sample[:1,:2],actor.radius or actor.width/2,scene.ego.length,scene.ego.width)
@@ -532,6 +553,7 @@ class Planner:
             dense=np.asarray(dense);times=np.arange(len(dense))*sub_dt
             bodies=shapely.polygons(body_vertices(dense,scene.ego.length,scene.ego.width))
             inside=shapely.covers(accepted_road,bodies)
+            domain_inside=shapely.covers(potential_domain,shapely.points(dense[:,:2]))
             line_ok=np.ones(len(dense),bool)
             for item in physical_lines.values():
                 line_ok &= shapely.distance(bodies,item['geometry'])>=clearance-tolerance
@@ -559,9 +581,10 @@ class Planner:
             if stop_local is not None:
                 front_s=project_polyline(body_vertices(dense,scene.ego.length,scene.ego.width).reshape(-1,2),global_reference)[0]
                 stop_ok=bool(np.max(front_s)<=stop_local+tolerance)
-            return {'valid':bool(inside.all() and line_ok.all() and actor_ok.all() and stop_ok),
+            return {'valid':bool(inside.all() and domain_inside.all() and line_ok.all() and actor_ok.all() and stop_ok),
                 'substep_s':sub_dt,'samples':len(dense),'actor_clearance_min_m':None if not np.isfinite(minimum) else minimum,
                 'offroad_samples':int((~inside).sum()),'line_violation_samples':int((~line_ok).sum()),
+                'outside_potential_domain_samples':int((~domain_inside).sum()),
                 'stop_line_passed':not stop_ok,'predicted_contacts':contacts,
                 'limitation':'物理子步离散复核，不是连续时间碰撞证明；周车未来来自预测'}
 
@@ -569,6 +592,8 @@ class Planner:
             value_started=time.perf_counter();evaluations['values']+=1
             # 线搜索只需真实原值；只有进入下一次QP的名义点才计算控制导数。
             states=self.dynamics.rollout(controls,initial);current=states[1:]
+            field_projection=potential_geometry.project_sequence(states[:,:2],potential_s0)
+            field_query={key:value[1:] for key,value in field_projection.items()}
             geometry_started=time.perf_counter()
             s,path_residual,tangent,path_interior,heading,heading_derivative,goal_tracking_mask,s_tangent,s_interior,post_goal_corridor=tracking_geometry(current)
             navigation_s,_,navigation_tangent,navigation_interior=_path_projection(current[:,:2],global_reference)
@@ -621,6 +646,16 @@ class Planner:
                 residual('penalty_'+name,np.minimum(margin,0.),derivative,penalties.get(name,100.),scale)
                 rows.append(jac);lower.append(-margin);upper.append(np.full(len(margin),np.inf))
             penalty('road_clearance',road_distance.ravel()+tolerance,road_jac)
+            center_points=shapely.points(current[:,:2])
+            domain_inside=shapely.covers(potential_domain,center_points)
+            domain_nearest=shapely.get_coordinates(shapely.get_point(shapely.shortest_line(domain_boundary,center_points),0))
+            domain_offset=current[:,:2]-domain_nearest
+            domain_distance=np.linalg.norm(domain_offset,axis=1)
+            domain_sign=np.where(domain_inside,1.,-1.)
+            domain_margin=domain_sign*domain_distance
+            domain_normal=domain_sign[:,None]*domain_offset/np.maximum(domain_distance[:,None],1e-10)
+            penalty('potential_domain',domain_margin,
+                lambda c:np.einsum('ni,nij->nj',domain_normal,c['sens'][:,:2]))
             if len(uncovered):
                 # 完整车体越界面积覆盖孔洞和凹角。不能把随形状重选的见证点
                 # 当成固定车体点求导，否则软目标的数值和Jacobian不一致。
@@ -686,44 +721,46 @@ class Planner:
             tracking_jac=lambda c:2*allowed[:,None]*recovery_slope[:,None]*c['sj']-2*np.einsum('ni,nij->nj',path_residual,c['sens'][:,:2])
             penalty('tracking_corridor',tracking_margin,tracking_jac)
             goal_evidence=None
+            goal_constant=0.
             if goal_context is not None:
                 goal_ref,goal_position,sqrt_weight=goal_context
                 goal_residual,goal_jacobian,goal_evidence=first_arrival_residual(states[:,:2],goal_ref,
-                    active_goal['s_goal_m'],goal_position,sqrt_weight,active_goal['last_s'])
+                    active_goal['s_goal_m'],goal_position,sqrt_weight,active_goal['last_s'],
+                    frenet_geometry=potential_geometry)
                 goal_jac=lambda c:np.einsum('rni,nij->rj',goal_jacobian,c['all'][:,:2])
-                # 一次事件势能0.5*w*||R(p_hit-g)||²，不随时域节点数稀释。
+                # 一次事件势能0.5*w*||D(F(p_hit)-F(g))||²-C，不随节点数稀释。
                 residual('goal_attraction',goal_residual,goal_jac,.5*self.goals.p['attraction_weight']*n)
+                goal_constant=float(self.goals.p['potential_shift'])
+                components['goal_attraction']-=goal_constant
+                goal_evidence['potential_shift']=goal_constant
             residual('speed',current[:,3]-target,lambda c:c['sens'][:,3]-np.einsum('ni,nij->nj',target_direction,c['sens'][:,:2]),weights.get('speed',1),scales['speed_mps'])
             for index,key,scale,selector in [(0,'acceleration','acceleration_mps2',accel_selector),(1,'steering','steering_rad',steer_selector)]:
                 residual('control',controls[:,index],selector,weights.get(key,.1 if index==0 else .2),scales[scale])
             residual('control',delta[:,0]/dt,difference@accel_selector/dt,weights.get('jerk',.2),scales['jerk_mps3'])
             residual('control',delta[:,1]/dt,difference@steer_selector/dt,weights.get('steering_rate',.2),scales['steering_rate_radps'])
-            floor=float(risk_cfg.get('clearance_floor_m',.25));increment=float(risk_cfg.get('attention_increment',1.))
-            def risk(name,distance,partial,settings,rank_weight):
-                extent=float(settings.get('influence_m',12.));eta=float(settings.get('eta',1.))*(1+increment*rank_weight)
-                value=np.maximum(1/(distance+floor)-1/(extent+floor),0.)
-                derivative=np.where(distance<extent,-1/(distance+floor)**2,0.)
-                jac=lambda c:np.einsum('ni,nij->nj',partial() if callable(partial) else partial,c['sens'])*derivative[:,None]
-                residual(name,value,jac,weights.get('risk',2)*eta/2)
+            field_invalid=int((~field_query['valid']).sum())
             geometry_started=time.perf_counter()
             for actor,sample,other_vertices in targets:
-                class_risk=risk_cfg.get('classes',{}).get(actor.kind,{'eta':1.,'influence_m':12.})
+                class_risk=risk_cfg.get('classes',{}).get(actor.kind)
+                if class_risk is None:
+                    raise ValueError('缺少势场对象类别参数：'+actor.kind)
                 if actor.kind=='pedestrian':
                     gap,partial=circle_gap(current,sample[1:,:2],actor.radius or actor.width/2,scene.ego.length,scene.ego.width)
-                    distance=np.maximum(gap,0.);distance_partial=partial*(gap>0)[:,None]
                 else:
                     gap,partial=rectangle_gap(current,sample[1:],scene.ego.length,scene.ego.width,actor.length,actor.width)
-                    # SAT间隙是欧氏净距下界；下界已在势场范围外时，
-                    # 其势场严格为零，不必重复求32组顶点—边见证点。
-                    relevant=gap<float(class_risk.get('influence_m',12.))
-                    distance=np.maximum(gap,0.);distance_partial=np.zeros((n,4))
-                    if np.any(relevant):
-                        distance[relevant],distance_partial[relevant]=rectangle_distance(
-                            current[relevant],vertices[relevant],other_vertices[relevant],gap[relevant])
                 penalty('actor_clearance',gap-clearance+tolerance,
                         lambda c,partial=partial:np.einsum('ni,nij->nj',partial,c['sens']))
                 minima.append(float((gap-clearance).min()))
-                risk('actor_risk',distance,distance_partial,class_risk,attention.get(actor.id,0.))
+                source_projection={key:value[1:] for key,value in source_projections[actor.id].items()}
+                field=potential_geometry.repulsion_from_projection(field_query,source_projection,class_risk,
+                    attention_gain=1.+increment*attention.get(actor.id,0.))
+                # 公共势场在域外为NaN，不存在“域外低势能”。SQP的不可行迭代
+                # 仅屏蔽这些残差槽；独立车道域约束和子步验收始终拒绝它们。
+                value=np.where(field['valid'],field['residual'],0.)
+                derivative=np.where(field['valid'][:,None],field['residual_jacobian'],0.)
+                residual('actor_risk',value,
+                    lambda c,derivative=derivative:np.einsum('ni,nij->nj',derivative,c['sens'][:,:2]),
+                    weights.get('risk',2))
             line_minimum=np.inf
             for item in physical_lines.values():
                 distance=shapely.distance(polygons,item['geometry'])
@@ -753,8 +790,6 @@ class Planner:
                 penalty('noncrossable_line_clearance',signed-clearance+tolerance,
                         lambda c,partial=line_partial:np.einsum('ni,nij->nj',partial(),c['sens']))
                 line_minimum=min(line_minimum,float((signed-clearance).min()))
-                risk_partial=lambda partial=line_partial,contact=contact:np.where(contact[:,None],0.,partial())
-                risk('line_risk',distance,risk_partial,risk_cfg.get('classes',{}).get('noncrossable_line',{'eta':.03,'influence_m':1.5}),max([attention.get(identity,0.) for identity in item['ids']],default=0.))
             if physical_lines:minima.append(line_minimum)
             if stop_local is not None:
                 # 将完整矩形四角投影到同一导航参考线，转弯/偏航时不能用固定L/2代替车头。
@@ -791,10 +826,11 @@ class Planner:
             # 进度属于导航，横向/航向跟踪属于局部参考，坐标用途不混用。
             progress=-float(weights.get('progress',1))*(navigation_s[-1]-(ego_s-start_arc))/scales['progress_m'];components['progress']=progress
             residual_vector=np.concatenate(residuals)
-            objective=float(residual_vector@residual_vector+progress)
+            objective=float(residual_vector@residual_vector+progress-goal_constant)
             for key in ('actor_risk','line_risk','goal_attraction','contour','heading'):components.setdefault(key,0.)
             metrics={name:value for name,value in zip(labels,minima)}
             metrics['tracking_corridor']=float(tracking_margin.min())
+            metrics['potential_domain']=float(domain_margin.min())
             if terminal_margins:metrics['terminal_stopping']=float(min(terminal_margins))
             control_margin=float(min(np.min(controls[:,0]-min_a),np.min(max_a-controls[:,0]),
                                      np.min(max_delta-np.abs(controls[:,1]))))
@@ -805,12 +841,15 @@ class Planner:
             safety_feasible=(all(initial_safety.values()) and all(value>=-(speed_tolerance if key=='speed_limit' else tolerance) for key,value in metrics.items()
                              if key!='tracking_corridor' or not is_brake)
                              and dense['valid']
+                             and bool(domain_inside.all()) and field_invalid==0
+                             and (goal_evidence is None or goal_evidence['potential_valid'])
                              and bool(np.all(shapely.covers(accepted_road,polygons))))
             result=dict(states=states,controls=controls.copy(),objective=objective,components=components,
                 lower=np.concatenate(lower),upper=np.concatenate(upper),minima=metrics,valid=bool(valid),polygons=polygons,
                 following_headway_minimum=(float(np.min(headway_margin)) if np.isfinite(headway_margin).any() else None),
                 safety_feasible=bool(safety_feasible),dense_validation=dense,is_brake=bool(is_brake),
-                violation=max(0.,-min(metrics.values()),-control_margin),goal_evidence=goal_evidence)
+                violation=max(0.,-min(metrics.values()),-control_margin),goal_evidence=goal_evidence,
+                potential_invalid_samples=field_invalid)
             def linearize():
                 linearization_started=time.perf_counter();evaluations['linearizations']+=1
                 sensitivity=self.dynamics.sensitivity(controls,initial)
@@ -1023,6 +1062,17 @@ class Planner:
         elapsed=time.perf_counter()-started
         diagnostics={'solver_seconds':time.perf_counter()-solver_started,'planning_seconds':elapsed,'solver_status':statuses,
             'planning_object_selection':object_selection,'execution_mode':execution_mode,
+            'potential_field':{'version':'lane-frenet-center-ellipse-1.0','coordinates':'lane_frenet',
+                'kernel':'(1-rho)^3*(1+3*rho+6*rho^2) for rho<1; zero otherwise',
+                'sampling_point':'ego_center','source_shape':'lane_aligned_center_ellipse',
+                'physical_dimensions_used_for_potential':False,'physical_collision_constraints_retained':True,
+                'line_treatment':'full_body_geometric_constraints; no_line_APF',
+                'domain':domain_evidence,'invalid_samples':accepted['potential_invalid_samples'],
+                'geometry':potential_geometry.diagnostics,'source_projection_uncovered_samples':source_coverage,
+                'source_projection_policy':'outside_confirmed_reference_no_APF;physical_collision_constraints_retained',
+                'classes':risk_cfg['classes'],'attention_increment':increment,
+                'outer_risk_weight':float(weights.get('risk',2)),
+                'goal_event':'legacy_frozen_polyline_first_crossing; energy_on_same_smooth_Frenet_projection'},
             'emergency':execution_mode=='emergency_unverified',
             'braking_release_conflicts':accepted.get('braking_release_conflicts',[]),
             'braking_risk_metrics':accepted.get('braking_risk_metrics'),
@@ -1084,7 +1134,7 @@ class Planner:
             safety_feasible=accepted['safety_feasible'],initial_safety_checks=initial_safety,
             speed_numerical_tolerance_mps=speed_tolerance,
             hard_constraint_groups=['dynamics','acceleration','steering','nonnegative_speed','jerk','steering_rate',
-                'road','noncrossable_line','actor_clearance','speed_limit','lateral_acceleration','stop_line','terminal_stopping','tracking_corridor'],
+                'road','potential_domain','noncrossable_line','actor_clearance','speed_limit','lateral_acceleration','stop_line','terminal_stopping','tracking_corridor'],
             soft_constraint_violations={key:max(0.,-value) for key,value in accepted['minima'].items()
                                         if key not in ('nonnegative_speed','control_box')},
             geometry_progress='closest_point_eliminated_free_progress')
