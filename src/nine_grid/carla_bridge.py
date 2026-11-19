@@ -19,6 +19,41 @@ except ImportError:
     from carla_execution import ControlTimeline, duration_tick_limit
 
 
+class CameraMetadataError(RuntimeError):
+    """A sensor header cannot establish the requested image/world identity."""
+
+    def __init__(self, key, image, frame, timestamp, reason):
+        raw_time = float(image.timestamp)
+        self.details = {'camera': key, 'reason': reason,
+            'sensor_frame': int(image.frame),
+            'sensor_timestamp': raw_time if math.isfinite(raw_time) else None,
+            'world_frame': int(frame), 'world_timestamp': float(timestamp)}
+        super().__init__('RGB元数据冲突：{}；{}；图像帧{}、时间{}，世界帧{}、时间{}；'
+            '拒绝改写帧号或用时间戳替代帧号'.format(
+                key, reason, image.frame, image.timestamp, frame, timestamp))
+
+
+def camera_matches_snapshot(key, image, frame, timestamp):
+    """Only genuinely older headers can be drained as stale; never relabel pixels.
+
+    CARLA 0.9.15 PixelReader captures the frame before asynchronous GPU readback,
+    but constructs the stream timestamp/transform later. Equal timestamps alone
+    cannot rescue an earlier frame (PixelReader.h and AsyncDataStreamImpl.h).
+    """
+    stamp = float(image.timestamp)
+    if not math.isfinite(stamp):
+        raise CameraMetadataError(key, image, frame, timestamp, 'nonfinite_timestamp')
+    if image.frame < frame:
+        if stamp >= timestamp-1e-5:
+            raise CameraMetadataError(key, image, frame, timestamp, 'old_frame_with_current_or_future_time')
+        return False
+    if image.frame > frame:
+        raise CameraMetadataError(key, image, frame, timestamp, 'future_frame')
+    if abs(stamp-timestamp) > 1e-5:
+        raise CameraMetadataError(key, image, frame, timestamp, 'frame_timestamp_disagreement')
+    return True
+
+
 def validate_camera_source_clock(clock):
     """文件型模型输入只能使用本轮归档源帧，禁止高频调用时混入旧相机图。"""
     frequency = clock.get('fast_hz', 1)
@@ -263,8 +298,45 @@ def closed_crosswalks(locations, base_z, tolerance, height_support=None):
     return polygons
 
 
-ENVIRONMENT_OBSTACLE_LABELS = ('Car', 'Truck', 'Bus', 'Train', 'Motorcycle', 'Bicycle',
-    'Vehicles', 'Static', 'Other', 'Fences', 'GuardRail', 'Walls', 'Poles', 'TrafficSigns', 'TrafficLight')
+OBJECT_CATEGORY_VERSION = 'carla-road-participant-categories-1.0'
+ENVIRONMENT_PARTICIPANT_KINDS = {
+    'Car': 'vehicle', 'Truck': 'vehicle', 'Bus': 'vehicle', 'Train': 'vehicle',
+    'Motorcycle': 'vehicle', 'Vehicles': 'vehicle', 'Bicycle': 'bicycle',
+    'Pedestrians': 'pedestrian', 'Pedestrian': 'pedestrian',
+}
+# Exact SDK blueprint IDs from CARLA 0.9.15 catalogue_props/ (Road category).
+# Road signs, permanent barriers/fences, furniture and arbitrary Static/Other
+# meshes are not obstacles. No substring guessing from a map component name.
+ROAD_OBSTACLE_BLUEPRINTS = frozenset('static.prop.' + name for name in (
+    'streetbarrier', 'constructioncone', 'trafficcone01', 'trafficcone02',
+    'ironplank', 'brokentile01', 'brokentile02', 'brokentile03', 'brokentile04',
+    'dirtdebris01', 'dirtdebris02', 'dirtdebris03'))
+BICYCLE_BLUEPRINTS = frozenset(('vehicle.bh.crossbike', 'vehicle.diamondback.century',
+                              'vehicle.gazelle.omafiets'))
+
+
+def environment_category(label, name):
+    """Category evidence only; lane-chain/range admission happens downstream."""
+    if label in ENVIRONMENT_PARTICIPANT_KINDS:
+        return ENVIRONMENT_PARTICIPANT_KINDS[label], 'semantic_label:' + label
+    if label in ('Static', 'Other') and name in ROAD_OBSTACLE_BLUEPRINTS:
+        return 'static_obstacle', 'exact_road_obstacle_blueprint_name:' + name
+    return None, ('unresolved_static_or_other' if label in ('Static', 'Other')
+                  else 'not_a_road_participant_or_obstacle')
+
+
+def actor_category(actor):
+    """Do not turn arbitrary experiment props into road obstacles."""
+    identity = actor.type_id
+    if identity in BICYCLE_BLUEPRINTS:
+        return 'bicycle', 'sdk_bicycle_blueprint:' + identity
+    if identity.startswith('vehicle.'):
+        return 'vehicle', 'sdk_vehicle_blueprint:' + identity
+    if identity.startswith('walker.pedestrian.'):
+        return 'pedestrian', 'sdk_pedestrian_blueprint:' + identity
+    if identity in ROAD_OBSTACLE_BLUEPRINTS:
+        return 'static_obstacle', 'exact_road_obstacle_blueprint:' + identity
+    return None, 'unrecognized_road_obstacle_blueprint:' + identity
 
 
 def environment_catalogue(world, carla):
@@ -272,15 +344,22 @@ def environment_catalogue(world, carla):
 
     get_environment_objects的框已经位于世界坐标，不能再乘EnvironmentObject.transform。
     在创建实验车辆之前读取，配合独立空世界准入避免把动态actor重复成静态物。
-    不读取Building/Road/Sidewalk/Ground等大区域框；不以尺寸或数量截断障碍物。
+    只收有类别证据的交通对象和路面障碍候选；车道内与前后范围由公共筛选器判断。
+    围栏、护栏、墙、杆和未识别Static/Other不因有包围框就变成障碍物。
     """
-    labels = {getattr(carla.CityObjectLabel, name): name for name in ENVIRONMENT_OBSTACLE_LABELS
+    names = tuple(ENVIRONMENT_PARTICIPANT_KINDS) + ('Static', 'Other')
+    labels = {getattr(carla.CityObjectLabel, name): name for name in names
               if hasattr(carla.CityObjectLabel, name)}
     objects, seen, excluded, normalizations = [], {}, {}, []
+    category_audit = []
     for item in sorted(world.get_environment_objects(carla.CityObjectLabel.Any), key=lambda obj: obj.id):
-        if item.type not in labels:
-            name = str(item.type)
-            excluded[name] = excluded.get(name, 0) + 1
+        label = labels.get(item.type, str(item.type))
+        name = getattr(item, 'name', '')
+        kind, evidence = environment_category(label, name)
+        category_audit.append({'id': str(item.id), 'name': name, 'label': label,
+                              'kind': kind, 'included': kind is not None, 'evidence': evidence})
+        if kind is None:
+            excluded[label] = excluded.get(label, 0) + 1
             continue
         box = item.bounding_box
         values = (box.location.x, box.location.y, box.location.z, box.extent.x, box.extent.y,
@@ -288,7 +367,7 @@ def environment_catalogue(world, carla):
         if not all(math.isfinite(value) for value in values) or any(value == 0 for value in values[3:6]):
             raise ValueError('环境障碍物框包含非有限值或零半尺寸：id={}，name={!r}，label={}，'
                 'center={}，extent={}，rotation={}'.format(item.id, getattr(item, 'name', ''),
-                    labels[item.type], values[:3], values[3:6], values[6:]))
+                    label, values[:3], values[3:6], values[6:]))
         if any(value < 0 for value in values[3:6]):
             # 0.9.15直接将半尺寸乘组件缩放，镜像网格会保留负号。
             # ±半尺寸枚举的八角点集合不变；不删除障碍物，不修改原始地图框。
@@ -298,26 +377,31 @@ def environment_catalogue(world, carla):
                 carla.Vector3D(x=extent[0], y=extent[1], z=extent[2]))
             positive_box.rotation = carla.Rotation(yaw=values[6], pitch=values[7], roll=values[8])
             normalizations.append({'id': str(item.id), 'name': getattr(item, 'name', ''),
-                'label': labels[item.type], 'source_extent_m': list(values[3:6]),
+                'label': label, 'source_extent_m': list(values[3:6]),
                 'canonical_extent_m': list(extent)})
             box = positive_box
             values = values[:3] + extent + values[6:]
         # 完全相同的环境几何可能有多个组件标签，仅合并精确几何重复，不近似删物体。
-        signature = tuple(values)
+        signature = (kind,) + tuple(values)
         if signature in seen:
             seen[signature]['source_ids'].append(str(item.id))
             continue
-        entry = {'id': 'environment_{}'.format(item.id), 'box': box, 'label': labels[item.type],
-                 'source_ids': [str(item.id)]}
+        entry = {'id': 'environment_{}'.format(item.id), 'box': box, 'label': label,
+                 'kind': kind, 'classification_evidence': evidence, 'source_ids': [str(item.id)]}
         seen[signature] = entry
         objects.append(entry)
     return objects, {'source': 'CARLA_0.9.15_get_environment_objects_world_bounding_boxes',
-        'included_labels': sorted(labels.values()), 'excluded_label_counts': excluded,
+        'included_labels': sorted(set(entry['label'] for entry in objects)),
+        'excluded_label_counts': excluded,
+        'category_version': OBJECT_CATEGORY_VERSION, 'category_decisions': category_audit,
+        'category_counts': {kind: sum(entry['kind'] == kind for entry in objects)
+                            for kind in ('vehicle', 'bicycle', 'pedestrian', 'static_obstacle')},
+        'road_obstacle_blueprints': sorted(ROAD_OBSTACLE_BLUEPRINTS),
         'catalogue_count': len(objects), 'loaded_before_experiment_actors': True,
         'geometry_version': 'carla-environment-box-1.1',
         'signed_extent_normalized_count': len(normalizations),
         'signed_extent_normalizations': normalizations,
-        'scope': '已标注环境障碍物；排除建筑/道路/地面等区域语义，未缩小或关闭实体'}
+        'scope': '类别准入候选，不代表车道范围准入；泛Static/Other及围栏护栏墙杆不入对象表，实体与RGB不修改'}
 
 
 class CarlaSession:
@@ -461,9 +545,9 @@ class CarlaSession:
         audit_path = self.root / 'carla_environment_audit.json'
         audit_path.write_text(json.dumps(self.environment_audit, ensure_ascii=False,
                                         allow_nan=False, indent=2), encoding='utf-8')
-        # 全地图规范化明细只保存一次，避免每帧重复写入全部环境物体。
+        # 全地图类别/规范化明细只保存一次，避免每帧重复写入全部环境物体。
         self.environment_audit = {key: value for key, value in self.environment_audit.items()
-                                  if key != 'signed_extent_normalizations'}
+                                  if key not in ('signed_extent_normalizations', 'category_decisions')}
         self.environment_audit['audit_path'] = str(audit_path)
         if self.environment_audit['signed_extent_normalized_count']:
             print('已对{}条镜像环境包围框作等价半尺寸规范化，未删除障碍物；明细：{}'.format(
@@ -624,19 +708,23 @@ class CarlaSession:
                 'role_name': actor.attributes.get('role_name', '')}
 
     def _check_world_ownership(self, settings):
-        actors = self.world.get_actors()
-        existing = [actor for pattern in ('vehicle.*', 'walker.pedestrian.*', 'static.prop.*')
-                    for actor in actors.filter(pattern)]
+        try:
+            from .carla_world_ownership import inspect_world_actors
+        except ImportError:
+            from carla_world_ownership import inspect_world_actors
+        classification = inspect_world_actors(self.world.get_actors())
+        existing = classification['blocking_actors']
         reasons = []
         if settings.synchronous_mode:
             reasons.append('world_already_synchronous')
         if existing:
             reasons.append('existing_experiment_actor_types')
-        self.world_ownership = {'version': 'carla-world-ownership-1.0',
+        self.world_ownership = {'version': 'carla-world-ownership-1.1',
             'map': self.world.get_map().name, 'frame': int(self.world.get_snapshot().frame),
             'settings': self._settings_record(settings), 'rejection_reasons': reasons,
-            'blocking_actors': [self._actor_record(actor) for actor in existing],
-            'accepted': not reasons, 'policy': '不接管同步世界，不删除既有演员'}
+            'accepted': not reasons, 'policy': '不接管同步世界，不删除既有演员；'
+                '仅按0.9.15原生注册属性识别地图网格，未知身份仍拒绝'}
+        self.world_ownership.update(classification)
         path = self.root / 'carla_world_ownership.json'
         path.write_text(json.dumps(self.world_ownership, ensure_ascii=False, allow_nan=False, indent=2),
                         encoding='utf-8')
@@ -661,7 +749,7 @@ class CarlaSession:
             # 仅用于启动相位探测；运行期仍严格等待指定当前帧，不继续推进找图。
             front_key = next(iter(self.queues))
             for _ in range(6*period):
-                self._initialization_tick('camera_phase_probe')
+                probe = self._initialization_tick('camera_phase_probe')
                 deadline = min(time.monotonic()+.2, self._rgb_initialization_deadline)
                 image = None
                 while time.monotonic() < deadline:
@@ -669,7 +757,13 @@ class CarlaSession:
                         item = self.queues[front_key].get(timeout=max(0., deadline-time.monotonic()))
                     except queue.Empty:
                         break
-                    if item.frame < self.frame:
+                    try:
+                        matched = camera_matches_snapshot(front_key, item, self.frame,
+                            float(probe.timestamp.elapsed_seconds))
+                    except CameraMetadataError:
+                        self._record_camera_event(front_key, 'rejected_metadata', item)
+                        raise
+                    if not matched:
                         self._record_camera_event(front_key, 'discarded_startup_delayed', item)
                         continue
                     image = item
@@ -824,8 +918,10 @@ class CarlaSession:
                     if selected is None and previous.get('requested_frame') == frame else
                     {key: {'frame': image.frame, 'timestamp': image.timestamp}
                      for key, image in (selected or {}).items()})
-        report = {'version': 'carla-rgb-sync-diagnostic-1.0',
+        report = {'version': 'carla-rgb-sync-diagnostic-1.1',
             'error': type(error).__name__+': '+str(error), 'requested_frame': frame,
+            'error_kind': 'rgb_metadata_conflict' if isinstance(error, CameraMetadataError) else 'rgb_sync_failure',
+            'metadata_conflict': copy.deepcopy(getattr(error, 'details', None)),
             'bridge_frame': self.frame, 'sim_time': self._sim_time,
             't0': self.t0, 'runtime_metrics': copy.deepcopy(self._runtime_metrics),
             'requested_camera_hz': 10., 'sensor_tick_s': .1,
@@ -837,7 +933,8 @@ class CarlaSession:
             'initialization_ticks': copy.deepcopy(self._initialization_ticks),
             'initial_motion': copy.deepcopy(getattr(self.experiment, 'initial_motion_audit', None)),
             'initialization_events': copy.deepcopy(self.events) if self.t0 is None else [],
-            'note': '相机帧与世界帧严格对应；初始化相位推进单独记录，运行期不追加补图tick。'}
+            'note': '同时核验原始帧号与时间戳；时间戳相同不能覆盖原始帧号冲突。'
+                    '初始化相位推进单独记录，运行期不追加补图tick，不复用旧图。'}
         try:
             snap = self.world.get_snapshot()
             report['world_frame'] = snap.frame
@@ -866,12 +963,19 @@ class CarlaSession:
         if not self.queues:
             self.frames = {}
             return
-        if self.frames and all(image.frame == frame for image in self.frames.values()):
-            return
         started = time.monotonic()
         result = {}
         prefetched = dict(prefetched or {})
         try:
+            snap = self.world.get_snapshot()
+            if snap.frame != frame:
+                raise RuntimeError('RGB等待开始时世界帧与目标帧不一致；拒绝旧图配新状态')
+            target_time = float(snap.timestamp.elapsed_seconds)
+            if (set(self.frames) == set(self.queues) and
+                    all(image.frame == frame for image in self.frames.values())):
+                for key, image in self.frames.items():
+                    camera_matches_snapshot(key, image, frame, target_time)
+                return
             deadline = time.monotonic() + self.timeout
             if self.t0 is None and self._rgb_initialization_deadline is not None:
                 deadline = min(deadline, self._rgb_initialization_deadline)
@@ -886,12 +990,15 @@ class CarlaSession:
                         item = prefetched.pop(key) if key in prefetched else q.get(timeout=min(remaining, .1))
                     except queue.Empty:
                         continue
-                    if item.frame == frame:
+                    try:
+                        matched = camera_matches_snapshot(key, item, frame, target_time)
+                    except CameraMetadataError:
+                        self._record_camera_event(key, 'rejected_metadata', item)
+                        raise
+                    if matched:
                         result[key] = item
                         self._record_camera_event(key, 'selected', item)
                         break
-                    if item.frame > frame:
-                        raise RuntimeError('RGB源帧丢失：{}需要{}收到{}'.format(key, frame, item.frame))
                     self._record_camera_event(key, 'discarded_stale', item)
             timestamps = [item.timestamp for item in result.values()]
             if max(timestamps) - min(timestamps) > 1e-6:
@@ -955,11 +1062,9 @@ class CarlaSession:
         velocity, acceleration, omega = actor.get_velocity(), actor.get_acceleration(), actor.get_angular_velocity()
         yaw = math.radians(transform.rotation.yaw + bb.rotation.yaw)
         identity = 'ego' if is_ego else 'carla_{}'.format(actor.id)
-        kind = 'pedestrian' if actor.type_id.startswith('walker.') else 'vehicle'
-        if actor.type_id.startswith('static.'):
-            kind = 'static_obstacle'
-        elif actor.type_id in ('vehicle.bh.crossbike', 'vehicle.diamondback.century', 'vehicle.gazelle.omafiets'):
-            kind = 'bicycle'
+        kind, classification_evidence = actor_category(actor)
+        if kind is None:
+            raise ValueError('对象没有交通参与者/路面障碍类别证据：' + actor.type_id)
         waypoint = self.map.get_waypoint(center, project_to_road=False, lane_type=self.carla.LaneType.Driving)
         offset = [center.x - transform.location.x, center.y - transform.location.y]
         angular = math.radians(omega.z)
@@ -976,6 +1081,8 @@ class CarlaSession:
             'lane_id': lane_key(waypoint) if waypoint is not None else None,
             'visible': True, 'radius': max(bb.extent.x, bb.extent.y) if kind == 'pedestrian' else None,
             'z': center.z, 'origin_z': transform.location.z,
+            'classification': {'version': OBJECT_CATEGORY_VERSION, 'kind': kind,
+                               'evidence': classification_evidence, 'type_id': actor.type_id},
             'state_sources': {'position': 'bounding_box_world_center', 'velocity': 'actor_velocity_plus_angular_offset',
                               'acceleration': 'actor_acceleration_plus_causal_angular_offset',
                               'angular_acceleration': 'past_difference' if previous else 'initial_zero_assumption'}}
@@ -996,12 +1103,16 @@ class CarlaSession:
         ey = max(abs(-(p.x-box.location.x)*math.sin(yaw)+(p.y-box.location.y)*math.cos(yaw)) for p in vertices)
         waypoint = self.map.get_waypoint(box.location, project_to_road=False,
                                         lane_type=self.carla.LaneType.Driving)
-        return {'id': entry['id'], 'kind': 'static_obstacle', 'position': xy(box.location),
+        return {'id': entry['id'], 'kind': entry['kind'], 'position': xy(box.location),
             'velocity': [0., 0.], 'acceleration': [0., 0.], 'heading': -math.radians(box.rotation.yaw),
             'length': 2.*ex, 'width': 2.*ey, 'height_m': max(p.z for p in vertices)-min(p.z for p in vertices),
             'lane_id': lane_key(waypoint) if waypoint is not None else None, 'visible': True,
-            'radius': None, 'z': box.location.z, 'origin_z': box.location.z,
+            'radius': max(ex, ey) if entry['kind'] == 'pedestrian' else None,
+            'z': box.location.z, 'origin_z': box.location.z,
             'environment_label': entry['label'], 'environment_ids': entry['source_ids'],
+            'classification': {'version': OBJECT_CATEGORY_VERSION, 'kind': entry['kind'],
+                               'evidence': entry['classification_evidence'],
+                               'environment_label': entry['label']},
             'state_sources': {'position': 'environment_bbox_world_center',
                               'geometry': 'yaw_aligned_envelope_of_world_bbox_xy_projection',
                               'velocity': 'fixed_map_mesh_zero', 'acceleration': 'fixed_map_mesh_zero'}}
@@ -1012,7 +1123,7 @@ class CarlaSession:
             box = entry['box']
             if math.hypot(box.location.x-ego['position'][0], -box.location.y-ego['position'][1]) > radius + math.sqrt(box.extent.x**2+box.extent.y**2+box.extent.z**2):
                 continue
-            # 垂直区间重叠而非中心高度差，避免高护栏/立柱被错误排除。
+            # 仅作同层候选抓取；沿车道的最终范围由主进程公共对象筛选器决定。
             vertices = box.get_world_vertices(self.carla.Transform())
             if max(p.z for p in vertices) < ego['z']-ego['height_m']/2 or min(p.z for p in vertices) > ego['z']+ego['height_m']/2:
                 continue
@@ -1106,8 +1217,14 @@ class CarlaSession:
         ego = self._actor(self.ego, True)
         radius = float(self.cfg.get('perception_radius_m', 120.))
         actors = []
+        category_decisions = []
         for actor in self.world.get_actors():
             if actor.id == self.ego.id or not (actor.type_id.startswith('vehicle.') or actor.type_id.startswith('walker.pedestrian.') or actor in self.experiment.actors and actor.type_id.startswith('static.')):
+                continue
+            kind, evidence = actor_category(actor)
+            category_decisions.append({'id': 'carla_{}'.format(actor.id), 'type_id': actor.type_id,
+                                       'kind': kind, 'included': kind is not None, 'evidence': evidence})
+            if kind is None:
                 continue
             center = bounding_box_world_center(actor.get_transform(), actor.bounding_box, self.carla)
             if abs(center.z-ego['z']) > float(self.cfg.get('same_level_tolerance_m', 1.5)):
@@ -1118,6 +1235,7 @@ class CarlaSession:
         static_actors = self._range_environment(ego, radius)
         actors.extend(static_actors)
         actors.sort(key=lambda actor: actor['id'])
+        self.environment_audit['runtime_actor_category_decisions'] = category_decisions
         self._entities_cache = (self.frame, ego, actors, len(static_actors))
         return ego, actors, len(static_actors)
 

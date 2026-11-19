@@ -32,6 +32,17 @@
 /scripts/*
 !/scripts/check_environment.py
 !/scripts/check_carla_camera_clock.py
+!/scripts/check_carla_camera_alignment.py
+!/scripts/check_carla_camera_clock_metadata.py
+!/scripts/check_carla_world_ownership.py
+!/scripts/check_carla_object_categories.py
+!/scripts/check_highway_model_camera.py
+!/scripts/check_model_object_scope.py
+!/scripts/check_lane_object_scope.py
+!/scripts/check_highway_truth_scope.py
+!/scripts/check_grid_storage.py
+!/scripts/check_grid_memory_io.py
+!/scripts/check_grid_vector_retrieval.py
 !/scripts/run_highway.py
 !/scripts/run_carla.py
 !/scripts/memory_admin.py
@@ -69,6 +80,7 @@
 !/docs/
 /docs/*
 !/docs/carla_experiments.md
+!/docs/eight_grid_storage.md
 /outputs/
 /data/
 /.cache/

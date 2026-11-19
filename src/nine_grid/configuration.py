@@ -8,9 +8,10 @@ import math
 
 GRID_METRIC_VERSION = 'gospa-inspired-region-partial-1.0'
 OCC_METRIC_VERSION = 'observed-soft-iou-2.0'
-RETRIEVAL_METRIC_VERSION = 'bev-occ-eight-channel-top1-3.0'
-# 只改召回选择策略，表示与单通道距离未变；旧记录仍以当前策略重算，不恢复旧融合逻辑。
-READABLE_RETRIEVAL_METRIC_VERSIONS = (RETRIEVAL_METRIC_VERSION, 'bev-occ-eight-joint-2.0')
+RETRIEVAL_METRIC_VERSION = 'bev-occ-eight-channel-top1-3.1'
+# 各通道独立准入；表示和单通道距离未变，旧记录按当前策略重算。
+READABLE_RETRIEVAL_METRIC_VERSIONS = (RETRIEVAL_METRIC_VERSION,
+    'bev-occ-eight-channel-top1-3.0', 'bev-occ-eight-joint-2.0')
 
 # 仅限制VLM阅读层的文字；无字DINO图、实体集合和规划输入不受影响。
 BEV_LABEL_DEFAULTS = {'max_dynamic_labels':8, 'max_vehicle_labels':5, 'max_vulnerable_labels':3}
@@ -129,7 +130,7 @@ FIXED_CONTRACT = {
                  "channels":["crosswalk","ego","vehicle","bicycle","pedestrian","static_obstacle"],
                  "score_channels":["crosswalk","vehicle","bicycle","pedestrian","static_obstacle"]},
     "dino":{"embedding":"CLS","dimension":768,"input_width_px":252,"input_height_px":504,"l2_normalize":True,"labels_in_embedding_image":False},
-    "retrieval":{"per_channel_k":1,"selection":"per_channel_top1","merge_same_record":True,"require_all_channels":True,
+    "retrieval":{"per_channel_k":1,"selection":"per_channel_top1","merge_same_record":True,"require_all_channels":False,
                  "near_duplicate_removal":False,"cross_platform":True,"cross_road_type":True},
     "grid_distance":{"same_type_only":True,"require_intersecting_slots":True,"empty_non_ego_both_is_valid":True,
                      "metric":"gospa_inspired_region_partial_assignment"},

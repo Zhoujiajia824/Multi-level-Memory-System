@@ -14,6 +14,7 @@ import yaml
 from shapely.geometry import LineString,box
 from .contracts import ModelAnswer, plain
 from .decision_protocol import normalize_model_output
+from .object_scope import scope_scene
 
 logger=logging.getLogger(__name__)
 
@@ -136,7 +137,8 @@ class VisionClient:
 
 def attention_ids(scene):
     # 只接受实际提供给模型的当前对象ID；地图边界不再进入模型输入。
-    return {a.id for a in scene.actors if a.visible and a.id != scene.ego.id}
+    scoped, _ = scope_scene(scene)
+    return {a.id for a in scoped.actors}
 
 
 def _camera_entries(scene):
@@ -184,7 +186,8 @@ def _goal_reference(scene,config=None):
     reference=scene.diagnostics.get('goal_reference')
     if reference is None:
         from .goals import build_goal_reference
-        reference=build_goal_reference(scene,config)
+        scoped, _ = scope_scene(scene, config)
+        reference=build_goal_reference(scoped,config)
         scene.diagnostics['goal_reference']=reference
     return reference
 
@@ -204,6 +207,7 @@ def parse_answer(raw,scene,source='fast',max_characters=6000,reference=None,conf
     except (ValueError,TypeError):
         raise ValueError('回答不是单个有效 JSON') from None
     attention,goal,explanation,output_protocol=normalize_model_output(data)
+    scene, _ = scope_scene(scene, config)
     ids=attention_ids(scene)
     seen=set()
     for item in attention:
@@ -252,6 +256,11 @@ _REGION_NAMES = {
 
 def _eight_direction_context(scene,grid):
     """内部格子仅提供区域归属；给模型的数值全部取自当前世界状态。"""
+    from .representations import build_grid
+    scene, scope = scope_scene(scene)
+    # 检索八向仍描述较宽的图像上下文，不能直接将其代表对象塞入模型真值表。
+    # 模型角色按同一车道拓扑、当前物理车道和本次限定弧长重新确定。
+    grid = build_grid(scene, object_range=scope['settings'], include_static=True)
     actors={a.id:a for a in scene.actors if a.visible}
     available=bool(grid.get('valid',False))
     regions={}
@@ -262,6 +271,17 @@ def _eight_direction_context(scene,grid):
         info=grid.get('slots',{}).get(slot,{}) if available else {}
         state=info.get('state')
         identity=info.get('id')
+        candidates=[]
+        for key,row in scope['objects'].items():
+            member=row['memberships'].get(slot)
+            if key in actors and member is not None:
+                gap=member['side_gap_m'] if slot.endswith('side') else member['longitudinal_gap_m']
+                candidates.append((gap,abs(member['delta_s_m']),key))
+        if candidates:
+            identity=min(candidates)[2]
+            state='occupied'
+        elif state=='occupied':
+            state='unknown'
         if state=='occupied' and identity in actors:
             regions.setdefault(identity,[]).append(label)
         elif state=='empty':
@@ -283,14 +303,24 @@ def _eight_direction_context(scene,grid):
 
 def scene_text(scene,representations):
     """只构造模型所需的当前状态；完整快照仍用于物理规划与审计。"""
+    scene, scope = scope_scene(scene)
     context,others=_eight_direction_context(scene,representations.grid)
     from .goals import goal_reference_context
-    data={'自车':_current_actor(scene.ego),'八向图':context,'其他可见对象':others,
+    data={'自车':_current_actor(scene.ego),'八向图':context,'范围内其他对象':others,
+        '对象输入范围':{'version':scope['version'], **scope['settings'],
+            '距离定义':'对象中心沿各允许车道连续中心线的弧长差；不是圆形距离',
+            '类型':['vehicle','bicycle','pedestrian','static_obstacle'],
+            '障碍物定义':'明确类别的道路阻塞物且实际进入准入车道；不含围栏、护栏、墙、杆和泛化Static/Other',
+            '对象数量':len(scene.actors),
+            '车道':{side:None if chain is None else chain['lane_ids'] for side,chain in scope['chains'].items()},
+            '说明':'范围之外未提供当前对象真值；图像可能显示更宽背景，不能据此编造可关注ID或精确运动状态'},
         '规划参考':goal_reference_context(scene,_goal_reference(scene)),
-        '图像解释':'自车固定朝上，横纵轴为米。非行驶区白色，道路为NAVSIM浅灰，人行横道为30%透明紫色；车道边界线和分割线不绘制，细深灰短虚线表示虚拟车道中心线及连接参考路径，不得将其视作交通标线。模型图的绿色虚线是本次固定Frenet参考，s+距离标签表示从原帧自车投影开始的道路弧长，不等于BEV前向x距离；这些参考标签不进入DINO特征图。颜色不是风险或关注度。自车红色、其他车辆蓝色、自行车橙色、行人紫色、静态障碍黄色；图中历史轨迹保持类别色相和高亮度，速度越高饱和度越高，固定范围0至120km/h。历史只含已观测样本。未被八向图选中的可见对象列于其他可见对象，同样可以被关注。'}
+        '图像解释':'自车固定朝上，横纵轴为米。非行驶区白色，道路为NAVSIM浅灰，人行横道为30%透明紫色；车道边界线和分割线不绘制，细深灰短虚线表示虚拟车道中心线及连接参考路径，不得将其视作交通标线。模型图的绿色虚线是本次固定Frenet参考，s+距离标签表示从原帧自车投影开始的道路弧长，不等于BEV前向x距离；这些参考标签不进入DINO特征图。颜色不是风险或关注度。自车红色、其他车辆蓝色、自行车橙色、行人紫色、静态障碍黄色；图中历史轨迹保持类别色相和高亮度，速度越高饱和度越高，固定范围0至120km/h。历史只含已观测样本。范围内未被八向图选中的对象列于范围内其他对象，同样可以被关注；图像范围和结构化对象准入范围不同。'}
     if scene.diagnostics.get('observation_policy')=='range_limited_ground_truth_no_occlusion-1.0':
-        data['输入权限']='规定感知范围内的完整对象真值，不判断遮挡；“可见对象”为程序沿用的集合名称，不表示RGB中必然可见。不得依据图像遮挡编造或删除给定状态。'
+        data['输入权限']='仅允许车道及前后弧长范围内的指定交通对象真值，不判断遮挡；不等同于实际传感器可见性。不得依据图像遮挡编造或删除给定状态，也不得恢复范围外对象。'
     cameras=_camera_entries(scene)
+    if any(item['view']=='highway_env_topdown' for item in cameras):
+        data['图像解释']+=' highway_env_topdown是原生环境俯视图：世界x向右、y向下，自车不固定朝上，配色由环境定义；不含规划线，不按BEV刻度读数。'
     if cameras:
         data['图像解释']+=' 当前输入图像依次为：'+ '、'.join(item['view'] for item in cameras)+'、当前BEV。相机图像与上述状态属于同一冻结帧；摄像头视角不能按BEV坐标直接读数。'
     return json.dumps(plain(data),ensure_ascii=False,allow_nan=False)
@@ -308,7 +338,8 @@ def _historical_situation(situation):
 def _reflection_diagnostics(value):
     """原帧身份留在任务与日志中，不通过诊断嵌套字段重新进入模型请求。"""
     value=plain(value)
-    excluded={'visible','history','observed',
+    excluded={'visible','history','observed','object_scope','planning_object_selection',
+              'planning_scope','road_rule_observations','excluded','actor_classification',
               '仿真时间秒','坐标','导航路线世界坐标','导航路线当前自车坐标','规则','地图边界',
               'historical_only_objects','只供历史回顾且不可选为当前关注对象',
               'rules','rule_evidence','desired_speed','must_wait','wait_reason','stop_s','speed_limit',

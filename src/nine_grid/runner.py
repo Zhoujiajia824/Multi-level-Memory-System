@@ -17,6 +17,7 @@ from .memory import MemoryStore
 from .models import VisionClient, CommunicationFailure, parse_answer, build_prompt, local_line, model_image_paths
 from .planner_factory import create_planner
 from .planning_context import prepare_planning_context
+from .object_scope import scope_scene
 from .prediction import Predictor
 from .quality import evaluate, admissible, reflection_reasons, execution_audit
 from .representations import build_representations, DINOExtractor, NineGridBuilder, render_goal_overlay
@@ -299,6 +300,9 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
             timing['snapshot_build_s']=float(adapter_timing.get('snapshot_build_s',timing['snapshot_s']))
             timing_samples['observation_wait'].append(timing['observation_wait_s'])
             timing_samples['snapshot_build'].append(timing['snapshot_build_s'])
+            # 同一冻结帧绑定模型与规划的车道范围；原始实体只保留作审计/图像上下文。
+            model_scene, object_scope = scope_scene(scene, config)
+            scene.diagnostics['object_scope'] = object_scope
             # 标签只影响模型阅读图；不删减对象或改变DINO使用的无字底图。
             scene.diagnostics['bev_label_options']=copy.deepcopy(config.get('bev',{}).get('labels',{}))
             previous_control=_bind_previous_control(scene,previous_control)
@@ -372,9 +376,11 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
             if source_frame:
                 # 原帧的固定参考同时绑定模型输入、答案、反思和记忆，不能中途重解释。
                 scene.diagnostics['goal_reference']=build_goal_reference(
-                    scene,config,request_version=summary['fast_requests']+1)
+                    model_scene,config,request_version=summary['fast_requests']+1)
                 stage_started=time.perf_counter()
                 capture_dir=writer.path/'captures'/f'{step:06d}'
+                if hasattr(adapter, 'capture_model_camera'):
+                    adapter.capture_model_camera(scene, capture_dir)
                 reps=build_representations(scene,capture_dir,extractor,grid_builder=grids)
                 timing['representations_s']=time.perf_counter()-stage_started
                 timing_samples['representations'].append(timing['representations_s'])
@@ -398,6 +404,9 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
                     prompt=build_prompt(scene,reps,active_retrieval)
                     images=model_image_paths(scene,reps)
                     writer.append('model_inputs',dict(frame_id=scene.frame_id,time=scene.time,prompt=prompt,images=images,
+                        object_input_count=object_scope['selected_count'],
+                        object_input_ids=object_scope['selected_ids'],
+                        object_scope_version=object_scope['version'],
                         answer_protocol_version=ANSWER_PROTOCOL_VERSION,
                         goal_reference_id=scene.diagnostics['goal_reference']['reference_id']))
                     summary['fast_requests']+=1
@@ -506,11 +515,11 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
                 quality=evaluate(planning_input,plan,reference,predictions,config)
                 timing['quality_s']=time.perf_counter()-stage_started
                 timing_samples['quality'].append(timing['quality_s'])
-                logger.info('仿真 %.1fs：轨迹可执行=%s，安全条件满足=%s，候选=%s，主求解=%.1fms（%s），预测=%.1fms，表示=%.1fms，参照=%.1fms，评分=%.1fms，质量=%s，预碰撞=%s，完整场景对象=%d，实际规划对象=%d',
+                logger.info('仿真 %.1fs：轨迹可执行=%s，安全条件满足=%s，候选=%s，主求解=%.1fms（%s），预测=%.1fms，表示=%.1fms，参照=%.1fms，评分=%.1fms，质量=%s，预碰撞=%s，完整场景对象=%d，范围内对象=%d，实际规划对象=%d',
                     scene.time,plan.valid,plan.diagnostics.get('safety_feasible'),plan.diagnostics.get('candidate_source'),
                     timing['mpc_s']*1000,'首次' if timing['mpc_cold_start'] else '后续',
                     timing['prediction_s']*1000,timing['representations_s']*1000,timing['reference_s']*1000,
-                    timing['quality_s']*1000,quality.score,quality.precollision,len(scene.actors),len(planning_input.actors))
+                    timing['quality_s']*1000,quality.score,quality.precollision,len(scene.actors),object_scope['selected_count'],len(planning_input.actors))
                 initial_failures=plan.diagnostics.get('optimizer_skipped_initial_failures',[])
                 if initial_failures:
                     logger.warning('初态不合格项=%s；跳过无法改写初态的QP迭代，制动仍独立验收；速度证据=%s',

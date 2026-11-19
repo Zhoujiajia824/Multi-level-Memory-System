@@ -26,6 +26,7 @@ from .carla_bridge import camera_storage_due
 from .carla_execution import duration_tick_limit
 from .carla_public_priority import PublicPriorityTracker
 from .geometry import actor_shape, clean_polyline, polyline_lengths, project_polyline, sample_polyline
+from .object_scope import scope_scene
 
 
 class BridgeProcess:
@@ -781,10 +782,32 @@ class CarlaAdapter:
             if s is not None:
                 stop_s = s if stop_s is None else min(stop_s, s)
                 stop_reasons.append(obligation['id'])
-        priority_state = self._public_priority.update(public, raw['ego'], raw['actors'],
+        evidence = raw.get('current_road_evidence')
+        identities = {lane.id for lane in self.lanes}
+        map_complete = bool(evidence is not None and evidence.get('lane_id') == ego.lane_id and
+            ego.lane_id in identities and all(evidence.get(side) is None or evidence[side] in identities for side in ('left', 'right')))
+        if map_complete:
+            current_lane = next(lane for lane in self.lanes if lane.id == ego.lane_id)
+            current_lane.left, current_lane.right = evidence['left'], evidence['right']
+        classifications = {a['id']: copy.deepcopy(a['classification']) for a in raw['actors']
+                           if isinstance(a.get('classification'), dict)}
+        # 路权的动态触发也必须使用本帧同一车道弧长范围；否则即使MPC和提示词
+        # 已筛选，范围外来车仍能经 must_wait/stop_s 间接控制自车。
+        scope_input = SceneSnapshot(frame_id, timestamp, ego, actors, self.lanes, self.route,
+            self.route_lane_ids, self.drivable, 'carla', diagnostics={
+                'lane_map_complete': map_complete, 'stable_navigation_lane_id': self._confirmed_lane,
+                'platform': 'carla', 'actor_classification': classifications})
+        priority_scene, object_scope = scope_scene(scope_input, self.config)
+        priority_ids = {a.id for a in priority_scene.actors}
+        priority_state = self._public_priority.update(public, raw['ego'],
+            [a for a in raw['actors'] if a['id'] in priority_ids],
             self._navigation_route, timestamp,
             lane_paths={lane.id: {'center': lane.center, 'successors': lane.successors}
                         for lane in self.lanes})
+        priority_state['evidence']['input_policy'] = object_scope['version']
+        priority_state['evidence']['object_scope'] = {
+            'version': object_scope['version'], 'settings': copy.deepcopy(object_scope['settings']),
+            'selected_ids': sorted(priority_ids), 'selected_count': len(priority_ids)}
         priority_stop = priority_state.get('stop_position')
         if priority_stop is not None:
             s = self._project_public_stop(priority_stop)
@@ -800,19 +823,13 @@ class CarlaAdapter:
             'road_priority_available': bool(public.get('rules')) and priority_complete and priority_state['available'],
             'goal_s': self._goal_s, 'public_road_rules': copy.deepcopy(public),
             'priority_map_complete': priority_complete, 'public_priority_screen': priority_state}
-        evidence = raw.get('current_road_evidence')
-        identities = {lane.id for lane in self.lanes}
-        map_complete = bool(evidence is not None and evidence.get('lane_id') == ego.lane_id and
-            ego.lane_id in identities and all(evidence.get(side) is None or evidence[side] in identities for side in ('left', 'right')))
-        if map_complete:
-            current_lane = next(lane for lane in self.lanes if lane.id == ego.lane_id)
-            current_lane.left, current_lane.right = evidence['left'], evidence['right']
         cycle_result = self._result(raw)
         cycle_result.pop('evaluation', None)
         diagnostics = {'route_s': self._route_s, 'reference_anchor_s': self._route_s,
             'navigation_progress_m': self._route_s+self._progress_offset, 'stable_navigation_lane_id': self._confirmed_lane,
             'previous_control': self._previous_control.tolist(), 'reference_revision': self._reference_revision,
             'lane_map_complete': map_complete, 'visibility_wkt': observed_wkt,
+            'object_scope': object_scope, 'actor_classification': classifications,
             'visibility_evidence': observation_audit, 'physics_hz': self.cfg['physics_hz'],
             'historical_only_objects': {k: v for k, v in self._history.items() if k not in {a.id for a in [ego] + actors}},
             'platform': 'carla', 'carla_frame': raw['frame'], 'carla_timestamp': raw['timestamp'],

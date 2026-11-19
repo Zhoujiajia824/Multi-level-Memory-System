@@ -1,4 +1,4 @@
-"""highway-env 1.12.1 的连续控制、公共地图和可见状态适配。"""
+"""highway-env 1.12.1 的连续控制、公共地图和当前对象真值适配。"""
 from __future__ import annotations
 
 import copy
@@ -67,9 +67,6 @@ class HighwayAdapter:
         from highway_env.vehicle.behavior import IDMVehicle
 
         self.config = copy.deepcopy(config)
-        angular_step=float(self.config.get("perception",{}).get("visibility_angular_step_deg",.25))
-        angles=np.arange(-np.pi,np.pi,np.deg2rad(angular_step))
-        self._visibility_directions=np.stack((np.cos(angles),np.sin(angles)),axis=1)
         self.scenario = config.get("scenario", "highway")
         if isinstance(self.scenario, dict):
             self.scenario = self.scenario.get("name", "highway")
@@ -451,43 +448,16 @@ class HighwayAdapter:
                      -heading,float(obj.LENGTH),float(obj.WIDTH),lane_id=lane_id,
                      radius=float(obj.WIDTH)/2 if kind=="pedestrian" else None)
 
-    def _visibility(self,ego,actors):
-        radius=float(self.config.get("perception",{}).get("radius_m",120.))
-        directions=self._visibility_directions
-        in_range=[a for a in actors if np.linalg.norm(a.position-ego.position)<=radius]
-        distance=np.full(len(directions),radius)
-        shapes=[actor_shape(a) for a in in_range]
-        if in_range:
-            # 计算每条可见射线与公开物体外轮廓的最近交点。
-            rings=[np.array(shape.exterior.coords) for shape in shapes]
-            starts=np.vstack([r[:-1] for r in rings])-ego.position
-            segments=np.vstack([np.diff(r,axis=0) for r in rings])
-            cross=directions[:,None,0]*segments[None,:,1]-directions[:,None,1]*segments[None,:,0]
-            safe=np.where(np.abs(cross)<1e-12,np.nan,cross)
-            t=(starts[:,0]*segments[:,1]-starts[:,1]*segments[:,0])[None,:]/safe
-            u=(starts[None,:,0]*directions[:,None,1]-starts[None,:,1]*directions[:,None,0])/safe
-            valid=(t>=0)&(u>=0)&(u<=1)&np.isfinite(t)
-            distance=np.minimum(distance,np.min(np.where(valid,t,np.inf),axis=1))
-        polygon=Polygon(ego.position+directions*distance[:,None]).buffer(0)
-        visible_boundary=polygon.buffer(.015)
-        visible=[a for a,shape in zip(in_range,shapes) if shape.boundary.intersects(visible_boundary)]
-        return visible,polygon
-
     def snapshot(self):
         if self._cached_snapshot is not None:return self._cached_snapshot
         ego=self._actor(self.env.vehicle)
         timestamp=self._step*self.dt
         self._stable_ego_lane(ego,timestamp)
-        from highway_env.vehicle.objects import Obstacle
-        radius=float(self.config.get("perception",{}).get("radius_m",120.))
-        objects=[v for v in [*self.env.road.vehicles,*self.env.road.objects] if v is not self.env.vehicle
-                 and np.linalg.norm(v.position-self.env.vehicle.position)<=radius]
-        # 可见性阶段只访问几何；通过判定以后才提取速度、加速度等状态。
-        raw=[Actor(self._identity(v),getattr(v,"research_kind","static_obstacle" if isinstance(v,Obstacle) else "vehicle"),
-                   np.asarray(v.position)*np.array([1.,-1.]),np.zeros(2),np.zeros(2),-float(v.heading),float(v.LENGTH),float(v.WIDTH)) for v in objects]
-        visible_geometry,visibility=self._visibility(ego,raw)
-        visible_ids={a.id for a in visible_geometry}
-        actors=[self._actor(v) for v in objects if self._identity(v) in visible_ids]
+        # 原始当前态留给图像和审计；模型、预测和规划统一在 object_scope 中
+        # 沿允许车道链筛选。此处不再用圆形范围或遮挡提前丢失合法范围内对象。
+        # 只读取当前物理状态，不读取其他车辆隐藏路线、目标车道或未来状态。
+        objects=[v for v in [*self.env.road.vehicles,*self.env.road.objects] if v is not self.env.vehicle]
+        actors=[self._actor(v) for v in objects]
         if timestamp+1e-8>=self._next_history:
             for actor in [ego]+actors:
                 hist=self._history.setdefault(actor.id,[])
@@ -508,8 +478,12 @@ class HighwayAdapter:
                      "lane_map_complete": True,
                      "reference_revision":self._reference_revision,
                      "stable_navigation_lane_id":self._ego_lane_id,"navigation_progress_m":route_s+self._route_progress_offset,
-                     "reference_anchor_s":route_s,"has_occlusion":len(actors)<len(raw),
-                     "visibility_polygon":np.array(visibility.exterior.coords).tolist(),
+                     "reference_anchor_s":route_s,"has_occlusion":False,
+                     "visibility_wkt":self.drivable.wkt,
+                     "observation_policy":"range_limited_ground_truth_no_occlusion-1.0",
+                     "observation_evidence":{"mode":"lane_local_ground_truth_no_occlusion",
+                         "known_geometry":"public_drivable_map_not_camera_visibility",
+                         "object_admission":"object_scope_permitted_lane_chains"},
                      "historical_only_objects":{key:value for key,value in self._history.items() if key not in {a.id for a in [ego]+actors}},
                      "navigation":self.route_diagnostics,"acceleration_source":"kinematic_dynamics_current_hold", "physics_hz":self.physics_hz}
         self._cached_snapshot=SceneSnapshot(f"{self.episode_id}:{self._step:06d}",timestamp,ego,actors,self.lanes,
@@ -573,6 +547,55 @@ class HighwayAdapter:
         if image is None and self.env.viewer is not None:
             image=self.env.viewer.get_image()
         return image
+
+    def capture_model_camera(self,scene,output_dir):
+        """保存冻结状态的原生俯视图；独立画布不带直播/录像的规划线。"""
+        import hashlib
+        import pygame
+        from PIL import Image
+        from highway_env.road.graphics import RoadGraphics, WorldSurface
+        from highway_env.vehicle.graphics import VehicleGraphics
+        from .paths import filesystem_path
+
+        expected_id=f"{self.episode_id}:{self._step:06d}"
+        expected_time=self._step*self.dt
+        current_ego=self._actor(self.env.vehicle)
+        if (scene.frame_id!=expected_id or not math.isclose(scene.time,expected_time,abs_tol=1e-8,rel_tol=0.)
+                or not np.allclose(scene.ego.position,current_ego.position,atol=1e-8,rtol=0.)
+                or abs(wrap_angle(scene.ego.heading-current_ego.heading))>1e-8):
+            raise ValueError('highway 原生图像必须在当前冻结状态采集，禁止给历史帧配当前图')
+        physical_clock=(self._step,self.env.steps,float(self.env.time))
+        cfg=self.env.config
+        size=(int(cfg['screen_width']),int(cfg['screen_height']))
+        surface=WorldSurface(size,0,pygame.Surface(size))
+        surface.scaling=cfg.get('scaling',surface.INITIAL_SCALING)
+        surface.centering_position=cfg.get('centering_position',surface.INITIAL_CENTERING)
+        surface.move_display_window_to(self.env.vehicle.position)
+        # 同原生 EnvViewer 的道路/物体/当前车辆图层，保留原生相机缩放和朝向。
+        # 不调用 env.render/step，也不调用 agent 回调、历史/未来轨迹绘制或显示翻转。
+        RoadGraphics.display(self.env.road,surface)
+        RoadGraphics.display_road_objects(self.env.road,surface,offscreen=True)
+        for vehicle in self.env.road.vehicles:
+            VehicleGraphics.display(vehicle,surface,offscreen=True,label=False)
+        image=np.moveaxis(pygame.surfarray.array3d(surface),0,1).copy()
+        if physical_clock!=(self._step,self.env.steps,float(self.env.time)):
+            raise RuntimeError('highway 原生图像采集过程中物理世界被推进')
+        if image.ndim!=3 or image.shape[2]!=3 or image.dtype!=np.uint8 or image.min()==image.max():
+            raise RuntimeError('highway 原生俯视图为空或不是有效RGB图像')
+        root=filesystem_path(output_dir)
+        root.mkdir(parents=True,exist_ok=True)
+        name=hashlib.sha256(scene.frame_id.encode('utf-8')).hexdigest()[:20]
+        path=root/f'{name}_highway_topdown.png'
+        Image.fromarray(image).save(path)
+        entry={'view':'highway_env_topdown','path':str(path.resolve()),
+               'frame_id':scene.frame_id,'time':float(scene.time),
+               'source':'highway_env_native_current_state_offscreen',
+               'camera_kind':'native_simulator_topdown_not_physical_sensor',
+               'plan_overlay':False,'size':[image.shape[1],image.shape[0]],
+               'orientation':'native_world_x_right_y_down_not_ego_up',
+               'physics_steps':self.env.steps,'native_time':float(self.env.time)}
+        scene.assets['camera_images']=[entry]
+        return entry
 
     def start_recording(self,path):
         """使用原生渲染缓冲，接收每个物理子步而非每个规划步的画面。"""

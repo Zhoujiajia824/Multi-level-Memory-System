@@ -20,8 +20,12 @@ import threading
 import time
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+from nine_grid.carla_world_ownership import inspect_world_actors
+
 
 SENSOR_TICKS = ("0.1", "0.09999999403953552", "0")
+METADATA_TIMESTAMP_TOLERANCE_S = 1e-5
 SETTING_NAMES = (
     "synchronous_mode", "fixed_delta_seconds", "no_rendering_mode",
     "substepping", "max_substep_delta_time", "max_substeps",
@@ -44,10 +48,9 @@ def error_text(exc):
 
 
 def blockers(world):
-    actors = [actor for actor in world.get_actors()
-              if actor.type_id.startswith(("vehicle.", "walker.", "static.prop."))]
-    return {"count": len(actors), "first_25": [
-        {"id": actor.id, "type_id": actor.type_id} for actor in actors[:25]]}
+    classification = inspect_world_actors(world.get_actors())
+    return dict(classification, count=len(classification['blocking_actors']),
+                first_25=classification['blocking_actors'][:25])
 
 
 def increment(histogram, key):
@@ -74,6 +77,9 @@ class Recorder:
             "first_12_samples": [], "frame_interval_counts": {},
             "timestamp_interval_seconds_counts": {},
             "snapshot_frame_lag_counts": {}, "callback_errors": 0,
+            "frame_timestamp_conflict_count": 0,
+            "first_12_frame_timestamp_conflicts": [],
+            "frame_timestamp_match_tolerance_s": METADATA_TIMESTAMP_TOLERANCE_S,
         }
         with self.lock:
             self.data[sensor_tick] = row
@@ -85,14 +91,25 @@ class Recorder:
                 frame, timestamp = int(image.frame), float(image.timestamp)
                 with self.lock:
                     completed = self.completed_frame
-                snapshot_frame = int(self.world.get_snapshot().frame)
+                snapshot = self.world.get_snapshot()
+                snapshot_frame = int(snapshot.frame)
+                snapshot_timestamp = float(snapshot.timestamp.elapsed_seconds)
+                timestamp_difference = snapshot_timestamp - timestamp
+                # A normally delayed callback has both an older frame and an
+                # older timestamp. Flag only an old frame paired with the
+                # current snapshot's timestamp; never rewrite either header.
+                metadata_conflict = (frame < snapshot_frame and
+                    abs(timestamp_difference) <= METADATA_TIMESTAMP_TOLERANCE_S)
                 sample = {
                     "frame": frame, "timestamp": timestamp,
                     "last_completed_world_frame": completed,
                     "world_snapshot_frame_at_receive": snapshot_frame,
+                    "world_snapshot_timestamp_at_receive": snapshot_timestamp,
                     "completed_frame_minus_sensor_frame": (
                         None if completed is None else completed - frame),
                     "snapshot_frame_minus_sensor_frame": snapshot_frame - frame,
+                    "snapshot_timestamp_minus_sensor_timestamp_s": timestamp_difference,
+                    "frame_timestamp_conflict": metadata_conflict,
                     "wall_received_seconds": round(received, 6),
                 }
                 with self.lock:
@@ -107,6 +124,10 @@ class Recorder:
                     self.previous[sensor_tick] = (frame, timestamp)
                     row["count"] += 1
                     row["last_sample"] = sample
+                    if metadata_conflict:
+                        row["frame_timestamp_conflict_count"] += 1
+                        if len(row["first_12_frame_timestamp_conflicts"]) < 12:
+                            row["first_12_frame_timestamp_conflicts"].append(sample)
                     if len(row["first_12_samples"]) < 12:
                         row["first_12_samples"].append(sample)
             except Exception as exc:
@@ -151,6 +172,9 @@ def run_probe(args, carla, report):
         report["sdk"] = {"client_version": client.get_client_version(),
                          "server_version": client.get_server_version(),
                          "module_path": str(getattr(carla, "__file__", "unknown"))}
+        if any(report['sdk'][key].split('-')[0] != '0.9.15'
+               for key in ('client_version', 'server_version')):
+            raise RefusedError('Map-native mesh admission requires CARLA 0.9.15 client and server')
         world = client.get_world()
         previous_settings = world.get_settings()
         report["previous_settings"] = settings_dict(previous_settings)
@@ -334,8 +358,9 @@ def main(argv=None):
     for sensor_tick in SENSOR_TICKS:
         row = report.get("sensors", {}).get(sensor_tick)
         if row is not None:
-            print("  sensor_tick={}: {} samples; frame intervals {}".format(
-                sensor_tick, row["count"], row["frame_interval_counts"]))
+            print("  sensor_tick={}: {} samples; frame intervals {}; metadata conflicts {}".format(
+                sensor_tick, row["count"], row["frame_interval_counts"],
+                row["frame_timestamp_conflict_count"]))
     if report.get("error"):
         print("  " + report["error"], file=sys.stderr)
     for error in report.get("cleanup", {}).get("errors", []):

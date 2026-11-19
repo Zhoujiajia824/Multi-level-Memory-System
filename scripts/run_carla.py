@@ -236,7 +236,9 @@ def platform_configuration(data,args,scene_path):
     refresh_scene_audit(cfg)
     names=('carla_bridge.py','carla_adapter.py','carla_execution.py','carla_experiments.py',
            'carla_experiment_spec.py','carla_experiment_routes.py','carla_evaluation.py','carla_task_criteria.py',
-           'carla_initialization.py','carla_public_priority.py','carla_sensor_policy.py','carla_experiment_validation.py')
+           'carla_initialization.py','carla_public_priority.py','carla_sensor_policy.py','carla_experiment_validation.py',
+           'carla_world_ownership.py','object_scope.py','lane_roles.py','planning_objects.py',
+           'models.py','representations.py','runner.py','highway.py','runtime.py')
     files={name:hashlib.sha256((ROOT/'src/nine_grid'/name).read_text(encoding='utf-8-sig').replace('\r\n','\n').encode('utf-8')).hexdigest() for name in names}
     files['scripts/run_carla.py']=hashlib.sha256(Path(__file__).read_text(encoding='utf-8-sig').replace('\r\n','\n').encode('utf-8')).hexdigest()
     cfg['implementation_sha256']=hashlib.sha256(json.dumps(files,sort_keys=True).encode()).hexdigest()

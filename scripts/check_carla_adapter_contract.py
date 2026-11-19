@@ -71,16 +71,43 @@ class AdapterContract(unittest.TestCase):
         raw['runtime'].update(physical_ticks=ticks,terminal_reason=terminal)
         raw['public_road_rules'].update(frame=raw['frame'],physical_tick=ticks)
         return raw
-    def test_public_rule_uses_same_source_and_real_stop_line(self):
+    def test_public_map_rule_retained_but_outside_actor_cannot_trigger_yield(self):
         self.bridge.raw['evaluation']['task_criteria']={'private_script_answer':'pass_and_return'}
         source=self.adapter.snapshot()
         self.assertTrue(source.rules['road_priority_available'])
-        self.assertTrue(source.rules['must_wait'])
-        self.assertAlmostEqual(source.rules['stop_s'],18.)
+        self.assertFalse(source.rules['must_wait'])
+        self.assertIsNone(source.rules['stop_s'])
+        self.assertEqual(source.rules['public_road_rules']['rules'][0]['stop_route_s_m'],18.)
+        self.assertEqual(source.rules['public_priority_screen']['evidence']['object_scope']['selected_ids'],[])
         self.assertIs(self.adapter.snapshot(),source)
         self.assertNotIn('contract',source.frame_id)
         self.assertNotIn('independent_evaluation',source.diagnostics)
         self.assertNotIn('evaluation',source.diagnostics['cycle_result'])
+    def test_priority_and_classification_use_current_scope_without_fabricating_evidence(self):
+        near=actor('near',25.,0.,'1|0|-1')
+        near['classification']={'kind':'vehicle','evidence':'sdk_vehicle_type','type_id':'vehicle.test'}
+        far=actor('far',50.1,0.,'1|0|-1')
+        self.bridge.raw['actors'] += [near,far]
+        source=self.adapter.snapshot()
+        state=source.rules['public_priority_screen']['evidence']
+        self.assertEqual(state['object_scope']['selected_ids'],['near'])
+        self.assertEqual(state['full_observed_actor_count'],1)
+        self.assertEqual(source.diagnostics['object_scope']['selected_ids'],['near'])
+        self.assertEqual(source.diagnostics['actor_classification'],{'near':near['classification']})
+        near['classification']['evidence']='changed_after_capture'
+        self.assertEqual(source.diagnostics['actor_classification']['near']['evidence'],'sdk_vehicle_type')
+    def test_current_adjacency_is_applied_before_priority_scope(self):
+        raw=self.bridge.raw
+        raw['map']['lanes'].append(lane('adj',[[0.,3.5],[100.,3.5]],
+            [[-10.,1.75],[110.,1.75],[110.,5.25],[-10.,5.25]]))
+        # 原地图无邻道指针，仅本帧SDK证据提供该相邻车道。
+        raw['current_road_evidence']['left']='adj'
+        boundary={'points':[[0.,1.75],[100.,1.75]],'crossable':True}
+        raw['map']['lanes'][0]['boundaries']=[copy.deepcopy(boundary)]
+        raw['map']['lanes'][-1]['boundaries']=[copy.deepcopy(boundary)]
+        raw['actors']=[actor('adjacent',20.,3.5,'adj')]
+        source=self.adapter.snapshot()
+        self.assertEqual(source.rules['public_priority_screen']['evidence']['object_scope']['selected_ids'],['adjacent'])
     def test_mixed_frame_public_rules_rejected(self):
         self.bridge.raw['public_road_rules']['frame']=99
         with self.assertRaisesRegex(ValueError,'冻结场景帧'):self.adapter.snapshot()
