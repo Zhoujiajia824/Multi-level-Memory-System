@@ -12,10 +12,13 @@ import numpy as np
 import shapely
 from PIL import Image, ImageDraw, ImageFont
 from .paths import filesystem_path
+from .lane_roles import (ASSIGNMENT_PROTOCOL, PARAMETERS as LANE_ROLE_PARAMETERS,
+                         trace_lane, lane_owner, belongs_to_trace, forward_reachable)
 from shapely.geometry import Polygon, Point, LineString, box
 from shapely.ops import unary_union
 
 from .contracts import Actor, SceneSnapshot, Representations
+from .grid_storage import save_grid
 from .configuration import (grid_distance_config, grid_metric_signature,
                             grid_observation_config, grid_observation_signature,
                             occupancy_distance_config, bev_label_config)
@@ -43,14 +46,35 @@ def valid_dino_signature(value):
     return isinstance(value,str) and bool(re.fullmatch(r"dinov2-base-sha256:[0-9a-f]{64}|test:[a-zA-Z0-9_.-]+",value))
 
 
+def _canonical_dino_state(state):
+    """统一DINOv2 Base的官方注意力参数名，保持所有张量原值不变。
+
+    Transformers新版Dinov2Model将query/key/value和output.dense纯重命名为
+    q_proj/k_proj/v_proj/o_proj。只规范这四组精确路径；其他参数不猜测。
+    不能让重命名覆盖已有参数，即使两者内容相同也拒绝含糊的状态字典。
+    """
+    projections={'attention.query':'q_proj','attention.key':'k_proj',
+                 'attention.value':'v_proj','output.dense':'o_proj'}
+    result={}
+    for name,value in state.items():
+        if not isinstance(name,str) or not name:
+            raise ValueError('DINO参数名必须为非空字符串')
+        match=re.fullmatch(r'(encoder\.layer\.\d+\.attention\.)(attention\.(?:query|key|value)|output\.dense)\.(weight|bias)',name)
+        target=(match[1]+projections[match[2]]+'.'+match[3]) if match else name
+        if target in result:
+            raise ValueError('DINO参数名规范化发生冲突：'+target)
+        result[target]=value
+    return result
+
+
 def dino_state_signature(state,config):
-    """对实际加载的权重逐张量哈希，不依赖文件路径或检查点封装格式。"""
+    """规范官方参数命名后对完整配置、dtype、shape及每个权重字节哈希。"""
     # 来源路径与下载提交号不是前向运算定义；相同权重搬迁后须保持身份。
     metadata={'_name_or_path','name_or_path','_commit_hash','architectures','transformers_version'}
     semantic_config={key:value for key,value in config.items() if key not in metadata}
     digest=hashlib.sha256()
     digest.update(json.dumps(semantic_config,sort_keys=True,separators=(',',':'),default=str).encode('utf-8'))
-    for name,value in sorted(state.items()):
+    for name,value in sorted(_canonical_dino_state(state).items()):
         if hasattr(value,'detach'):
             import torch
             tensor=value.detach().cpu().contiguous()
@@ -142,38 +166,10 @@ def _frenet(actor, data, anchor_s=None):
 
 
 def _adjacent_road_evidence(scene, current, lanes, side, settings):
-    """只在当前截面确认同向邻道与边界权限；远处虚线不能提供当前位置证据。"""
-    unknown = {"known": False, "exists": None, "crossable": None, "reason": "map_unknown"}
-    if current is None or scene.diagnostics.get("lane_map_complete") is not True:
-        return unknown
-    identity = getattr(current, side)
-    if identity is None:
-        return {"known": True, "exists": False, "crossable": False, "reason": "no_adjacent_lane"}
-    target = lanes.get(identity)
-    if target is None:
-        return dict(unknown, reason="adjacent_lane_geometry_missing")
-    try:
-        source_data, target_data = _reference_data(current.center), _reference_data(target.center)
-        source_s, _, source_heading, _, _ = _project(scene.ego.position, source_data)[0]
-        a = np.array([np.interp(source_s, source_data[3], source_data[0][:, i]) for i in (0, 1)])
-        target_s, _, target_heading, _, _ = _project(a, target_data)[0]
-        if math.cos(target_heading-source_heading) <= 0:
-            return {"known": True, "exists": False, "crossable": False, "reason": "no_same_direction_adjacent_lane"}
-        b = np.array([np.interp(target_s, target_data[3], target_data[0][:, i]) for i in (0, 1)])
-        middle = Point((a+b)/2)
-        permissions = []
-        for lane in (current, target):
-            nearby = [edge for edge in lane.boundaries
-                      if len(edge.get("points", [])) >= 2
-                      and LineString(edge["points"]).distance(middle) <= settings["boundary_local_tolerance_m"]]
-            if not nearby or any(type(edge.get("crossable")) is not bool for edge in nearby):
-                return dict(unknown, reason="current_boundary_permission_unknown")
-            permissions.extend(edge["crossable"] for edge in nearby)
-    except (ValueError, TypeError, IndexError):
-        return dict(unknown, reason="current_boundary_geometry_invalid")
-    crossable = bool(all(permissions))
-    return {"known": True, "exists": True, "crossable": crossable,
-            "reason": "crossable_boundary" if crossable else "noncrossable_boundary"}
+    """模型、检索与规划共用当前位置的同向邻道和边界权限证据。"""
+    from .object_scope import adjacent_road_evidence
+    return adjacent_road_evidence(scene, current, lanes, side,
+                                  tolerance=settings['boundary_local_tolerance_m'])
 
 
 def _visibility_geometry(scene):
@@ -198,9 +194,12 @@ def _visibility_geometry(scene):
 
 
 def build_grid(scene: SceneSnapshot, reference=None, current_lane_id=None, reference_anchor_s=None,
-               distance_config=None, observation_config=None):
+               distance_config=None, observation_config=None, object_range=None, include_static=False):
     """每格只选当前可见对象；道路不适用、确认空与遮挡未知分别编码。"""
     observation_config = grid_observation_config(observation_config)
+    front_m, rear_m = (70., 30.) if object_range is None else (float(object_range["front_m"]), float(object_range["rear_m"]))
+    if not (math.isfinite(front_m) and math.isfinite(rear_m) and front_m > 0 and rear_m >= 0):
+        raise ValueError("八向车道弧长范围无效")
     data = _reference_data(scene.route if reference is None else reference)
     anchor = scene.diagnostics.get("reference_anchor_s") if reference_anchor_s is None and reference is None else reference_anchor_s
     ego_f = _frenet(scene.ego, data, anchor)
@@ -210,11 +209,14 @@ def build_grid(scene: SceneSnapshot, reference=None, current_lane_id=None, refer
     ego_s = ego_f["position"][0]
     lane_by_id = {lane.id: lane for lane in scene.lanes}
     current = lane_by_id.get(current_lane_id or scene.ego.lane_id)
+    # 连续坐标参考可以暂存，但当前车道未被地图确认时不得把旧角色当成当前观测。
+    if scene.ego.lane_id not in lane_by_id:
+        current = None
     roads = {side: _adjacent_road_evidence(scene, current, lane_by_id, side, observation_config)
              for side in ("left", "right")}
     lane_ids = {"center": current.id if current else None, "left": current.left if current else None,
                 "right": current.right if current else None}
-    lane_shapes = {}
+    lane_shapes, traces, trace_data, trace_ego_interval = {}, {}, {}, {}
     for role, lane_id in lane_ids.items():
         if role != "center" and (not roads[role]["known"] or not roads[role]["crossable"]):
             lane_shapes[role] = None
@@ -223,90 +225,87 @@ def build_grid(scene: SceneSnapshot, reference=None, current_lane_id=None, refer
         if lane is None:
             lane_shapes[role] = None
             continue
-        origin_lane = lane
-        segments, seen = [], set()
-        while lane is not None and lane.id not in seen:
-            seen.add(lane.id)
-            if len(lane.polygon) >= 3:
-                segments.append(Polygon(lane.polygon))
-            successors = [lane_by_id[i] for i in lane.successors if i in lane_by_id and i not in seen]
-            if not successors:
-                break
-            # 多后继只为区域几何选择与统一参考线最贴近的一段，不读取周车隐藏路线。
-            lane = min(successors, key=lambda a: abs(_project(a.center[min(2, len(a.center)-1)], data, ego_s)[0, 1]))
-        # 跨过道路分段接缝后，后方 30m 仍可能位于前驱车道。
-        # 每次只接续一条与同一 Frenet 参考最一致的公开前驱，不能将汇入
-        # 分叉的全部来向合并成“本车道后方”，也不能读取交通对象的路线。
-        local_data = _reference_data(origin_lane.center)
-        local_s = _project(scene.ego.position,local_data)[0,0]
-        foot = np.array([np.interp(local_s,local_data[3],local_data[0][:,i]) for i in (0,1)])
-        expected_d = _project(foot,data,ego_s)[0,1]
-        previous = origin_lane
-        while True:
-            frontier = float(_project(previous.center,data,ego_s)[:,0].min())
-            if frontier <= ego_s-30:
-                break
-            choices = []
-            for candidate in scene.lanes:
-                if previous.id not in candidate.successors or candidate.id in seen:
-                    continue
-                candidate_data = _reference_data(candidate.center)
-                end = candidate_data[3][-1]
-                span = min(end,max(5.,frontier-(ego_s-30)+5))
-                sample_s = np.linspace(end-span,end,9)
-                sample = np.column_stack([np.interp(sample_s,candidate_data[3],candidate_data[0][:,i]) for i in (0,1)])
-                projected = _project(sample,data,ego_s)
-                if projected[:,0].min() >= frontier-.01:
-                    continue
-                candidate_heading = np.interp(sample_s,candidate_data[5],candidate_data[4])
-                angle = abs((candidate_heading-projected[:,2]+np.pi)%(2*np.pi)-np.pi)
-                if np.mean(angle) >= np.pi/2:
-                    continue
-                cost = float(np.mean(abs(projected[:,1]-expected_d)/max(candidate.width,.1)+2*angle))
-                choices.append((cost,candidate.id,candidate))
-            if not choices:
-                break
-            previous = min(choices,key=lambda item:(item[0],item[1]))[2]
-            seen.add(previous.id)
-            if len(previous.polygon)>=3:
-                segments.append(Polygon(previous.polygon))
-        lane_shapes[role] = unary_union(segments) if segments else None
+        trace = trace_lane(scene, lane_id, back_m=rear_m, front_m=front_m, center_role=role == 'center')
+        traces[role] = trace
+        lane_shapes[role] = trace['shape'] if trace is not None else None
+        if trace is not None:
+            trace_data[role] = _reference_data(trace['points'])
+            trace_ego_interval[role] = _project(np.asarray(_shape(scene.ego).exterior.coords),
+                                                       trace_data[role], trace['ego_s'])[:, 0]
+    lane_cache = {key: (lane, Polygon(lane.polygon), LineString(lane.center))
+                  for key, lane in lane_by_id.items() if len(lane.polygon) >= 3 and len(lane.center) >= 2}
     ego_shape = _shape(scene.ego)
     ego_interval = _project(np.asarray(ego_shape.exterior.coords), data, ego_s)[:, 0]
     candidates = {name: [] for row in SLOTS for name in row if name != "ego"}
     object_data = {}
     invalid_state_ids = []
+    ownership_diagnostics = []
     for actor in scene.actors:
-        if not actor.visible or actor.kind not in ("vehicle", "bicycle", "pedestrian"):
+        if not actor.visible or actor.kind not in (("vehicle", "bicycle", "pedestrian", "static_obstacle") if include_static else ("vehicle", "bicycle", "pedestrian")):
             continue
-        f = _frenet(actor, data, ego_s)
-        if f is None:
+        # 先按当前几何判断范围、适用车道和最近角色；无关对象的未知运动不能污染整图。
+        position = np.asarray(actor.position)
+        if position.shape != (2,) or not np.all(np.isfinite(position)):
             invalid_state_ids.append(actor.id)
             continue
-        ds = f["position"][0] - ego_s
-        if ds < -30 or ds > 70:
-            continue
+        projected = _project(position, data, ego_s)[0]
+        ds = projected[0] - ego_s
         body = _shape(actor)
         interval = _project(np.asarray(body.exterior.coords), data, ego_s)[:, 0]
         overlaps = interval.max() >= ego_interval.min() and interval.min() <= ego_interval.max()
-        front = ds >= 0
-        longitudinal_gap = max(0., float(interval.min()-ego_interval.max()) if front else float(ego_interval.min()-interval.max()))
+        owner_id = lane_owner(actor, lane_cache)
         roles = []
         for side, shape in lane_shapes.items():
-            if shape is None or body.intersection(shape).area < observation_config["body_lane_area_tolerance_m2"]:
+            trace = traces.get(side)
+            if not belongs_to_trace(actor, body, owner_id, trace, lane_cache,
+                                    observation_config['body_lane_area_tolerance_m2']):
                 continue
+            local_data = trace_data[side]
+            local_s = trace['ego_s']
+            projection = _project(position, local_data, local_s)[0]
+            # 有限地图参考之外不能把端点夹紧投影冒充范围内对象。
+            arc, points = local_data[3], local_data[0]
+            start_tangent = local_data[1][0]/local_data[2][0]
+            end_tangent = local_data[1][-1]/local_data[2][-1]
+            if ((projection[0] <= 1e-8 and np.dot(position-points[0], start_tangent) < -1e-5)
+                or (projection[0] >= arc[-1]-1e-8 and np.dot(position-points[-1], end_tangent) > 1e-5)):
+                continue
+            local_ds = projection[0]-local_s
+            if local_ds < -rear_m or local_ds > front_m:
+                continue
+            local_interval = _project(np.asarray(body.exterior.coords), local_data, local_s)[:, 0]
+            ego_range = trace_ego_interval[side]
+            local_overlap = local_interval.max() >= ego_range.min() and local_interval.min() <= ego_range.max()
+            front = local_ds >= 0
+            longitudinal_gap = max(0., float(local_interval.min()-ego_range.max()) if front
+                                   else float(ego_range.min()-local_interval.max()))
             if side == "center":
                 name = "front" if front else "rear"
             else:
-                name = side + ("_side" if overlaps else "_front" if front else "_rear")
+                name = side + ("_side" if local_overlap else "_front" if front else "_rear")
             gap = body.distance(ego_shape) if name.endswith("side") else longitudinal_gap
-            candidates[name].append((gap, abs(ds), actor.id))
+            candidates[name].append((gap, abs(local_ds), actor.id))
             roles.append(name)
-        object_data[actor.id] = {"id": actor.id, "kind": actor.kind, "position": [ds, f["position"][1]-ego_f["position"][1]],
+        if roles:
+            ownership_diagnostics.append({'id': actor.id, 'owner_lane_id': owner_id, 'candidate_slots': roles})
+        if roles:
+            object_data[actor.id] = {"actor": actor, "position": [float(ds), float(projected[1]-ego_f["position"][1])],
+                                     "longitudinal_overlap": bool(overlaps)}
+    # 每格确定最近对象后才检查其运动；不能跳过未知近车而用更远的已知对象代替。
+    nearest_ids = {min(values)[2] for values in candidates.values() if values}
+    for actor_id in sorted(nearest_ids):
+        geometry = object_data[actor_id]
+        actor = geometry["actor"]
+        f = _frenet(actor, data, ego_s)
+        if f is None:
+            invalid_state_ids.append(actor_id)
+            object_data[actor_id] = None
+            continue
+        object_data[actor_id] = {"id": actor_id, "kind": actor.kind, "position": geometry["position"],
                                 "velocity": (np.array(f["velocity"])-ego_f["velocity"]).tolist(),
                                 "acceleration": f["acceleration"], "heading": f["heading"],
                                 "length": actor.length, "width": actor.width, "slots": [],
-                                "state_valid": True, "longitudinal_overlap": bool(overlaps)}
+                                "state_valid": True, "longitudinal_overlap": geometry["longitudinal_overlap"]}
     observed = _visibility_geometry(scene)
     known_geometry = None
     if observed is not None:
@@ -317,17 +316,20 @@ def build_grid(scene: SceneSnapshot, reference=None, current_lane_id=None, refer
         if known_geometry is None or lane_shapes[side] is None:
             return {"coverage": 0., "raw_coverage": 0., "unobserved_area_m2": None,
                     "observation_reason": "visibility_missing"}
+        local_data = trace_data[side]
+        local_s = traces[side]['ego_s']
+        local_ego_interval = trace_ego_interval[side]
         if name == "front":
-            start,end = ego_s,ego_s+70
+            start,end = local_s,local_s+front_m
         elif name == "rear":
-            start,end = ego_s-30,ego_s
+            start,end = local_s-rear_m,local_s
         elif name.endswith("front"):
-            start,end = ego_interval.max(),ego_s+70
+            start,end = local_ego_interval.max(),local_s+front_m
         elif name.endswith("rear"):
-            start,end = ego_s-30,ego_interval.min()
+            start,end = local_s-rear_m,local_ego_interval.min()
         else:
-            start,end = ego_interval.min(),ego_interval.max()
-        ref,_,_,arc,_,_,_,_ = data
+            start,end = local_ego_interval.min(),local_ego_interval.max()
+        ref,_,_,arc,_,_,_,_ = local_data
         if min(arc[-1], end) <= max(arc[0], start):
             return {"coverage": 0., "raw_coverage": 0., "unobserved_area_m2": None,
                     "observation_reason": "reference_region_missing"}
@@ -340,7 +342,7 @@ def build_grid(scene: SceneSnapshot, reference=None, current_lane_id=None, refer
         normal = np.column_stack((-direction[:,1],direction[:,0]))
         if side not in lateral_widths:
             boundaries = np.vstack([np.asarray(part.exterior.coords) for part in _iter_polygons(lane_shapes[side])])
-            lateral_extent = float(np.max(np.abs(_project(boundaries,data,ego_s)[:,1])))
+            lateral_extent = float(np.max(np.abs(_project(boundaries,local_data,local_s)[:,1])))
             lateral_widths[side] = lateral_extent+lane_by_id[lane_ids[side]].width
         half_width = lateral_widths[side]
         band = Polygon(np.vstack((xy+normal*half_width,(xy-normal*half_width)[::-1]))).buffer(0)
@@ -379,6 +381,10 @@ def build_grid(scene: SceneSnapshot, reference=None, current_lane_id=None, refer
                 slots[name] = dict(shared, state="unknown", applicable=True, clear=False, reason="lane_geometry_missing")
             elif candidates[name]:
                 gap, _, actor_id = min(candidates[name])
+                if object_data[actor_id] is None:
+                    slots[name] = dict(shared, **slot_coverage(side,name), state="unknown", applicable=True,
+                                       clear=False, reason="selected_object_motion_unknown", selected_candidate_id=actor_id)
+                    continue
                 slots[name] = dict(slot_coverage(side,name), state="occupied", id=actor_id,
                                    kind=object_data[actor_id]["kind"], clearance=float(gap),
                                    applicable=True, clear=True, state_valid=True)
@@ -397,6 +403,11 @@ def build_grid(scene: SceneSnapshot, reference=None, current_lane_id=None, refer
             "distance_config":distance_config,"metric_signature":grid_metric_signature(distance_config),
             "observation_config": observation_config,
             "observation_signature": grid_observation_signature(observation_config),
+            "role_range_m": {"front_m": front_m, "rear_m": rear_m},
+            "assignment_protocol": ASSIGNMENT_PROTOCOL, "assignment_parameters": dict(LANE_ROLE_PARAMETERS),
+            "lane_roles": {key: {'lane_ids': value['lane_ids'], 'decisions': value['decisions']}
+                           for key, value in traces.items() if value is not None},
+            "object_lane_assignment": sorted(ownership_diagnostics, key=lambda row: row['id']),
             "matrices": matrices, "objects": [selected[key] for key in sorted(selected)],
             "ego": dict(ego_f, id=scene.ego.id, world_position=np.asarray(scene.ego.position).tolist(),
                         world_velocity=np.asarray(scene.ego.velocity).tolist(), world_acceleration=np.asarray(scene.ego.acceleration).tolist(),
@@ -427,57 +438,9 @@ class NineGridBuilder:
         self.navigation_revision = None
 
     def _reference(self,scene,lane_id):
-        lanes = {x.id:x for x in scene.lanes}
-        if lane_id not in lanes:
-            return np.asarray(scene.route).copy()
-        lane = lanes[lane_id]
-        points = np.asarray(lane.center).copy()
-        visited = {lane.id}
-        previous = lane
-        def join(first,second):
-            data = _reference_data(second)
-            arc,distance,_,_,_ = _project(first[-1],data)[0]
-            # 地图车道多含端部延伸，剔除几何连续后继开头已经经过的区间。
-            if abs(distance) < 1 and arc > .1:
-                index = int(np.searchsorted(data[3],arc,side="right"))
-                second = second[min(index,len(second)-1):]
-            return np.vstack((first,second))
-        def heading(line,end=False):
-            a,b = (line[-2],line[-1]) if end else (line[0],line[1])
-            return math.atan2(b[1]-a[1],b[0]-a[0])
-        def successor_cost(candidate,source,forward=True):
-            end = source.center[-1] if forward else source.center[0]
-            start = candidate.center[0] if forward else candidate.center[-1]
-            h0 = heading(source.center,forward)
-            h1 = heading(candidate.center,not forward)
-            delta = abs((h1-h0+math.pi)%(2*math.pi)-math.pi)
-            route_distance = np.linalg.norm(np.asarray(scene.route)-candidate.center[len(candidate.center)//2],axis=1).min()
-            return (float(np.linalg.norm(end-start)+5*delta+.1*route_distance),candidate.id)
-        while _project(scene.ego.position,_reference_data(points))[0,0] < self.back:
-            options = [x for x in scene.lanes if previous.id in x.successors and x.id not in visited]
-            if not options:
-                break
-            previous = min(options,key=lambda x:successor_cost(x,previous,False))
-            visited.add(previous.id)
-            points = join(previous.center,points)
-        following = lane
-        while True:
-            data = _reference_data(points)
-            s = _project(scene.ego.position,data)[0,0]
-            if data[3][-1]-s >= self.front:
-                break
-            options = [lanes[k] for k in following.successors if k in lanes and k not in visited]
-            if not options:
-                break
-            following = min(options,key=lambda x:successor_cost(x,following,True))
-            visited.add(following.id)
-            points = join(points,following.center)
-        # 相邻路段采样端部可能重合或有 5m 重叠，不能把重叠弧长倒走计入参考。
-        clean = [points[0]]
-        for point in points[1:]:
-            if np.linalg.norm(point-clean[-1])>.01:
-                clean.append(point)
-        return np.asarray(clean)
+        # 坐标参考与角色走廊使用同一套公开后继/导航判定，避免二次选岔路。
+        trace = trace_lane(scene, lane_id, back_m=self.back, front_m=self.front)
+        return np.asarray(scene.route).copy() if trace is None else trace['points'].copy()
 
     def update(self,scene: SceneSnapshot,build=True):
         """每帧推进参考；只有需要检索表示时才生成实体矩阵。"""
@@ -505,7 +468,9 @@ class NineGridBuilder:
         elif observed != self.lane_id and observed in lanes:
             old = lanes.get(self.lane_id)
             # 纵向驶入公开合法后继不属于换道；横向换道必须持续满足面积及中心条件。
-            if old is None or (observed in old.successors and observed not in (old.left,old.right)):
+            if old is None or (observed not in (old.left,old.right)
+                               and forward_reachable(lanes, old.id, observed)
+                               and Polygon(lanes[observed].polygon).covers(Point(scene.ego.position))):
                 self.lane_id = observed
                 switch = True
             elif observed in (old.left,old.right):
@@ -521,6 +486,11 @@ class NineGridBuilder:
                 else:
                     self.candidate,self.candidate_since = None,None
             else:
+                # 地图重定位/断链时只重确认本帧实际覆盖的新车道；不继续输出旧前车。
+                if (Polygon(lanes[observed].polygon).covers(Point(scene.ego.position))
+                    and not Polygon(old.polygon).covers(Point(scene.ego.position))):
+                    self.lane_id = observed
+                    switch = True
                 self.candidate,self.candidate_since = None,None
         else:
             self.candidate,self.candidate_since = None,None
@@ -667,11 +637,14 @@ def _bev_label_actors(scene):
 
     机动车和弱势交通参与者分别保留名额，按真实车体净距选择；ID仅用于同分排序。
     """
+    from .object_scope import select_scope_objects
+    permitted, _ = select_scope_objects(scene)
+    permitted_ids = {actor.id for actor in permitted}
     options=bev_label_config(scene.diagnostics.get('bev_label_options'))
     ego_shape=_shape(scene.ego)
     candidates=[]
     for actor in scene.actors:
-        if not actor.visible or actor.id==scene.ego.id or actor.kind not in ('vehicle','bicycle','pedestrian'):
+        if actor.id not in permitted_ids or not actor.visible or actor.id==scene.ego.id or actor.kind not in ('vehicle','bicycle','pedestrian'):
             continue
         point=_pixel([actor.position],scene.ego)[0]
         if np.all(np.isfinite(point)) and 0<=point[0]<500 and 0<=point[1]<1000:
@@ -961,7 +934,11 @@ def build_representations(scene: SceneSnapshot, output_dir, extractor=None, grid
     signature=getattr(extractor,'signature',None) if extractor is not None else None
     if feature is not None and not valid_dino_signature(signature):
         raise ValueError('图像特征提取器没有有效权重身份；测试替身也必须显式使用 test: 身份')
+    grid = grid_builder.update(scene) if grid_builder is not None else build_grid(scene)
+    grid_path = root/f"{name}_grid.npz"
+    save_grid(grid_path, grid)
     return Representations(scene.frame_id,scene.time,str(bev_path.resolve()),str(feature_path.resolve()),occ,known,
-                           grid_builder.update(scene) if grid_builder is not None else build_grid(scene),feature,
+                           grid,feature,
                            dino_signature=signature,
+                           grid_path=str(grid_path.resolve()),
                            occupancy_config=(grid_builder.occupancy_config if grid_builder is not None else occupancy_distance_config()))

@@ -263,10 +263,88 @@ def validate_representations(reps):
     return errors
 
 
+def _occupancy_channel_comparison(query,reps):
+    """参数兼容性只影响OCC通道，不替代原有覆盖率与前景检查。"""
+    try:
+        compatible=bool(query.occupancy_config and reps.occupancy_config and
+            query.occupancy_config==occupancy_distance_config(query.occupancy_config) and
+            reps.occupancy_config==occupancy_distance_config(reps.occupancy_config) and
+            occupancy_metric_signature(query.occupancy_config)==occupancy_metric_signature(reps.occupancy_config))
+    except (ValueError,TypeError):
+        compatible=False
+    if not compatible:
+        return _invalid('占据指标参数缺失或不兼容')
+    return occupancy_comparison(query.occ,reps.occ,query.occ_known,reps.occ_known,query.occupancy_config)
+
+
+def representation_channel_eligibility(reps):
+    """自身比较确定可用通道；不替代读库的资产、审核及DINO身份保护。"""
+    if not isinstance(reps,Representations):
+        channels={name:_invalid('未加载有效表示') for name in ('bev','occupancy','grid')}
+    else:
+        score=bev_similarity(reps.bev_feature,reps.bev_feature) if valid_dino_signature(reps.dino_signature) else None
+        channels=dict(bev=dict(valid=score is not None,score=score,
+            reason='有效BEV余弦' if score is not None else 'BEV特征或DINO指纹无效'),
+            occupancy=_occupancy_channel_comparison(reps,reps),grid=grid_comparison(reps.grid,reps.grid))
+    return dict(protocol='independent-channel-admission-1.0',
+        eligible=any(report['valid'] for report in channels.values()),channels=channels)
+
+
+def _prepare_grid(grid):
+    """只在当前比较/检索调用中复用校验和数值，不缓存可变字典身份。"""
+    errors=validate_grid_schema(grid)
+    prepared=dict(grid=grid,errors=errors)
+    if errors:
+        return prepared
+    objects=_unique_objects(grid)
+    # 稳定ID排序沿用原分配顺序；对象ID不参与跨场景距离。
+    prepared.update(objects=objects,
+        values=np.asarray([[*o['position'],*o['velocity'],*o['acceleration'],o['heading']]
+            for o in objects],dtype=np.float64).reshape(-1,7),
+        kinds=np.asarray([o['kind'] for o in objects],dtype=str),
+        roles=np.asarray([sum(1<<i for i,s in enumerate(REGIONS) if s in o['slots'])
+            for o in objects],dtype=np.uint8))
+    return prepared
+
+
+def _pair_distances(left,right,joint,config):
+    """广播计算P/V/A/H代价矩阵；类别和共同区域掩码仍是硬匹配条件。"""
+    joint_mask=sum(1<<i for i,s in enumerate(REGIONS) if s in joint)
+    shared=left['roles'][:,None]&right['roles'][None,:]&joint_mask
+    eligible=(left['kinds'][:,None]==right['kinds'][None,:])&(shared!=0)
+    scales=config['scales']
+    axis_scales=np.asarray([scales[k] for k in ('s_m','d_m','vs_mps','vd_mps','as_mps2','ad_mps2')])
+    with np.errstate(over='ignore',invalid='ignore',divide='ignore'):
+        delta=(left['values'][:,None,:6]-right['values'][None,:,:6])/axis_scales
+        norms=np.linalg.norm(delta.reshape(*delta.shape[:2],3,2),axis=-1)/math.sqrt(2)
+        heading=np.abs((left['values'][:,None,6]-right['values'][None,:,6]+math.pi)%(2*math.pi)-math.pi)/scales['heading_rad']
+        components=dict(delta_P=norms[:,:,0],delta_V=norms[:,:,1],delta_A=norms[:,:,2],delta_H=heading)
+        w=config['weights']
+        # 原公式使用内置sum(V,A,H)：保留解释器自身的求和语义（3.12起有补偿），
+        # 不复制CPython实现或以np.sum改变末位；只有最后三个标量项的归约逐对执行。
+        terms=(w['velocity']*components['delta_V'],w['acceleration']*components['delta_A'],w['heading']*heading)
+        position=w['position']*components['delta_P']
+        rho=np.full(eligible.shape,np.nan,dtype=float)
+        for i,j in zip(*np.nonzero(eligible)):
+            rho[i,j]=sum(float(term[i,j]) for term in terms)+float(position[i,j])
+    # 旧实现只计算符合类型/区域条件的对象对；无关对象的溢出不能污染通道。
+    # 对阈值附近的值复核原标量运算，避免不同NumPy/BLAS的末位差异改变rho<c。
+    near=eligible&np.isfinite(rho)&np.isclose(rho,config['cutoff_c'],rtol=8*np.finfo(float).eps,atol=0.)
+    for i,j in zip(*np.nonzero(near)):
+        rho[i,j],scalar=_distances(left['objects'][i],right['objects'][j],config)
+        for key,value in scalar.items():components[key][i,j]=value
+    return rho,components,shared,eligible
+
+
 def grid_comparison(a,b):
+    return _grid_comparison_prepared(_prepare_grid(a),_prepare_grid(b))
+
+
+def _grid_comparison_prepared(prepared_a,prepared_b):
+    a,b=prepared_a['grid'],prepared_b['grid']
     details=dict(matches=[],unmatched_query=[],unmatched_memory=[],gamma=None,D_T=None,D_E=None,
                  S_obj=None,C_star=None,timing_s=dict(assignment=0.))
-    errors=validate_grid_schema(a)+validate_grid_schema(b)
+    errors=prepared_a['errors']+prepared_b['errors']
     if errors:
         return _invalid('；'.join(dict.fromkeys(errors)),**details)
     if a['metric_signature']!=b['metric_signature'] or a['observation_signature']!=b['observation_signature']:
@@ -279,7 +357,7 @@ def grid_comparison(a,b):
     if not union:
         return _invalid('没有可比较的适用区域',**details)
     details['gamma']=len(joint&union)/len(union)
-    left,right=_unique_objects(a),_unique_objects(b)
+    left,right=prepared_a['objects'],prepared_b['objects']
     n,m=len(left),len(right)
     details.update(n=n,m=m,unmatched_query=[o['id'] for o in left],unmatched_memory=[o['id'] for o in right])
     if details['gamma']<cfg['min_joint_known_fraction']:
@@ -302,20 +380,13 @@ def grid_comparison(a,b):
         if not math.isfinite(forbidden) or not math.isfinite(normalization) or normalization<=0:
             return _invalid('部分分配参数超出有限数值范围',**details)
         costs=np.full((n+m,n+m),forbidden,dtype=float)
-        pair_details={}
-        for i,qa in enumerate(left):
-            for j,mb in enumerate(right):
-                shared=qa['slots']&mb['slots']&joint
-                if qa['kind']!=mb['kind'] or not shared:
-                    continue
-                rho,components=_distances(qa,mb,cfg)
-                if not math.isfinite(rho):
-                    return _invalid('状态距离溢出',**details)
-                if rho<c:  # 等于阈值明确不配对。
-                    costs[i,j]=rho
-                    pair_details[i,j]=dict(query_id=qa['id'],memory_id=mb['id'],shared_slots=sorted(shared),rho=rho,cost=rho,**components)
-        for i in range(n):costs[i,m+i]=c/2
-        for j in range(m):costs[n+j,j]=c/2
+        rho,components,shared,eligible=_pair_distances(prepared_a,prepared_b,joint,cfg)
+        if np.any(eligible&~np.isfinite(rho)):
+            return _invalid('状态距离溢出',**details)
+        accepted=eligible&(rho<c)  # 等于阈值明确不配对。
+        costs[:n,:m][accepted]=rho[accepted]
+        costs[np.arange(n),m+np.arange(n)]=c/2
+        costs[n+np.arange(m),np.arange(m)]=c/2
         costs[n:,m:]=0.
         start=time.perf_counter()
         rows,cols=linear_sum_assignment(costs)
@@ -325,7 +396,11 @@ def grid_comparison(a,b):
         total=float(costs[rows,cols].sum())
         details['C_star']=total
         details['S_obj']=_unit_score(1-total/normalization)
-        details['matches']=[pair_details[i,j] for i,j in zip(rows,cols) if i<n and j<m]
+        details['matches']=[dict(query_id=left[i]['id'],memory_id=right[j]['id'],
+            shared_slots=sorted(s for k,s in enumerate(REGIONS) if shared[i,j]&(1<<k)),
+            rho=float(rho[i,j]),cost=float(rho[i,j]),
+            **{key:float(value[i,j]) for key,value in components.items()})
+            for i,j in zip(rows,cols) if i<n and j<m]
         matched_q={v['query_id'] for v in details['matches']}
         matched_m={v['memory_id'] for v in details['matches']}
         details['unmatched_query']=[v['id'] for v in left if v['id'] not in matched_q]
@@ -352,7 +427,7 @@ def _same_record_evidence(a,b):
 
 
 def retrieve(query:Representations,records,snapshot_id='',config=None)->RetrievalResult:
-    """合格经验池内各通道选一条；同ID只展示一次，不融合排序、不补齐。"""
+    """各通道在自身有效池内选一条；同ID只展示一次，不融合、不补齐。"""
     started=time.perf_counter()
     settings=(config or {}).get('retrieval',{})
     minimum_grid=settings.get('minimum_grid_score',.2)
@@ -361,15 +436,16 @@ def retrieve(query:Representations,records,snapshot_id='',config=None)->Retrieva
     if set(settings)&{'weights','minimum_score','final_k'}:
         raise ValueError('旧融合参数已取消，不能用于各通道Top-1检索')
     for key,value in (('per_channel_k',1),('selection','per_channel_top1'),
-                      ('merge_same_record',True),('require_all_channels',True)):
+                      ('merge_same_record',True),('require_all_channels',False)):
         if key in settings and (type(settings[key]) is not type(value) or settings[key]!=value):
             raise ValueError('当前检索固定契约不匹配：'+key)
     diagnostics=dict(query_frame_id=query.frame_id,versions=dict(representation=FEATURE_VERSION,
         grid_representation=GRID_REPRESENTATION_VERSION,occupancy_representation=OCC_REPRESENTATION_VERSION,
         grid_metric=GRID_METRIC_VERSION,occupancy_metric=OCC_METRIC_VERSION,retrieval_metric=RETRIEVAL_METRIC_VERSION),
-        dino_signature=query.dino_signature,timing_s=dict(bev=0.,occupancy=0.,grid=0.,assignment=0.,overall=0.),
+        dino_signature=query.dino_signature,timing_s=dict(bev=0.,occupancy=0.,grid=0.,grid_query_preparation=0.,assignment=0.,overall=0.),
         selection='per_channel_top1',minimum_grid_score=minimum_grid,
-        channel_order=['bev','occupancy','grid'],merge_same_record=True,
+        channel_order=['bev','occupancy','grid'],merge_same_record=True,require_all_channels=False,
+        admission_protocol='independent-channel-admission-1.0',
         channel_recalls={c:[] for c in ('bev','occupancy','grid')},
         candidate_ids=[],candidates=[],all_records=[],reason='')
     result=RetrievalResult(query.frame_id,snapshot_id=snapshot_id,time=query.time,diagnostics=diagnostics)
@@ -392,12 +468,13 @@ def retrieve(query:Representations,records,snapshot_id='',config=None)->Retrieva
         elif revision==previous.get('revision',1) and record is not previous and not _same_record_evidence(record,previous):
             groups[identity]=dict(id=identity,revision=revision,status='duplicate_conflict')
     scored=[]
+    prepared_query=None
     for identity in sorted(groups):
         record=groups[identity]
         reps=record.get('_representations')
         diag=dict(query_frame_id=query.frame_id,experience_id=identity,revision=record.get('revision',1),
                   S_B=None,S_O=None,S_G=None,accepted=False,eligible=False,
-                  matched_channels=[],reason='',channels={},
+                  matched_channels=[],eligible_channels=[],reason='',channels={},
                   stored_retrieval_metric=record.get('retrieval_metric_version'))
         diagnostics['all_records'].append(diag)
         if record.get('status','active')!='active':
@@ -415,22 +492,17 @@ def retrieve(query:Representations,records,snapshot_id='',config=None)->Retrieva
             grid_metric_signature=stored_grid.get('metric_signature'),
             grid_observation_signature=stored_grid.get('observation_signature'),
             occupancy_metric_signature=occ_signature)
+        if prepared_query is None:
+            clock=time.perf_counter()
+            prepared_query=_prepare_grid(query.grid)
+            diagnostics['timing_s']['grid_query_preparation']=time.perf_counter()-clock
+            diagnostics['timing_s']['grid']+=diagnostics['timing_s']['grid_query_preparation']
         for channel,callback in (
             ('bev',lambda:dict(score=bev_similarity(query.bev_feature,reps.bev_feature))),
-            ('occupancy',lambda:occupancy_comparison(query.occ,reps.occ,query.occ_known,reps.occ_known,query.occupancy_config)),
-            ('grid',lambda:grid_comparison(query.grid,reps.grid))):
+            ('occupancy',lambda:_occupancy_channel_comparison(query,reps)),
+            ('grid',lambda:_grid_comparison_prepared(prepared_query,_prepare_grid(reps.grid)))):
             clock=time.perf_counter()
-            if channel=='occupancy':
-                try:
-                    compatible=bool(query.occupancy_config and reps.occupancy_config and
-                        query.occupancy_config==occupancy_distance_config(query.occupancy_config) and
-                        reps.occupancy_config==occupancy_distance_config(reps.occupancy_config) and
-                        occupancy_metric_signature(query.occupancy_config)==occupancy_metric_signature(reps.occupancy_config))
-                except (ValueError,TypeError):
-                    compatible=False
-                report=callback() if compatible else _invalid('占据指标参数缺失或不兼容')
-            else:
-                report=callback()
+            report=callback()
             if channel=='bev':
                 report.update(valid=report['score'] is not None,reason='有效BEV余弦' if report['score'] is not None else 'BEV证据无效')
             diagnostics['timing_s'][channel]+=time.perf_counter()-clock
@@ -438,25 +510,30 @@ def retrieve(query:Representations,records,snapshot_id='',config=None)->Retrieva
             diag['channels'][channel]=report
         diag.update(S_B=diag['channels']['bev']['score'],S_O=diag['channels']['occupancy']['score'],S_G=diag['channels']['grid']['score'])
         scored.append(dict(record=record,diag=diag))
-    # 沿用现有证据与八向最低相关性准入；只移除融合分门槛。
-    # 先验收再取第一名，损坏的高分记录不能挤掉有证据的合法候选。
-    eligible=[]
+    # 每个通道先验收自身证据再选第一名；八向阈值不连带排除BEV/OCC。
+    pools={channel:[] for channel in ('bev','occupancy','grid')}
     for item in scored:
         diag=item['diag']
-        if any(not v['valid'] for v in diag['channels'].values()):
-            diag['reason']='通道证据不足：'+'；'.join(v['reason'] for v in diag['channels'].values() if not v['valid'])
-        elif diag['S_G']<minimum_grid:
-            diag['reason']='八向相关性低于最低阈值'
-        else:
-            diag['eligible']=True
-            diag['reason']='合格但未成为任一通道Top-1'
-            eligible.append(item)
+        rejected=[]
+        for channel,report in diag['channels'].items():
+            eligible=report['valid'] and (channel!='grid' or report['score']>=minimum_grid)
+            report['eligible']=bool(eligible)
+            report['eligibility_reason']=(report['reason'] if not report['valid'] else
+                '八向相关性低于最低阈值' if not eligible else '满足本通道准入')
+            if eligible:
+                pools[channel].append(item)
+                diag['eligible_channels'].append(channel)
+            else:
+                rejected.append(channel+'：'+report['eligibility_reason'])
+        diag['eligible']=bool(diag['eligible_channels'])
+        diag['reason']=('合格但未成为任一可用通道Top-1' if diag['eligible'] else
+            '全部通道不可用：'+'；'.join(rejected))
     selected=[]
     selected_ids=set()
     for channel,key in (('bev','S_B'),('occupancy','S_O'),('grid','S_G')):
-        if not eligible:
+        if not pools[channel]:
             continue
-        item=min(eligible,key=lambda v:(-v['diag'][key],v['record']['id']))
+        item=min(pools[channel],key=lambda v:(-v['diag'][key],v['record']['id']))
         identity=item['record']['id']
         diagnostics['channel_recalls'][channel]=[identity]
         item['diag']['matched_channels'].append(channel)

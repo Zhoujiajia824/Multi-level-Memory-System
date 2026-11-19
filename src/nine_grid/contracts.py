@@ -76,6 +76,7 @@ class Representations:
     coordinates: str = "bev_ego_x_forward_y_left_m;grid_frenet_m"
     dino_signature: str | None = None
     occupancy_config: dict = field(default_factory=dict)
+    grid_path: str | None = None
 
 
 @dataclass

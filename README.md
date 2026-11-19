@@ -70,11 +70,11 @@ python scripts/check_environment.py
 
 跟驰包络只作用于参考走廊内的同向主运动对象（沿参考向前速度大于横向速度绝对值），以及静态/低速阻挡物；预测切入后成为同向前车的阶段仍可加入。移动横穿与对向对象继续参与全部逐时实体避碰和路权审计，不套同向跟车的时距与终端停车包络。`following.candidate_classification`记录逐预测时刻分类，`entity_collision_target_ids`用于核查对象并未从碰撞检查中删除。
 
-道路优先级审计与MPC对象筛选分开：筛选前冻结本帧已观测、具有公开车道的车辆/自行车状态，按既有55米公共通路范围判断让行，不能等横向来车进入MPC走廊才看到其路权。规则通路统一由当前已观测运动方向和公开后继几何确定，不复用EKF短时后继假设，避免预测分支抖动造成同一停止线反复撤销和恢复；EKF后继仍照常用于动态避碰预测。`road_rule_observations`绑定原帧、时间和坐标，重复筛选仍保留；`rule_observation_scope`分别记录路权对象与MPC对象。额外路权对象只使用当前状态和公开车道几何，不增加EKF预测或MPC碰撞计算对象，不读取隐藏路线。
+道路优先级审计先在相同的车道及前40米、后20米准入范围内冻结具有公开车道的车辆/自行车状态，再独立于八向代表筛选判断让行。规则通路由当前运动方向和公开后继几何确定，不复用EKF短时后继假设；EKF后继仍用于动态避碰预测。`road_rule_observations`绑定原帧、时间和坐标，重复筛选只保留当前准入范围内的记录；`rule_observation_scope`分别记录路权对象与MPC对象。路权审计不读取周车隐藏路线，也不扩大对象输入范围。
 
-先从当前场景筛选，再运行动态EKF：常规前30米、后10米、横向25米，八向每格最近一个、同ID去重。前向范围按 `v*reaction_s + v*v/(2*braking_mps2) + stopping_margin_m` 必要扩展；进入候选道路走廊的横穿/切入、短时纵向冲突和后方快车单列安全例外。模型关注可再加最多3个有效范围内对象。**常规集最多8个不等于总集合永远8或11个。**静态障碍保留几何但不运行EKF；路外静止物体不加入道路规划。完整场景仍供BEV、模型、检索及回放，不改检索九宫格的范围和语义。
+先按当前车道及当前位置可跨越同向邻道的中心线链筛选，默认沿各链前40米、后20米，再运行动态EKF。八向每区域最近一个、同ID去重；范围内直接冲突对象可补充，模型关注可再加最多3个范围内对象，均不越过固定车道与弧长边界。**常规集最多8个不等于总集合永远8或11个。**静态障碍保留几何但不运行EKF；路外静止物体不加入道路规划。模型数值真值仅含准入对象，完整场景仍供BEV图像上下文、检索及回放，不改检索九宫格的画布范围。
 
-`config/parameters.json` 的 `planning_objects` 使用 `frenet-eight-planning-2.0`，新增开发默认值：`adaptive_front: true`、`reaction_s: 1`、`braking_mps2: 4`、`stopping_margin_m: 5`、`conflict_horizon_s: 3`、`conflict_margin_m: 0.5`。这些是计算范围及粗筛设置，不是全场景安全证明。
+`config/parameters.json` 的 `planning_objects` 使用 `frenet-eight-planning-3.0`，默认 `front_m: 40`、`rear_m: 20`、`adaptive_front: false`；范围沿允许车道链弧长计算。`conflict_horizon_s: 3`、`conflict_margin_m: 0.5`仅用于范围内的运动冲突粗筛，旧制动距离参数不再扩大范围。上述设置不构成全场景安全证明。
 
 MPC时域3秒、控制网格0.1秒、物理子步0.02秒。重规划频率可选1、2、10Hz，默认10Hz；同步模式计算完成后执行前10、5、1段控制。本分支在 `config/parameters.json` 改 `clock.planner_hz`，不提供CARLA运行入口。不要把1Hz误理解为第一项控制恒持1秒。
 
@@ -184,17 +184,22 @@ python scripts/run_highway.py --scenario highway --fast server --reflection serv
 
 ## 4. 记忆采集、检索和冻结库实验
 
+新八向状态写入 `grid.npz`，保留原始双精度、对象身份和空/未知掩码；不再重复写 `grid.json`。检索对象距离使用数值数组，保持现有部分匹配公式和各通道Top1。旧JSON只读兼容，损坏NPZ不会静默回退。存储格式、3×3×16张量接口和离线库转换要求见 [八向数组存储说明](docs/eight_grid_storage.md)；正式离线库不会自动迁移。
+
 检索或写记忆需要真实 DINOv2 Base 权重。默认使用仓库内的 `models/dinov2-base`，首次克隆后先执行 `git lfs pull`。使用其他本地目录时，在下列命令追加 `--dino-model "模型目录"`。纯基础诊断默认也加载DINO；只有显式关闭DINO诊断且检索、写入均关闭时才不加载。
 
-当前表示版本为 `bev-occ-grid-2.1`；NAVSIM白底、浅灰道路及对象配色，不绘制车道边界线和分割线，仅保留深灰虚线中心参考路径；历史轨迹采用鲜亮的同色系饱和度渐变。目标参考线与沿线距离标记只进入模型图和回放，不进入DINO特征图或OCC。模型文本含当前状态、八向区域、目标参考摘要与图像解释，命中时附历史情境和参考答案；不发送完整地图边界、历史状态列表或检索四矩阵。目标参考摘要另携带输入帧、仿真时间、参考身份、当前横偏、候选车道及相关导航规则，供正确解释Frenet目标。未入格的可见对象仍提供。
+DINO身份计算先按官方纯重命名规则统一注意力层的`query/key/value/output.dense`与`q_proj/k_proj/v_proj/o_proj`，再校验完整配置及全部张量的数据类型、形状和字节。相同Base权重在已验证的Transformers 5.10.2与5.22.2中得到同一指纹，无需改写当前离线库或重提特征；参数名规范化有冲突则报错。其他未知架构/权重差异仍不能混检。曾保存旧运行时指纹`181f…`的其他库不会自动改标签，须另做真实资产核验；当前正式离线库使用`7fdb…`，保持原文件与审核证据。
 
-新经验须声明 `local-goal-frenet-1.0` 并保存原帧目标参考。本次三通道表示升级另要求道路存在/可跨越属性、观测掩码及完整运动状态。缺少这些证据的旧记录明确排除，原库保留，不补零、不自动迁移。被排除原因可在轮初 `memory_snapshot.jsonl` 和 `configuration.json` 查看，或使用下方 `memory_admin.py list`。
+当前表示版本为 `bev-occ-grid-2.1`；NAVSIM白底、浅灰道路及对象配色，不绘制车道边界线和分割线，仅保留深灰虚线中心参考路径；历史轨迹采用鲜亮的同色系饱和度渐变。目标参考线与沿线距离标记只进入模型图和回放，不进入DINO特征图或OCC。模型文本含当前状态、八向区域、目标参考摘要与图像解释，命中时附历史情境和参考答案；不发送完整地图边界、历史状态列表或检索四矩阵。目标参考摘要另携带输入帧、仿真时间、参考身份、当前横偏、候选车道及相关导航规则，供正确解释Frenet目标。已准入范围内未成为八向代表的对象仍单独提供。
 
-先要求三通道证据均有效且八向分数至少0.2，再由BEV、OCC、八向各取最相似的一条；同一经验ID合并，最多返回3条，不补齐，不再加权融合。确认空场景可以是有效证据，遮挡未知不能当成空场景。以下可调参数在 `config/parameters.json` 修改，并随每轮配置保存；改变参数后与旧参数签名不同的经验不会静默混算。
+在线新经验须声明 `local-goal-frenet-1.0` 并保存原帧目标参考。离线回顾型经验通过独立只读适配器读取完整文本，不伪造在线模型答案或PDM验收。道路、运动或观测证据不足仅限制对应检索通道，未知保持未知；原帧、时间、资产哈希、版本、DINO身份及人工审核绑定仍须通过检查。未审核的`pending`记录不进入快照，冻结离线库不能作为在线写入库。被排除原因可在轮初 `memory_snapshot.jsonl` 和 `configuration.json` 查看。
+
+BEV、OCC、八向分别在自身有效候选池中取最相似的一条，八向分数至少0.2的门槛仅约束八向召回；同一经验ID合并，最多返回3条，不补齐，不加权融合。某通道证据不足不会连带排除其他有效通道；有效0分与无证据分开记录。确认空场景可以是有效证据，遮挡未知不能当成空场景。以下参数在 `config/parameters.json` 修改，并随每轮配置保存；参数签名不兼容的通道不会静默混算。
 
 | 检索参数组 | 开发默认值及含义 |
 |---|---|
-| `retrieval.minimum_grid_score` | `0.2`，先要求三通道证据有效、八向达到此分数，再按各通道独立选择 |
+| `retrieval.minimum_grid_score` | `0.2`，仅限制八向通道，不阻止有效BEV或OCC参与各自排名 |
+| `retrieval.require_all_channels` | 固定 `false`，各通道独立准入；旧配置显式设为`true`会报错 |
 | `retrieval.per_channel_k / selection` | 固定 `1 / per_channel_top1`，BEV、OCC、八向各取第一名；同分按经验ID |
 | `retrieval.merge_same_record` | 固定 `true`，同ID只向模型展示一次，保留全部命中通道；不补齐第二名，返回最多3条 |
 | `grid_distance.cutoff_c` | `0.5`，部分匹配阈值；每个未匹配对象代价为其一半 |
@@ -207,9 +212,9 @@ python scripts/run_highway.py --scenario highway --fast server --reflection serv
 | `occupancy_distance.empty_min_known_fraction` | `0.95`，整个OCC裁剪域确认双空所需本方覆盖率 |
 | `occupancy_distance.min_union_area_m2 / area_tolerance_m2` | `0.01 / 0.01`平方米，面积有效性阈值及舍入容差 |
 
-本版取消加权融合、融合分门槛和最终Top-K重排；旧 `weights / minimum_score / final_k` 配置会明确报错，请使用以上字段。`retrieval.jsonl` 保存各通道第一名及 `matched_channels`，不再生成 `fused` 分数。检索策略版本为 `bev-occ-eight-channel-top1-3.0`。已有 `bev-occ-eight-joint-2.0` 经验在表示、单通道指标、观测证据与DINO指纹均兼容时仍可只读使用，始终按新选择策略计算，不迁移或改写原库。
+本版取消加权融合、融合分门槛和最终Top-K重排；旧 `weights / minimum_score / final_k` 配置会明确报错，请使用以上字段。`retrieval.jsonl`保存各通道有效性、排除原因、第一名及`matched_channels`，没有`fused`分数。检索策略版本为`bev-occ-eight-channel-top1-3.1`；允许只读加载3.0/2.0的兼容资产并按当前策略重算，不改写旧特征、教师回答或审核证据。各通道资格由`representation_channel_eligibility()`实际计算，不使用空函数或缺失值补零。仅自比较有效不代表跨场景一定命中。
 
-以上为开发起点，不是已优化的检索参数。禁跨邻道的对象只退出八向集合，仍进入完整场景、BEV、OCC、模型输入和物理避碰。
+以上为开发起点，不是已优化的检索参数。禁跨邻道及40米/20米范围外的对象不进入模型数值真值或MPC对象集合；原始快照、BEV/OCC图像上下文和物理世界保留，不能据此把其数值重新加入规划。检索八向使用自身现有范围与准入规则。
 
 空库采集，不检索历史：
 
@@ -373,3 +378,51 @@ python scripts/memory_admin.py --memory-dir outputs/memory_db/experiment_01 inva
 | `local_goal.attraction_weight` | `3`，单次首次到达吸引项的独立权重，开发起点 |
 | `local_goal.longitudinal_scale_m / lateral_scale_m` | `30 / 3.5`米，目标处切向/法向归一化尺度 |
 | `risk.classes.*.influence_m` | 机动车20、自行车10、行人10、静物12、不可跨越线1.5米，按实体净距，不是硬安全距离 |
+
+## 9. 采集正式场景的离线记忆素材
+
+`scripts/capture_highway.py` 读取与实验相同的参数和场景配置，由当前基础规划器实际驾驶。采集种子应与正式评测分开；不要将正式评测轮次用于补充其检索库。
+
+在项目根目录的 Bash 终端执行，例如高速场景采集5轮、seed 1001–1005、每轮最多30秒：
+
+```bash
+python scripts/capture_highway.py \
+  --scenario highway \
+  --config config/parameters.json \
+  --scenarios-config config/scenarios.yaml \
+  --episodes 5 --seed 1001 --duration 30 \
+  --output-dir "E:/datasets/highway_env/ep_driver_memory/captures/highway"
+```
+
+如果实验使用了冻结配置，将这两个配置路径替换为对应文件。其他场景将 `highway` 换为 `merge`、`roundabout` 或 `intersection`，输出目录也相应修改。追加 `--live` 可以观看；默认不打开窗口。每次运行创建独立批次，不覆盖已有采集。
+
+每轮沿用离线工作台的原始输入格式：
+
+```text
+<批次>_<场景>_seed<种子>/
+  run.json             # 配置、种子、来源和完成状态
+  frames.jsonl         # 当时可观测的场景、实际执行状态与审计
+  future_states.jsonl  # 独立保存完整对象真值，仅供离线审计
+  native/*.png         # 原生RGB画面，无规划轨迹叠加
+```
+
+按真实控制步保存图像和状态（当前为10Hz），包括初帧和实际终帧；1/2/10Hz重规划均保留这些控制步。发生碰撞或到达终点会提前结束，不能把实际执行轨迹自动当作正确示范。中断或失败的轮次标记 `complete=false`，离线工具会跳过。
+
+采集保留主规划、预测和执行安全审计；不调用视觉模型、检索或写记忆，不计算DINO、BEV/OCC/八向特征、额外参照规划或轨迹评分。无需模型配置和密钥，也不生成视频。
+
+采集完成后，在现有离线工作台的整理/`prepare` 步骤直接选择 `captures` 目录；后续特征、教师总结和人工审核沿用原流程，无需转换格式。
+
+
+### 在线对象范围与模型图像（2026-11-18）
+
+当前两个分支共享 `lane-local-object-scope-1.0`：对象只从当前物理车道及当前位置可跨越的同向相邻车道选取，沿各车道唯一连续中心线链计算前后弧长；默认前40m、后20m。范围配置为 `config/parameters.json` 的 `planning_objects.front_m/rear_m`。前后界限以对象中心弧长为准，车道归属及跨线以真实外廓判断，不用自车圆形半径。路口重叠面按中心线与当前运动消歧，连接段按公开导航及前后继延伸；不读取周车隐藏路线。
+
+模型文字提供范围内全部车辆、自行车、行人和有明确类别证据的路面障碍；八向每区域展示最近代表，其他范围内对象单独列出。模型关注ID、目标合法性校验、EKF前的规划筛选及路权对象输入都遵守同一范围。MPC在范围内选八向代表，并允许范围内直接冲突补充及最多3个额外关注对象；旧的自适应距离、后方追近例外不再扩大当前输入范围。范围外危险不在本实验的结构化感知保证内，不能将此策略声称为真实传感器感知或全场景安全证明。
+
+CARLA围栏、护栏、墙、杆、灯牌不当作交通障碍物。`Static/Other`及任意家具不因语义标签自动准入；施工锥、临时路障、掉落物须精确类别证据且外廓进入允许车道。地图停放车保持车辆类别。物理世界实体没有被删除，交通灯与停止线等地图规则仍保留。
+
+原始快照和较宽BEV/OCC仍用于审计、图像上下文及检索，不把其中全部对象数值送入模型或MPC。检索八向默认前70m/后30m，模型和MPC的八向关系在本次40m/20m准入范围内独立计算，二者均采用 `lane-topology-role-assignment-1.0` 的车道拓扑匹配；画布范围不等于数值真值范围；模型BEV只给准入对象标注ID，范围外可保留图像轮廓作为背景。`model_inputs.jsonl`记录实际对象数量和ID。
+
+highway-env在每个低频模型源帧保存无规划叠加的原生俯视图，模型输入顺序为原生俯视图、BEV；前者世界x向右/y向下，自车不固定朝上，后者自车朝上。两图绑定同一冻结帧，采图不推进仿真。CARLA保持同帧六RGB拼图、BEV。新增经验的对象状态正文也使用相同准入范围；完整原帧仍独立留存。
+
+不需要调用模型的本地检查：`python scripts/check_lane_object_scope.py`、`python scripts/check_model_object_scope.py`、`python scripts/check_highway_model_camera.py`。CARLA另有 `python scripts/check_carla_object_categories.py`；服务器闭环效果需另行实验验证。

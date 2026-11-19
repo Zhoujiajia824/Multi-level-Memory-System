@@ -40,7 +40,9 @@ class EpisodeWriter:
 
 
 def make_record(scene,reps,answer,quality,asset_path=None):
-    # 完整真值存在不可变资产中；检索文本保持完整四段与可核对的局部状态。
+    # 经验正文只保存本帧实际允许给模型的对象；完整原帧仍留在审计资产中。
+    from .object_scope import scope_scene
+    scene, scope = scope_scene(scene)
     situation={'frame_id':scene.frame_id,'time':scene.time,'scenario':scene.scenario,
         '坐标':'local_goal使用历史原帧固定Frenet参考：delta_s_m相对该帧自车投影，d_m相对参考线绝对偏移；不可复制为当前目标',
         '原点世界姿态':[*scene.ego.position,scene.ego.heading],
@@ -48,6 +50,7 @@ def make_record(scene,reps,answer,quality,asset_path=None):
         '可见对象':[{'id':a.id,'类型':a.kind,'世界位置':plain(a.position),'速度':plain(a.velocity),'尺寸':[a.length,a.width]} for a in scene.actors if a.visible]}
     if scene.diagnostics.get('observation_policy'):
         situation['观测来源']=scene.diagnostics['observation_policy']
+    situation['对象输入范围']={'version':scope['version'], **scope['settings']}
     selected={'attention':answer.attention,'local_goal':answer.local_goal,'explanation':answer.explanation}
     assets={**scene.assets}
     if asset_path:

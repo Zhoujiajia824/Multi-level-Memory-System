@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import copy
 import hashlib
+from io import BytesIO
 import json
 import math
 import os
 from pathlib import Path
+from zipfile import BadZipFile
 import shutil
 import tempfile
 import threading
@@ -19,8 +21,9 @@ from .configuration import (GRID_METRIC_VERSION, OCC_METRIC_VERSION, RETRIEVAL_M
                             READABLE_RETRIEVAL_METRIC_VERSIONS,
                             grid_metric_signature, occupancy_distance_config,
                             occupancy_metric_signature)
-from .retrieval import validate_representations
+from .retrieval import representation_channel_eligibility, validate_representations
 from .paths import filesystem_path
+from .grid_storage import GRID_STORAGE_VERSION, load_grid, save_grid
 
 
 def _sha(path):
@@ -36,6 +39,42 @@ def _json_write(path,payload):
         json.dump(plain(payload),stream,ensure_ascii=False,indent=2,allow_nan=False)
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def _asset_path(base, name):
+    if not isinstance(name,str) or not name or Path(name).is_absolute():
+        raise ValueError('经验资产必须使用非空相对路径')
+    asset=filesystem_path(base/name)
+    if not asset.is_relative_to(base):
+        raise ValueError('经验资产路径越出记录目录')
+    return asset
+
+
+def _read_grid_asset(base, record):
+    """只读声明的资产；损坏 NPZ 不回退旧 JSON，格式版本不改变检索版本。"""
+    features=record.get('features')
+    if not isinstance(features,dict):
+        raise ValueError('经验缺少特征资产声明')
+    name=features.get('grid')
+    asset=_asset_path(base,name)
+    suffix=Path(name).suffix.lower()
+    if suffix not in ('.npz','.json'):
+        raise ValueError('八向资产必须显式声明为 .npz 或旧 .json')
+    storage_version=record.get('grid_storage_version')
+    if storage_version is not None and (storage_version!=GRID_STORAGE_VERSION or suffix!='.npz'):
+        raise ValueError('经验八向存储版本与声明文件格式不符')
+    other=_asset_path(base,str(Path(name).with_suffix('.json' if suffix=='.npz' else '.npz')))
+    if other.exists():
+        raise ValueError('经验同时存在同名 JSON 和 NPZ 八向资产；请保留声明的一份并更新校验清单')
+    if name not in record['checksums']:
+        raise ValueError('经验缺少声明的八向资产校验项')
+    data=asset.read_bytes()
+    if hashlib.sha256(data).hexdigest()!=record['checksums'][name]:
+        raise ValueError('经验八向资产校验不符')
+    grid=load_grid(BytesIO(data)) if suffix=='.npz' else json.loads(data.decode('utf-8'))
+    if not isinstance(grid,dict):
+        raise ValueError('九宫格资产必须解码为对象')
+    return grid,asset
 
 
 def _validate_feature_metadata(record):
@@ -152,12 +191,23 @@ def _validate_metadata(record):
 
 class MemoryStore:
     """snapshot 返回已载入的独立副本；之后 write 不会改变本轮可检索集合。"""
-    def __init__(self, read_dir, write_dir=None):
+    def __init__(self, read_dir, write_dir=None, *, allow_test_features=False):
+        if type(allow_test_features) is not bool:
+            raise ValueError('测试特征许可必须为布尔值；正式入口不得启用')
+        self.allow_test_features=allow_test_features
         self.read_dir = filesystem_path(read_dir) if read_dir is not None else None
         self.write_dir = filesystem_path(write_dir) if write_dir is not None else None
+        from .offline_memory import ensure_writable_online
+        ensure_writable_online(self.write_dir)
         self.snapshot_id = ""
         self.audit = []
         self._lock = threading.RLock()
+
+    def _check_dino_identity(self, signature):
+        if not valid_dino_signature(signature):
+            raise ValueError('经验缺少有效的 DINO 权重身份')
+        if signature.startswith('test:') and not self.allow_test_features:
+            raise ValueError('正式记忆库拒绝测试替身 DINO 特征；仅隔离测试可显式许可')
 
     def _invalidated(self, root):
         invalid = set()
@@ -181,6 +231,18 @@ class MemoryStore:
             if self.read_dir is None or not self.read_dir.exists():
                 return []
             invalid = self._invalidated(self.read_dir)
+            from .offline_memory import is_offline_library, read_snapshot
+            if is_offline_library(self.read_dir):
+                try:
+                    result,self.audit=read_snapshot(self.read_dir,self._check_dino_identity,
+                        allow_test_features=self.allow_test_features,invalidated=invalid)
+                except (ValueError,KeyError,TypeError,OSError,BadZipFile,EOFError) as exc:
+                    self.audit=[{'path':str(self.read_dir/'manifest.json'),'reason':str(exc)}]
+                    return []
+                evidence=[{'id':r['id'],'revision':r['revision'],'checksums':r['checksums'],
+                           'metadata_sha256':r['_metadata_sha256']} for r in result]
+                self.snapshot_id=hashlib.sha256(json.dumps(evidence,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode('utf-8')).hexdigest()
+                return result
             result = []
             records_root=self.read_dir/'records'
             if records_root.exists() and not records_root.is_dir():
@@ -203,7 +265,7 @@ class MemoryStore:
                         self.audit.append({"id":record["id"],"reason":"经验已停用"})
                         continue
                     result.append(record)
-                except (ValueError,KeyError,TypeError,OSError) as exc:
+                except (ValueError,KeyError,TypeError,OSError,BadZipFile,EOFError) as exc:
                     self.audit.append({"path":str(record_path),"reason":str(exc)})
             evidence = [{"id":r["id"],"revision":r["revision"],"checksums":r["checksums"],
                          "metadata_sha256":r['_metadata_sha256']} for r in result]
@@ -223,37 +285,32 @@ class MemoryStore:
         if record.get("status") != "active":
             raise ValueError("经验未处于有效状态")
         _validate_metadata(record)
-        if not valid_dino_signature(record.get('dino_signature')):
-            raise ValueError('经验缺少有效的 DINO 权重身份')
+        self._check_dino_identity(record.get('dino_signature'))
         base = filesystem_path(path.parent)
         for name,expected in record.get("checksums",{}).items():
-            asset = filesystem_path(base/name)
-            if not asset.is_relative_to(base) or not asset.is_file() or _sha(asset) != expected:
+            asset = _asset_path(base,name)
+            if not asset.is_file() or _sha(asset) != expected:
                 raise ValueError(f"经验资产缺失或校验不符：{name}")
-        required = {"features.npz","grid.json","assets/bev.png","assets/feature.png"}
+        required = {"features.npz","assets/bev.png","assets/feature.png"}
         if not required.issubset(record.get("checksums",{})):
             raise ValueError("经验缺少必要资产校验项")
         with np.load(base/"features.npz",allow_pickle=False) as features:
             bev = features["bev"].copy()
             occ,known = features["occ"].copy(),features["known"].copy()
-        if bev.shape != (768,) or not np.all(np.isfinite(bev)) or np.linalg.norm(bev)<1e-8:
-            raise ValueError("BEV 特征无效")
-        if occ.shape != (6,50,25) or known.shape != occ.shape or not np.all(np.isfinite(occ)) or not np.all(np.isfinite(known)):
-            raise ValueError("占据特征无效")
-        if not np.all((occ>=0)&(occ<=1)) or not np.all((known>=0)&(known<=1)):
-            raise ValueError('占据及已知掩码必须位于 [0,1]')
-        grid = json.loads((base/"grid.json").read_text(encoding="utf-8"))
-        if not isinstance(grid,dict) or grid.get("version") != FEATURE_VERSION or not grid.get("valid",False):
-            raise ValueError("九宫格版本或有效性不符")
+        grid,grid_path = _read_grid_asset(base,record)
         if record.get('metric_signature')!=grid_metric_signature(grid.get('distance_config')):
             raise ValueError('九宫格距离参数签名不符')
         record["_representations"] = Representations(record["frame_id"],record["time"],str(base/"assets/bev.png"),
                                                      str(base/"assets/feature.png"),occ,known,grid,bev,
                                                      dino_signature=record['dino_signature'],
                                                      occupancy_config=record['occupancy_config'])
-        errors = validate_representations(record['_representations'])
-        if errors:
-            raise ValueError('经验表示证据不完整：'+'；'.join(errors))
+        record['_representations'].grid_path=str(grid_path)
+        eligibility = representation_channel_eligibility(record['_representations'])
+        if not eligibility['eligible']:
+            reasons = [name + '：' + report['reason']
+                       for name, report in eligibility['channels'].items()]
+            raise ValueError('经验没有有效检索通道：'+'；'.join(reasons))
+        record['retrieval_eligibility'] = eligibility
         record["_asset_root"] = str(base)
         record['_metadata_sha256'] = hashlib.sha256(metadata).hexdigest()
         return record
@@ -261,6 +318,8 @@ class MemoryStore:
     def write(self, record: ExperienceRecord | dict, reps: Representations):
         if self.write_dir is None:
             raise RuntimeError("记忆写入已关闭：未配置写入目录")
+        from .offline_memory import ensure_writable_online
+        ensure_writable_online(self.write_dir)
         payload = plain(record)
         payload = {k:v for k,v in payload.items() if not k.startswith("_")}
         if payload.get("version") != VERSION or reps.version != VERSION or payload.get("frame_id") != reps.frame_id:
@@ -344,11 +403,12 @@ class MemoryStore:
                 payload['occupancy_metric_signature'] = occupancy_metric_signature(reps.occupancy_config)
                 payload['dino_signature'] = reps.dino_signature
                 payload["metric_signature"] = grid_metric_signature(reps.grid.get('distance_config'))
+                payload['grid_storage_version'] = GRID_STORAGE_VERSION
                 payload["features"] = {"path":"features.npz","bev_dimension":768,"occ_shape":[6,50,25],
-                                       "occupancy_known":"features.npz:known","grid":"grid.json"}
+                                       "occupancy_known":"features.npz:known","grid":"grid.npz"}
                 np.savez_compressed(temporary/"features.npz",bev=np.asarray(reps.bev_feature,dtype=np.float32),
                                     occ=np.asarray(reps.occ,dtype=np.float32),known=np.asarray(reps.occ_known,dtype=np.float32))
-                _json_write(temporary/"grid.json",reps.grid)
+                save_grid(temporary/"grid.npz",reps.grid)
                 payload["checksums"] = {str(p.relative_to(temporary)).replace("\\","/"):_sha(p) for p in temporary.rglob("*") if p.is_file()}
                 _json_write(temporary/"record.json",payload)
                 # 同一文件系统目录原子替换；只在完整资产和元数据均写完后对读取者可见。
@@ -365,6 +425,8 @@ class MemoryStore:
         """仅供已确认错误的经验停用；事故关联本身不调用此方法。"""
         if self.write_dir is None:
             raise RuntimeError("未配置可写记忆库")
+        from .offline_memory import ensure_writable_online
+        ensure_writable_online(self.write_dir)
         if not reason.strip():
             raise ValueError("停用经验必须填写原因")
         self.write_dir.mkdir(parents=True,exist_ok=True)
