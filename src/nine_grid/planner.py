@@ -12,6 +12,7 @@ from .local_reference import LocalReferenceManager, LocalReferenceResult
 from .goals import GoalManager, goal_seed_path, first_arrival_residual
 from .lane_potential import LanePotentialGeometry
 from .potential_domain import build_lane_potential_domain
+from .navigation_connections import confirmed_navigation_connections
 from .realtime_solver import Dynamics, QuadraticSolver, rectangle_gap, circle_gap, bicycle_geometry
 from .stop_control import brake_acceleration_limit
 from .geometry import (clean_polyline, ego_to_world, world_to_ego,
@@ -374,12 +375,11 @@ class Planner:
             sqrt_weight=np.diag([1/self.goals.p['longitudinal_scale_m'],1/self.goals.p['lateral_scale_m']])
             goal_context=(goal_ref,goal_position,sqrt_weight)
         domain_world,domain_evidence=build_lane_potential_domain(scene,front_m=max(120.,reach),rear_m=20.)
-        potential_domain=shapely.transform(domain_world,lambda xy:world_to_ego(xy,origin,angle))
-        domain_boundary=potential_domain.boundary
-        shapely.prepare(potential_domain)
         # 换道五次参考是跟踪目标；势场坐标始终沿导航车道，不随避让轨迹摆动。
         potential_reference=goal_context[0] if goal_context is not None else clean_polyline(world_to_ego(scene.route,origin,angle))
-        potential_geometry=LanePotentialGeometry(potential_reference,potential_domain)
+        # 有效面在刚体旋转后仍可能因接触边浮点退化而自交。保留世界域，
+        # 仅转换查询点和法向，避免修补/扩张/简化授权车道几何。
+        potential_geometry=LanePotentialGeometry(potential_reference,domain_world,domain_pose=(origin,angle))
         potential_old_s=(active_goal['last_s'] if active_goal is not None else
             project_polyline(origin,scene.route,scene.diagnostics.get('route_s'),angle)[0])
         potential_s0=float(potential_geometry.chart_arc_from_polyline_s(potential_old_s))
@@ -481,12 +481,38 @@ class Planner:
                         hd_d[k]=0. # 分段直线投影内方向恒定，切段后重新线性化。
             return ss,residual,tangent,interior,hd,hd_d,goal_mask,progress_tangent,progress_interior,post_goal_corridor
         difference=np.eye(n)-np.eye(n,k=-1);accel_selector=np.eye(2*n)[::2];steer_selector=np.eye(2*n)[1::2]
+        # 导航连接已按同一自行车模型积分并验收车体朝向。变曲率段不能
+        # 再以稳态圆弧公式重造姿态，否则同一中心线也可能产生越线初值。
+        # 只给完全相同的纯导航参考使用；模型目标/主动换道有自己的参考。
+        seed_connections=[]
+        if (active_goal is None and np.array_equal(seed_world,scene.route) and
+                np.isclose(wheelbase,scene.ego.length,rtol=0.,atol=1e-9) and
+                np.isclose(rear,scene.ego.length/2,rtol=0.,atol=1e-9)):
+            for connection in confirmed_navigation_connections(scene).values():
+                points=world_to_ego(connection['points'],origin,angle)
+                derivatives=np.gradient(points,axis=0)
+                seed_connections.append(dict(points=points,arc=polyline_lengths(points),
+                    headings=np.unwrap(connection['headings']-angle),
+                    tangents=np.unwrap(np.arctan2(derivatives[:,1],derivatives[:,0])),
+                    width_m=connection['width_m']))
         def seed(scale=1.):
             controls=[];state=initial.copy();last=previous_control.copy()
             for step_index in range(n):
                 s,d,_=project_polyline(state[:2],seed_reference);kappa=float(np.interp(s,seed_arc,seed_curvature))
                 feed=np.arctan(wheelbase*kappa/np.sqrt(max(.01,1-(rear*kappa)**2)))
                 heading=float(np.interp(s,seed_arc,seed_tangents))-np.arctan(axle_ratio*np.tan(feed))
+                connection_matches=[]
+                for connection in seed_connections:
+                    cs,_,_=project_polyline(state[:2],connection['points'])
+                    foot=sample_polyline(connection['points'],cs)
+                    if (.05<cs<connection['arc'][-1]-.05 and
+                            np.linalg.norm(state[:2]-foot)<=connection['width_m']/2):
+                        ch=float(np.interp(cs,connection['arc'],connection['headings']))
+                        theta=float(np.interp(cs,connection['arc'],connection['tangents']))
+                        if abs(float(wrap_angle(theta-state[2])))<=.7:
+                            connection_matches.append((ch,np.arctan(np.tan(theta-ch)/axle_ratio)))
+                if len(connection_matches)==1:
+                    heading,feed=connection_matches[0]
                 steer=feed+1.2*float(wrap_angle(heading-state[2]))-.3*np.arctan(d/max(state[3],2.))
                 navigation_s=s if active_goal is None else project_polyline(state[:2],reference)[0]
                 desired=min(max_speed,float(scene.rules.get('desired_speed',25.))*scale,np.sqrt(max_lat*2*rear/max(2*abs(np.sin(np.arctan(axle_ratio*np.tan(steer)))),.001))*.9,float(np.interp(navigation_s,reference_arc,speed_profile)))
@@ -527,7 +553,7 @@ class Planner:
         initial_body=shapely.polygons(body_vertices(initial[None,:],scene.ego.length,scene.ego.width))[0]
         initial_safety={'on_road':bool(shapely.covers(accepted_road,initial_body)),
                         'speed_limit':bool(speed<=max_speed+speed_tolerance)}
-        initial_safety['potential_domain']=bool(shapely.covers(potential_domain,shapely.Point(initial[:2])))
+        initial_safety['potential_domain']=bool(potential_geometry.domain_contains(initial[:2])[0])
         for actor,sample,_ in targets:
             if actor.kind=='pedestrian':
                 gap,_=circle_gap(initial[None,:],sample[:1,:2],actor.radius or actor.width/2,scene.ego.length,scene.ego.width)
@@ -543,20 +569,19 @@ class Planner:
         if stop_local is not None:labels.append('yield_stop_line')
         evaluations={'values':0,'linearizations':0,'value_seconds':0.,'linearization_seconds':0.,'geometry_seconds':0.}
 
-        def dense_check(controls):
+        def dense_check(controls,dense):
             """按物理子步重积分；周车仅在原预测样本之间插值，不读取真实未来。"""
-            dense=[initial.copy()]
             sub_dt=dt/self.substeps
-            for command in controls:
-                for _ in range(self.substeps):
-                    dense.append(propagate(dense[-1],command,scene.ego.length,sub_dt,1,wheelbase,rear))
-            dense=np.asarray(dense);times=np.arange(len(dense))*sub_dt
+            times=np.arange(len(dense))*sub_dt
             bodies=shapely.polygons(body_vertices(dense,scene.ego.length,scene.ego.width))
             inside=shapely.covers(accepted_road,bodies)
-            domain_inside=shapely.covers(potential_domain,shapely.points(dense[:,:2]))
+            domain_inside=potential_geometry.domain_contains(dense[:,:2])
             line_ok=np.ones(len(dense),bool)
+            line_clearance_minimum=np.inf
             for item in physical_lines.values():
-                line_ok &= shapely.distance(bodies,item['geometry'])>=clearance-tolerance
+                line_distance=shapely.distance(bodies,item['geometry'])
+                line_clearance_minimum=min(line_clearance_minimum,float((line_distance-clearance).min()))
+                line_ok &= line_distance>=clearance-tolerance
             actor_ok=np.ones(len(dense),bool);contacts=[];minimum=np.inf
             for actor,sample,_ in targets:
                 other=np.stack([np.interp(times,np.arange(n+1)*dt,sample[:,j]) for j in range(4)],axis=1)
@@ -584,6 +609,7 @@ class Planner:
             return {'valid':bool(inside.all() and domain_inside.all() and line_ok.all() and actor_ok.all() and stop_ok),
                 'substep_s':sub_dt,'samples':len(dense),'actor_clearance_min_m':None if not np.isfinite(minimum) else minimum,
                 'offroad_samples':int((~inside).sum()),'line_violation_samples':int((~line_ok).sum()),
+                'line_clearance_min_m':None if not np.isfinite(line_clearance_minimum) else line_clearance_minimum,
                 'outside_potential_domain_samples':int((~domain_inside).sum()),
                 'stop_line_passed':not stop_ok,'predicted_contacts':contacts,
                 'limitation':'物理子步离散复核，不是连续时间碰撞证明；周车未来来自预测'}
@@ -591,7 +617,8 @@ class Planner:
         def terms(controls,is_brake=False):
             value_started=time.perf_counter();evaluations['values']+=1
             # 线搜索只需真实原值；只有进入下一次QP的名义点才计算控制导数。
-            states=self.dynamics.rollout(controls,initial);current=states[1:]
+            dense_states=self.dynamics.dense_rollout(controls,initial)
+            states=dense_states[::self.substeps];current=states[1:]
             field_projection=potential_geometry.project_sequence(states[:,:2],potential_s0)
             field_query={key:value[1:] for key,value in field_projection.items()}
             geometry_started=time.perf_counter()
@@ -646,14 +673,8 @@ class Planner:
                 residual('penalty_'+name,np.minimum(margin,0.),derivative,penalties.get(name,100.),scale)
                 rows.append(jac);lower.append(-margin);upper.append(np.full(len(margin),np.inf))
             penalty('road_clearance',road_distance.ravel()+tolerance,road_jac)
-            center_points=shapely.points(current[:,:2])
-            domain_inside=shapely.covers(potential_domain,center_points)
-            domain_nearest=shapely.get_coordinates(shapely.get_point(shapely.shortest_line(domain_boundary,center_points),0))
-            domain_offset=current[:,:2]-domain_nearest
-            domain_distance=np.linalg.norm(domain_offset,axis=1)
-            domain_sign=np.where(domain_inside,1.,-1.)
-            domain_margin=domain_sign*domain_distance
-            domain_normal=domain_sign[:,None]*domain_offset/np.maximum(domain_distance[:,None],1e-10)
+            domain_inside=field_projection['domain_valid'][1:]
+            domain_margin,domain_normal=potential_geometry.domain_clearance(current[:,:2])
             penalty('potential_domain',domain_margin,
                 lambda c:np.einsum('ni,nij->nj',domain_normal,c['sens'][:,:2]))
             if len(uncovered):
@@ -762,33 +783,45 @@ class Planner:
                     lambda c,derivative=derivative:np.einsum('ni,nij->nj',derivative,c['sens'][:,:2]),
                     weights.get('risk',2))
             line_minimum=np.inf
+            line_states=dense_states[1:]
+            line_polygons=shapely.polygons(body_vertices(line_states,scene.ego.length,scene.ego.width)) if physical_lines else None
+            line_count=len(line_states)
+            node_indices=np.arange(self.substeps-1,line_count,self.substeps)
+            intermediate_indices=np.flatnonzero((np.arange(line_count)+1)%self.substeps)
             for item in physical_lines.values():
-                distance=shapely.distance(polygons,item['geometry'])
+                distance=shapely.distance(line_polygons,item['geometry'])
                 contact=distance<=1e-8;signed=distance.copy()
                 contact_partial=None
                 if np.any(contact):
-                    center_nearest=shapely.get_coordinates(shapely.get_point(shapely.shortest_line(item['geometry'],shapely.points(current[:,:2])),0))
-                    offset=current[:,:2]-center_nearest;center_distance=np.linalg.norm(offset,axis=1);normal_line=offset/np.maximum(center_distance[:,None],1e-10)
-                    c,si=np.cos(current[:,2]),np.sin(current[:,2]);along=normal_line[:,0]*c+normal_line[:,1]*si;across=-normal_line[:,0]*si+normal_line[:,1]*c
+                    center_nearest=shapely.get_coordinates(shapely.get_point(shapely.shortest_line(item['geometry'],shapely.points(line_states[:,:2])),0))
+                    offset=line_states[:,:2]-center_nearest;center_distance=np.linalg.norm(offset,axis=1);normal_line=offset/np.maximum(center_distance[:,None],1e-10)
+                    c,si=np.cos(line_states[:,2]),np.sin(line_states[:,2]);along=normal_line[:,0]*c+normal_line[:,1]*si;across=-normal_line[:,0]*si+normal_line[:,1]*c
                     support=scene.ego.length/2*np.abs(along)+scene.ego.width/2*np.abs(across)
                     signed[contact]=np.minimum(center_distance[contact]-support[contact],0.)
-                    contact_partial=np.zeros((n,4));contact_partial[contact,:2]=normal_line[contact]
+                    contact_partial=np.zeros((line_count,4));contact_partial[contact,:2]=normal_line[contact]
                     contact_partial[contact,2]=(-scene.ego.length/2*np.sign(along)*across+scene.ego.width/2*np.sign(across)*along)[contact]
                 # 候选验收只需真实值；见证点导数留到该候选真正进入下一次QP。
                 cache={}
                 def line_partial(geometry=item['geometry'],distance=distance,contact=contact,
                                  contact_partial=contact_partial,cache=cache):
                     if 'partial' not in cache:
-                        witnesses=shapely.shortest_line(geometry,polygons)
+                        witnesses=shapely.shortest_line(geometry,line_polygons)
                         remote=shapely.get_coordinates(shapely.get_point(witnesses,0));own=shapely.get_coordinates(shapely.get_point(witnesses,1))
                         normal_line=(own-remote)/np.maximum(distance[:,None],1e-10)
-                        partial=np.zeros((n,4));partial[:,:2]=normal_line
-                        arm=own-current[:,:2];partial[:,2]=-normal_line[:,0]*arm[:,1]+normal_line[:,1]*arm[:,0]
+                        partial=np.zeros((line_count,4));partial[:,:2]=normal_line
+                        arm=own-line_states[:,:2];partial[:,2]=-normal_line[:,0]*arm[:,1]+normal_line[:,1]*arm[:,0]
                         if contact_partial is not None:partial[contact]=contact_partial[contact]
                         cache['partial']=partial
                     return cache['partial']
-                penalty('noncrossable_line_clearance',signed-clearance+tolerance,
-                        lambda c,partial=line_partial:np.einsum('ni,nij->nj',partial(),c['sens']))
+                # 保留控制节点的原代价；段间物理子步也进入同一硬约束，
+                # 不能只在最终拒绝它们，却让QP看不到修正方向。
+                penalty('noncrossable_line_clearance',signed[node_indices]-clearance,
+                        lambda c,partial=line_partial:np.einsum('ni,nij->nj',partial()[node_indices],c['sens']))
+                if len(intermediate_indices):
+                    rows.append(lambda c,partial=line_partial:np.einsum(
+                        'ni,nij->nj',partial()[intermediate_indices],c['dense'][intermediate_indices]))
+                    lower.append(clearance-signed[intermediate_indices])
+                    upper.append(np.full(len(intermediate_indices),np.inf))
                 line_minimum=min(line_minimum,float((signed-clearance).min()))
             if physical_lines:minima.append(line_minimum)
             if stop_local is not None:
@@ -837,7 +870,7 @@ class Planner:
             metrics['control_box']=control_margin
             valid=(np.isfinite(states).all() and np.isfinite(controls).all() and minima[1]>=-1e-8
                    and control_margin>=-1e-8 and np.isfinite(objective))
-            dense=dense_check(controls)
+            dense=dense_check(controls,dense_states)
             safety_feasible=(all(initial_safety.values()) and all(value>=-(speed_tolerance if key=='speed_limit' else tolerance) for key,value in metrics.items()
                              if key!='tracking_corridor' or not is_brake)
                              and dense['valid']
@@ -857,6 +890,8 @@ class Planner:
                 sj=np.einsum('ni,nij->nj',s_tangent,sens[:,:2])
                 sj[~s_interior]=0.
                 context={'all':sensitivity,'sens':sens,'sj':sj}
+                if physical_lines and len(intermediate_indices):
+                    context['dense']=self.dynamics.dense_sensitivity(controls,initial)[1:]
                 jacobian=np.vstack([(jac(context) if callable(jac) else np.asarray(jac))*factor for jac,factor in jacobians])
                 navigation_jac=navigation_tangent[-1]@sens[-1,:2] if navigation_interior[-1] else np.zeros(2*n)
                 gradient_extra=-float(weights.get('progress',1))*navigation_jac/scales['progress_m']
@@ -907,6 +942,21 @@ class Planner:
         nominal['initialization_source']=nominal_source
         nominal['candidate_source']='validated_current_initialization'
         accepted=nominal
+        restoration={'eligible':False,'source':None}
+        if (not _brake_only and active_goal is None and seed_connections and
+                domain_evidence.get('current_lane_association') and initial_reselection['evaluated']):
+            # 制动是可执行后备，不必同时成为SQP的线性化点。零速制动点
+            # 的横纵耦合灵敏度会退化，难以修正连接上几厘米的跟踪偏差。
+            # 仅用已验证导航连接的有限前进初值做原SQP可行性恢复；
+            # accepted始终独立保留验收后的后备，未验收初值绝不执行。
+            forward=[item for item in alternatives if item[0]=='navigation_seed' and
+                     item[1]['valid'] and not item[1]['safety_feasible']]
+            if forward and accepted['safety_feasible']:
+                nominal_source,nominal=forward[0]
+                controls=nominal['controls']
+                nominal['initialization_source']=nominal_source
+                nominal['candidate_source']='initialization_restoration_only'
+                restoration.update(eligible=True,source=nominal_source)
         trust=np.tile([float(p.get('sqp_trust_acceleration_mps2',1.5)),float(p.get('sqp_trust_steering_rad',.15))],n)
         last_iteration_seconds=0.;iteration_history=[];termination='iteration_limit'
         recovery_speed=float(p.get('warm_start_recovery_speed_mps',.3))
@@ -947,13 +997,18 @@ class Planner:
                 if exact and preference(candidate)<=preference(nominal):break
             if not candidates:
                 termination='control_projection_infeasible';break
-            next_nominal=min([accepted,*[value for value in candidates if value['valid']]],key=preference)
+            # 恢复阶段允许继续线性化仍有微小违约的改进点；可执行解
+            # 单独放在accepted中。否则每步都会又被静止后备拉回零速。
+            pool=([nominal] if restoration['eligible'] and not nominal['safety_feasible'] else [accepted])
+            next_nominal=min([*pool,*[value for value in candidates if value['valid']]],key=preference)
             improvement=abs(next_nominal['objective']-nominal['objective'])
             step_norm=float(np.linalg.norm(step,np.inf))
             iteration_history.append({'iteration':iteration+1,'nominal_cost':nominal['objective'],
                 'candidate_cost':next_nominal['objective'],'absolute_cost_change':improvement,
                 'qp_step_inf':step_norm,'gradient_inf':float(np.linalg.norm(nominal['gradient'],np.inf)),
                 'candidate_valid':next_nominal['valid'],'candidate_violation':next_nominal['violation'],
+                'candidate_safety_feasible':next_nominal['safety_feasible'],
+                'candidate_dense_validation':next_nominal['dense_validation'],
                 'qp_residuals':dict(getattr(self.qp,'last_diagnostics',{}))})
             controls=next_nominal['controls'];nominal=next_nominal;last=nominal
             last_iteration_seconds=time.perf_counter()-iteration_started
@@ -1103,6 +1158,7 @@ class Planner:
             'optimizer_termination':termination,'iteration_history':iteration_history,
             'warm_start_recovery':recovery,
             'initial_guess_source':initial_guess_source,'infeasible_initial_reselection':initial_reselection,
+            'navigation_initialization_restoration':restoration,
             'qp_cache_builds':self.qp.cache_builds-qp_before[0],'qp_cache_hits':self.qp.cache_hits-qp_before[1],
             'qp_setup_seconds':self.qp.setup_seconds-qp_before[2],
             'value_evaluations':evaluations['values'],'linearization_evaluations':evaluations['linearizations'],

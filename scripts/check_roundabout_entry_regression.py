@@ -1,7 +1,7 @@
 """Real roundabout map and audited stop-state regression; independent headless instance.
 
-No simulator stepping, VLM, DINO or user experiment files are used. SQP is run
-once on a clean-road fixture at the stop position audited in seed 2001.
+No simulator stepping, VLM, DINO or user experiment files are used. SQP covers
+clean-road stationary fixtures at the audited entry and exit stop positions.
 """
 from dataclasses import replace
 import copy
@@ -24,8 +24,9 @@ import yaml
 from nine_grid.geometry import project_polyline
 from nine_grid.highway import HighwayAdapter
 from nine_grid.lane_roles import trace_lane
-from nine_grid.navigation_connections import confirmed_navigation_connections
-from nine_grid.object_scope import select_scope_objects
+from nine_grid.navigation_connections import (active_navigation_connection,
+                                              confirmed_navigation_connections)
+from nine_grid.object_scope import lane_role_geometry, select_scope_objects
 from nine_grid.planner import Planner
 from nine_grid.potential_domain import build_lane_potential_domain
 from nine_grid.prediction import Predictor
@@ -43,6 +44,23 @@ class RoundaboutEntry(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.adapter.close()
+
+    def exit_fixture(self, position=None, heading=None):
+        scene = copy.deepcopy(self.scene)
+        connection = confirmed_navigation_connections(scene)[('ee|nx|1', 'nx|nxs|0')]
+        middle = len(connection['points'])//2
+        if position is None:
+            position = connection['points'][middle].copy()
+        if heading is None:
+            heading = float(connection['headings'][middle])
+        scene.frame_id = 'audited-exit-fixture:1'
+        scene.ego = replace(scene.ego, position=np.asarray(position, float), heading=heading,
+            velocity=np.zeros(2), acceleration=np.zeros(2), history=[], lane_id='nx|ne|1')
+        scene.actors = []
+        anchor = project_polyline(scene.ego.position, scene.route, heading=heading)[0]
+        scene.diagnostics.update(route_s=anchor, reference_anchor_s=anchor,
+            stable_navigation_lane_id='ee|nx|1', previous_control=[0., -.245])
+        return scene
 
     def test_entry_and_exit_use_the_confirmed_navigation_curves(self):
         s = copy.deepcopy(self.scene)
@@ -88,6 +106,55 @@ class RoundaboutEntry(unittest.TestCase):
         self.assertEqual(plan.diagnostics['potential_field']['invalid_samples'], 0)
         self.assertGreater(plan.controls[0, 0], .1)
         self.assertGreater(plan.states[-1, 3], .5)
+
+    def test_exit_curve_and_audited_stop_keep_the_downstream_exit_domain(self):
+        for position, heading in ((None, None), ([6.8934759169, 23.7768782683], 2.53)):
+            with self.subTest(position=position):
+                scene = self.exit_fixture(position, heading)
+                active = active_navigation_connection(scene)
+                self.assertIsNotNone(active)
+                self.assertEqual(active['evidence']['raw_lane_id'], 'nx|ne|1')
+                traces, roads, _ = lane_role_geometry(scene)
+                self.assertIn('nx|nxs|0', traces['center']['lane_ids'])
+                self.assertIn('nxs|nxr|0', traces['center']['lane_ids'])
+                self.assertNotIn('nx|ne|1', traces['center']['lane_ids'])
+                self.assertEqual(scene.ego.lane_id, 'nx|ne|1')
+                self.assertTrue(all(not roads[side]['known'] for side in ('left', 'right')))
+                domain, evidence = build_lane_potential_domain(scene)
+                exit_lane = next(lane for lane in scene.lanes if lane.id == 'nx|nxs|0')
+                self.assertTrue(domain.covers(shapely.Point(exit_lane.center[-1])))
+                continuation = next(lane for lane in scene.lanes if lane.id == 'nx|ne|1')
+                branch_point = continuation.center[len(continuation.center)*3//4]
+                self.assertFalse(domain.covers(shapely.Point(branch_point)))
+                self.assertIn({'from_lane_id': 'ee|nx|1', 'to_lane_id': 'nx|nxs|0'},
+                              evidence['navigation_connections'])
+                for identity, lane, index in (('exit_vehicle', exit_lane, len(exit_lane.center)*2//3),
+                        ('other_branch_vehicle', continuation, len(continuation.center)*3//4)):
+                    point = lane.center[index].copy()
+                    scene.actors.append(replace(scene.ego, id=identity, lane_id=lane.id,
+                        position=point, heading=project_polyline(point, lane.center)[2]))
+                selected, scope = select_scope_objects(scene, self.config)
+                self.assertEqual([actor.id for actor in selected], ['exit_vehicle'])
+                self.assertIn('front', scope['objects']['exit_vehicle']['roles'])
+                self.assertEqual(scope['current_lane_association']['to_lane_id'], 'nx|nxs|0')
+
+    def test_audited_stationary_exit_state_can_resume(self):
+        scene = self.exit_fixture([6.8934759169, 23.7768782683], 2.53)
+        plan = Planner(self.config).solve(scene, Predictor(self.config).predict(scene))
+        evidence = {key: plan.diagnostics.get(key) for key in (
+            'execution_mode', 'optimizer_termination', 'initial_guess_source',
+            'accepted_initialization_source', 'candidate_source', 'initial_constraints',
+            'infeasible_initial_reselection', 'warm_start_recovery', 'iteration_history',
+            'constraint_minima', 'dense_validation', 'local_reference', 'must_wait', 'stop_s')}
+        evidence.update(first_controls=plan.controls[:5].tolist(),
+                        terminal_state=plan.states[-1].tolist())
+        failure = json.dumps(evidence, ensure_ascii=False, default=lambda value: value.tolist())
+        self.assertTrue(plan.valid)
+        self.assertTrue(plan.diagnostics['safety_feasible'], plan.diagnostics['constraint_minima'])
+        self.assertEqual(plan.diagnostics['dense_validation']['outside_potential_domain_samples'], 0)
+        self.assertEqual(plan.diagnostics['potential_field']['invalid_samples'], 0)
+        self.assertGreater(plan.controls[0, 0], .1, failure)
+        self.assertGreater(plan.states[-1, 3], .5, failure)
 
 
 if __name__ == '__main__':

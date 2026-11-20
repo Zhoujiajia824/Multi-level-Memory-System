@@ -40,6 +40,8 @@ def build_lane_potential_domain(scene, front_m=120., rear_m=20.):
         'version': 'lane-potential-domain-1.1',
         'lane_ids': sorted(selected),
         'chains': {side: None if trace is None else trace['lane_ids'] for side, trace in traces.items()},
+        'current_lane_association': (traces['center'].get('current_lane_association')
+                                     if traces.get('center') is not None else None),
         'adjacent_permissions': permissions,
         'navigation_connections': [{'from_lane_id': pair[0], 'to_lane_id': pair[1]} for pair in sorted(connections)],
         'geometry': 'union(actual_lane_polygon intersect centerline_half_width_band;confirmed_traversed_navigation_connection_band) intersect drivable',

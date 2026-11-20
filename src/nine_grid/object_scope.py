@@ -13,6 +13,7 @@ from shapely.geometry import LineString, Point, Polygon
 from .geometry import actor_shape
 from .lane_roles import (ASSIGNMENT_PROTOCOL, trace_lane, lane_owner,
                          belongs_to_trace, project)
+from .navigation_connections import active_navigation_connection
 
 VERSION = 'lane-local-object-scope-1.0'
 KINDS = ('vehicle', 'bicycle', 'pedestrian', 'static_obstacle')
@@ -73,10 +74,16 @@ def lane_role_geometry(scene, current_lane_id=None, front_m=40., rear_m=20.):
     """返回角色链、邻道权限、地图归属缓存；不读取任何对象隐藏路线。"""
     lanes = {lane.id: lane for lane in scene.lanes}
     # 历史导航身份可保持坐标连续，但不能代替当前物理车道的观测证据。
-    current = (lanes.get(current_lane_id or scene.ego.lane_id)
-               if scene.ego.lane_id in lanes else None)
-    roads = {side: adjacent_road_evidence(scene, current, lanes, side)
-             for side in ('left', 'right')}
+    active = active_navigation_connection(scene) if current_lane_id is None else None
+    identity = (active['connection']['from_lane_id'] if active is not None
+                else current_lane_id if current_lane_id is not None else scene.ego.lane_id)
+    current = lanes.get(identity)
+    # 连接中途没有源车道在当前位置的共同边界证据，不能继承其旧邻道权限。
+    roads = ({side: dict(known=False, exists=None, crossable=None,
+                        reason='active_navigation_connection_no_current_shared_boundary')
+              for side in ('left', 'right')} if active is not None else
+             {side: adjacent_road_evidence(scene, current, lanes, side)
+              for side in ('left', 'right')})
     traces = {}
     for side in ('center', 'left', 'right'):
         identity = current.id if side == 'center' and current else getattr(current, side, None)
@@ -85,6 +92,8 @@ def lane_role_geometry(scene, current_lane_id=None, front_m=40., rear_m=20.):
         else:
             traces[side] = trace_lane(scene, identity, back_m=rear_m, front_m=front_m,
                                       center_role=side == 'center')
+            if side == 'center' and active is not None and traces[side] is not None:
+                traces[side]['current_lane_association'] = active['evidence']
     cache = {key: (lane, Polygon(lane.polygon), LineString(lane.center))
              for key, lane in lanes.items() if len(lane.polygon) >= 3 and len(lane.center) >= 2}
     return traces, roads, cache
@@ -156,9 +165,11 @@ def select_scope_objects(scene, config=None):
         frame_id=scene.frame_id, time=float(scene.time), settings=settings,
         range_rule='actor_center_arc_distance_on_each_permitted_lane_chain',
         selected_ids=[actor.id for actor in selected], selected_count=len(selected),
+        current_lane_association=(traces.get('center') or {}).get('current_lane_association'),
         input_count=len(scene.actors), objects=objects, roads=roads,
         chains={side: None if trace is None else dict(lane_ids=trace['lane_ids'],
-                    ego_s_m=float(trace['ego_s']), decisions=trace['decisions'])
+                    ego_s_m=float(trace['ego_s']), decisions=trace['decisions'],
+                    current_lane_association=trace.get('current_lane_association'))
                 for side, trace in traces.items()},
         excluded=[dict(id=key, reason=excluded[key]) for key in sorted(excluded)],
         adaptive_expansion=False,

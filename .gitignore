@@ -26,6 +26,8 @@
 !/scripts/check_environment.py
 !/scripts/check_frenet_apf.py
 !/scripts/check_planner_lane_potential.py
+!/scripts/check_potential_domain_frame.py
+!/scripts/check_dense_line_constraints.py
 !/scripts/plot_lane_potential.py
 !/scripts/check_highway_model_camera.py
 !/scripts/check_model_object_scope.py

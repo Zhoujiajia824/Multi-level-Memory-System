@@ -17,7 +17,7 @@ import numpy as np
 import shapely
 from scipy.interpolate import CubicSpline
 
-from .geometry import clean_polyline
+from .geometry import clean_polyline, ego_to_world
 
 
 VERSION = 'lane-frenet-centre-potential-1.0'
@@ -56,7 +56,10 @@ def compact_shape(rho):
 class LanePotentialGeometry:
     """A frozen smooth lane chart plus its explicit admissible field domain.
 
-    ``reference`` and ``domain`` use the same world or ego Cartesian frame.
+    ``reference`` and query points use one Cartesian frame. ``domain`` uses
+    that frame too unless ``domain_pose=(world_origin, world_heading)`` maps
+    queries from an ego frame into the domain's unchanged world frame. Only
+    points and normal vectors are transformed, never the polygon topology.
     ``anchor_s`` / ``anchors`` are coordinates in THIS chart's integrated arc
     length.  They must not be old polyline arc lengths from another reference.
     Per-point anchors and a bounded search window prevent selecting a remote
@@ -67,7 +70,7 @@ class LanePotentialGeometry:
     chart, uncovered endpoint or unconverged projection is invalid explicitly.
     """
 
-    def __init__(self, reference, domain, *, anchor_s=None,
+    def __init__(self, reference, domain, *, anchor_s=None, domain_pose=None,
                  projection_window_m=120., minimum_metric=.05):
         points = np.asarray(reference, float)
         if points.ndim != 2 or points.shape[1] != 2 or not np.isfinite(points).all():
@@ -78,6 +81,19 @@ class LanePotentialGeometry:
         if domain.geom_type not in ('Polygon', 'MultiPolygon'):
             raise ValueError('potential lane domain must be polygonal')
         self.domain = domain
+        self._domain_boundary = domain.boundary
+        self._domain_pose = None
+        self._domain_rotation = None
+        if domain_pose is not None:
+            origin, heading = domain_pose
+            origin = np.asarray(origin, float)
+            heading = float(heading)
+            if origin.shape != (2,) or not np.isfinite(origin).all() or not np.isfinite(heading):
+                raise ValueError('potential domain pose must be a finite 2D origin and heading')
+            self._domain_pose = (origin.copy(), heading)
+            self._domain_rotation = np.array([[np.cos(heading), -np.sin(heading)],
+                                             [np.sin(heading), np.cos(heading)]])
+        shapely.prepare(self.domain)
         self.projection_window_m = _positive(projection_window_m, 'projection_window_m')
         self.minimum_metric = _positive(minimum_metric, 'minimum_metric')
         if self.minimum_metric >= 1.:
@@ -102,8 +118,40 @@ class LanePotentialGeometry:
             'projection_jacobian': 'implicit_closest_point;curvature_metric_included',
             'projection_window_m': self.projection_window_m,
             'reference_length_m': self.length,
+            'domain_coordinates': 'query_frame' if domain_pose is None else 'unchanged_world_frame',
+            'domain_query': 'point_transform_only;polygon_topology_unchanged',
             'limitation': 'local_normal_chart;branch/window switches are not globally smooth',
         }
+
+    def _domain_points(self, points):
+        points = np.atleast_2d(np.asarray(points, float))
+        if points.ndim != 2 or points.shape[1] != 2 or not np.isfinite(points).all():
+            raise ValueError('potential domain queries must be finite (N,2) points')
+        return points if self._domain_pose is None else ego_to_world(points, *self._domain_pose)
+
+    def domain_contains(self, points):
+        """Inclusive membership in the original domain, including its boundary."""
+        query = self._domain_points(points)
+        return np.asarray(shapely.intersects_xy(self.domain, query[:, 0], query[:, 1]), bool)
+
+    def domain_clearance(self, points):
+        """Signed distance and inward normal, expressed in the query frame.
+
+        Positive inside, negative outside (including holes); at non-smooth
+        nearest-boundary choices this retains the existing local derivative.
+        The normal is a vector, so changing frames applies rotation only.
+        """
+        query = self._domain_points(points)
+        inside = np.asarray(shapely.intersects_xy(self.domain, query[:, 0], query[:, 1]), bool)
+        nearest = shapely.get_coordinates(shapely.get_point(
+            shapely.shortest_line(self._domain_boundary, shapely.points(query)), 0))
+        offset = query-nearest
+        distance = np.linalg.norm(offset, axis=1)
+        sign = np.where(inside, 1., -1.)
+        normal = sign[:, None]*offset/np.maximum(distance[:, None], 1e-10)
+        if self._domain_rotation is not None:
+            normal = normal @ self._domain_rotation
+        return sign*distance, normal
 
     def _integral(self, lo, hi):
         lo, hi = np.broadcast_arrays(np.asarray(lo, float), np.asarray(hi, float))
@@ -257,7 +305,7 @@ class LanePotentialGeometry:
                            'coverage': coverage, 'coordinate_valid': coordinate_valid,
                            'metric': metric, 'feet': curve})
         result = {key: np.concatenate([part[key] for part in output], axis=0) for key in output[0]}
-        result['domain_valid'] = np.asarray(shapely.intersects_xy(self.domain, points[:, 0], points[:, 1]), bool)
+        result['domain_valid'] = self.domain_contains(points)
         result['valid'] = result['coordinate_valid'] & (result['domain_valid'] if require_domain else True)
         return result
 

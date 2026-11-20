@@ -11,7 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'src'))
 from nine_grid.contracts import Actor, Lane, SceneSnapshot
 from nine_grid.lane_roles import PARAMETERS, trace_lane
-from nine_grid.navigation_connections import VERSION, confirmed_navigation_connections
+from nine_grid.navigation_connections import (VERSION, active_navigation_connection,
+                                              confirmed_navigation_connections)
+from nine_grid.object_scope import lane_role_geometry, select_scope_objects
 from nine_grid.potential_domain import build_lane_potential_domain
 
 
@@ -36,6 +38,16 @@ def fixture():
 
 def row(scene):
     return scene.diagnostics['navigation']['connections'][0]
+
+
+def active_bridge_fixture():
+    scene = fixture()
+    # A native nearest-lane label can identify the other branch while the body
+    # is following the independently validated, frozen navigation connector.
+    scene.ego.position = np.array([16., 0.])
+    scene.ego.lane_id = 'fork'
+    scene.diagnostics.update(reference_anchor_s=36., route_s=36.)
+    return scene
 
 
 class NavigationConnections(unittest.TestCase):
@@ -127,6 +139,66 @@ class NavigationConnections(unittest.TestCase):
         domain, evidence = build_lane_potential_domain(scene, front_m=5., rear_m=0.)
         self.assertFalse(domain.covers(Point(13., 0.)))
         self.assertEqual(evidence['navigation_connections'], [])
+
+    def test_current_connector_resolves_roles_without_changing_native_identity(self):
+        scene = active_bridge_fixture()
+        active = active_navigation_connection(scene)
+        self.assertIsNotNone(active)
+        self.assertEqual(active['evidence']['raw_lane_id'], 'fork')
+        traces, roads, _ = lane_role_geometry(scene)
+        self.assertEqual(traces['center']['lane_ids'], ['in', 'ring'])
+        self.assertEqual(traces['center']['current_lane_association']['to_lane_id'], 'ring')
+        self.assertEqual(scene.ego.lane_id, 'fork')
+        for side in ('left', 'right'):
+            self.assertIsNone(traces[side])
+            self.assertFalse(roads[side]['known'])
+            self.assertIsNone(roads[side]['crossable'])
+        domain, evidence = build_lane_potential_domain(scene)
+        self.assertTrue(domain.covers(Point(30., 0.)))
+        self.assertFalse(domain.covers(Point(16., 12.)))
+        self.assertEqual(evidence['current_lane_association']['raw_lane_id'], 'fork')
+        allowed = copy.deepcopy(scene.ego)
+        allowed.id, allowed.lane_id, allowed.position = 'exit_vehicle', 'ring', np.array([28., 0.])
+        branch = copy.deepcopy(scene.ego)
+        branch.id, branch.lane_id, branch.position = 'branch_vehicle', 'fork', np.array([16., 12.])
+        scene.actors = [allowed, branch]
+        selected, evidence = select_scope_objects(scene)
+        self.assertEqual([actor.id for actor in selected], ['exit_vehicle'])
+        self.assertEqual(evidence['objects']['exit_vehicle']['roles'], ['front'])
+
+    def test_explicit_current_lane_is_not_overridden_by_navigation(self):
+        scene = active_bridge_fixture()
+        traces, _, _ = lane_role_geometry(scene, current_lane_id='fork')
+        self.assertEqual(traces['center']['lane_ids'], ['fork'])
+        self.assertIsNone(traces['center'].get('current_lane_association'))
+
+    def test_connector_association_rejects_wrong_direction_band_anchor_and_evidence(self):
+        for case in ('reverse', 'outside_band', 'wrong_anchor', 'missing_anchor', 'forged_evidence'):
+            with self.subTest(case=case):
+                scene = active_bridge_fixture()
+                if case == 'reverse':
+                    scene.ego.heading = np.pi
+                elif case == 'outside_band':
+                    scene.ego.position[1] = 2.1
+                elif case == 'wrong_anchor':
+                    scene.diagnostics.update(reference_anchor_s=0., route_s=0.)
+                elif case == 'missing_anchor':
+                    scene.diagnostics.pop('reference_anchor_s')
+                    scene.diagnostics.pop('route_s')
+                else:
+                    row(scene)['validated'] = False
+                self.assertIsNone(active_navigation_connection(scene))
+                traces, _, _ = lane_role_geometry(scene)
+                self.assertEqual(traces['center']['lane_ids'], ['fork'])
+                self.assertIsNone(traces['center'].get('current_lane_association'))
+
+    def test_native_endpoint_is_not_mistaken_for_connector_interior(self):
+        for x in (8., 18.):
+            with self.subTest(x=x):
+                scene = active_bridge_fixture()
+                scene.ego.position = np.array([x, 0.])
+                scene.diagnostics.update(reference_anchor_s=x+20., route_s=x+20.)
+                self.assertIsNone(active_navigation_connection(scene))
 
 
 if __name__ == '__main__':

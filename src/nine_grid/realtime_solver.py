@@ -25,7 +25,7 @@ class Dynamics:
         wheelbase,rear=bicycle_geometry(length,wheelbase_m,rear_axle_to_center_m)
         ratio=rear/wheelbase
         u=ca.SX.sym('u',2*n);initial=ca.SX.sym('initial',4)
-        state=initial;columns=[state]
+        state=initial;columns=[state];dense_columns=[state]
         for k in range(n):
             acceleration,steering=u[2*k],u[2*k+1]
             beta=ca.atan(ratio*ca.tan(steering));step=dt/substeps
@@ -34,12 +34,18 @@ class Dynamics:
                 state=ca.vertcat(x+speed*ca.cos(heading+beta)*step,
                     y+speed*ca.sin(heading+beta)*step,
                     heading+speed/rear*ca.sin(beta)*step,speed+acceleration*step)
+                dense_columns.append(state)
             columns.append(state)
         states=ca.horzcat(*columns)
         sensitivity=ca.jacobian(ca.vec(states),u)
         self.function=ca.Function('vehicle_rollout',[u,initial],[states,sensitivity])
         self.state_function=ca.Function('vehicle_states',[u,initial],[states])
         self.sensitivity_function=ca.Function('vehicle_sensitivity',[u,initial],[sensitivity])
+        dense_states=ca.horzcat(*dense_columns)
+        self.dense_state_function=ca.Function('vehicle_dense_states',[u,initial],[dense_states])
+        self.dense_sensitivity_function=ca.Function('vehicle_dense_sensitivity',[u,initial],
+                                                  [ca.jacobian(ca.vec(dense_states),u)])
+        self.substeps=substeps
         self.n=n;self.build_seconds=time.perf_counter()-begin
 
     def __call__(self,controls,initial):
@@ -51,6 +57,13 @@ class Dynamics:
 
     def sensitivity(self,controls,initial):
         return self.sensitivity_function(np.asarray(controls).ravel(),initial).full().reshape(self.n+1,4,2*self.n)
+
+    def dense_rollout(self,controls,initial):
+        return self.dense_state_function(np.asarray(controls).ravel(),initial).full().T
+
+    def dense_sensitivity(self,controls,initial):
+        return self.dense_sensitivity_function(np.asarray(controls).ravel(),initial).full().reshape(
+            self.n*self.substeps+1,4,2*self.n)
 
 
 class QuadraticSolver:

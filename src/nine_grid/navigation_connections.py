@@ -117,6 +117,7 @@ def _validate(scene, row, lanes, pairs):
         return {'from_lane_id': source.id, 'to_lane_id': target.id,
                 'points': points, 'headings': headings, 'shape': shape,
                 'width_m': width, 'version': VERSION,
+                'route_s_interval_m': (float(route_s[0]), float(route_s[-1])),
                 'validation': 'directed_navigation_pair;native_end_attachment;frozen_route;full_body_drivable'}, None
     except (ValueError, TypeError, KeyError, IndexError, AttributeError):
         return None, 'malformed_connection_evidence'
@@ -157,3 +158,53 @@ def confirmed_navigation_connections(scene):
                 accepted[pair] = connection
     scene.assets[_CACHE_KEY] = {'fingerprint': fingerprint, 'connections': accepted, 'rejected': rejected}
     return accepted
+
+
+def active_navigation_connection(scene):
+    """以当前几何和冻结导航锚点识别正在行驶的连接，不改原生车道标签。
+
+    原生地图最近车道可能在平滑出口中途指向继续绕环的支路。只在中心
+    位于已核验曲线内部窄带、方向相容、同一冻结路线弧长一致且唯一时
+    返回连接。证据不足或多条曲线歧义时，调用者保持原车道归属。
+    """
+    try:
+        point = np.asarray(scene.ego.position, float)
+        heading = float(scene.ego.heading)
+        anchor = float(scene.diagnostics.get('reference_anchor_s',
+                                             scene.diagnostics.get('route_s')))
+        if point.shape != (2,) or not np.isfinite(point).all() or not math.isfinite(heading) or not math.isfinite(anchor):
+            return None
+        route = np.asarray(scene.route, float)
+        route = route[np.r_[True, np.linalg.norm(np.diff(route, axis=0), axis=1) > 1e-8]]
+        route_arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(route, axis=0), axis=1))]
+        if len(route_arc) < 2 or anchor < 0. or anchor > route_arc[-1]:
+            return None
+        anchor_point = np.array([np.interp(anchor, route_arc, route[:, dim]) for dim in range(2)])
+        matches = []
+        for connection in confirmed_navigation_connections(scene).values():
+            start, end = connection['route_s_interval_m']
+            if not start-ENDPOINT_TOLERANCE_M <= anchor <= end+ENDPOINT_TOLERANCE_M:
+                continue
+            if np.linalg.norm(anchor_point-point) > connection['width_m']/2+ENDPOINT_TOLERANCE_M:
+                continue
+            if not shapely.covers(connection['shape'], shapely.Point(point)):
+                continue
+            curve_s, tangent, distance = _project(connection['points'], point)
+            length = float(np.linalg.norm(np.diff(connection['points'], axis=0), axis=1).sum())
+            if not ENDPOINT_TOLERANCE_M < curve_s[0] < length-ENDPOINT_TOLERANCE_M:
+                continue
+            difference = abs((heading-float(tangent[0])+math.pi) % (2*math.pi)-math.pi)
+            if difference > .7:
+                continue
+            evidence = dict(version='active-navigation-connection-1.0',
+                from_lane_id=connection['from_lane_id'], to_lane_id=connection['to_lane_id'],
+                raw_lane_id=scene.ego.lane_id, resolved_from_lane_id=connection['from_lane_id'],
+                source='confirmed_directed_curve_current_geometry_and_frozen_route_anchor',
+                curve_s_m=float(curve_s[0]),
+                curve_length_m=length, center_distance_m=float(distance[0]),
+                heading_difference_rad=difference, route_s_interval_m=[start, end],
+                route_anchor_s_m=anchor)
+            matches.append(dict(connection=connection, evidence=evidence))
+        return matches[0] if len(matches) == 1 else None
+    except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+        return None
