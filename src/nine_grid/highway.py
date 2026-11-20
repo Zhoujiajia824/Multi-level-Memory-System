@@ -332,11 +332,27 @@ class HighwayAdapter:
             pieces.append(np.array([lane.position(s,0) for s in ss]))
         route = pieces[0]
         connections = []
-        for piece in pieces[1:]:
+        for pair_index,piece in enumerate(pieces[1:]):
             gap = float(np.linalg.norm(route[-1]-piece[0]))
             h0 = np.arctan2(*(route[-1]-route[-2])[::-1]); h1=np.arctan2(*(piece[1]-piece[0])[::-1])
             if gap > .2 or abs(wrap_angle(h1-h0)) > .1:
                 route,piece,detail = self._connect(route,piece)
+                # 同一条经过道路/转向采样核验的连接，供对象车道链和势场域使用。
+                # _navigation 始终从原生左手地图构造；初始化和换道重建都在此
+                # 显式转换证据，不能随 self._right_handed 状态重复翻转。
+                points=detail.pop('_points_native')
+                headings=detail.pop('_headings_native')
+                detail.update(version='confirmed-navigation-connection-1.0',
+                    from_lane_id=_lane_id(indexes[pair_index]),
+                    to_lane_id=_lane_id(indexes[pair_index+1]),
+                    points_world=(points*np.array([1.,-1.])).tolist(),
+                    headings_world=(-headings).tolist(),
+                    coordinates='world_xy_m_right_handed_y_negated_from_native',
+                    steering_limit=float(self.steer_max),
+                    ego_length_m=float(self.env.vehicle.LENGTH),
+                    ego_width_m=float(self.env.vehicle.WIDTH),
+                    validated=bool(detail['outside_samples']==0 and
+                                   detail['maximum_steering']<=self.steer_max))
                 connections.append(detail)
             route = np.vstack((route,piece))
         route = clean_polyline(route)
@@ -381,9 +397,13 @@ class HighwayAdapter:
                     outside=sum(not road_test.covers(Polygon(rectangle_corners(p,h,length,width))) for p,h in zip(points,headings))
                     excess=max(0.,float(np.abs(steering).max())-self.steer_max)
                     score=outside*10000+excess*1000+float(curvature.max())+scale*.001+abs(shift)*.0001
-                    if best is None or score<best[0]:best=(score,s0,s1,points,outside,float(curvature.max()),float(np.abs(steering).max()))
-        _,s0,s1,points,outside,curvature,max_steering=best
-        return np.vstack((before[before_arc<s0],points)),after[after_arc>s1],{"outside_samples":outside,"maximum_curvature":curvature,"maximum_steering":max_steering,"method":"road_checked_cubic_hermite"}
+                    if best is None or score<best[0]:best=(score,s0,s1,points,headings,outside,float(curvature.max()),float(np.abs(steering).max()))
+        _,s0,s1,points,headings,outside,curvature,max_steering=best
+        return np.vstack((before[before_arc<s0],points)),after[after_arc>s1],{
+            "outside_samples":outside,"maximum_curvature":curvature,
+            "maximum_steering":max_steering,"method":"road_checked_cubic_hermite",
+            "from_end_trim_m":float(before_arc[-1]-s0),"to_start_trim_m":float(s1),
+            '_points_native':points,'_headings_native':headings}
 
     def _goal_arc(self):
         if self.scenario == "highway": return float("inf")

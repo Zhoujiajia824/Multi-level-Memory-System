@@ -31,6 +31,9 @@
 !/scripts/check_model_object_scope.py
 !/scripts/check_lane_object_scope.py
 !/scripts/check_highway_truth_scope.py
+!/scripts/check_highway_navigation_connectors.py
+!/scripts/check_navigation_connection_domain.py
+!/scripts/check_roundabout_entry_regression.py
 !/scripts/check_grid_storage.py
 !/scripts/check_grid_memory_io.py
 !/scripts/check_grid_vector_retrieval.py

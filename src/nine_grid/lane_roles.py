@@ -11,6 +11,8 @@ import numpy as np
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
+from .navigation_connections import confirmed_navigation_connections
+
 ASSIGNMENT_PROTOCOL = "lane-topology-role-assignment-1.0"
 # 开发默认值；仅用于地图连接/数值消歧，不是交通安全距离。
 PARAMETERS = {"connection_gap_m": 2., "connection_angle_rad": math.pi / 3,
@@ -53,6 +55,20 @@ def _join(first, second):
     return _clean(np.vstack((first, second)))
 
 
+def _join_navigation_connection(first, second, connection):
+    """使用导航实际验证的曲线，不能将原生端点间隙直线计入范围。"""
+    first, second = _clean(first), _clean(second)
+    curve = connection['points']
+    source_s, _, _, source_error = project(first, curve[0])
+    target_s, _, _, target_error = project(second, curve[-1])
+    if max(source_error, target_error) > .05:
+        raise ValueError('已确认导航连接不再接于当前车道链，拒绝拼接')
+    first_arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(first, axis=0), axis=1))]
+    second_arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(second, axis=0), axis=1))]
+    return _clean(np.vstack((first[first_arc < source_s-1e-8], curve,
+                             second[second_arc > target_s+1e-8])))
+
+
 def _connection(source, target):
     """前后继必须端部相接且切向相容；不接受反向行驶的另一条车道。"""
     source, target = _clean(source), _clean(target)
@@ -78,6 +94,8 @@ def trace_lane(scene, origin_id, *, back_m=30., front_m=70., center_role=True):
     if len(points) < 2:
         return None
     used, decisions = [origin.id], []
+    confirmed = confirmed_navigation_connections(scene)
+    used_connections = []
     route = _clean(scene.route)
     route_line = LineString(route)
     _, source_foot, _, _ = project(points, scene.ego.position)
@@ -89,7 +107,12 @@ def trace_lane(scene, origin_id, *, back_m=30., front_m=70., center_role=True):
         ranked = []
         for lane in candidates:
             geometry = _clean(lane.center)
-            connection = _connection(source.center, geometry) if forward else _connection(geometry, source.center)
+            pair = (source.id, lane.id) if forward else (lane.id, source.id)
+            bridge = confirmed.get(pair)
+            connection = (_connection(source.center, geometry) if forward else
+                          _connection(geometry, source.center))
+            if bridge is not None:
+                connection = (float(np.linalg.norm(np.diff(bridge['points'], axis=0), axis=1).sum()), 0.)
             if connection is None:
                 continue
             line = LineString(geometry)
@@ -113,7 +136,10 @@ def trace_lane(scene, origin_id, *, back_m=30., front_m=70., center_role=True):
         best = ranked[0]
         decisions.append({"from": source.id, "to": best[2], "direction": "forward" if forward else "backward",
                           "source": "navigation_lane_ids" if best[0] == 0 else "public_topology_and_route_geometry",
-                          "alternatives": len(ranked)})
+                          "alternatives": len(ranked),
+                          "connection_geometry": ('confirmed_navigation_curve' if
+                              ((source.id, best[2]) if forward else (best[2], source.id)) in confirmed
+                              else 'native_lane_endpoints')})
         return best[3]
 
     before = origin
@@ -125,7 +151,11 @@ def trace_lane(scene, origin_id, *, back_m=30., front_m=70., center_role=True):
         if previous is None:
             break
         used.insert(0, previous.id)
-        points = _join(previous.center, points)
+        bridge = confirmed.get((previous.id, before.id))
+        points = (_join_navigation_connection(previous.center, points, bridge)
+                  if bridge is not None else _join(previous.center, points))
+        if bridge is not None:
+            used_connections.insert(0, bridge)
         before = previous
     after = origin
     for _ in range(PARAMETERS['max_chain_segments']):
@@ -137,11 +167,17 @@ def trace_lane(scene, origin_id, *, back_m=30., front_m=70., center_role=True):
         if following is None:
             break
         used.append(following.id)
-        points = _join(points, following.center)
+        bridge = confirmed.get((after.id, following.id))
+        points = (_join_navigation_connection(points, following.center, bridge)
+                  if bridge is not None else _join(points, following.center))
+        if bridge is not None:
+            used_connections.append(bridge)
         after = following
     shapes = [Polygon(lanes[key].polygon) for key in used if len(lanes[key].polygon) >= 3]
+    shapes.extend(connection['shape'] for connection in used_connections)
     return {"points": points, "lane_ids": used, "shape": unary_union(shapes) if shapes else None,
-            "ego_s": project(points, scene.ego.position)[0], "decisions": decisions}
+            "ego_s": project(points, scene.ego.position)[0], "decisions": decisions,
+            "navigation_connections": used_connections}
 
 
 def lane_owner(actor, lane_cache):

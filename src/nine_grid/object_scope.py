@@ -123,6 +123,11 @@ def select_scope_objects(scene, config=None):
                 belongs = any(body.intersection(cache[key][1]).intersection(
                     cache[key][2].buffer(cache[key][0].width/2, cap_style=2)).area >= 1e-5
                     for key in trace['lane_ids'] if key in cache)
+                if not belongs:
+                    # 原生车道端部之间的已验证导航连接同属这条链，不把
+                    # 连接上的当前物体误当路外；仍按下方曲线弧长40/20准入。
+                    belongs = any(body.intersection(link['shape']).area >= 1e-5
+                                  for link in trace.get('navigation_connections', []))
             if not belongs:
                 continue
             points = trace['points']
