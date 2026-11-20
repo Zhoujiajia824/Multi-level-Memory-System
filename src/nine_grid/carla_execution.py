@@ -81,6 +81,7 @@ class ControlTimeline:
         self.step_s = None
         self.revision = 0
         self.endpoint_speeds = []
+        self.source_speed_mps = None
         if physics_hz is not None and (type(physics_hz) is not int or physics_hz <= 0):
             raise ValueError('控制时钟物理频率必须为正整数')
         self.physics_hz = physics_hz
@@ -131,6 +132,7 @@ class ControlTimeline:
                 speed = max(0., speed + acceleration * float(step_s))
                 endpoints.append(speed)
         self.controls = checked
+        self.source_speed_mps = None if source_speed_mps is None else float(source_speed_mps)
         self.endpoint_speeds = endpoints
         self.source_time = float(source_time)
         self.step_s = float(step_s)
@@ -166,4 +168,117 @@ class ControlTimeline:
                 'remaining_segment_s': (((index+1)*self.step_ticks-age_ticks)/float(self.physics_hz)
                     if age_ticks is not None else (index+1)*self.step_s-age),
                 'target_speed_mps': self.endpoint_speeds[index] if self.endpoint_speeds else None,
+                'segment_start_speed_mps': (self.source_speed_mps if index == 0 else
+                    self.endpoint_speeds[index-1]) if self.endpoint_speeds else None,
                 'revision': self.revision, 'remaining_s': len(self.controls)*self.step_s-max(0., age)}
+
+
+class SignedAccelerationController:
+    """50Hz有符号加速度前馈和有界反馈；状态跨计划保留，不积累虚构速度目标。
+
+    throttle/brake是执行器归一化输入，前馈增益仍须真实CARLA闭环验收。
+    不依赖Ackermann内部将速度误差两次积分后才改变踏板的响应。
+    """
+    VERSION = 'signed-acceleration-feedforward-1.0'
+
+    def __init__(self, maximum_steering_rad, dt=.02, acceleration_min=-6.,
+                 acceleration_max=3., steering_rate=.8, settings=None):
+        settings = dict(settings or {})
+        defaults = {'throttle_full_acceleration_mps2': 6., 'brake_full_deceleration_mps2': 8.,
+                    'speed_kp': 1.5, 'acceleration_kp': .2, 'acceleration_ki': .4,
+                    'integral_limit_mps2': 1., 'stop_hold_brake': .5,
+                    'stop_speed_mps': .1, 'intent_deadband_mps2': .05}
+        if set(settings)-set(defaults):
+            raise ValueError('未知纵向执行参数：'+','.join(sorted(set(settings)-set(defaults))))
+        defaults.update(settings)
+        for name, value in defaults.items():
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                raise ValueError('纵向执行参数必须为有限非负数字：'+name)
+        if (defaults['throttle_full_acceleration_mps2'] <= 0 or
+                defaults['brake_full_deceleration_mps2'] <= 0 or
+                not 0 < defaults['stop_hold_brake'] <= 1):
+            raise ValueError('执行器前馈增益及停车保持参数非法')
+        values = (maximum_steering_rad, dt, acceleration_min, acceleration_max, steering_rate)
+        if (any(type(v) not in (int, float) or not math.isfinite(v) for v in values) or
+                maximum_steering_rad <= 0 or dt <= 0 or acceleration_min >= 0 or
+                acceleration_max <= 0 or steering_rate <= 0):
+            raise ValueError('执行控制器物理参数非法')
+        self.settings = defaults
+        self.maximum_steering = float(maximum_steering_rad)
+        self.dt, self.minimum, self.maximum = float(dt), float(acceleration_min), float(acceleration_max)
+        self.steering_rate = float(steering_rate)
+        self.integral = 0.
+        self.previous_intent = 0
+        self.last_tick = None
+        self.last_result = None
+        self._before_step = None
+        self._last_inputs = None
+        self.steering = None
+
+    def step(self, tick, acceleration, steering, target_speed, measured_speed,
+             measured_acceleration, actual_steering_rad=0.):
+        if type(tick) is not int or tick < 0:
+            raise ValueError('执行反馈需要非负整数物理帧')
+        values = (acceleration, steering, target_speed, measured_speed,
+                  measured_acceleration, actual_steering_rad)
+        if any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
+            raise ValueError('执行反馈必须为有限物理量')
+        if self.last_tick is not None:
+            if tick < self.last_tick:
+                raise ValueError('执行反馈物理帧倒退')
+            if tick == self.last_tick:
+                if values == self._last_inputs:
+                    return dict(self.last_result)
+                # 异步等待期间同帧接纳新计划：可替换本帧命令，但反馈积分只算一次。
+                self.integral, self.previous_intent, self.steering = self._before_step
+            elif tick != self.last_tick+1:
+                raise ValueError('执行反馈不能漏过物理帧')
+        if tick != self.last_tick:
+            self._before_step = (self.integral, self.previous_intent, self.steering)
+        cfg = self.settings
+        acceleration = max(self.minimum, min(self.maximum, acceleration))
+        speed_error = max(0., target_speed)-max(0., measured_speed)
+        acceleration_error = acceleration-measured_acceleration
+        deadband = cfg['intent_deadband_mps2']
+        intent = 1 if acceleration > deadband else -1 if acceleration < -deadband else 0
+        # 制动/起步切换不继承相反方向的积分，不限制真实物理减速响应。
+        if intent and intent != self.previous_intent:
+            self.integral = 0.
+        proposed_integral = max(-cfg['integral_limit_mps2'], min(cfg['integral_limit_mps2'],
+            self.integral+cfg['acceleration_ki']*acceleration_error*self.dt))
+        without_integral = acceleration+cfg['speed_kp']*speed_error+cfg['acceleration_kp']*acceleration_error
+        unsaturated = without_integral+proposed_integral
+        # 到达加速度限幅时，只允许能解除饱和的积分变化。
+        if not ((unsaturated > self.maximum and acceleration_error > 0) or
+                (unsaturated < self.minimum and acceleration_error < 0)):
+            self.integral = proposed_integral
+        requested_acceleration = max(self.minimum, min(self.maximum, without_integral+self.integral))
+        if intent < 0:
+            # 有明确制动意图时不能由滞后的正速度误差或积分生成油门。
+            # 仍允许反馈减弱过强制动；下界只保留明确的制动方向，不能反向给油。
+            requested_acceleration = min(requested_acceleration, .25*acceleration)
+        hold = (intent <= 0 and target_speed <= cfg['stop_speed_mps'] and
+                abs(measured_speed) <= cfg['stop_speed_mps'])
+        throttle = max(0., min(1., requested_acceleration/cfg['throttle_full_acceleration_mps2']))
+        brake = max(0., min(1., -requested_acceleration/cfg['brake_full_deceleration_mps2']))
+        if hold:
+            throttle, brake, self.integral = 0., max(brake, cfg['stop_hold_brake']), 0.
+        elif intent < 0:
+            throttle = 0.
+        # 与CARLA Ackermann相同的最大轮转角归一化；保留原左正坐标约定。
+        previous_steering = actual_steering_rad if self.steering is None else self.steering
+        change = self.steering_rate*self.dt
+        self.steering = max(-self.maximum_steering, min(self.maximum_steering,
+            max(previous_steering-change, min(previous_steering+change, steering))))
+        result = {'controller': self.VERSION, 'control_period_s': self.dt,
+            'planned_acceleration_mps2': acceleration, 'planned_steering_rad_left': steering,
+            'target_speed_mps': max(0., target_speed), 'measured_speed_mps': measured_speed,
+            'measured_longitudinal_acceleration_mps2': measured_acceleration,
+            'speed_error_mps': speed_error, 'acceleration_error_mps2': acceleration_error,
+            'integral_mps2': self.integral, 'requested_acceleration_mps2': requested_acceleration,
+            'throttle': throttle, 'brake': brake, 'stop_hold': hold,
+            'steer_normalized_right': -self.steering/self.maximum_steering,
+            'steering_rad_left': self.steering, 'maximum_steering_rad': self.maximum_steering}
+        self.previous_intent, self.last_tick, self.last_result = intent, tick, result
+        self._last_inputs = values
+        return dict(result)

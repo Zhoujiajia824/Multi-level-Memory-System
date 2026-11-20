@@ -1,5 +1,7 @@
 """Technical admission plus observed coverage, independent of planner success."""
 import hashlib
+import bisect
+import copy
 import json
 import math
 import re
@@ -15,14 +17,20 @@ MEASUREMENTS = ('body_on_road', 'wrong_way', 'speed_limit', 'collision_events', 
                 'traffic_lights', 'stop_signs', 'public_priority', 'complete_physical_ticks')
 INFRASTRUCTURE_KEYS = ('camera_width', 'camera_height', 'camera_fov', 'camera_height_m', 'camera_hz',
     'camera_save_hz', 'rgb_postprocess_effects', 'map_resolution_m', 'map_speed_cap_mps',
-    'same_level_tolerance_m', 'arrival_margin_m')
+    'same_level_tolerance_m', 'arrival_margin_m', 'longitudinal_control')
 
 
 def infrastructure_contract(config):
     missing = [key for key in INFRASTRUCTURE_KEYS if key not in config]
     if missing:
         raise ValueError('missing sensor/map contract: '+','.join(missing))
-    return {key: config[key] for key in INFRASTRUCTURE_KEYS}
+    from .carla_execution import SignedAccelerationController
+    settings=config['longitudinal_control']
+    if not isinstance(settings,dict):raise ValueError('longitudinal_control must be a mapping')
+    result={key:config[key] for key in INFRASTRUCTURE_KEYS}
+    result['longitudinal_control']=dict(SignedAccelerationController(.6,settings=settings).settings)
+    result['longitudinal_controller_version']=SignedAccelerationController.VERSION
+    return result
 
 
 def sdk_supported(version):
@@ -64,11 +72,123 @@ def _xy(row):
     raise ValueError('missing initial actor position')
 
 
+class _ProjectionMapReplay:
+    """Rebuild gates/cross sections from archived native map queries, not verdicts."""
+    def __init__(self,settings,task):
+        self.points=settings['route']['points'];self.task=task;self.corridors={};self.boundaries=None;self.widths=None
+
+    @staticmethod
+    def _waypoint(row):
+        values=list(row['position'])+[row['z'],row['heading_rad'],row['width_m']]
+        if len(row['position'])!=2 or any(type(x) not in (int,float) or not math.isfinite(x) for x in values):
+            raise ValueError('invalid archived native waypoint geometry')
+        keys=row['lane_id'].split('|')
+        if len(keys)!=3 or any(str(int(key))!=key for key in keys) or int(keys[-1])==0:
+            raise ValueError('invalid archived native waypoint identity')
+        if not isinstance(row['lane_type'],str):raise ValueError('missing native lane type')
+        return row
+
+    def _anchor(self,index,row):
+        if type(index) is not int or not 0<=index<len(self.points):raise ValueError('map evidence route index out of range')
+        self._waypoint(row);source=self.points[index]
+        identity='{}|{}|{}'.format(source['road_id'],source.get('section_id',0),source['lane_id'])
+        angle=(row['heading_rad']+math.radians(source['yaw_deg'])+math.pi)%(2*math.pi)-math.pi
+        if (row['lane_id']!=identity or row['lane_type']!='Driving' or not 0<row['width_m']<10.
+                or math.hypot(row['position'][0]-source['x_m'],row['position'][1]+source['y_m'])>.11
+                or abs(row['z']-source['z_m'])>.11 or abs(angle)>.02):
+            raise ValueError('archived map anchor differs from frozen route')
+        if self.widths is not None and abs(row['width_m']-self.widths[index])>1e-6:
+            raise ValueError('archived native widths disagree')
+
+    def update(self,payload,tick):
+        if payload is None:
+            if tick==0:raise ValueError('missing first-frame native route map evidence')
+            return
+        if (payload.get('version')!='carla-route-map-evidence-1.0' or
+                payload.get('physical_tick')!=tick or payload.get('source')!='native_public_waypoint_topology'):
+            raise ValueError('native map evidence version/source/tick mismatch')
+        if 'route_widths_m' in payload:
+            widths=payload['route_widths_m']
+            if (self.widths is not None or len(widths)!=len(self.points) or
+                    any(type(x) not in (int,float) or not math.isfinite(x) or not 0<x<10. for x in widths)):
+                raise ValueError('invalid or changed native route widths')
+            self.widths=list(widths)
+        if tick==0 and self.widths is None:raise ValueError('missing native route widths for physical replay')
+        if 'boundary_gates' in payload:
+            if self.boundaries is not None:raise ValueError('native boundary map changed during episode')
+            links={}
+            for gate in payload['boundary_gates']:
+                index=gate['index'];anchor=gate['route_waypoint'];self._anchor(index,anchor)
+                if index in links or gate['distance_m']!=3.:raise ValueError('invalid boundary query identity/distance')
+                accepted=[]
+                for direction in ('previous','next'):
+                    for other in gate[direction]:
+                        self._waypoint(other)
+                        if (math.cos(other['heading_rad']-anchor['heading_rad'])>.5
+                                and abs(other['z']-anchor['z'])<1.5 and other['lane_type']=='Driving'):
+                            accepted.append(other['lane_id'])
+                links[index]=accepted
+            if set(links)!={gate['index'] for gate in self.task.checkpoints}:
+                raise ValueError('native boundary evidence does not cover ordered gates')
+            self.boundaries=links;self.task.set_boundary_topology(links)
+        if tick==0 and self.boundaries is None:raise ValueError('missing initial boundary queries')
+        for key,raw in payload.get('corridors',{}).items():
+            index=int(key)
+            if str(index)!=key:raise ValueError('invalid cross-section index')
+            self._anchor(index,raw['route_waypoint'])
+            if index in self.corridors and self.corridors[index][0]!=raw:
+                raise ValueError('native cross section changed during episode')
+            anchor=raw['route_waypoint'];heading=anchor['heading_rad'];c,s=math.cos(heading),math.sin(heading)
+            lanes={anchor['lane_id']:{'offset_m':0.,'width_m':anchor['width_m']}}
+            previous={side:anchor['lane_id'] for side in ('left','right')}
+            if len(raw['neighbour_links'])>32:raise ValueError('excess native neighbour chain')
+            for link in raw['neighbour_links']:
+                other=self._waypoint(link['to_waypoint']);side=link['side'];source=link['from_lane_id']
+                if side not in previous or source!=previous[side] or other['lane_id'] in lanes:
+                    raise ValueError('disconnected native neighbour chain')
+                dx=other['position'][0]-anchor['position'][0];dy=other['position'][1]-anchor['position'][1]
+                offset=-s*dx+c*dy
+                if (other['lane_id'].split('|')[:2]!=anchor['lane_id'].split('|')[:2]
+                        or other['lane_type']!='Driving' or math.cos(other['heading_rad']-heading)<=.9
+                        or abs(other['z']-anchor['z'])>=1.5 or abs(c*dx+s*dy)>2.
+                        or not 0<other['width_m']<10.
+                        or abs(offset-lanes[source]['offset_m'])>(other['width_m']+lanes[source]['width_m'])/2.+.5):
+                    raise ValueError('invalid native neighbour geometry')
+                lanes[other['lane_id']]={'offset_m':offset,'width_m':other['width_m']};previous[side]=other['lane_id']
+            lower=min(lane['offset_m']-lane['width_m']/2. for lane in lanes.values())
+            upper=max(lane['offset_m']+lane['width_m']/2. for lane in lanes.values())
+            self.corridors[index]=(copy.deepcopy(raw),{'route_index':index,'route_lane_id':anchor['lane_id'],
+                'lanes':lanes,'lateral_interval_m':[lower,upper],'heading_rad':heading,
+                'maximum_distance_m':max(abs(lower),abs(upper))+.25,
+                'source':'native_same_section_same_direction_driving_neighbour_cross_section'})
+
+    def corridor(self,index,ego,route_s):
+        section=str(ego.get('lane_id','')).split('|')[:2]
+        def point_section(point):return [str(point['road_id']),str(point.get('section_id',0))]
+        if (point_section(self.points[index])!=section and index+1<len(self.points)
+                and point_section(self.points[index+1])==section):index+=1
+        if index not in self.corridors:raise ValueError('missing native cross section used by physical projection')
+        corridor=copy.deepcopy(self.corridors[index][1])
+        j=min(len(self.task.route)-2,max(0,bisect.bisect_right(self.task.arc,route_s)-1))
+        fraction=max(0.,min(1.,(route_s-self.task.arc[j])/max(1e-9,self.task.arc[j+1]-self.task.arc[j])))
+        point=[self.task.route[j][dim]+fraction*(self.task.route[j+1][dim]-self.task.route[j][dim]) for dim in (0,1)]
+        dx,dy=ego['position'][0]-point[0],ego['position'][1]-point[1]
+        c,s=math.cos(corridor['heading_rad']),math.sin(corridor['heading_rad'])
+        lateral,longitudinal=-s*dx+c*dy,c*dx+s*dy;lane=corridor['lanes'].get(ego.get('lane_id'))
+        contains=bool(lane is not None and math.cos(ego['heading']-corridor['heading_rad'])>=.5
+            and abs(longitudinal)<=1. and abs(lateral-lane['offset_m'])<=lane['width_m']/2.+.25)
+        corridor.update(observed_lane_id=ego.get('lane_id'),lateral_m=lateral,
+            longitudinal_residual_m=longitudinal,contains_observed_center=contains)
+        return corridor
+
+
 def _physics(directory, settings, initial, evaluation, errors):
     task = TaskCriteria(settings)
+    map_replay=_ProjectionMapReplay(settings,task)
+    task.projection_metadata=map_replay.corridor
     geometry = RouteGeometry([SimpleNamespace(transform=SimpleNamespace(location=SimpleNamespace(
         x=point['x_m'], y=point['y_m'], z=point['z_m']))) for point in settings['route']['points']])
-    hint = None
+    hint = 0;last_director_progress=0.;last_director_position=None
     source_actors = _actors(initial)
     roles = {role: str(row['carla_actor_id']) for role, row in source_actors.items()}
     if len(set(roles.values())) != len(roles):
@@ -91,10 +211,22 @@ def _physics(directory, settings, initial, evaluation, errors):
                 errors['source_alignment'].append('physical_instance_mismatch')
             previous_time = timestamp
             ego = row['ego']
-            progress, _, hint, _ = geometry.project(SimpleNamespace(
+            map_replay.update(row.get('route_map_evidence'),tick)
+            progress, _, candidate_hint, residual = geometry.project(SimpleNamespace(
                 x=ego['position'][0], y=-ego['position'][1], z=ego.get('z', 0.)), hint)
+            a,b=task.route[candidate_hint],task.route[candidate_hint+1]
+            heading_error=abs((ego['heading']-math.atan2(b[1]-a[1],b[0]-a[0])+math.pi)%(2*math.pi)-math.pi)
+            width=map_replay.widths[candidate_hint]
+            travel=(0. if last_director_position is None else math.hypot(
+                ego['position'][0]-last_director_position[0],ego['position'][1]-last_director_position[1]))
+            continuous=last_director_position is None or abs(progress-last_director_progress)<=max(2.,travel*1.5+1.)
+            director_valid=(residual<=max(3.,min(6.,1.5*width))
+                and heading_error<=math.pi/3 and continuous)
+            if director_valid:
+                hint=candidate_hint;last_director_progress=progress;last_director_position=list(ego['position'])
             clock[tick] = {'frame': frame, 'timestamp': timestamp, 'route_s_m': row.get('route_s_m'),
-                           'director_route_s_m': progress}
+                           'director_route_s_m': progress if director_valid else None,
+                           'director_projection_valid':director_valid,'director_projection_error_m':residual}
             if tick == 0:
                 actual = {str(actor['id']): actor for actor in [ego]+row.get('actors', [])}
                 for role, source_actor in source_actors.items():
@@ -117,9 +249,12 @@ def _physics(directory, settings, initial, evaluation, errors):
         errors['source_alignment'].append('insufficient_or_mismatched_physics')
     recomputed = task.report()
     reported = evaluation.get('task_criteria', {})
-    for key in ('route_checkpoints_completed', 'route_checkpoints_total', 'wrong_exit'):
+    for key in ('route_checkpoints_completed', 'route_checkpoints_total', 'wrong_exit',
+                'completed','projection_invalid_ticks'):
         if reported.get(key) != recomputed[key]:
             errors['route'].append('task_report_does_not_match_physical_observations:'+key)
+    if reported.get('route_projection',{}).get('valid')!=recomputed['route_projection']['valid']:
+        errors['route'].append('task_report_does_not_match_physical_observations:projection_valid')
     return clock, recomputed
 
 
@@ -318,7 +453,8 @@ def validate_runs(directories, coverage_directories=()):
             clock, task = _physics(directory, settings, initial, ev, errors)
             event_coverage = _event_coverage(directory, settings, ev, clock, errors, files)
             route_complete = (task['route_checkpoints_completed'] == task['route_checkpoints_total']
-                              and task['route_checkpoints_total'] >= 2 and not task['wrong_exit'])
+                              and task['route_checkpoints_total'] >= 2 and not task['wrong_exit']
+                              and task.get('completed') is True and task['route_projection']['valid'])
             row['coverage'] = {'route': route_complete, 'events': event_coverage['complete'],
                                'complete': route_complete and event_coverage['complete'],
                                'task': task, 'required_events': event_coverage}

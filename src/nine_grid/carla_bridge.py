@@ -14,9 +14,9 @@ import zlib
 from pathlib import Path
 
 try:
-    from .carla_execution import ControlTimeline, duration_tick_limit
+    from .carla_execution import ControlTimeline, SignedAccelerationController, duration_tick_limit
 except ImportError:
-    from carla_execution import ControlTimeline, duration_tick_limit
+    from carla_execution import ControlTimeline, SignedAccelerationController, duration_tick_limit
 
 
 class CameraMetadataError(RuntimeError):
@@ -439,6 +439,9 @@ class CarlaSession:
         self._entities_cache = None
         self._last_applied_control = None
         self._last_command = None
+        self._execution_controller = None
+        self._last_control_response = None
+        self._reference_transition = None
         self._applied_key = None
         self._pending_plan = None
         self._visualization = None
@@ -581,6 +584,13 @@ class CarlaSession:
                 selection['selected_spawn_index'],selection['interaction_length_m'],
                 selection['route_length_m'],selection_path),file=sys.stderr,flush=True)
         self.ego = self.experiment.ego
+        maximum_steering = max(float(wheel.max_steer_angle)
+            for wheel in self.ego.get_physics_control().wheels)
+        self._execution_controller = SignedAccelerationController(math.radians(maximum_steering),
+            dt=1./self.physics_hz, acceleration_min=self.timeline.minimum,
+            acceleration_max=self.timeline.maximum,
+            steering_rate=float(config.get('steering_rate_abs_max_radps', .8)),
+            settings=config.get('longitudinal_control'))
         self.route_wps = self.experiment.route_waypoints
         if len(self.route_wps) < 2:
             raise ValueError('场景未提供有效自车导航路线')
@@ -1291,6 +1301,11 @@ class CarlaSession:
             observation_age_s=None if self._latest is None else max(0., self._sim_time-self._latest['time']),
             observation_wall_age_s=None if self._latest_published_at is None else max(0., now-self._latest_published_at),
             worker_error=self._worker_error,
+            execution_controller=(None if self._execution_controller is None else
+                dict(version=self._execution_controller.VERSION,
+                     period_s=self._execution_controller.dt,
+                     maximum_steering_rad=self._execution_controller.maximum_steering,
+                     settings=dict(self._execution_controller.settings))),
             last_applied_control=copy.deepcopy(self._last_applied_control))
 
     def snapshot(self, include_cameras=True):
@@ -1337,7 +1352,10 @@ class CarlaSession:
             # scenario/evaluation channel, never in the planner observation.
             'collision': any(event.get('kind') == 'collision' and event.get('phase') == 'runtime'
                              for event in self.events), 'events': list(self.events),
-            'actual_actuation': {'throttle': actual.throttle, 'brake': actual.brake, 'steer_normalized_right': actual.steer},
+            'actual_actuation': {'throttle': actual.throttle, 'brake': actual.brake,
+                'steer_normalized_right': actual.steer, 'hand_brake': actual.hand_brake,
+                'reverse': actual.reverse, 'gear': actual.gear},
+            'control_response': copy.deepcopy(self._last_control_response),
             'current_road_evidence': road_evidence,
             'environment_obstacles': dict(self.environment_audit, in_range_count=static_count),
             'weather': weather_record, 'weather_source': ('scenario_weather_then_current_world_get_weather'
@@ -1455,6 +1473,15 @@ class CarlaSession:
             if not state['available']:
                 raise ValueError('新控制序列无法用于当前仿真时间：'+state['reason'])
             candidate.revision = self.timeline.revision+1
+            previous = self.timeline.at(self._sim_time, self._runtime_metrics['physical_ticks'])
+            previous_speed = previous.get('target_speed_mps') if previous.get('available') else None
+            self._reference_transition = {'source_frame': source_frame,
+                'source_speed_mps': source_speed_mps,
+                'previous_segment_endpoint_speed_mps': previous_speed,
+                'new_segment_endpoint_speed_mps': state['target_speed_mps'],
+                'endpoint_speed_jump_mps': (None if previous_speed is None else
+                    state['target_speed_mps']-previous_speed),
+                'policy': 'source_state_feedback_reference;actuator_feedback_state_retained'}
             self.timeline = candidate
             self._runtime_metrics['submitted_sequences'] = self._runtime_metrics.get('submitted_sequences', 0)+1
             self._runtime_metrics['last_submission_skipped_segments'] = state['index']
@@ -1472,37 +1499,81 @@ class CarlaSession:
             pending = self._pending_plan
             self._pending_plan = None
             source_time = self.timeline.source_time
+            source_tick = self.timeline.source_tick
+            source_frame = self._initial_source_frame+source_tick
         if pending is not None:
             self._visualization = self._show_plan(pending[1])
             self._visualization['sequence_revision'] = pending[0]
             self._visualization['source_carla_frame'] = pending[2]
-        key = (state['revision'], state['index'])
+        # 同计划同物理帧重复调用幂等。异步等待期间的新计划允许替换本帧命令，
+        # 控制器回到该帧反馈积分前状态再计算，不能重复积累同一帧误差。
+        tick = self._runtime_metrics['physical_ticks']
+        key = (tick, state['revision'], state['index'])
         if key != self._applied_key:
             acceleration, steering = state['control']
-            velocity = self.ego.get_velocity()
-            speed = math.sqrt(velocity.x**2+velocity.y**2+velocity.z**2)
+            speed, measured_acceleration = self._forward_kinematics()
             # 源时标中途接纳的段只执行剩余部分，过期段不重放。
             remaining = state['remaining_segment_s']
-            # CARLA0.9.15 Ackermann控制器将speed作为跟踪目标，acceleration的绝对值
-            # 是内部速度PID的加速度上限，并非直接加速度命令。每段目标速度必须
-            # 从源帧按已规划a序列累计，不能每段重新锚定滞后的实测速。
-            desired = state['target_speed_mps']
-            steering_rate = float(self.cfg.get('steering_rate_abs_max_radps', .8))
-            command = self.carla.VehicleAckermannControl(steer=-steering, speed=desired,
-                acceleration=abs(acceleration), steer_speed=steering_rate)
-            self.ego.apply_ackermann_control(command)
+            # v参考仍由规划原帧积分，取下一物理步目标；有符号a直接参与踏板前馈，
+            # 不再让小速度误差经Ackermann两层增量PID弱化制动/起步意图。
+            elapsed_in_segment = self.control_step_s-remaining
+            desired = max(0., state['segment_start_speed_mps']+
+                acceleration*min(self.control_step_s, elapsed_in_segment+1./self.physics_hz))
+            if self._execution_controller is None:
+                raise RuntimeError('车辆执行控制器尚未按真实轮转角初始化')
+            actual = self.ego.get_control()
+            requested = self._execution_controller.step(tick, acceleration, steering, desired,
+                speed, measured_acceleration,
+                -float(actual.steer)*self._execution_controller.maximum_steering)
+            command = self.carla.VehicleControl(throttle=requested['throttle'], brake=requested['brake'],
+                steer=requested['steer_normalized_right'], hand_brake=False, reverse=False,
+                manual_gear_shift=False)
+            self.ego.apply_control(command)
             self._last_command = {'acceleration_mps2': acceleration, 'steering_rad_left': steering,
-                'speed_mps_ackermann': desired, 'measured_speed_mps': speed,
-                'speed_error_mps': desired-speed, 'ackermann_acceleration_limit_mps2': abs(acceleration),
-                'ackermann_steering_rate_rps': steering_rate,
-                'actuation_mapping': 'source_speed_plus_planned_acceleration_integral-1.0'}
+                'planned_segment_endpoint_speed_mps': state['target_speed_mps'],
+                'target_speed_mps': desired, 'measured_speed_mps': speed,
+                'speed_error_mps': desired-speed, 'requested_actuation': requested,
+                'reference_transition': copy.deepcopy(self._reference_transition),
+                'actuation_mapping': SignedAccelerationController.VERSION}
             self._last_applied_control = dict(self._last_command, sequence_index=state['index'],
                 sequence_revision=state['revision'], source_time=source_time,
-                source_tick=self.timeline.source_tick, applied_tick=self._runtime_metrics['physical_ticks'],
+                source_frame=source_frame, source_tick=source_tick, applied_tick=tick,
                 applied_time=self._sim_time, frame=self.frame,
                 control=[acceleration, steering], remaining_segment_s=remaining)
             self._applied_key = key
         return True
+
+    def _forward_kinematics(self):
+        transform = self.ego.get_transform()
+        forward = transform.get_forward_vector()
+        velocity, acceleration = self.ego.get_velocity(), self.ego.get_acceleration()
+        speed = velocity.x*forward.x+velocity.y*forward.y+velocity.z*forward.z
+        measured_acceleration = (acceleration.x*forward.x+acceleration.y*forward.y+
+                                 acceleration.z*forward.z)
+        return float(speed), float(measured_acceleration)
+
+    def _read_control_response(self):
+        if self._last_applied_control is None:
+            return None
+        actual = self.ego.get_control()
+        speed, acceleration = self._forward_kinematics()
+        response = copy.deepcopy(self._last_applied_control)
+        response.update(observed_frame=self.frame,
+            observed_tick=self._runtime_metrics['physical_ticks'],
+            observed_time=self._sim_time, measured_speed_after_mps=speed,
+            measured_acceleration_after_mps2=acceleration,
+            actual_actuation={'throttle': float(actual.throttle), 'brake': float(actual.brake),
+                'steer_normalized_right': float(actual.steer), 'hand_brake': bool(actual.hand_brake),
+                'reverse': bool(actual.reverse), 'gear': int(actual.gear)},
+            semantics='command_applied_before_tick;actual_control_and_motion_observed_after_tick')
+        requested = response['requested_actuation']
+        response['pedal_readback_matches_request'] = (abs(actual.throttle-requested['throttle']) <= .01 and
+            abs(actual.brake-requested['brake']) <= .01)
+        response['braking_intent_with_actual_throttle'] = (response['acceleration_mps2'] < -.05 and
+            actual.throttle > .01)
+        # 只记录实际响应，不把踏板指令一致当成加速度/安全已验收。
+        response['acceleration_tracking_error_after_mps2'] = response['acceleration_mps2']-acceleration
+        return response
 
     def _tick_once(self):
         previous_frame = self.world.get_snapshot().frame
@@ -1523,9 +1594,11 @@ class CarlaSession:
                 previous_frame, self.frame, snap.frame))
         self._sample_history()
         self.experiment.after_tick(self.frame, self._runtime_metrics['physical_ticks'], snap)
+        self._last_control_response = self._read_control_response()
         if self.evaluation_probe is not None:
             self._evaluation = self.evaluation_probe.observe(snap, self._runtime_metrics['physical_ticks'],
-                events=list(self.events), scenario_events=self.experiment.evaluation_state())
+                events=list(self.events), scenario_events=self.experiment.evaluation_state(),
+                control_execution=self._last_control_response)
             if any(item.get('kind') == 'initialization_collision'
                    for item in self._evaluation.get('infrastructure_errors', [])):
                 self._terminal_reason = 'initialization_collision'

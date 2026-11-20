@@ -65,14 +65,14 @@ class PhysicalProbe:
     def __init__(self, directory):
         self.evaluator = EpisodeEvaluator([[0., 0.], [10., 0.]], directory=directory)
 
-    def observe(self, snapshot, tick, events=(), scenario_events=None):
+    def observe(self, snapshot, tick, events=(), scenario_events=None, control_execution=None):
         ego = {'id': 'ego', 'kind': 'vehicle', 'position': [6.7+.1*tick, 0.],
                'heading': 0., 'length': 4., 'width': 2., 'velocity': [5., 0.],
                'acceleration': [0., 0.]}
         road = {'body_on_road': True, 'wrong_way': False, 'speed_limit_mps': 10.,
                 'coverage': {key: True for key in self.evaluator.coverage}}
         return self.evaluator.observe(tick, snapshot.frame, snapshot.timestamp.elapsed_seconds,
-            ego, [], road, events, scenario_events)
+            ego, [], road, events, scenario_events, control_execution=control_execution)
 
     def ingest_events(self, events):
         self.evaluator.ingest_events(events)

@@ -9,7 +9,7 @@ import unittest
 from types import SimpleNamespace as NS
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'src'))
-from nine_grid.carla_evaluation import EpisodeEvaluator, CarlaEvaluationProbe
+from nine_grid.carla_evaluation import EpisodeEvaluator, CarlaEvaluationProbe, _boundary_topology
 
 
 def state(x=0., speed=2., identity='ego'):
@@ -58,6 +58,78 @@ class EvaluationTests(unittest.TestCase):
         observe(e, 0)
         self.assertFalse(e.report('timeout')['route_completed'])
         self.assertFalse(e.report('timeout')['strict_success'])
+
+    def test_loop_projection_loss_freezes_progress_and_preserves_real_violations(self):
+        e = EpisodeEvaluator([[0., 0.], [100., 0.], [100., 100.], [0., 100.], [0., 0.]])
+        observe(e, 0, state(0.))
+        observe(e, 1, state(.2))
+        before = e.progress_s
+        lost = state(.3); lost['position'] = [80., 70.]
+        result = observe(e, 2, lost, events=[{'kind': 'red_light', 'frame': 102, 'id': '38'}])
+        self.assertFalse(result['route_projection']['valid'])
+        self.assertEqual(e.progress_s, before)
+        self.assertIsNone(result['route_completion'])
+        self.assertIsNone(result['progress_m'])
+        self.assertIn('red_light', result['violations'])
+        self.assertTrue(result['infrastructure_valid'])
+        self.assertFalse(result['route_measurement_valid'])
+        self.assertFalse(result['arrival'])
+
+    def test_parallel_return_leg_cannot_relocate_to_another_loop_segment(self):
+        e = EpisodeEvaluator([[0., 0.], [50., 0.], [50., 3.5], [0., 3.5]])
+        observe(e, 0, state(0.))
+        ego = state(.1); ego['position'][1] = 3.5
+        result = observe(e, 1, ego)
+        self.assertLess(e.progress_s, 1.)
+        self.assertFalse(result['arrival'])
+
+    def test_projection_can_correct_backward_within_supported_local_branch(self):
+        e = self.evaluator()
+        observe(e, 0, state(2.))
+        observe(e, 1, state(1.9))
+        self.assertAlmostEqual(e.progress_s, 1.9)
+        self.assertTrue(e.report()['route_projection']['valid'])
+
+    def test_destination_lane_and_original_three_metre_margin_are_required(self):
+        e = EpisodeEvaluator([[0., 0.], [4., 0.]], settings={'arrival_lane_id': '1|0|-1'})
+        wrong = state(2.); wrong['lane_id'] = '1|0|-2'
+        self.assertFalse(observe(e, 0, wrong)['arrival'])
+        outside = state(.9)
+        self.assertFalse(observe(e, 1, outside)['arrival'])
+        self.assertTrue(observe(e, 2, state(2.))['arrival'])
+
+    def test_destination_heading_must_match_original_route(self):
+        e = EpisodeEvaluator([[0., 0.], [4., 0.]], settings={'arrival_lane_id': '1|0|-1'})
+        ego = state(2.);ego['heading'] = math.pi
+        result = observe(e, 0, ego)
+        self.assertFalse(result['arrival'])
+        self.assertGreater(result['arrival_evidence']['heading_error_rad'], math.pi/3)
+
+    def test_control_execution_is_bound_to_the_completed_physical_observation(self):
+        output_root = Path(__file__).resolve().parents[1]/'outputs'
+        output_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='verify_actuation_', dir=str(output_root)) as directory:
+            e = self.evaluator(directory=directory)
+            evidence = {'source_frame': 95, 'applied_tick': 0, 'observed_tick': 1,
+                        'planned_acceleration_mps2': -4., 'actual_actuation': {'throttle': 0., 'brake': .7}}
+            e.observe(0, 100, 123., state(), [], road(), scenario_events={'scenario_valid': True},
+                      control_execution=evidence)
+            row = json.loads((Path(directory)/'physical_evaluation.jsonl').read_text(encoding='utf-8'))
+            self.assertEqual(row['control_execution'], evidence)
+            self.assertEqual(row['frame'], 100)
+
+    def test_boundary_links_come_from_native_directed_nearby_topology(self):
+        calls=[]
+        def waypoint(road,yaw=0.,z=0.):
+            return NS(road_id=road,section_id=0,lane_id=2,lane_width=3.5,lane_type='Driving',
+                transform=NS(rotation=NS(yaw=yaw),location=NS(x=0.,y=0.,z=z)))
+        start=waypoint(2);before=waypoint(676);reversed_lane=waypoint(9,180.);overpass=waypoint(10,z=5.)
+        start.previous=lambda distance:calls.append(('previous',distance)) or [before,reversed_lane,overpass]
+        start.next=lambda distance:calls.append(('next',distance)) or [waypoint(2)]
+        links=_boundary_topology([start],[{'index':0}])
+        self.assertEqual(calls,[('previous',3.),('next',3.)])
+        self.assertIn('676|0|2',links[0])
+        self.assertNotIn('9|0|2',links[0]);self.assertNotIn('10|0|2',links[0])
 
     def test_final_frame_collision_received_after_arrival_is_retained(self):
         e = EpisodeEvaluator([[0., 0.], [4., 0.]])
@@ -251,6 +323,42 @@ class MutatingTransform:
 
 
 class ProbeTests(unittest.TestCase):
+    def test_native_same_road_cross_section_supports_seven_metre_legal_lateral_offset(self):
+        def waypoint(lane,y):
+            return NS(road_id=1,section_id=0,lane_id=lane,lane_width=3.5,lane_type='Driving',
+                transform=NS(rotation=NS(yaw=0.),location=NS(x=0.,y=-y,z=0.)))
+        a,b,c=waypoint(1,0.),waypoint(2,3.5),waypoint(3,7.)
+        a.get_left_lane=lambda:b;a.get_right_lane=lambda:None
+        b.get_left_lane=lambda:c;b.get_right_lane=lambda:a
+        c.get_left_lane=lambda:None;c.get_right_lane=lambda:b
+        for identity,y,heading,expected in (('1|0|3',7.,0.,True),('9|0|3',7.,0.,False),
+                                            ('1|0|3',20.,0.,False),('1|0|3',7.,math.pi,False)):
+            probe=CarlaEvaluationProbe.__new__(CarlaEvaluationProbe)
+            probe.evaluator=EpisodeEvaluator([[0.,0.],[100.,0.]])
+            probe._route_waypoints=[a,a];probe._projection_corridors={}
+            probe.evaluator.projection_metadata=probe._projection_corridor
+            ego=state(0.);ego.update(lane_id=identity,position=[0.,y],heading=heading)
+            result=observe(probe.evaluator,0,ego)
+            with self.subTest(lane=identity,y=y,heading=heading):
+                self.assertEqual(result['route_projection']['valid'],expected)
+                self.assertFalse(result['arrival'])
+                if expected:
+                    self.assertGreater(result['route_projection']['max_distance_m'],7.)
+                    self.assertAlmostEqual(probe.evaluator.progress_s,0.)
+                    probe._route_boundary_evidence=[];probe._route_boundary_published=False
+                    evidence=probe._pop_route_map_evidence(0)
+                    self.assertEqual(evidence['version'],'carla-route-map-evidence-1.0')
+                    self.assertIn('boundary_gates',evidence)
+                    native=evidence['corridors']['0']
+                    self.assertEqual(native['route_waypoint']['position'],[0.,0.])
+                    self.assertEqual(native['neighbour_links'][1]['to_waypoint']['position'],[0.,7.])
+                    self.assertIsNone(probe._pop_route_map_evidence(1))
+        # Numeric IDs cannot invent a connection or widen an independent road.
+        a.get_left_lane=lambda:None
+        probe._projection_corridors={}
+        ego.update(lane_id='1|0|3',position=[0.,7.],heading=0.)
+        self.assertFalse(probe._projection_corridor(0,ego,0.)['contains_observed_center'])
+
     def test_priority_actor_identity_survives_observed_junction_lane_transition(self):
         p = CarlaEvaluationProbe.__new__(CarlaEvaluationProbe)
         p.evaluator = EpisodeEvaluator([[0., 0.], [100., 0.]])
@@ -330,11 +438,14 @@ class ProbeTests(unittest.TestCase):
         p = CarlaEvaluationProbe.__new__(CarlaEvaluationProbe)
         p.evaluator = EpisodeEvaluator([[0., 0.], [100., 0.]])
         p._stops, p._stop_regions, p.public_rules = [], [], []
-        wp = NS(transform=NS(rotation=NS(yaw=0.), location=NS(x=10., y=0., z=0.)), lane_width=3.5)
+        wp = NS(transform=NS(rotation=NS(yaw=0.), location=NS(x=10., y=0., z=0.)), lane_width=3.5,
+                road_id=1, section_id=0, lane_id=-1)
         p._lights = [(NS(id=7, get_state=lambda: 'Red'), wp)]
         p._previous_ego = state(7.9)
         events = p._rules(state(8.1), [], 5, {})
         self.assertEqual(events[0]['kind'], 'red_light')
+        self.assertEqual(events[0]['crossing_evidence']['controlled_lane_id'], '1|0|-1')
+        self.assertGreater(events[0]['crossing_evidence']['front_signed_distance_m'], 0.)
         p._previous_ego = state(8.1)
         self.assertEqual(p._rules(state(8.2), [], 6, {}), [])
         previous, current = state(7.9), state(8.1)

@@ -52,14 +52,15 @@ class EventState:
 
 
 class SignalProgram:
-    """Stable map-based groups; a single light per junction group can be green.
+    """One phase per verified incoming approach, rather than per lamp head.
 
-    Conservative sequential phases avoid inferring which approaches are compatible.
-    All phases are frozen during sensor warmup and restarted at official tick zero.
+    Only stop-waypoint road/section, direction and tangent establish an approach.
+    Different or unknown approaches remain exclusive: lamp orientation does not
+    establish compatible movements. Every treatment receives this same program.
     """
     def __init__(self,world,carla,config):
         self.carla=carla;self.config=config;self.groups=[];self.saved=[];self.states={}
-        self.last_signature=None
+        self.last_signature=None;self.phase_evidence=[]
         lights=list(world.get_actors().filter('traffic.traffic_light*'))
         seen=set()
         def key(light):
@@ -72,12 +73,51 @@ class SignalProgram:
                 if member.id not in seen:
                     self.saved.append((member,member.get_state(),bool(member.is_frozen())))
                     seen.add(member.id)
-            self.groups.append(group)
+            phases=[];approaches=[]
+            for member in group:
+                incoming=self._incoming_approach(member)
+                index=next((i for i,previous in enumerate(approaches)
+                    if incoming is not None and previous is not None
+                    and incoming[0]==previous[0]
+                    and all(abs(wrap(a-b))<math.radians(20.)
+                        for a,b in zip(incoming[1],previous[1]))),None)
+                if index is None:
+                    phases.append([member]);approaches.append(incoming)
+                else:phases[index].append(member)
+            self.groups.append(phases)
+            self.phase_evidence.append({'phases':[{
+                'light_ids':[str(member.id) for member in phase],
+                'incoming_sections':None if approach is None else [list(key) for key in approach[0]],
+                'source':'stop_waypoint_incoming_road_section_direction' if approach is not None else 'unknown_single_light',
+                } for phase,approach in zip(phases,approaches)],
+                'different_approaches':'exclusive_no_unverified_opposing_flow_merge'})
         try:
             for light,_,_ in self.saved:light.freeze(True)
             self.apply(0)
         except BaseException:
             self.close();raise
+
+    @staticmethod
+    def _incoming_approach(light):
+        """Do not guess an approach from a pole transform or a missing map link."""
+        try:points=list(light.get_stop_waypoints())
+        except (AttributeError,RuntimeError):return None
+        if not points:return None
+        by_section={}
+        for point in points:
+            if not all(hasattr(point,key) for key in ('road_id','section_id','lane_id','transform')):
+                return None
+            if point.lane_id==0:return None
+            key=(int(point.road_id),int(point.section_id),1 if point.lane_id>0 else -1)
+            angle=math.radians(float(point.transform.rotation.yaw))
+            if not math.isfinite(angle):return None
+            by_section.setdefault(key,[]).append(angle)
+        keys=tuple(sorted(by_section));headings=[]
+        for key in keys:
+            angles=by_section[key]
+            if any(abs(wrap(angle-angles[0]))>=math.radians(20.) for angle in angles):return None
+            headings.append(math.atan2(sum(math.sin(a) for a in angles),sum(math.cos(a) for a in angles)))
+        return keys,tuple(headings)
 
     def apply(self,tick):
         green=self.config.get('green_ticks',500);yellow=self.config.get('yellow_ticks',150)
@@ -86,12 +126,13 @@ class SignalProgram:
         for group in self.groups:
             phase=(tick+self.config.get('offset_ticks',0))%(slot*len(group))
             active=phase//slot;within=phase%slot
-            for index,light in enumerate(group):
+            for index,lights in enumerate(group):
                 name='Red'
                 if index==active:name='Green' if within<green else ('Yellow' if within<green+yellow else 'Red')
-                if self.states.get(light.id)!=name:
-                    light.set_state(getattr(self.carla.TrafficLightState,name));self.states[light.id]=name
-                signature.append(name)
+                for light in lights:
+                    if self.states.get(light.id)!=name:
+                        light.set_state(getattr(self.carla.TrafficLightState,name));self.states[light.id]=name
+                    signature.append(name)
         changed=tuple(signature)!=self.last_signature;self.last_signature=tuple(signature)
         return changed
 
@@ -116,6 +157,7 @@ class Experiment:
         self._pending_initial_velocities=[];self.ego=None;self._closed=False
         self._signals=None;self._weather=None;self._stops=[];self._errors=[];self._ego_stops={};self._stop_regions={}
         self._tick=-1;self._frame=None;self._ego_hint=None;self._ego_s=0.
+        self._ego_projection={'valid':False,'reason':'not_observed'};self._ego_projection_position=None
         self._state={};self.physics_hz=50
         try:self._setup()
         except BaseException:
@@ -181,7 +223,8 @@ class Experiment:
                         'lane_id':lane_id(wp),'must_stop':True,'source':source,'route_s_m':s,'hold_start_tick':None,'completed_tick':None,
                         'hold_region_carla':hold_region}
         self.events.append({'event':'instance_created','instance_hash':self.settings['instance_hash'],
-            'map':self.road_map.name,'signal_policy':'map_groups_sequential_physical_ticks',
+            'map':self.road_map.name,'signal_policy':'map_incoming_approach_exclusive_physical_ticks',
+            'signal_phases':copy.deepcopy(self._signals.phase_evidence),
             'route_task':self.settings['route'].get('task',{}),'server_acceptance':'pending'})
 
     @staticmethod
@@ -330,7 +373,7 @@ class Experiment:
             for row in self._rows:
                 actor=row['actor'];source=row['source'];event=row['event']
                 if not actor.is_alive:raise RuntimeError('scenario actor disappeared: '+source['role'])
-                if source['behavior'] not in ('follow','parked'):
+                if source['behavior'] not in ('follow','parked') and self._ego_projection.get('valid',False):
                     event.consider(tick,self._ego_s,self._gap(row))
                 self._flush_events(row)
                 if source['type']=='pedestrian':
@@ -352,8 +395,30 @@ class Experiment:
         if tick!=self._tick+1:raise RuntimeError('scenario after_tick must receive every physical state exactly once')
         if self._frame is not None and frame!=self._frame+1:raise RuntimeError('external world tick detected by scenario director')
         self._tick,self._frame=tick,frame
-        self._ego_s,_,self._ego_hint,_=self.geometry.project(self._center(self.ego),self._ego_hint)
-        for item in self._ego_stops.values():
+        center=self._center(self.ego)
+        candidate_s,_,candidate_hint,error=self.geometry.project(center,0 if self._ego_hint is None else self._ego_hint)
+        a=self.geometry.points[candidate_hint].transform.location
+        b=self.geometry.points[min(candidate_hint+1,len(self.geometry.points)-1)].transform.location
+        heading_error=abs(wrap(math.radians(self.ego.get_transform().rotation.yaw)-math.atan2(b.y-a.y,b.x-a.x)))
+        width=float(getattr(self.geometry.points[candidate_hint],'lane_width',3.5))
+        maximum_error=max(3.,min(6.,1.5*width))
+        previous_position=getattr(self,'_ego_projection_position',None)
+        travel=0. if previous_position is None else math.hypot(center.x-previous_position[0],center.y-previous_position[1])
+        continuous=(previous_position is None or abs(candidate_s-self._ego_s)<=max(2.,travel*1.5+1.))
+        valid=error<=maximum_error and heading_error<=math.pi/3 and continuous
+        previous_valid=getattr(self,'_ego_projection',{}).get('valid')
+        self._ego_projection={'valid':valid,'euclidean_error_m':error,'maximum_error_m':maximum_error,
+            'heading_error_rad':heading_error,'continuous':continuous,'candidate_s_m':candidate_s,
+            'reason':None if valid else 'outside_local_route_projection_gate',
+            'policy':'last_valid_anchor_local_window_no_global_relocalization'}
+        if valid:
+            self._ego_s,self._ego_hint=candidate_s,candidate_hint
+            self._ego_projection_position=(center.x,center.y)
+        if previous_valid is not None and previous_valid!=valid:
+            self.events.append({'event':'scenario_route_projection_recovered' if valid else 'scenario_route_projection_invalid',
+                'tick':tick,'frame':frame,'last_valid_route_s_m':self._ego_s,
+                'projection':copy.deepcopy(self._ego_projection)})
+        for item in (self._ego_stops.values() if valid else []):
             distance_to_stop=item['route_s_m']-self._ego_s-self._half_along_route(self.ego,self.geometry,self._ego_hint)
             region=item.get('hold_region_carla')
             if region:
@@ -400,6 +465,7 @@ class Experiment:
         self._state={'version':'carla-scenario-events-2.0','instance_hash':self.settings['instance_hash'],
             'coordinate_contract':copy.deepcopy(COORDINATE_CONTRACT),
             'tick':self._tick,'frame':self._frame,'ego_s_m':self._ego_s,'route_length_m':self.geometry.length,
+            'ego_route_projection':copy.deepcopy(self._ego_projection),
             'scenario_valid':not self._errors,'errors':list(self._errors),
             'events':[r['event'].payload() for r in self._rows],
             'actor_tracking':{r['source']['role']:copy.deepcopy(r['tracking']) for r in self._rows},

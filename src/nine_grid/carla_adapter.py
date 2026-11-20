@@ -17,7 +17,7 @@ import zlib
 
 import numpy as np
 from PIL import Image, ImageDraw
-from shapely.geometry import Polygon, Point, LineString
+from shapely.geometry import Polygon, Point
 from shapely.ops import unary_union
 
 from .contracts import Actor, Lane, SceneSnapshot, plain
@@ -25,7 +25,8 @@ from .paths import filesystem_path
 from .carla_bridge import camera_storage_due
 from .carla_execution import duration_tick_limit
 from .carla_public_priority import PublicPriorityTracker
-from .geometry import actor_shape, clean_polyline, polyline_lengths, project_polyline, sample_polyline
+from .geometry import (actor_shape, clean_polyline, polyline_lengths, project_polyline,
+                       sample_polyline, checked_route_projection, wrap_angle)
 from .object_scope import scope_scene
 
 
@@ -383,6 +384,11 @@ class CarlaAdapter:
         self._public_priority = PublicPriorityTracker()
         self._next_history = 0.
         self._route_s = None
+        self._route_projection = None
+        self._projection_position = None
+        self._projection_frame = None
+        self._projection_tick = None
+        self._navigation_status = 'following'
         self._previous_control = np.zeros(2)
         self._planned = None
         self._recorder = None
@@ -504,6 +510,8 @@ class CarlaAdapter:
             self.crosswalks = mapping.get('crosswalks')
             self._navigation_route = self.route.copy()
             self._navigation_lane_ids = list(self.route_lane_ids)
+            self._goal_position = self._navigation_route[-1].copy()
+            self._goal_lane_id = self._navigation_lane_ids[-1]
             self._goal_s = float(polyline_lengths(self.route)[-1]) - float(self.cfg.get('arrival_margin_m', 3.))
             if not set(self.route_lane_ids).issubset({l.id for l in self.lanes}):
                 raise ValueError('自车路线超出已提取的同层地图；不能补造缺失车道')
@@ -562,36 +570,8 @@ class CarlaAdapter:
                 fields[key] = value[key]
         return Actor(**fields)
 
-    def _lane_route(self, start_lane):
-        """沿已知自车道路分支连接新车道，不修改导航目的地，不访问周车路线。"""
-        lanes = {lane.id: lane for lane in self.lanes}
-        sections = [tuple(identity.split('|')[:2]) for identity in self._navigation_lane_ids]
-        section = tuple(start_lane.id.split('|')[:2])
-        if section not in sections:
-            raise ValueError('换道后的道路不属于已知导航分支')
-        index = sections.index(section)
-        chain = [start_lane]
-        for target_section in sections[index + 1:]:
-            if target_section == tuple(chain[-1].id.split('|')[:2]):
-                continue
-            options = [lanes[key] for key in chain[-1].successors if key in lanes
-                       and tuple(key.split('|')[:2]) == target_section]
-            if not options:
-                raise ValueError('目标车道缺少通向已知导航下一路段的公开连接')
-            chain.append(min(options, key=lambda lane: (np.linalg.norm(lane.center[0]-chain[-1].center[-1]), lane.id)))
-        path = clean_polyline(np.vstack([lane.center for lane in chain]))
-        start = max(0., project_polyline(self._navigation_route[0], path)[0]) if index == 0 else 0.
-        end = project_polyline(self._navigation_route[-1], path)[0]
-        if end-start < 2.:
-            raise ValueError('目标车道导航延伸长度不足')
-        arc = polyline_lengths(path)
-        path = clean_polyline(np.vstack([sample_polyline(path, start), path[(arc>start)&(arc<end)], sample_polyline(path, end)]))
-        if not self.drivable.buffer(.02).covers(LineString(path)):
-            raise ValueError('新车道导航连接穿出公开可行驶区域，不能直线补造连接')
-        return path, [lane.id for lane in chain]
-
     def _confirm_lane(self, ego, timestamp):
-        """半车体进入邻道并持续0.3秒后切换坐标参考；保持导航进度连续。"""
+        """半车体进入邻道持续0.3秒后确认实际车道；冻结任务路线不随之平移。"""
         candidate = ego.lane_id
         if candidate is None or candidate == self._confirmed_lane:
             self._pending_lane = self._pending_since = None
@@ -616,18 +596,87 @@ class CarlaAdapter:
             self._pending_lane, self._pending_since = candidate, timestamp
         if timestamp-self._pending_since+1e-8 < float(settings.get('lane_switch_hold_s', .3)):
             return
-        path, identities = self._lane_route(new)
-        old_progress = project_polyline(ego.position, self.route, self._route_s, ego.heading)[0]+self._progress_offset
-        new_progress = project_polyline(ego.position, path, heading=ego.heading)[0]
-        self.route, self.route_lane_ids = path, identities
-        self._progress_offset = old_progress-new_progress
-        self._route_s = new_progress
-        self._goal_s = float(polyline_lengths(path)[-1])-float(self.cfg.get('arrival_margin_m', 3.))
+        # 导航路线/终点不可因实际换道平移。局部参考负责在合法邻道行驶及归道，
+        # 规则、进度和到达始终使用同一条冻结任务路线。
         self._confirmed_lane = candidate
         self._pending_lane = self._pending_since = None
         self._reference_revision += 1
 
-    def _project_public_stop(self, position):
+    def _update_navigation(self, ego, frame):
+        if self._projection_frame == frame:
+            return self._route_projection
+        travel = (0. if self._projection_position is None else
+                  float(np.linalg.norm(ego.position-self._projection_position)))
+        tick = self._raw.get('runtime',{}).get('physical_ticks',0)
+        elapsed = 0. if self._projection_tick is None else max(0.,tick-self._projection_tick)/self.cfg['physics_hz']
+        physical_reach = max(2.,float(np.linalg.norm(ego.velocity))*elapsed+3.*elapsed**2+1.)
+        measured_jump = self._projection_position is not None and travel > physical_reach
+        travel = min(travel,physical_reach)
+        window = 20. if self._route_s is None else max(4., 2.*travel+2.)
+        projection = checked_route_projection(ego.position, self.route,
+            0. if self._route_s is None else self._route_s, ego.heading, window=window)
+        if (not projection['valid'] and projection['reason']=='distance_exceeded' and
+                abs(projection['distance_m']-abs(projection['lateral_m'])) < .5):
+            maximum=self._cross_section_limit(ego.lane_id,projection['position'])
+            current_lane=next((lane for lane in self.lanes if lane.id==ego.lane_id),None)
+            if (maximum>6. and current_lane is not None and
+                    Polygon(current_lane.polygon).buffer(.01).covers(Point(ego.position))):
+                projection=checked_route_projection(ego.position,self.route,
+                    0. if self._route_s is None else self._route_s,ego.heading,
+                    window=window,maximum_distance=maximum)
+        if measured_jump:
+            projection.update(valid=False,reason='observed_displacement_exceeds_reachable_distance')
+        if projection['valid']:
+            self._route_s = projection['s_m']
+        elif self._route_s is None:
+            self._route_s = 0.
+        self._projection_position = ego.position.copy()
+        self._projection_frame = frame
+        self._projection_tick = tick
+        self._route_projection = projection
+        total = float(polyline_lengths(self._navigation_route)[-1])
+        end_delta=self._navigation_route[-1]-self._navigation_route[-2]
+        heading = float(np.arctan2(end_delta[1],end_delta[0]))
+        beyond = float((ego.position-self._goal_position) @ np.array([np.cos(heading),np.sin(heading)]))
+        missed = (self._route_s >= total-15. and
+                  (beyond > 1. or (beyond >= -3. and ego.lane_id != self._goal_lane_id)))
+        # 一旦错过任务终点只受控制动，禁止把下一圈解释为同一任务的延伸。
+        if self._navigation_status != 'destination_missed':
+            self._navigation_status = ('destination_missed' if missed else
+                'following' if projection['valid'] else 'route_projection_invalid')
+        return projection
+
+    def _cross_section_limit(self, current_id, navigation_position):
+        """只按同路段公开相邻车道的真实横截面扩展投影距离，不接纳平行道路。"""
+        lanes={lane.id:lane for lane in self.lanes}
+        current=lanes.get(current_id)
+        if current is None:return 6.
+        section=tuple(str(current_id).split('|')[:2])
+        roots=[lane for lane in self.lanes if lane.id in self._navigation_lane_ids
+            and tuple(str(lane.id).split('|')[:2])==section
+            and Polygon(lane.polygon).buffer(.01).covers(Point(navigation_position))]
+        seen=set();pending=roots[:]
+        while pending:
+            lane=pending.pop()
+            if lane.id in seen:continue
+            seen.add(lane.id)
+            if lane.id==current_id:
+                s,_,heading=project_polyline(navigation_position,current.center)
+                base=sample_polyline(current.center,s)
+                delta=base-np.asarray(navigation_position)
+                # 只允许横向宽度，不能以纵向端点残差扩展搜索走廊。
+                tangent=np.array([np.cos(heading),np.sin(heading)])
+                if abs(float(delta@tangent))>.5:return 6.
+                return max(6.,float(np.linalg.norm(delta))+current.width/2.)
+            for key in (lane.left,lane.right):
+                other=lanes.get(key)
+                if other is None or tuple(str(key).split('|')[:2])!=section:continue
+                a=project_polyline(navigation_position,lane.center)[2]
+                b=project_polyline(navigation_position,other.center)[2]
+                if abs(float(wrap_angle(a-b)))<.3:pending.append(other)
+        return 6.
+
+    def _project_public_stop(self, position, lane_id=None):
         """Project public stop geometry onto the upcoming navigation, without a 40m cap.
 
         A lateral residual alone is insufficient at a clipped polyline endpoint:
@@ -641,7 +690,15 @@ class CarlaAdapter:
             return None
         path = clean_polyline(np.vstack((sample_polyline(self.route, start), remaining)))
         s, _, _ = project_polyline(position, path)
-        if np.linalg.norm(position-sample_polyline(path, s)) >= 3.:
+        # 邻道停止线可有一条车道宽的横向偏差，仍沿冻结导航弧长约束。
+        # 只为实际当前车道/导航声明车道放宽几何关联；其他道路不参与。
+        maximum = (self._cross_section_limit(lane_id,sample_polyline(path,s))
+                   if lane_id == self._raw['ego']['lane_id'] else 3.)
+        tangent = project_polyline(position, path)[2]
+        lane = next((item for item in self.lanes if item.id == lane_id), None)
+        if lane is not None and abs(float(wrap_angle(project_polyline(position,lane.center)[2]-tangent))) > .7:
+            return None
+        if np.linalg.norm(position-sample_polyline(path, s)) >= maximum:
             return None
         s += start
         return float(s) if s >= self._route_s-.1 else None
@@ -676,7 +733,7 @@ class CarlaAdapter:
                 del self._history[identity]
         for actor in [ego] + actors:
             actor.history = copy.deepcopy(self._history.get(actor.id, []))
-        self._route_s = project_polyline(ego.position, self.route, self._route_s, ego.heading)[0]
+        self._update_navigation(ego, raw['frame'])
         applied_evidence=raw.get('last_applied_control')
         if isinstance(applied_evidence,dict):
             applied_evidence=applied_evidence.get('control')
@@ -741,21 +798,38 @@ class CarlaAdapter:
             camera_images = [{'view': 'multi_camera_mosaic', 'path': str(mosaic_path.resolve()),
                               'frame_id': frame_id, 'time': timestamp}]
         stop_s, light_records = None, []
+        unmapped_current_red = False
         for light in raw.get('traffic_lights', []):
             relevant = []
+            current_red_unmapped = False
+            considered_stops = []
             for stop in light['stops']:
-                if stop['lane_id'] not in self.route_lane_ids:
+                if stop['lane_id'] not in self.route_lane_ids and stop['lane_id'] != ego.lane_id:
                     continue
-                s = self._project_public_stop(stop['position'])
+                considered_stops.append(stop)
+                s = self._project_public_stop(stop['position'], stop['lane_id'])
                 if s is not None:
                     relevant.append(s)
+                elif stop['lane_id'] == ego.lane_id and light['state'] in ('red','yellow'):
+                    lane = next((item for item in self.lanes if item.id == ego.lane_id), None)
+                    if lane is not None:
+                        ego_lane_s = project_polyline(ego.position,lane.center)[0]
+                        stop_lane_s = project_polyline(stop['position'],lane.center)[0]
+                        current_red_unmapped |= bool(0. <= stop_lane_s-ego_lane_s <= 40.)
+                        unmapped_current_red |= current_red_unmapped
             if not relevant:
+                if current_red_unmapped:
+                    light_records.append({'id':light['id'],'state':light['state'],'stop_s':None,
+                        'association':'current_lane_stop_unmapped','stops':copy.deepcopy(considered_stops)})
                 continue
             s = min(relevant)
-            light_records.append({'id': light['id'], 'state': light['state'], 'stop_s': s})
+            light_records.append({'id': light['id'], 'state': light['state'], 'stop_s': s,
+                                  'association':'controlled_lane_and_geometry','stops':copy.deepcopy(considered_stops)})
             if light['state'] in ('red', 'yellow'):
                 stop_s = s if stop_s is None else min(stop_s, s)
         desired = float(self.cfg.get('desired_speed_mps', 10.))
+        remaining = float(polyline_lengths(self.route)[-1])-self._route_s
+        desired = min(desired, float(np.sqrt(2.*3.*max(0.,remaining-1.5))))
         public = raw.get('public_road_rules') or {'rules': []}
         if public.get('rules') or public.get('stop_obligations'):
             if (public.get('frame') != raw['frame'] or
@@ -821,11 +895,19 @@ class CarlaAdapter:
             'traffic_lights': light_records, 'crosswalks': self.crosswalks or [],
             'map_available': {'crosswalk': self.crosswalks is not None, 'traffic_light': True, 'stop_line': True},
             'road_priority_available': bool(public.get('rules')) and priority_complete and priority_state['available'],
-            'goal_s': self._goal_s, 'public_road_rules': copy.deepcopy(public),
+            'goal_s': self._goal_s, 'goal_position':self._goal_position.tolist(),
+            'goal_lane_id':self._goal_lane_id, 'goal_remaining_m':remaining,
+            'destination_stop_s':float(polyline_lengths(self.route)[-1])+ego.length/2.-1.5,
+            'navigation_status':self._navigation_status,
+            'navigation_brake_required':self._navigation_status != 'following' or unmapped_current_red,
+            'unmapped_current_red':unmapped_current_red,
+            'public_road_rules': copy.deepcopy(public),
             'priority_map_complete': priority_complete, 'public_priority_screen': priority_state}
         cycle_result = self._result(raw)
         cycle_result.pop('evaluation', None)
         diagnostics = {'route_s': self._route_s, 'reference_anchor_s': self._route_s,
+            'route_projection':copy.deepcopy(self._route_projection),
+            'navigation_status':self._navigation_status,
             'navigation_progress_m': self._route_s+self._progress_offset, 'stable_navigation_lane_id': self._confirmed_lane,
             'previous_control': self._previous_control.tolist(), 'reference_revision': self._reference_revision,
             'lane_map_complete': map_complete, 'visibility_wkt': observed_wkt,
@@ -881,14 +963,17 @@ class CarlaAdapter:
     def _result(self,raw):
         """控制提交和独立时钟观测采用相同的终态与导航审计。"""
         ego = self._convert_actor(raw['ego'])
-        progress, lateral, _ = project_polyline(ego.position, self.route, self._route_s, ego.heading)
+        projection = self._update_navigation(ego,raw['frame'])
+        progress, lateral = self._route_s, projection['lateral_m']
         offroad = not self.drivable.buffer(float(self.config.get('mpc', {}).get('body_constraint_tolerance_m', .001))).covers(actor_shape(ego))
         collision = bool(raw['collision'])
-        arrival = progress >= self._goal_s and abs(lateral) < 2.5 and not collision and not offroad
+        arrival = (projection['valid'] and progress >= self._goal_s and abs(lateral) < 2.5
+            and np.linalg.norm(ego.position-self._goal_position) <= float(self.cfg.get('arrival_margin_m',3.))
+            and ego.lane_id == self._goal_lane_id and not collision and not offroad)
         measured = raw.get('evaluation')
         if measured:
             collision = bool(measured.get('collision')) or collision
-            arrival = bool(measured.get('arrival'))
+            arrival = arrival and bool(measured.get('arrival'))
         runtime=raw.get('runtime',{})
         ticks=runtime.get('physical_ticks')
         if type(ticks) is not int or ticks < 0:
@@ -897,10 +982,16 @@ class CarlaAdapter:
         timeout = ticks >= duration_tick_limit(self.cfg['duration_s'], self.cfg['physics_hz'])
         runtime_reason=runtime.get('terminal_reason')
         runtime_failure=runtime_reason if runtime_reason not in (None,'duration','arrival','collision') else None
+        if runtime_reason == 'arrival' and not arrival:
+            runtime_failure = 'arrival_audit_mismatch'
+        navigation_stop = (self._navigation_status if self._navigation_status != 'following'
+            and np.linalg.norm(ego.velocity) < .2 else None)
+        runtime_failure = runtime_failure or navigation_stop
         reason=runtime_failure or ('collision' if collision else 'arrival' if arrival else 'timeout' if timeout else 'running')
-        return {'terminated': bool(collision or arrival or timeout or runtime_reason),
+        return {'terminated': bool(collision or arrival or timeout or runtime_reason or navigation_stop),
             'collision': collision, 'arrival': arrival,'offroad': offroad, 'timeout': timeout,
             'time': raw['time'], 'progress': progress+self._progress_offset,'reason':reason,
+            'route_projection':copy.deepcopy(projection),'navigation_status':self._navigation_status,
             'carla_frame': raw['frame'], 'control_response': raw.get('control_response'), 'events': raw.get('events', []),
             'runtime':copy.deepcopy(runtime),'bridge_timing':copy.deepcopy(raw.get('bridge_timing',{})),
             'evaluation': copy.deepcopy(measured),

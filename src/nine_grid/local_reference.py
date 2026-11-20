@@ -110,16 +110,26 @@ class LocalReferenceManager:
 
     def _continuation(self, scene, lane, lanes):
         """只沿导航声明的有序道路分支，不能从 successors 任挑一个出口。"""
-        if lane.id in scene.route_lane_ids:
+        anchor=scene.diagnostics.get('reference_anchor_s',scene.diagnostics.get('route_s'))
+        nav_s=project_polyline(scene.ego.position,scene.route,anchor,scene.ego.heading)[0]
+        nav_point=sample_polyline(scene.route,nav_s)
+        nav_heading=project_polyline(nav_point,scene.route,nav_s,scene.ego.heading)[2]
+        lane_heading=project_polyline(scene.ego.position,lane.center,heading=scene.ego.heading)[2]
+        if (lane.id in scene.route_lane_ids and
+                Polygon(lane.polygon).buffer(.01).covers(Point(nav_point)) and
+                abs(float(wrap_angle(nav_heading-lane_heading)))<.7):
             # 平台导航已处理路口/环岛入口出口的几何连接。重新拼原始车道中心
             # 会丢掉连接曲线，甚至因端点间隙提前截断，使车停在入口或出口前。
             # 邻道不在导航序列时仍使用下方拓扑核验，不能强行拉回旧车道。
-            return clean_polyline(scene.route).copy()
+            arc=polyline_lengths(scene.route)
+            start=max(0.,nav_s-20.);end=min(float(arc[-1]),nav_s+self.p['lookahead_m']+20.)
+            return clean_polyline(np.vstack((sample_polyline(scene.route,start),
+                scene.route[(arc>start)&(arc<end)],sample_polyline(scene.route,end))))
         path = np.asarray(lane.center, float).copy()
         ordered = scene.route_lane_ids
         own_segment = self._segment(lane.id)
-        index = next((i for i, key in enumerate(ordered)
-                      if self._segment(key) == own_segment), None)
+        matches=[i for i,key in enumerate(ordered) if self._segment(key)==own_segment]
+        index=(matches[-1] if scene.rules.get('goal_remaining_m',float('inf'))<90. else matches[0]) if matches else None
         if index is None:
             return path
         current = lane
@@ -180,6 +190,9 @@ class LocalReferenceManager:
         return True
 
     def _legal(self, scene, source, target, lanes):
+        destination_lane = self._destination_route_lane(scene, source)
+        if destination_lane == source.id and target.id != source.id:
+            return '终点接近阶段保留任务目标车道'
         if target.id not in (source.left, source.right):
             return "不是同向相邻车道"
         if not self._shared_crossable(source, target, scene.ego.position):
@@ -194,8 +207,20 @@ class LocalReferenceManager:
 
     def _navigation_change_needed(self, scene, source, target, lanes):
         """当前车道无法继续既定导航时，优先选择可接入的合法邻道。"""
+        destination_lane = self._destination_route_lane(scene, source)
+        if destination_lane is not None:
+            return source.id != destination_lane and target.id == destination_lane
         return (not self._navigation_compatible(scene,source,source,lanes)
                 and self._navigation_compatible(scene,source,target,lanes))
+
+    def _destination_route_lane(self, scene, source):
+        """终点前提前回到原任务路线的车道；仍必须通过合法性/车隙验收。"""
+        remaining = scene.rules.get('goal_remaining_m')
+        if remaining is None or remaining > max(140.,8.*np.linalg.norm(scene.ego.velocity)+60.):
+            return None
+        matches=[key for key in scene.route_lane_ids if self._segment(key)==self._segment(source.id)]
+        # 回环路线起终点可同 road/section，终点接近阶段取最终声明车道。
+        return matches[-1] if matches else None
 
     def _right_overtake_reason(self, scene, source, target, lanes, traffic=None):
         """限制绕过慢前车的右侧超车，不把普通右变道或归右一并禁止。"""
@@ -452,6 +477,10 @@ class LocalReferenceManager:
                       or scene.time-self.state["last_completed_at"]>=self.p["dwell_s"])
         can_change = can_change and (self.state.get("last_cancelled_at") is None
                                     or scene.time-self.state["last_cancelled_at"]>=self.p["dwell_s"])
+        destination_lane=self._destination_route_lane(scene,current)
+        if destination_lane is not None and destination_lane != current.id:
+            # 必需归道不受“无收益换道后的驻留”阻挡；车隙/标线/完整车体复核仍照常。
+            can_change=True
         candidate_due = (self.state.get("last_candidate_time") is None
                          or scene.time-self.state["last_candidate_time"]>=self.p["candidate_period_s"]-1e-8)
         if can_change and candidate_due:

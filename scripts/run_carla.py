@@ -168,13 +168,20 @@ def platform_configuration(data,args,scene_path):
     allowed={'python','host','port','timeout_s','allow_world_reset','camera_width','camera_height',
         'camera_fov','camera_height_m','arrival_margin_m','map_resolution_m',
         'map_speed_cap_mps','same_level_tolerance_m','runtime_mode','planner_hz','camera_hz',
-        'world_plan_debug','display_plan_overlay','camera_save_hz','rgb_postprocess_effects','display_queue_frames'}
+        'world_plan_debug','display_plan_overlay','camera_save_hz','rgb_postprocess_effects','display_queue_frames',
+        'longitudinal_control'}
     if set(data['carla'])-allowed:
         raise ValueError('carla包含未实现字段：'+str(sorted(set(data['carla'])-allowed)))
     scene,experiment,source=scene_configuration(scene_path,args.seed)
     if args.map is not None and args.map!=scene['map']:
         raise ValueError('锁定路线禁止--map换图；请选择对应地图的场景文件')
     cfg=copy.deepcopy(data['carla'])
+    from nine_grid.carla_execution import SignedAccelerationController
+    longitudinal=cfg.get('longitudinal_control',{})
+    if not isinstance(longitudinal,dict):raise ValueError('carla.longitudinal_control必须为参数对象')
+    # Only validates the SDK-independent controller and expands effective defaults.
+    # The measured steering geometry is installed by the bridge during setup.
+    cfg['longitudinal_control']=copy.deepcopy(SignedAccelerationController(.6,settings=longitudinal).settings)
     cfg.setdefault('runtime_mode','sync')
     if getattr(args,'runtime_mode',None) is not None:
         cfg['runtime_mode']=args.runtime_mode

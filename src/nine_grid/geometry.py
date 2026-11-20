@@ -101,6 +101,39 @@ def sample_polyline(reference, s):
     return np.stack([np.interp(s, arc, reference[:, dim]) for dim in range(2)], axis=-1)
 
 
+def checked_route_projection(position, reference, previous_s=None, heading=None,
+                             window=8., maximum_distance=6., maximum_heading=np.pi/3):
+    """有界导航投影，显式检验真实欧氏残差；不执行全局最近点重定位。
+
+    原 project_polyline 的三元组用于几何计算，保持兼容。导航调用者必须
+    仅在 valid 时推进锚点；端点之外的纵向残差也属于 distance，不能用 d
+    替代。失效不意味着碰撞/离路，也不自动把另一圈或平行道路当作当前路线。
+    """
+    point = np.asarray(position, float)
+    path = clean_polyline(reference)
+    offset = 0.
+    if previous_s is not None:
+        arc = polyline_lengths(path)
+        offset = max(0., min(float(arc[-1])-1e-7,float(previous_s)-window))
+        end = max(offset+1e-7,min(float(arc[-1]),float(previous_s)+window))
+        # 真正裁剪线段内部的弧长范围；仅筛选长线段仍可在段内跳过整个窗口。
+        path = clean_polyline(np.vstack((sample_polyline(path,offset),
+            path[(arc>offset)&(arc<end)],sample_polyline(path,end))))
+    local_s, d, tangent = project_polyline(point, path, heading=heading)
+    s = local_s+offset
+    closest = sample_polyline(path, local_s)
+    distance = float(np.linalg.norm(point-closest))
+    angle = 0. if heading is None else abs(float(wrap_angle(heading-tangent)))
+    valid = bool(distance <= maximum_distance and angle <= maximum_heading)
+    return {'valid': valid, 's_m': s, 'lateral_m': d,
+            'distance_m': distance, 'heading_error_rad': angle,
+            'heading_rad': tangent, 'position': closest.tolist(),
+            'reason': ('distance_exceeded' if distance > maximum_distance else
+                       'heading_mismatch' if angle > maximum_heading else None),
+            'anchor_s_m': previous_s, 'window_m': float(window),
+            'maximum_distance_m': float(maximum_distance)}
+
+
 def rectangle_separation(corners_a, corners_b):
     """分离轴最大间隙；正值分离、负值穿透，不把零净距误当安全。"""
     a, b = np.asarray(corners_a), np.asarray(corners_b)

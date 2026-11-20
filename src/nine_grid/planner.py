@@ -167,6 +167,9 @@ class Planner:
         lanes={lane.id:lane for lane in scene.lanes}
         ego_lane=lanes.get(scene.ego.lane_id)
         reason=scene.rules.get("wait_reason")
+        destination_stop=scene.rules.get('destination_stop_s')
+        if destination_stop is not None and (stop_s is None or destination_stop < stop_s):
+            stop_s=float(destination_stop);reason='固定任务终点前减速停车'
         rules=self.config.get("rules",{})
         stop_margin=float(rules.get("stop_margin_m",1.))
         self.rule_evidence=[]
@@ -266,6 +269,8 @@ class Planner:
         _validate_prediction_input(scene,predictions,n*dt)
         # 完整输入必须先验明；局部MPC视图不污染模型、检索、反思和独立审计。
         scene,predictions,object_selection=planning_view(scene,predictions,self.config,answer)
+        navigation_brake=bool(scene.rules.get('navigation_brake_required',False))
+        _brake_only = _brake_only or navigation_brake
         wheelbase,rear=bicycle_geometry(scene.ego.length,scene.ego.wheelbase_m,scene.ego.rear_axle_to_center_m)
         axle_ratio=rear/wheelbase
         cold_start=not getattr(self,'_has_solved',False);self._has_solved=True
@@ -1125,6 +1130,8 @@ class Planner:
             'warm_start_across_goal_update':bool(warm and new_goal_active),
             'warm_start_rejection_reason':warm_rejection,
             'deadline_missed':elapsed>budget,'deadline_budget_seconds':budget,'must_wait':stop_s is not None,'wait_reason':wait_reason,'stop_s':stop_s,
+            'navigation_brake_required':navigation_brake,
+            'navigation_status':scene.rules.get('navigation_status'),
             'rule_evidence':self.rule_evidence,'rule_observation_scope':self.rule_observation_scope,
             'initial_constraints':initial_diagnostics,
             'map_rejections':[{'actor_id':identity,'reason':info.get('reason'),

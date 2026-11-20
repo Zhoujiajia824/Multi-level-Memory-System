@@ -13,6 +13,17 @@ carla:
   runtime_mode: sync
   # 重规划可选1/2/10Hz；同步模式默认10Hz，计算结束后再执行0.1秒。
   planner_hz: 10
+  # 50Hz踏板执行：有符号a前馈+速度/加速度反馈；默认标定待真实闭环验收。
+  longitudinal_control:
+    throttle_full_acceleration_mps2: 6.0
+    brake_full_deceleration_mps2: 8.0
+    speed_kp: 1.5
+    acceleration_kp: 0.2
+    acceleration_ki: 0.4
+    integral_limit_mps2: 1.0
+    stop_hold_brake: 0.5
+    stop_speed_mps: 0.1
+    intent_deadband_mps2: 0.05
   camera_width: 640
   camera_height: 360
   camera_fov: 100

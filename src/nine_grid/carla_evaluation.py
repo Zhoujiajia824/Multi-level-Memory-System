@@ -10,7 +10,7 @@ import math
 from pathlib import Path
 
 
-VERSION = 'carla-physical-evaluation-2.0'
+VERSION = 'carla-physical-evaluation-2.1'
 DEFAULTS = {
     'arrival_margin_m': 3., 'arrival_lateral_m': 2.5,
     'speed_tolerance_mps': .5, 'overspeed_grace_s': .5,
@@ -18,6 +18,7 @@ DEFAULTS = {
     'stall_seconds': 30., 'stall_progress_m': .5,
     'stop_speed_mps': .15, 'stop_hold_s': 1.,
     'body_sample_spacing_m': .35, 'required_event_ids': [],
+    'route_projection_max_distance_m': 6.,
     'strict_event_completion': True,
 }
 
@@ -40,6 +41,45 @@ def _sub(a, b):
 
 def _lane_id(waypoint):
     return None if waypoint is None else '{}|{}|{}'.format(waypoint.road_id, waypoint.section_id, waypoint.lane_id)
+
+
+def _native_waypoint_evidence(waypoint):
+    transform = waypoint.transform
+    return {'lane_id': _lane_id(waypoint),
+        'position': [float(transform.location.x), -float(transform.location.y)],
+        'z': float(transform.location.z), 'heading_rad': -math.radians(transform.rotation.yaw),
+        'width_m': float(waypoint.lane_width), 'lane_type': str(waypoint.lane_type).split('.')[-1]}
+
+
+def _boundary_topology_evidence(route_waypoints, checkpoints):
+    """Raw public map queries; archived once for independent offline replay."""
+    result = []
+    for gate in checkpoints:
+        waypoint = route_waypoints[gate['index']]
+        item = {'index': gate['index'], 'route_waypoint': _native_waypoint_evidence(waypoint),
+                'distance_m': 3., 'previous': [], 'next': []}
+        for direction in ('previous', 'next'):
+            method = getattr(waypoint, direction, None)
+            if method is not None:
+                item[direction] = [_native_waypoint_evidence(other) for other in method(3.)]
+        result.append(item)
+    return result
+
+
+def _boundary_links(evidence):
+    result = {}
+    for item in evidence:
+        source = item['route_waypoint']
+        result[item['index']] = [other['lane_id'] for direction in ('previous', 'next')
+            for other in item[direction]
+            if math.cos(other['heading_rad']-source['heading_rad']) > .5
+            and abs(other['z']-source['z']) < 1.5 and other['lane_type'] == 'Driving']
+    return result
+
+
+def _boundary_topology(route_waypoints, checkpoints):
+    """Public native directed links, used only at a gate's 3m boundary zone."""
+    return _boundary_links(_boundary_topology_evidence(route_waypoints, checkpoints))
 
 
 def _box_corners(actor):
@@ -102,10 +142,15 @@ class EpisodeEvaluator:
             self.arc.append(self.arc[-1]+_norm(_sub(b, a)))
         if self.arc[-1] <= 0:
             raise ValueError('evaluation route has zero length')
+        end_delta = _sub(self.route[-1], self.route[-2])
+        self.goal_heading = math.atan2(end_delta[1], end_delta[0])
+        self.projection_metadata = None
         self.directory = Path(directory) if directory is not None else None
         self.tick, self.frame, self.first_frame = None, None, None
         self.timestamp, self.first_timestamp = None, None
         self.start_s = self.progress_s = self.lateral = None
+        self.route_projection = {'valid': False, 'reason': 'not_observed', 'distance_m': None}
+        self.projection_invalid_ticks = 0
         self.previous = None
         self.actual_distance_m = 0.
         self.arrival, self.stalled = False, False
@@ -132,17 +177,23 @@ class EpisodeEvaluator:
         with (self.directory/name).open('a', encoding='utf-8') as stream:
             stream.write(json.dumps(value, ensure_ascii=False, allow_nan=False)+'\n')
 
-    def project(self, position, heading=None, global_search=False):
+    def project(self, position, heading=None, global_search=False, ego=None):
         best = None
+        travel = 0. if self.previous is None else _norm(_sub(position, self.previous['position']))
+        speed = 0. if self.previous is None else _norm(self.previous.get('velocity', [0., 0.]))
+        discontinuity = travel > max(5., 3.*speed*self.dt+1.)
+        anchor = 0. if self.progress_s is None else self.progress_s
+        low = 0. if global_search else max(0., anchor-5.)
+        high = self.arc[-1] if global_search else min(self.arc[-1], anchor+max(5., min(travel, 5.)*2.+2.))
         for index, (a, b) in enumerate(zip(self.route, self.route[1:])):
-            if self.progress_s is not None and not global_search:
-                if self.arc[index+1] < self.progress_s-10 or self.arc[index] > self.progress_s+20:
-                    continue
+            if self.arc[index+1] < low or self.arc[index] > high:
+                continue
             delta = _sub(b, a)
             length = self.arc[index+1]-self.arc[index]
             if length <= 1e-9:
                 continue
-            t = max(0., min(1., _dot(_sub(position, a), delta)/(length*length)))
+            t = max(max(0., (low-self.arc[index])/length),
+                    min(min(1., (high-self.arc[index])/length), _dot(_sub(position, a), delta)/(length*length)))
             q = [a[0]+t*delta[0], a[1]+t*delta[1]]
             residual = _sub(position, q)
             distance2 = _dot(residual, residual)
@@ -152,7 +203,20 @@ class EpisodeEvaluator:
             if best is None or result[:2] < best[:2]:
                 best = result
         if best is None:
-            raise ValueError('route projection has no supported segment')
+            self.route_projection = {'valid': False, 'reason': 'no_local_segment', 'distance_m': None,
+                                     'candidate_s_m': None, 'search_s_m': [low, high]}
+            return None, None, None
+        maximum = self.settings['route_projection_max_distance_m']
+        corridor = (self.projection_metadata(best[1], ego, best[2])
+                    if callable(self.projection_metadata) and ego is not None else None)
+        if corridor is not None and corridor.get('contains_observed_center'):
+            maximum = max(maximum, corridor['maximum_distance_m'])
+        valid = best[4] <= maximum and not discontinuity
+        self.route_projection = {'valid': valid, 'distance_m': best[4], 'candidate_s_m': best[2],
+            'reason': ('physical_displacement_discontinuity' if discontinuity else
+                       'within_local_route' if valid else 'outside_local_route_distance'),
+            'max_distance_m': maximum, 'cross_section': corridor, 'search_s_m': [low, high],
+            'relocalization': 'local_only_no_global_jump'}
         return best[2], best[3], best[4]
 
     def point_at(self, distance):
@@ -256,7 +320,8 @@ class EpisodeEvaluator:
                     setattr(self, attr, value)
         return nearest
 
-    def observe(self, tick, frame, timestamp, ego, actors, road, events=(), scenario_events=None):
+    def observe(self, tick, frame, timestamp, ego, actors, road, events=(), scenario_events=None,
+                control_execution=None, route_map_evidence=None):
         if type(tick) is not int or tick < 0 or type(frame) is not int or not _finite(timestamp):
             raise ValueError('evaluation identity must contain integer tick/frame and finite timestamp')
         if self.tick is None and tick != 0:
@@ -279,10 +344,15 @@ class EpisodeEvaluator:
         if self.first_frame is None:
             self.first_frame = frame
             self.first_timestamp = timestamp
-        self.progress_s, self.lateral, route_distance = self.project(ego['position'], ego['heading'])
-        if self.start_s is None:
-            self.start_s = self.progress_s
+        progress, lateral, route_distance = self.project(ego['position'], ego['heading'], ego=ego)
+        if self.route_projection['valid']:
+            self.progress_s, self.lateral = progress, lateral
+        else:
+            self.projection_invalid_ticks += 1
+        if self.first_frame == frame:
             self.initial_state = {'frame': frame, 'ego': copy.deepcopy(ego), 'road': copy.deepcopy(road)}
+        if self.start_s is None and self.route_projection['valid']:
+            self.start_s = self.progress_s
             self.stall_origin_tick, self.stall_origin_s = tick, self.progress_s
         if self.previous is not None:
             self.actual_distance_m += _norm(_sub(ego['position'], self.previous['position']))
@@ -324,13 +394,25 @@ class EpisodeEvaluator:
         self.seconds['stopped'] += dt*int(speed < self.settings['stop_speed_mps'])
         expected_wait = road.get('expected_wait', False)
         self.seconds['expected_wait'] += dt*int(bool(expected_wait))
-        if abs(self.progress_s-self.stall_origin_s) >= self.settings['stall_progress_m'] or expected_wait:
+        if (self.route_projection['valid'] and self.stall_origin_s is not None
+                and abs(self.progress_s-self.stall_origin_s) >= self.settings['stall_progress_m']) or expected_wait:
             self.stall_origin_s, self.stall_origin_tick = self.progress_s, tick
-        self.stalled = (tick-self.stall_origin_tick)/self.hz >= self.settings['stall_seconds']
+        self.stalled = (self.route_projection['valid'] and self.stall_origin_tick is not None
+            and (tick-self.stall_origin_tick)/self.hz >= self.settings['stall_seconds'])
         endpoint_distance = _norm(_sub(ego['position'], self.route[-1]))
-        self.arrival = (self.progress_s >= self.arc[-1]-self.settings['arrival_margin_m']
+        goal_lane = self.settings.get('arrival_lane_id')
+        goal_lane_match = goal_lane is None or ego.get('lane_id') == goal_lane
+        goal_heading_error = abs((ego['heading']-self.goal_heading+math.pi)%(2.*math.pi)-math.pi)
+        self.arrival = (self.route_projection['valid'] and goal_lane_match and goal_heading_error <= math.pi/3
+                        and self.progress_s >= self.arc[-1]-self.settings['arrival_margin_m']
                         and endpoint_distance <= self.settings['arrival_margin_m']
                         and abs(self.lateral) <= self.settings['arrival_lateral_m'])
+        self.arrival_evidence = {'goal_lane_id': goal_lane, 'observed_lane_id': ego.get('lane_id'),
+            'goal_lane_match': goal_lane_match, 'endpoint_distance_m': endpoint_distance,
+            'distance_margin_m': self.settings['arrival_margin_m'],
+            'lateral_margin_m': self.settings['arrival_lateral_m'],
+            'heading_error_rad': goal_heading_error, 'heading_margin_rad': math.pi/3,
+            'route_projection_valid': self.route_projection['valid']}
         if scenario_events is not None:
             self.scenario = copy.deepcopy(scenario_events if isinstance(scenario_events, dict)
                                           else {'scenario_valid': True, 'events': list(scenario_events)})
@@ -349,11 +431,17 @@ class EpisodeEvaluator:
         self.ingest_events(events)
         following = self._following(ego, actors)
         self.previous = copy.deepcopy(ego)
+        map_evidence = route_map_evidence(tick) if callable(route_map_evidence) else route_map_evidence
         self._write('physical_evaluation.jsonl', {'version': VERSION, 'physical_tick': tick, 'frame': frame,
             'instance_hash': self.scenario.get('instance_hash'),
             'coordinate_system': 'carla_world_x_negative_y_m_yaw_left_positive',
-            'timestamp': timestamp, 'sim_time_s': tick/self.hz, 'ego': ego, 'actors': actors, 'route_s_m': self.progress_s,
-            'route_lateral_m': self.lateral, 'speed_mps': speed, 'road': road, 'following': following,
+            'timestamp': timestamp, 'sim_time_s': tick/self.hz, 'ego': ego, 'actors': actors,
+            'route_s_m': self.progress_s if self.route_projection['valid'] else None,
+            'route_lateral_m': self.lateral if self.route_projection['valid'] else None,
+            'route_projection': copy.deepcopy(self.route_projection), 'last_valid_route_s_m': self.progress_s,
+            'route_map_evidence': copy.deepcopy(map_evidence),
+            'speed_mps': speed, 'road': road, 'following': following,
+            'control_execution': copy.deepcopy(control_execution), 'arrival_evidence': copy.deepcopy(self.arrival_evidence),
             'arrival': self.arrival, 'stalled': self.stalled, 'observed_actor_count': len(actors),
             'actor_scope': 'physical_observation_not_mpc_selection'})
         return self.report()
@@ -379,12 +467,15 @@ class EpisodeEvaluator:
         scenario_valid = self.scenario.get('scenario_valid')
         coverage_complete = all(self.coverage.values()) and not self.unknown_events and not self._pending
         infrastructure_valid = scenario_valid is True and not self.infrastructure_errors and self.coverage['complete_physical_ticks']
-        valid = infrastructure_valid and coverage_complete
+        route_measurement_valid = self.projection_invalid_ticks == 0 and self.route_projection['valid']
+        valid = infrastructure_valid and coverage_complete and route_measurement_valid
         strict_success = bool(valid and self.arrival and conditions_complete and not violations)
         success_status = ('success' if strict_success else 'failed' if violations or self.stalled or reason in ('timeout', 'duration')
-                          else 'undetermined' if not valid else 'task_incomplete' if self.arrival and not conditions_complete else 'in_progress')
+                          else 'projection_invalid' if not self.route_projection['valid'] else
+                          'undetermined' if not valid else 'task_incomplete' if self.arrival and not conditions_complete else 'in_progress')
         driving_reason = ('collision' if collision else 'arrival' if self.arrival and conditions_complete else
-                          'goal_reached_task_incomplete' if self.arrival else 'stall' if self.stalled else reason or 'running')
+                          'goal_reached_task_incomplete' if self.arrival else 'route_projection_invalid' if not self.route_projection['valid']
+                          else 'stall' if self.stalled else reason or 'running')
         route_remaining = max(1e-9, self.arc[-1]-(self.start_s or 0.))
         contacts, last_contact = 0, {}
         for event in sorted((e for e in self.events if e['kind'] == 'collision'), key=lambda e: e['frame']):
@@ -400,13 +491,17 @@ class EpisodeEvaluator:
             'simulated_seconds': (self.tick or 0)/self.hz,
             'scenario_valid': scenario_valid, 'evaluation_valid': valid,
             'infrastructure_valid': bool(infrastructure_valid), 'measurement_complete': coverage_complete,
+            'route_measurement_valid': route_measurement_valid, 'route_projection': copy.deepcopy(self.route_projection),
+            'projection_invalid_ticks': self.projection_invalid_ticks, 'last_valid_route_s_m': self.progress_s,
             'strict_success_status': success_status,
             'strict_success': strict_success, 'arrival': self.arrival,
             'route_completed': self.arrival and route_checkpoints_complete, 'collision': collision,
             'stalled': self.stalled, 'driving_outcome': driving_reason, 'runtime_termination_reason': reason,
             'terminal_reason': driving_reason,
-            'progress_m': max(0., (self.progress_s or 0.)-(self.start_s or 0.)),
-            'route_completion': min(1., max(0., ((self.progress_s or 0.)-(self.start_s or 0.))/route_remaining)),
+            'progress_m': max(0., (self.progress_s or 0.)-(self.start_s or 0.)) if self.route_projection['valid'] else None,
+            'route_completion': (min(1., max(0., ((self.progress_s or 0.)-(self.start_s or 0.))/route_remaining))
+                                 if self.route_projection['valid'] else None),
+            'arrival_evidence': copy.deepcopy(getattr(self, 'arrival_evidence', None)),
             'distance_travelled_m': self.actual_distance_m, 'violations': sorted(set(violations)),
             'collision_contact_episodes': contacts,
             'collision_contact_episodes_per_km': contacts*1000/self.actual_distance_m if self.actual_distance_m > 0 else None,
@@ -446,13 +541,24 @@ class CarlaEvaluationProbe:
         self.map = world.get_map()
         self.settings = dict(settings or {})
         route = [[p.transform.location.x, -p.transform.location.y] for p in route_waypoints]
-        evaluation = self.settings.get('evaluation', self.settings)
+        evaluation = dict(self.settings.get('evaluation', self.settings))
+        # Arrival belongs to the original fixed destination lane, even when the
+        # planner temporarily selects another legal lane for an overtake.
+        evaluation['arrival_lane_id'] = _lane_id(route_waypoints[-1])
         self.evaluator = EpisodeEvaluator(route, evaluation, physics_hz, directory)
         try:
             from .carla_task_criteria import TaskCriteria
         except ImportError:
             from carla_task_criteria import TaskCriteria
         self.task_criteria = TaskCriteria(self.settings, route, physics_hz)
+        self._route_boundary_evidence = _boundary_topology_evidence(route_waypoints, self.task_criteria.checkpoints)
+        self.task_criteria.set_boundary_topology(_boundary_links(self._route_boundary_evidence))
+        self._route_waypoints = list(route_waypoints)
+        self._projection_corridors = {}
+        self._pending_projection_corridors = {}
+        self._route_boundary_published = False
+        self.evaluator.projection_metadata = self._projection_corridor
+        self.task_criteria.projection_metadata = self._projection_corridor
         self._previous_ego = None
         self._previous_waypoint, self._crossing_evidence = None, {}
         self._stops, self._lights, self._stop_dwell, self._stop_passed = [], [], {}, set()
@@ -497,6 +603,88 @@ class CarlaEvaluationProbe:
         for rule in self.public_rules:
             if rule.get('kind') != 'yield' or not rule.get('priority_lane_ids') or len(rule.get('conflict_route_s_m', [])) != 2:
                 self._coverage['public_priority'] = False
+
+    def _projection_corridor(self, index, ego, route_s):
+        """Allow lateral movement only in the original road's real cross section.
+
+        Native directed neighbours and their actual widths establish the bounds;
+        numeric lane-ID differences never establish geometry or connectivity.
+        The local arc window remains authoritative, including on a loop.
+        """
+        # A segment can straddle a native road/section boundary. Use its
+        # connected endpoint matching the actual section, never a global scan.
+        section = tuple(str(ego.get('lane_id', '')).split('|')[:2])
+        if (tuple(_lane_id(self._route_waypoints[index]).split('|')[:2]) != section
+                and index+1 < len(self._route_waypoints)
+                and tuple(_lane_id(self._route_waypoints[index+1]).split('|')[:2]) == section):
+            index += 1
+        if index not in self._projection_corridors:
+            waypoint = self._route_waypoints[index]
+            origin = waypoint.transform.location
+            yaw = -math.radians(waypoint.transform.rotation.yaw)
+            c, s = math.cos(yaw), math.sin(yaw)
+            lanes = {_lane_id(waypoint): {'offset_m': 0., 'width_m': float(waypoint.lane_width)}}
+            native_links = []
+            for direction in ('left', 'right'):
+                current = waypoint
+                for _ in range(16):
+                    other = getattr(current, 'get_'+direction+'_lane')()
+                    if other is None or _lane_id(other) in lanes:
+                        break
+                    angle = math.radians(other.transform.rotation.yaw-waypoint.transform.rotation.yaw)
+                    location = other.transform.location
+                    if (other.road_id != waypoint.road_id or other.section_id != waypoint.section_id
+                            or str(other.lane_type).split('.')[-1] != 'Driving'
+                            or math.cos(angle) <= .9 or abs(location.z-origin.z) >= 1.5):
+                        break
+                    dx, dy = location.x-origin.x, -(location.y-origin.y)
+                    # Same-s native neighbours must really form a transverse
+                    # section; reject a spatially disconnected map connection.
+                    if abs(c*dx+s*dy) > 2. or not 0. < float(other.lane_width) < 10.:
+                        break
+                    offset = -s*dx+c*dy
+                    previous = lanes[_lane_id(current)]
+                    if abs(offset-previous['offset_m']) > (float(other.lane_width)+previous['width_m'])/2.+.5:
+                        break
+                    lanes[_lane_id(other)] = {'offset_m': offset, 'width_m': float(other.lane_width)}
+                    native_links.append({'from_lane_id': _lane_id(current), 'side': direction,
+                                         'to_waypoint': _native_waypoint_evidence(other)})
+                    current = other
+            lower = min(row['offset_m']-row['width_m']/2. for row in lanes.values())
+            upper = max(row['offset_m']+row['width_m']/2. for row in lanes.values())
+            self._projection_corridors[index] = {'route_index': index, 'route_lane_id': _lane_id(waypoint), 'lanes': lanes,
+                'lateral_interval_m': [lower, upper], 'heading_rad': yaw,
+                'maximum_distance_m': max(abs(lower), abs(upper))+.25,
+                'source': 'native_same_section_same_direction_driving_neighbour_cross_section'}
+            if not hasattr(self, '_pending_projection_corridors'):
+                self._pending_projection_corridors = {}
+            self._pending_projection_corridors[str(index)] = {
+                'route_waypoint': _native_waypoint_evidence(waypoint), 'neighbour_links': native_links}
+        corridor = copy.deepcopy(self._projection_corridors[index])
+        projected = self.evaluator.point_at(route_s)
+        dx, dy = ego['position'][0]-projected[0], ego['position'][1]-projected[1]
+        c, s = math.cos(corridor['heading_rad']), math.sin(corridor['heading_rad'])
+        lateral, longitudinal = -s*dx+c*dy, c*dx+s*dy
+        lane = corridor['lanes'].get(ego.get('lane_id'))
+        aligned = math.cos(ego['heading']-corridor['heading_rad']) >= .5
+        corridor.update(observed_lane_id=ego.get('lane_id'), lateral_m=lateral,
+            longitudinal_residual_m=longitudinal,
+            contains_observed_center=bool(lane is not None and aligned and abs(longitudinal) <= 1.
+                and abs(lateral-lane['offset_m']) <= lane['width_m']/2.+.25))
+        return corridor
+
+    def _pop_route_map_evidence(self, tick):
+        """Static native evidence is emitted once, in existing physical records."""
+        result = {'version': 'carla-route-map-evidence-1.0',
+                  'source': 'native_public_waypoint_topology', 'physical_tick': tick}
+        if not self._route_boundary_published:
+            result['boundary_gates'] = copy.deepcopy(self._route_boundary_evidence)
+            result['route_widths_m'] = [float(waypoint.lane_width) for waypoint in self._route_waypoints]
+            self._route_boundary_published = True
+        if self._pending_projection_corridors:
+            result['corridors'] = copy.deepcopy(self._pending_projection_corridors)
+            self._pending_projection_corridors.clear()
+        return result if 'boundary_gates' in result or 'corridors' in result else None
 
     def _state(self, actor, snapshot):
         state = snapshot.find(actor.id)
@@ -603,15 +791,26 @@ class CarlaEvaluationProbe:
 
     def _rules(self, ego, actors, frame, road):
         events = []
+        light_observations = []
         for light, waypoint in self._lights:
             distance, relevant = self._line(ego, waypoint)
             state = str(light.get_state()).split('.')[-1].lower()
+            line_evidence = {'id': str(light.id), 'state': state, 'controlled_lane_id': _lane_id(waypoint),
+                'observed_lane_id': ego.get('lane_id'), 'front_signed_distance_m': distance,
+                'stop_position': [waypoint.transform.location.x, -waypoint.transform.location.y],
+                'stop_heading_rad': -math.radians(waypoint.transform.rotation.yaw),
+                'controlled_lane_width_m': waypoint.lane_width, 'relevant': relevant}
+            if relevant and abs(distance) <= 35.:
+                light_observations.append(line_evidence)
             if relevant and -35. < distance <= 0 and state in ('red', 'yellow'):
                 road['expected_wait'] = True
             if self._previous_ego is not None:
                 old, old_relevant = self._line(self._previous_ego, waypoint)
                 if relevant and old_relevant and old <= 0 < distance and state == 'red':
-                    events.append({'kind': 'red_light', 'frame': frame, 'id': str(light.id)})
+                    events.append({'kind': 'red_light', 'frame': frame, 'id': str(light.id),
+                        'previous_front_signed_distance_m': old, 'crossing_evidence': line_evidence,
+                        'source': 'actual_front_crossing_native_stop_waypoint_independent_of_navigation'})
+        road['traffic_light_observations'] = light_observations
         for identity, waypoint in self._stops:
             distance, relevant = self._line(ego, waypoint)
             stopped = relevant and -5. <= distance <= .1 and _norm(ego['velocity']) < self.evaluator.settings['stop_speed_mps']
@@ -745,7 +944,7 @@ class CarlaEvaluationProbe:
                     self.evaluator._write('conflict_zone_events.jsonl', row)
             self._zone_presence[identity] = present
 
-    def observe(self, snapshot, tick, events=(), scenario_events=None):
+    def observe(self, snapshot, tick, events=(), scenario_events=None, control_execution=None):
         ego = self._state(self.ego, snapshot)
         if ego is None:
             self.evaluator.infrastructure_error('ego_missing_from_world_snapshot')
@@ -767,7 +966,8 @@ class CarlaEvaluationProbe:
                                  else {'scenario_valid': True, 'events': list(scenario_events or [])})
         scenario['task_criteria'] = self.task_criteria.observe(tick, ego, actors, scenario.get('actor_roles', {}))
         result = self.evaluator.observe(tick, snapshot.frame, snapshot.timestamp.elapsed_seconds,
-            ego, actors, road, self._annotate_events(events)+rule_events, scenario)
+            ego, actors, road, self._annotate_events(events)+rule_events, scenario,
+            control_execution=control_execution, route_map_evidence=self._pop_route_map_evidence)
         self._measure_conflict_zones(ego, actors, tick, snapshot.frame)
         self._previous_ego = ego
         return result

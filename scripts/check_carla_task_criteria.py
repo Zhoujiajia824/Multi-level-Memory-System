@@ -52,6 +52,39 @@ class TaskTests(unittest.TestCase):
         self.assertFalse(result['completed'])
         self.assertLess(result['route_checkpoints_completed'],result['route_checkpoints_total'])
 
+    def test_start_boundary_requires_native_topology_and_near_aligned_gate(self):
+        for linked, y, heading, expected in ((False, 0., 0., False), (True, 0., 0., True),
+                                            (True, 4., 0., False), (True, 0., math.pi, False)):
+            check=TaskCriteria(settings())
+            if linked:check.set_boundary_topology({0:['676|0|2']})
+            ego=actor(1,.18,y,road=676,lane=2);ego['heading']=heading
+            result=check.observe(0,ego,[])
+            with self.subTest(linked=linked,y=y,heading=heading):
+                self.assertEqual(result['route_checkpoints_completed']>0,expected)
+        check=TaskCriteria(settings());check.set_boundary_topology({0:['676|0|2']})
+        check.observe(0,actor(1,.18,road=676,lane=2),[])
+        for tick in range(1,151):result=check.observe(tick,actor(1,tick),[])
+        self.assertTrue(result['completed'])
+
+    def test_projection_invalid_cannot_consume_checkpoints_or_be_task_complete(self):
+        check=TaskCriteria(settings());check.observe(0,actor(1,0),[])
+        before=check._next;progress=check.progress
+        result=check.observe(1,actor(1,100,50),[])
+        self.assertFalse(result['route_projection']['valid'])
+        self.assertEqual(check._next,before)
+        self.assertEqual(check.progress,progress)
+        self.assertIn('route_projection_invalid',result['reasons'])
+        self.assertFalse(result['completed'])
+
+    def test_only_verified_cross_section_metadata_can_extend_projection_distance(self):
+        for verified in (False,True):
+            check=TaskCriteria(settings())
+            check.projection_metadata=lambda index,ego,s:{'contains_observed_center':verified,
+                'maximum_distance_m':8.75,'source':'native_test_fixture'}
+            result=check.observe(0,actor(1,.1,7.,lane=3),[])
+            self.assertEqual(result['route_projection']['valid'],verified)
+            if not verified:self.assertEqual(result['route_projection']['max_distance_m'],6.)
+
     def test_declared_route_is_completed_with_actual_samples(self):
         check=TaskCriteria(settings())
         for tick in range(151):result=check.observe(tick,actor(1,tick),[])

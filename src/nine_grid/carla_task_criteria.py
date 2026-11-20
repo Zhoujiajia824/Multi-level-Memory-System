@@ -27,6 +27,9 @@ class TaskCriteria:
         self.arc=[0.]
         for a,b in zip(self.route,self.route[1:]):self.arc.append(self.arc[-1]+math.hypot(b[0]-a[0],b[1]-a[1]))
         self.tick=None;self.progress=0.;self.previous=None;self.records=[];self.checkpoints=[]
+        self.projection={'valid':False,'reason':'not_observed','distance_m':None,'candidate_s_m':None}
+        self.projection_invalid_ticks=0
+        self.projection_metadata=None
         self._next=0;self.wrong_exit=False;self._exit_expected=None;self._exit_mismatch_start=None
         self.overtake={'phase':'not_started','lead_role':self.task.get('lead_role','slow_lead'),'left_tick':None,'passed_tick':None,
             'returned_tick':None,'wrong_side_pass':False,'return_hold_start':None}
@@ -57,21 +60,46 @@ class TaskCriteria:
         for index in sorted(selected):
             self.checkpoints.append({'index':index,'route_s_m':self.arc[index],
                 'section':list(_section(_lane(self.points[index]))),'position':self.route[index],
-                'passed_tick':None})
+                'lane_id':_lane(self.points[index]),'boundary_lane_ids':[], 'passed_tick':None})
 
-    def _project(self,position):
+    def set_boundary_topology(self,links):
+        """SDK-verified directed predecessors/successors within 3m of each gate.
+
+        Geometry alone never certifies a different road section. The caller must
+        obtain these links from the public map, not the planner's chosen route.
+        """
+        for gate in self.checkpoints:
+            gate['boundary_lane_ids']=sorted(set(links.get(gate['index'],[])))
+
+    def _project(self,position,ego=None):
         travel=0. if self.previous is None else math.hypot(position[0]-self.previous['position'][0],position[1]-self.previous['position'][1])
-        forward=max(5.,travel*2.+2.);best=None
+        speed=0. if self.previous is None else math.hypot(*self.previous.get('velocity',[0.,0.]))
+        discontinuity=travel>max(5.,3.*speed/self.hz+1.)
+        forward=max(5.,min(travel,5.)*2.+2.);best=None
+        low=max(0.,self.progress-5.);high=min(self.arc[-1],self.progress+forward)
         for i,(a,b) in enumerate(zip(self.route,self.route[1:])):
             if self.arc[i+1]<self.progress-5. or self.arc[i]>self.progress+forward:continue
             dx,dy=b[0]-a[0],b[1]-a[1];length=math.hypot(dx,dy)
             if length<1e-8:continue
-            q=max(0.,min(1.,((position[0]-a[0])*dx+(position[1]-a[1])*dy)/length**2))
+            q=max(max(0.,(low-self.arc[i])/length),min(min(1.,(high-self.arc[i])/length),
+                ((position[0]-a[0])*dx+(position[1]-a[1])*dy)/length**2))
             ex,ey=position[0]-a[0]-q*dx,position[1]-a[1]-q*dy
             item=(ex*ex+ey*ey,self.arc[i]+q*length,(dx*ey-dy*ex)/length,i)
             if best is None or item[0]<best[0]:best=item
-        if best is None:raise ValueError('task observation no longer projects onto local locked route')
-        return best[1],best[2],best[3]
+        if best is None:
+            self.projection={'valid':False,'reason':'no_local_segment','distance_m':None,'candidate_s_m':None}
+            return None
+        maximum=6.
+        corridor=(self.projection_metadata(best[3],ego,best[1])
+                  if callable(self.projection_metadata) and ego is not None else None)
+        if corridor is not None and corridor.get('contains_observed_center'):
+            maximum=max(maximum,corridor['maximum_distance_m'])
+        distance=math.sqrt(best[0]);valid=distance<=maximum and not discontinuity
+        self.projection={'valid':valid,'reason':('physical_displacement_discontinuity' if discontinuity else
+            'within_local_route' if valid else 'outside_local_route_distance'),
+            'distance_m':distance,'candidate_s_m':best[1],'max_distance_m':maximum,'cross_section':corridor,
+            'search_s_m':[low,high],'relocalization':'local_only_no_global_jump'}
+        return (best[1],best[2],best[3]) if valid else None
 
     def _record(self,event,tick,**fields):
         self.records.append(dict(event=event,tick=tick,**fields))
@@ -84,10 +112,15 @@ class TaskCriteria:
             gate=self.checkpoints[self._next];j=gate['index']
             a,b=self.route[max(0,j-1)],self.route[min(len(self.route)-1,j+1)]
             heading=math.atan2(b[1]-a[1],b[0]-a[0])
-            if (section!=tuple(gate['section']) or abs(self.progress-gate['route_s_m'])>5.
+            distance=math.hypot(position[0]-gate['position'][0],position[1]-gate['position'][1])
+            boundary_match=(ego.get('lane_id') in gate['boundary_lane_ids'] and distance<=3.
+                and abs(self.progress-gate['route_s_m'])<=3.)
+            if ((section!=tuple(gate['section']) and not boundary_match) or abs(self.progress-gate['route_s_m'])>5.
                     or math.hypot(position[0]-gate['position'][0],position[1]-gate['position'][1])>15.
                     or abs(_wrap(ego['heading']-heading))>math.pi/3):break
-            gate['passed_tick']=tick;self._record('route_checkpoint',tick,checkpoint=self._next)
+            gate['passed_tick']=tick;self._record('route_checkpoint',tick,checkpoint=self._next,
+                section_match=section==tuple(gate['section']),boundary_topology_match=boundary_match,
+                observed_lane_id=ego.get('lane_id'))
             self._next+=1
         junction=ego.get('is_junction')
         previous_junction=self.previous.get('is_junction') if self.previous is not None else False
@@ -168,11 +201,17 @@ class TaskCriteria:
     def observe(self,tick,ego,actors,actor_roles=None):
         if type(tick) is not int or tick<0 or (self.tick is not None and tick!=self.tick+1):
             raise ValueError('task criteria require every physical tick in order')
-        self.progress,lateral,index=self._project(ego['position'])
-        self._navigation(tick,ego,index)
-        if self.kind=='overtake_return':self._overtake(tick,ego,actors,actor_roles or {},lateral,index)
-        if self.kind=='roundabout':self._circle(tick,ego)
-        if self.kind=='signal_junction':self._turn(tick,ego)
+        projected=self._project(ego['position'],ego)
+        if projected is not None:
+            self.progress,lateral,index=projected
+            self._navigation(tick,ego,index)
+            if self.kind=='overtake_return':self._overtake(tick,ego,actors,actor_roles or {},lateral,index)
+            if self.kind=='roundabout':self._circle(tick,ego)
+            if self.kind=='signal_junction':self._turn(tick,ego)
+        else:
+            self.projection_invalid_ticks+=1
+            if self.tick is None or not self.records or self.records[-1]['event']!='route_projection_invalid':
+                self._record('route_projection_invalid',tick,projection=copy.deepcopy(self.projection))
         self.tick=tick;self.previous=copy.deepcopy(ego)
         return self.report(detailed=False)
 
@@ -191,7 +230,11 @@ class TaskCriteria:
             if not maneuver:reasons.append('declared_junction_turn_not_observed')
         if not route_complete:reasons.append('ordered_route_checkpoints_not_completed')
         if self.wrong_exit:reasons.append('wrong_junction_exit')
-        return {'version':'carla-task-criteria-1.0','kind':self.kind,'completed':route_complete and maneuver and not self.wrong_exit,
+        if not self.projection['valid']:reasons.append('route_projection_invalid')
+        return {'version':'carla-task-criteria-1.1','kind':self.kind,
+            'completed':route_complete and maneuver and not self.wrong_exit and self.projection['valid'],
+            'route_projection':copy.deepcopy(self.projection),'projection_invalid_ticks':self.projection_invalid_ticks,
+            'last_valid_route_s_m':self.progress,
             'route_checkpoints_completed':self._next,'route_checkpoints_total':len(self.checkpoints),
             'checkpoints':copy.deepcopy(self.checkpoints) if detailed else None,'wrong_exit':self.wrong_exit,
             'maneuver_completed':maneuver,'overtake':copy.deepcopy(self.overtake) if self.kind=='overtake_return' else None,
