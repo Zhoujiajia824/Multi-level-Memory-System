@@ -281,8 +281,8 @@ def validate_config(config):
         if isinstance(FIXED_CONTRACT[group],dict) and group in result and not isinstance(result[group],dict):
             raise ValueError(f'{group} 必须为对象')
     fixed=FIXED_CONTRACT
-    if result.get('platform')=='carla':
-        # CARLA按本轮明确授权采用范围真值，不继续套用highway的遮挡权限。
+    if result.get('platform') in ('carla','navsim'):
+        # CARLA及NAVSIM特权基线显式采用范围真值，不套用传感器遮挡权限。
         fixed=copy.deepcopy(FIXED_CONTRACT)
         fixed['perception']['fully_occluded_in_current_planning']=True
     _check_fixed(result,fixed)
@@ -472,8 +472,8 @@ def validate_config(config):
         validate_scenario_settings(settings,name)
         if 'env_id' in settings and settings['env_id']!=env_ids[name]:raise ValueError(f'{name} 的环境实现固定为 {env_ids[name]}')
     platform = result.get('platform', 'highway')
-    if platform not in ('highway', 'carla'):
-        raise ValueError('platform仅支持highway或carla')
+    if platform not in ('highway', 'carla', 'navsim'):
+        raise ValueError('platform仅支持highway、carla或navsim')
     if platform == 'highway':
         highway_settings(result,result.get('scenario','highway'))
     return result

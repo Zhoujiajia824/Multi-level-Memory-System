@@ -1,0 +1,374 @@
+"""Launch pinned, unmodified official scoring scripts with explicit provenance."""
+import argparse
+import csv
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+import yaml
+
+from . import INPUT_CONDITION, OFFICIAL_COMMIT
+from .protocol import digest, write_json
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def source_fingerprint(root, subdir="navsim"):
+    root = Path(root).resolve()
+    files = sorted((p for p in (root / subdir).rglob("*") if p.is_file() and p.suffix in (".py", ".yaml")),
+                   key=lambda p: p.relative_to(root).as_posix())
+    entries = [p.relative_to(root).as_posix() + ":" + hashlib.sha256(p.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+               for p in files]
+    return len(files), hashlib.sha256("\n".join(entries).encode()).hexdigest()
+
+
+def verify_sdk(sdk_root):
+    lock = json.loads((ROOT / "config/navsim/official_v2_2.json").read_text(encoding="utf-8"))
+    count, fingerprint = source_fingerprint(sdk_root)
+    if count != lock["source_files"] or fingerprint != lock["source_sha256"]:
+        raise ValueError("NAVSIM SDK source/config does not match pinned official v2.2; do not patch scoring code")
+    return lock
+
+
+def split_contract(sdk_root, split):
+    root = Path(sdk_root).resolve() / "navsim/planning/script/config/common/train_test_split"
+    filter_path = root / "scene_filter" / (split + ".yaml")
+    mapping_path = root / (split + ".yaml")
+    scene_filter = yaml.safe_load(filter_path.read_text(encoding="utf-8"))
+    mapping = yaml.safe_load(mapping_path.read_text(encoding="utf-8"))["reactive_all_mapping"]
+    originals = set(scene_filter["tokens"])
+    synthetic = set(scene_filter["reactive_synthetic_initial_tokens"])
+    required = originals | synthetic
+    mapped = set()
+    for now, previous, second_stage in mapping:
+        mapped.update((now, previous))
+        for pair in second_stage:
+            mapped.update(pair)
+    if mapped != required:
+        raise ValueError("Official two-stage mapping/filter coverage differs; cannot define the evaluation set")
+    return dict(evaluation_tokens=sorted(required), evaluation_logs=sorted(scene_filter["log_names"]),
+                original_count=len(originals), reactive_synthetic_count=len(synthetic),
+                scene_filter_sha256=hashlib.sha256(filter_path.read_bytes()).hexdigest(),
+                mapping_sha256=hashlib.sha256(mapping_path.read_bytes()).hexdigest())
+
+
+def check_weight_file(model):
+    model = Path(model)
+    config = json.loads((model / "config.json").read_text(encoding="utf-8"))
+    if config.get("model_type") != "dinov2" or config.get("hidden_size") != 768:
+        raise ValueError("DINO retrieval requires a local DINOv2 Base model")
+    weights = model / "model.safetensors"
+    if not weights.is_file():
+        raise FileNotFoundError("Local DINO model.safetensors is required")
+    with weights.open("rb") as stream:
+        size = int.from_bytes(stream.read(8), "little")
+        if size < 2 or size > min(16 * 1024 * 1024, weights.stat().st_size - 8):
+            raise ValueError("DINO weights are invalid (possibly a Git LFS pointer): " + str(weights))
+        header = json.loads(stream.read(size))
+    if not isinstance(header, dict) or not any("data_offsets" in value for value in header.values() if isinstance(value, dict)):
+        raise ValueError("DINO safetensors contains no tensors")
+
+
+def stage_maps(data_root, destination):
+    """Keep nuPlan's .maplocks and any derived files outside the source dataset."""
+    source, target = Path(data_root) / "maps", Path(destination)
+    if target.resolve() == source.resolve():
+        raise ValueError("maps_runtime_root must differ from the read-only source dataset")
+    metadata = source / "nuplan-maps-v1.0.json"
+    catalog = json.loads(metadata.read_text(encoding="utf-8"))
+    files = [metadata] + [source / location / catalog[location]["version"] / "map.gpkg"
+                         for location in ("sg-one-north", "us-ma-boston", "us-nv-las-vegas-strip", "us-pa-pittsburgh-hazelwood")]
+    hashes = {}
+    for original in files:
+        relative = original.relative_to(source)
+        output = target / relative
+        with original.open("rb") as stream:
+            fingerprint = hashlib.file_digest(stream, "sha256").hexdigest()
+        if not output.is_file() or output.stat().st_size != original.stat().st_size:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(original, output)
+        with output.open("rb") as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() != fingerprint:
+                raise ValueError("Staged map differs from source; choose an empty maps_runtime_root: " + str(output))
+        hashes[relative.as_posix()] = fingerprint
+    return hashes
+
+
+def prepare_settings(config_path, split_override=None, output_override=None, bev_video_override=None):
+    source = Path(config_path).resolve()
+    settings = json.loads(source.read_text(encoding="utf-8"))
+    required = {"sdk_root", "sdk_python", "core_python", "data_root", "dino_model", "output_dir"}
+    if not required.issubset(settings):
+        raise ValueError("Missing NAVSIM runtime paths: " + ",".join(sorted(required - set(settings))))
+    def path(value):
+        value = Path(value).expanduser()
+        return str((value if value.is_absolute() else ROOT / value).resolve())
+    defaults = dict(parameters="config/parameters.json", models_config="config/models.example.yaml",
+                    prompts_config="config/prompts.yaml", split="warmup_two_stage", fast="off", retrieve=False,
+                    memory_read_dir=None, desired_speed_mps=10.0, map_radius_m=160.0,
+                    dino_device="cpu", timeout_s=600.0, bev_video=True)
+    settings = dict(defaults, **settings)
+    if split_override:
+        settings["split"] = split_override
+    if output_override:
+        settings["output_dir"] = output_override
+    if bev_video_override is not None:
+        settings["bev_video"] = bev_video_override
+    if type(settings["bev_video"]) is not bool:
+        raise ValueError("bev_video must be true or false")
+    if settings["split"] not in ("warmup_two_stage", "navhard_two_stage"):
+        raise ValueError("Only pinned v2.2 warmup_two_stage/navhard_two_stage are supported")
+    if settings["fast"] not in ("off", "api", "server") or type(settings["retrieve"]) is not bool:
+        raise ValueError("Invalid model/retrieval mode")
+    if settings["retrieve"] and (settings["fast"] == "off" or not settings["memory_read_dir"]):
+        raise ValueError("Frozen retrieval requires an enabled fast model and memory_read_dir")
+    for key in required | {"parameters", "models_config", "prompts_config"}:
+        settings[key] = path(settings[key])
+    if settings["memory_read_dir"]:
+        settings["memory_read_dir"] = path(settings["memory_read_dir"])
+    settings["metric_cache_path"] = path(settings.get("metric_cache_path",
+        "outputs/navsim/metric_cache_v2_2/" + settings["split"]))
+    settings["maps_runtime_root"] = path(settings.get("maps_runtime_root", "outputs/navsim/maps_runtime"))
+    for key in ("sdk_python", "core_python", "parameters", "models_config", "prompts_config"):
+        if not Path(settings[key]).is_file():
+            raise FileNotFoundError(key + ": " + settings[key])
+    settings["config_file_sha256"] = {key: hashlib.sha256(Path(settings[key]).read_bytes()).hexdigest()
+                                     for key in ("parameters", "models_config", "prompts_config")}
+    data = Path(settings["data_root"])
+    for name in ("maps", "navsim_logs/test", "sensor_blobs/test", settings["split"] + "/sensor_blobs",
+                 settings["split"] + "/synthetic_scene_pickles"):
+        if not (data / name).is_dir():
+            raise FileNotFoundError("Missing data directory: " + str(data / name))
+    lock = verify_sdk(settings["sdk_root"])
+    settings.update(split_contract(settings["sdk_root"], settings["split"]))
+    settings.update(memory_snapshot_id=hashlib.sha256(b"[]").hexdigest(), memory_record_count=0)
+    if settings["retrieve"]:
+        from nine_grid.memory import MemoryStore
+        from .worker import check_memory_disjoint
+        store = MemoryStore(settings["memory_read_dir"], None)
+        records = store.snapshot()
+        check_memory_disjoint(records, settings["evaluation_logs"], settings["evaluation_tokens"])
+        if not records:
+            raise ValueError("Retrieval requested but no compatible audited memory was loaded")
+        settings.update(memory_snapshot_id=store.snapshot_id, memory_record_count=len(records))
+    check_weight_file(settings["dino_model"])
+    settings["map_source_sha256"] = stage_maps(data, settings["maps_runtime_root"])
+    settings.update(input_condition=INPUT_CONDITION, standard_sensor_only_comparable=False,
+                    official_metric=lock["metric"], official_commit=OFFICIAL_COMMIT,
+                    official_source_sha256=lock["source_sha256"], online_memory_write=False,
+                    reflection_enabled=False, root=str(ROOT),
+                    numerical_source_sha256=source_fingerprint(ROOT, "src")[1])
+    frozen = Path(settings["output_dir"]) / "run_settings.json"
+    settings["settings_path"] = str(frozen)
+    if frozen.exists() and json.loads(frozen.read_text(encoding="utf-8")) != settings:
+        raise ValueError("Output directory belongs to different settings/code; choose a new output_dir")
+    write_json(frozen, settings)
+    return settings
+
+
+def environment(settings):
+    env = dict(os.environ)
+    env.pop("EP_NAVSIM_REPLAY_SETTINGS", None)
+    env.update(OPENSCENE_DATA_ROOT=settings["data_root"], NUPLAN_MAPS_ROOT=settings["maps_runtime_root"],
+               NUPLAN_MAP_VERSION="nuplan-maps-v1.0", NAVSIM_DEVKIT_ROOT=settings["sdk_root"],
+               NAVSIM_EXP_ROOT=str(Path(settings["output_dir"]).parent),
+               PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+    env["PYTHONPATH"] = str(ROOT / "src") + os.pathsep + settings["sdk_root"] + os.pathsep + env.get("PYTHONPATH", "")
+    return env
+
+
+def scoring_environment(settings):
+    env = environment(settings)
+    # This observer only exports the official scorer's already computed output.
+    # It is installed before the unchanged official script imports pdm_score.
+    if settings["bev_video"]:
+        env["EP_NAVSIM_REPLAY_SETTINGS"] = settings["settings_path"]
+    else:
+        env.pop("EP_NAVSIM_REPLAY_SETTINGS", None)
+    return env
+
+
+def render_existing(config_path, output_override=None, token=None):
+    """Render saved scoring traces without inference, simulation or SDK imports."""
+    config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    output = Path(output_override or config["output_dir"])
+    if not output.is_absolute():
+        output = ROOT / output
+    settings = json.loads((output / "run_settings.json").read_text(encoding="utf-8"))
+    samples = output / "samples"
+    paths = ([samples / digest(token)[:24] / "official_replay" / "trace.json.gz"]
+             if token else sorted(samples.glob("*/official_replay/trace.json.gz")))
+    if not paths or any(not path.is_file() for path in paths):
+        raise FileNotFoundError("No saved official scoring trace; old planned BEV/CSV cannot reconstruct reactive execution")
+    failures = []
+    for path in paths:
+        try:
+            subprocess.run([settings["core_python"], "-m", "ep_driver_navsim.replay_render",
+                            "--replay", str(path), "--output-dir", str(path.parent)],
+                           env=environment(settings), check=True, cwd=ROOT)
+        except subprocess.CalledProcessError as exc:
+            write_json(path.parent / "render_status.json", dict(status="failed", error=str(exc),
+                       failure_scope="visualization_only", official_score_unchanged=True))
+            failures.append(str(path))
+    from .replay_gallery import update_gallery
+    gallery = update_gallery(output)
+    print("Official scoring replay gallery:", gallery, flush=True)
+    if failures:
+        raise RuntimeError("BEV rendering failed for %d saved traces; scoring results unchanged" % len(failures))
+    return 0
+
+
+def run_sdk(settings, action):
+    subprocess.run([settings["sdk_python"], "-m", "ep_driver_navsim.sdk_runtime", action,
+                    "--settings", settings["settings_path"]], env=environment(settings), check=True, cwd=ROOT)
+
+
+def cache_contract(settings):
+    return {key: settings[key] for key in ("official_commit", "official_source_sha256", "split",
+            "scene_filter_sha256", "mapping_sha256", "data_root", "map_source_sha256")}
+
+
+def verify_cache_contract(settings, creating=False):
+    path = Path(settings["metric_cache_path"])
+    lock = path / "ep_navsim_cache_contract.json"
+    if lock.exists():
+        if json.loads(lock.read_text(encoding="utf-8")) != cache_contract(settings):
+            raise ValueError("Metric cache belongs to another SDK/split/dataset")
+    elif path.exists() and any(path.iterdir()):
+        raise ValueError("Existing cache has no v2.2 provenance; use a new empty metric_cache_path")
+    elif not creating:
+        raise FileNotFoundError("Generate the official metric cache first")
+    return lock
+
+
+def normalize_cache_metadata(settings):
+    """The official loader splits paths on '/'; normalize our own cache CSVs."""
+    root = Path(settings["metric_cache_path"]).resolve()
+    for path in (root / "metadata").glob("*.csv"):
+        with path.open(encoding="utf-8", newline="") as stream:
+            rows = list(csv.reader(stream))
+        if not rows or rows[0] != ["file_name"] or any(len(row) != 1 for row in rows[1:]):
+            raise ValueError("Unexpected official cache metadata schema")
+        normalized = []
+        for row in rows[1:]:
+            target = Path(row[0]).resolve()
+            if not target.is_relative_to(root) or not target.is_file() or "," in str(target):
+                raise ValueError("Official cache metadata refers to a missing/unsupported path")
+            normalized.append([target.as_posix()])
+        if rows[1:] != normalized:
+            with path.open("w", encoding="utf-8", newline="") as stream:
+                csv.writer(stream).writerows([rows[0]] + normalized)
+
+
+def official_command(settings, cache=False):
+    script = "run_metric_caching.py" if cache else "run_pdm_score.py"
+    sdk = Path(settings["sdk_root"])
+    # These are direct Hydra overrides of the official entry point; no local
+    # scoring formula, custom aggregation or changed traffic policy is used.
+    quote = lambda value: json.dumps(str(value).replace("\\", "/"))
+    command = [settings["sdk_python"], "-m", "ep_driver_navsim.sdk_bootstrap",
+        str(sdk / "navsim/planning/script" / script),
+        "train_test_split=" + settings["split"], "worker=sequential", "gpu=false",
+        "navsim_log_path=" + quote(Path(settings["data_root"]) / "navsim_logs/test"),
+        "original_sensor_path=" + quote(Path(settings["data_root"]) / "sensor_blobs/test"),
+        "synthetic_sensor_path=" + quote(Path(settings["data_root"]) / settings["split"] / "sensor_blobs"),
+        "synthetic_scenes_path=" + quote(Path(settings["data_root"]) / settings["split"] / "synthetic_scene_pickles"),
+        "metric_cache_path=" + quote(settings["metric_cache_path"])]
+    if cache:
+        command += ["force_feature_computation=false"]
+    else:
+        command += ["agent._target_=ep_driver_navsim.agent.EPDriverPrivilegedAgent",
+                    "+agent.settings_path=" + quote(settings["settings_path"]),
+                    "+agent.core_python=" + quote(settings["core_python"]),
+                    "+agent.timeout_s=" + str(settings["timeout_s"]),
+                    "experiment_name=ep_driver_privileged_" + settings["split"],
+                    "output_dir=" + quote(Path(settings["output_dir"]) / "official_scores")]
+    return command
+
+
+def verify_scores(settings, csv_path):
+    with Path(csv_path).open(encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    by_token = {row["token"]: row for row in rows}
+    expected = set(settings["evaluation_tokens"])
+    actual = {row["token"] for row in rows if not row["token"].startswith("extended_pdm_score_")}
+    if actual != expected or len(by_token) != len(rows):
+        raise RuntimeError("Official CSV is incomplete or has duplicate/unexpected tokens")
+    invalid = [token for token in expected if by_token[token]["valid"].lower() != "true"]
+    combined = by_token.get("extended_pdm_score_combined", {})
+    value = float(combined.get("score", "nan"))
+    if invalid or combined.get("valid", "").lower() != "true" or not math.isfinite(value):
+        raise RuntimeError("Official run is not a complete valid benchmark: failed=%d; aggregation_valid=%s" %
+                           (len(invalid), combined.get("valid")))
+    return dict(status="complete", official_csv=str(csv_path), official_two_stage_epdms=value,
+                evaluated_tokens=len(expected), failed_tokens=0, input_condition=INPUT_CONDITION,
+                standard_sensor_only_comparable=False, official_commit=OFFICIAL_COMMIT,
+                split=settings["split"], settings_sha256=digest(settings))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="EP-Driver privileged NAVSIM v2.2 official evaluation")
+    parser.add_argument("action", choices=("check", "smoke", "cache", "evaluate", "render", "gallery"))
+    parser.add_argument("--config", default="config/navsim.local.json")
+    parser.add_argument("--split", choices=("warmup_two_stage", "navhard_two_stage"))
+    parser.add_argument("--output-dir")
+    video = parser.add_mutually_exclusive_group()
+    video.add_argument("--bev-video", dest="bev_video", action="store_true", default=None,
+                       help="Save official execution BEV MP4 and trace for each scored sample (default)")
+    video.add_argument("--no-bev-video", dest="bev_video", action="store_false")
+    parser.add_argument("--token", help="Render one saved token only; does not restrict official evaluation")
+    args = parser.parse_args()
+    if args.action in ("render", "gallery"):
+        if args.split or args.bev_video is not None:
+            parser.error("render/gallery uses existing run settings; only --config/--output-dir/--token apply")
+        if args.action == "gallery":
+            if args.token:
+                parser.error("--token only applies to rendering saved traces")
+            from .replay_gallery import update_gallery
+            config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+            output = Path(args.output_dir or config["output_dir"])
+            print(update_gallery(output if output.is_absolute() else ROOT / output))
+            return 0
+        return render_existing(args.config, args.output_dir, args.token)
+    if args.token:
+        parser.error("--token only applies to rendering saved traces")
+    settings = prepare_settings(args.config, args.split, args.output_dir, args.bev_video)
+    print("Input condition:", INPUT_CONDITION, "(NOT standard sensor-only)", flush=True)
+    print("Official split:", settings["split"], "original:", settings["original_count"],
+          "reactive synthetic:", settings["reactive_synthetic_count"], flush=True)
+    if args.action in ("check", "smoke"):
+        run_sdk(settings, "inspect" if args.action == "check" else "smoke")
+    elif args.action == "cache":
+        run_sdk(settings, "inspect")
+        lock = verify_cache_contract(settings, creating=True)
+        # Write provenance before work begins so an interrupted cache generation
+        # can resume safely; coverage is checked again before any scoring.
+        write_json(lock, cache_contract(settings))
+        subprocess.run(official_command(settings, cache=True), check=True, env=environment(settings), cwd=ROOT)
+        normalize_cache_metadata(settings)
+        run_sdk(settings, "check-cache")
+    else:
+        verify_cache_contract(settings)
+        normalize_cache_metadata(settings)
+        run_sdk(settings, "inspect")
+        run_sdk(settings, "check-cache")
+        output = Path(settings["output_dir"]) / "official_scores"
+        before = set(output.glob("*.csv"))
+        try:
+            subprocess.run(official_command(settings), check=True, env=scoring_environment(settings), cwd=ROOT)
+        finally:
+            if settings["bev_video"]:
+                from .replay_gallery import update_gallery
+                print("Official scoring replay gallery:", update_gallery(settings["output_dir"]), flush=True)
+        created = set(output.glob("*.csv")) - before
+        if len(created) != 1:
+            raise RuntimeError("Expected one newly generated official result CSV")
+        result = verify_scores(settings, created.pop())
+        write_json(Path(settings["output_dir"]) / "benchmark_result.json", result)
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+    return 0

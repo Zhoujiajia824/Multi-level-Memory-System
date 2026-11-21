@@ -1,0 +1,20 @@
+{
+  "sdk_root": "/path/to/navsim-v2.2",
+  "sdk_python": "/path/to/navsim-python39/bin/python",
+  "core_python": "/path/to/ep-driver-python312/bin/python",
+  "data_root": "/path/to/openscene_navsim",
+  "dino_model": "/path/to/dinov2-base",
+  "dino_device": "cpu",
+  "split": "warmup_two_stage",
+  "output_dir": "outputs/navsim/warmup/A_base",
+  "parameters": "config/parameters.json",
+  "models_config": "config/models.example.yaml",
+  "prompts_config": "config/prompts.yaml",
+  "fast": "off",
+  "retrieve": false,
+  "memory_read_dir": null,
+  "desired_speed_mps": 10.0,
+  "map_radius_m": 160.0,
+  "timeout_s": 600.0,
+  "bev_video": true
+}

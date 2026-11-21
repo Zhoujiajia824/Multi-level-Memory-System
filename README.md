@@ -1,4 +1,49 @@
-# EP-Driver 运行指令与参数
+# EP-Driver-NAVSIM：特权输入基线与官方评测
+
+本分支从 `EP-Driver@f91af2d` 创建，复用现有五次参考、Frenet APF、MPC、BEV/OCC、八向张量、DINO、参照规划与质量诊断。下面的 Highway 指令保留用于原算法回归；NAVSIM 使用 `scripts/run_navsim.py`。
+
+NAVSIM 固定官方 **v2.2 / 359c7f72304bfa8273e754224a213d3751bd2340**，运行未经修改的 `run_metric_caching.py` 和 `run_pdm_score.py`。后者已经包含两阶段响应交通、成对帧舒适性和官方聚合，不能另用单帧均值代替。入口检查 SDK 源码指纹、完整样本及缓存覆盖，出现缺样本、失败轨迹或无效聚合时不输出合格 benchmark 结果。
+
+**输入条件是 privileged baseline，不属于标准 sensor-only 输入条件。** 规划只访问当前及历史四帧（约1.5秒）的对象标注、自车状态、当前地图/roadblock 导航、当前红灯标记与八路当前图片；不访问未来自车轨迹、未来对象标注或评分缓存。对象数值输入沿用当前/可跨越邻道前40米、后20米筛选及八向/安全例外；一般家具类 `generic_object` 排除，锥桶、施工标志和隔离障碍作为候选，仍需通过道路范围筛选。NAVSIM 提供相邻拓扑，未提供完整车道线跨越权限；本基线明确记录“同向相邻拓扑视为可跨越”的适配假设，不能把它写成真实标线真值。红灯布尔值的反值记为 `not_red`，不虚构绿/黄灯细分。
+
+每个官方评测锚点独立重置规划器和预测状态，不跨锚点延用计划。为满足官方输出，NAVSIM 单独使用4秒、0.1秒控制网格，输出未来0.5至4秒共8个**当前后轴坐标系**位姿；先将核心质心轨迹按 Pacifica 轴距和后轴偏移换回后轴，不能直接裁剪/补齐原3秒轨迹。内部质量分和预测执行审计与官方 EPDMS 分开保存。若启用模型，模型失败时基础规划回退及错误会留证；如果没有安全解，继续保留 `emergency_unverified`，不伪装为安全候选。
+
+首次准备两个独立环境：现有 EP-Driver Python3.12 数值环境，以及官方 SDK Python3.9 环境。按 [NAVSIM 官方安装说明](https://github.com/autonomousvision/navsim/blob/v2.2/docs/install.md)取得上述固定版本 NAVSIM 与 nuPlan v1.2；SDK 环境使用 `config/navsim/sdk-requirements.txt` 的推理/评分依赖，并将两份 devkit 以 `pip install --no-deps -e <路径>` 安装。Linux 为官方支持环境；本机 Windows 短测仅增加 Linux pickle 路径兼容和无下载的 `fcntl` 导入保护，评分源码/公式不变，不能据此声称完成 Linux 全量验证。缺少地图而需要 POSIX 文件锁时会明确失败。
+
+复制 `config/navsim.example.json` 为被忽略的 `config/navsim.local.json`，填写 SDK、两个 Python、数据与真实 DINO 权重目录；不得使用 LFS 指针代替权重。原始输入来自 `navsim_logs/test` 和 `sensor_blobs/test`，合成后续输入来自对应 `*_two_stage` 目录。入口将地图矢量文件校验后复制到本地 `outputs/navsim/maps_runtime`，官方临时文件不写入原数据目录。个人配置和运行产物不提交。
+
+在本分支根目录、数值环境中逐条运行：
+
+```bash
+python scripts/check_navsim_integration.py
+python scripts/run_navsim.py check
+python scripts/run_navsim.py smoke
+python scripts/run_navsim.py cache
+python scripts/run_navsim.py evaluate
+```
+
+默认 `warmup_two_stage` 含16个原始锚点和204个合成锚点。`smoke` 只对其中原始/合成各一个执行官方模拟和评分，明确不产生完整两阶段成绩。正式 `navhard_two_stage` 含450个原始锚点和5462个响应合成锚点，运行 `check/cache/evaluate` 时均加 `--split navhard_two_stage --output-dir outputs/navsim/navhard/A_base`。不能只评450个原始锚点后声称完成两阶段官方测评。
+
+`check/evaluate` 在长时间评分前检查所选集合的全部当前位姿、地图和导航连接，结果保存为 `navigation_preflight.json`。官方合成样本可能仍在公开导航首段的前驱车道上；适配器使用固定版本 PDM 的当前位姿/地图拓扑纠正函数补接导航，证据写入输入包的 `route_association`，不读取未来轨迹或评分缓存。车道交集中的零面积线/点从势场面域中排除，不缓冲扩大车道。任一样本预检失败会停止，不以删样本或替代分数完成评测。
+
+`smoke/evaluate` 默认开启 `bev_video: true`（命令行 `--bev-video`）；逐样本保存 `samples/<摘要ID>/official_replay/official_bev.mp4`、首帧图、压缩执行记录及独立导出状态，完成后打开输出目录下 `visualizations/index.html` 选择播放。动画使用本次官方控制器实际模拟的自车轨迹和本次响应交通策略返回的对象轨迹，叠加提交规划、记录人类参考和官方红灯区域；不是把数据集未来帧冒充算法执行。原始事件诊断与人类违规过滤后的官方整段指标分开显示，不虚构逐帧 EPDMS 或完整两阶段成绩。0至4秒的41个实际状态按10帧/秒编码，视频编码时长4.1秒；不同锚点不拼成连续驾驶。
+
+可视化在评分侧旁路采集，不把未来状态送回规划器，不修改官方SDK、响应策略、评分公式或聚合。人类参照评分前先复制算法对应的执行数据，避免被第二次评分覆盖。视频失败单列状态，不把官方分数改成失败或成功；`--no-bev-video` 可关闭导出。导出时间独立记录，不计作规划耗时。修改代码后使用新的输出目录，正在运行的旧评测不会自动获得动画。
+
+对已保存的执行记录可独立重绘，不运行规划器或官方仿真；只有旧CSV/静态规划图而无执行记录的实验不能恢复响应交通动画：
+
+```bash
+python scripts/run_navsim.py render --output-dir outputs/navsim/warmup/A_base_bev
+python scripts/run_navsim.py gallery --output-dir outputs/navsim/warmup/A_base_bev
+```
+
+`render` 可加 `--token <原始token>` 只重绘一个样本；`gallery` 可在评测运行期间刷新播放列表，既有视频不重算。
+
+默认 `fast: off, retrieve: false`；B组设置 `fast: server` 或 `api` 并指定个人模型配置，C组再启用 `retrieve: true` 和只读记忆库。沿用现有 `MemoryStore` 及其离线库只读适配，库必须通过现有资产/特征协议与新增来源审计；没有自动迁移旧库，也尚未验证真实模型和C组实验。全部组关闭在线写入和反思，启动时冻结记忆快照并在数值进程复核，拒绝评测同log/同token记忆及来源不明的真实数据记忆；不同组应使用不同输出目录。输出保存冻结配置、输入包、图像/表示、轨迹及诊断、官方原始CSV和完成状态。修改数值源码或参数后需新输出目录，避免混合实验。
+
+---
+
+# EP-Driver 原有运行指令与参数
 
 > 当前实现边界：正常行驶候选除软跟踪代价外，仍需满足窄跟踪带硬资格（允许误差为 `0.25m + 初始横向偏差 × exp(-路径进度/15m)`）；制动候选不使用此项硬资格。尚未实现“车道中心仅作为软偏好”的后续调整。CARLA物理仿真效果仍需服务器验证。
 
