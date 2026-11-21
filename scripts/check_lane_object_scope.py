@@ -85,7 +85,10 @@ class ScopeTests(unittest.TestCase):
         s.lanes.append(cross)
         s.actors=[actor('cross_traffic',10,0,heading=np.pi/2,lane='cross',speed=3),
                   actor('own_traffic',12,0,lane='c',speed=3)]
-        self.assertEqual(ids(s)[0],{'own_traffic'})
+        chosen, diagnostic = ids(s)
+        self.assertEqual(chosen, {'own_traffic', 'cross_traffic'})
+        self.assertEqual(diagnostic['objects']['cross_traffic']['owner_lane_id'], 'cross')
+        self.assertIn('front', diagnostic['objects']['cross_traffic']['roles'])
 
     def test_center_and_true_lane_straddle(self):
         s=straight();s.actors=[actor('straddle',8,1.7,lane='c')]

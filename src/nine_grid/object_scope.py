@@ -117,12 +117,6 @@ def select_scope_objects(scene, config=None):
         memberships = {}
         for side, trace in traces.items():
             belongs = belongs_to_trace(actor, body, owner, trace, cache, 1e-5)
-            if not belongs and owner is None and trace is not None:
-                # 中心尚在车道外、但真实外廓已经侵入车道的行人/障碍仍算在道上。
-                # 额外交集必须位于中心线物理宽度内，宽路口多边形不能单独准入。
-                belongs = any(body.intersection(cache[key][1]).intersection(
-                    cache[key][2].buffer(cache[key][0].width/2, cap_style=2)).area >= 1e-5
-                    for key in trace['lane_ids'] if key in cache)
             if not belongs:
                 continue
             points = trace['points']
