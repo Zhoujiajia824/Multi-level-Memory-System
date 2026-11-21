@@ -11,6 +11,7 @@ import time
 import hashlib
 import json
 import numpy as np
+from .lane_roles import ASSIGNMENT_PROTOCOL
 
 
 VERSION = 'frenet-eight-planning-3.0'
@@ -146,6 +147,8 @@ def select_planning_objects(scene, config=None, answer=None):
     started = time.perf_counter()
     options = (config or {}).get('planning_objects')
     existing = scene.diagnostics.get('planning_scope')
+    if isinstance(existing, dict) and existing.get('assignment_protocol') != ASSIGNMENT_PROTOCOL:
+        raise ValueError('已筛选规划场景的对象归属协议已改变，须从完整冻结帧重新筛选')
     if options is None:
         options = (existing['settings'] if isinstance(existing,dict) and existing.get('version') == VERSION
                    else scope_settings(scene))
@@ -239,6 +242,8 @@ def planning_scene(scene, config=None, answer=None):
     """先限定共同车道范围，再缩为EKF集合；原始场景留给图像及审计。"""
     from .object_scope import scope_scene
     existing = scene.diagnostics.get('planning_scope')
+    if isinstance(existing, dict) and existing.get('assignment_protocol') != ASSIGNMENT_PROTOCOL:
+        raise ValueError('已筛选规划场景的对象归属协议已改变，须从完整冻结帧重新筛选')
     if isinstance(existing,dict) and existing.get('version') == VERSION:
         # 必须在scope删除越界对象之前验证；否则变动对象可能被删掉后绕过签名，
         # 而旧路权快照仍携带它的原状态。

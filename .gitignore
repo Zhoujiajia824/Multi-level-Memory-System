@@ -32,6 +32,7 @@
 !/scripts/check_highway_model_camera.py
 !/scripts/check_model_object_scope.py
 !/scripts/check_lane_object_scope.py
+!/scripts/check_lane_body_intrusion.py
 !/scripts/check_highway_truth_scope.py
 !/scripts/check_highway_navigation_connectors.py
 !/scripts/check_navigation_connection_domain.py

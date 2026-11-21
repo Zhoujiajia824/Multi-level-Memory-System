@@ -13,7 +13,7 @@ from shapely.ops import unary_union
 
 from .navigation_connections import confirmed_navigation_connections
 
-ASSIGNMENT_PROTOCOL = "lane-topology-role-assignment-1.0"
+ASSIGNMENT_PROTOCOL = "lane-topology-role-assignment-1.1"
 # 开发默认值；仅用于地图连接/数值消歧，不是交通安全距离。
 PARAMETERS = {"connection_gap_m": 2., "connection_angle_rad": math.pi / 3,
               "geometry_tolerance_m": 1e-5,
@@ -228,29 +228,28 @@ def forward_reachable(lanes, start, target):
 
 
 def belongs_to_trace(actor, body, owner_id, trace, lane_cache, area_tolerance):
-    """所属链或真正跨越相邻同向中心线分界；宽地图面假相交不能抢占角色。"""
-    if owner_id is None or trace is None or trace['shape'] is None:
+    """车身实际侵入准入车道的物理宽度带即占用，不以来源车道方向否决。
+
+    owner_id只说明主车道归属；横穿、对向和转弯来车仍可能占用当前行驶链。
+    地图多边形须与真实中心线半宽带相交，避免宽路口包围面造成假占用。
+    范围、邻道权限和每区代表选择由调用方处理，本函数不扩大准入车道链。
+    """
+    if trace is None or trace['shape'] is None:
         return False
-    if owner_id in trace['lane_ids']:
-        return body.intersection(trace['shape']).area >= area_tolerance
-    owner, _, owner_line = lane_cache[owner_id]
-    _, _, h0, _ = project(owner.center, actor.position)
     for key in trace['lane_ids']:
+        if key not in lane_cache:
+            continue
         lane, polygon, line = lane_cache[key]
+        width = lane.width
+        if (isinstance(width, (bool, np.bool_))
+                or not isinstance(width, (int, float, np.integer, np.floating))
+                or not math.isfinite(float(width)) or width <= 0):
+            continue
         intersection = body.intersection(polygon)
         if intersection.area < area_tolerance:
             continue
-        _, _, h1, _ = project(lane.center, actor.position)
-        if math.cos(h1-h0) <= .5:
-            continue
-        parts = [intersection] if intersection.geom_type == 'Polygon' else list(getattr(intersection, 'geoms', []))
-        for part in parts:
-            if part.geom_type != 'Polygon':
-                continue
-            # 使用实际车体相交部分；不以面积占比删掉真正的少量压线。
-            samples = list(part.exterior.coords)+[part.representative_point().coords[0]]
-            for xy in samples:
-                point = Point(xy)
-                if line.distance(point)+PARAMETERS['geometry_tolerance_m'] < owner_line.distance(point):
-                    return True
-    return False
+        if intersection.intersection(line.buffer(float(width)/2, cap_style=2)).area >= area_tolerance:
+            return True
+    # 仅消费trace已有的验证连接；不在此生成或猜测新的道路连接。
+    return any(body.intersection(link['shape']).area >= area_tolerance
+               for link in trace.get('navigation_connections', []))

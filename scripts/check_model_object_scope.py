@@ -97,9 +97,10 @@ class ModelScopeTests(unittest.TestCase):
                     actor('own', 12, speed=3)]
         bind(s)
         g = build_grid(s)
-        self.assertEqual(g['slots']['front']['id'], 'own')
-        self.assertEqual(g['assignment_protocol'], 'lane-topology-role-assignment-1.0')
-        self.assertEqual(model_ids(payload(s)), {'own'})
+        # 横穿车真实占用当前车道且更近，不能因原属车道方向不同而忽略。
+        self.assertEqual(g['slots']['front']['id'], 'cross_traffic')
+        self.assertEqual(g['assignment_protocol'], 'lane-topology-role-assignment-1.1')
+        self.assertEqual(model_ids(payload(s)), {'own', 'cross_traffic'})
 
     def test_reflection_does_not_repeat_excluded_objects(self):
         result = _reflection_diagnostics({'plan': {'planning_object_selection': {'excluded': [{'id': 'far'}]},
