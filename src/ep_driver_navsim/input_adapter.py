@@ -65,6 +65,59 @@ def _correct_route_order(map_api, origin, order):
     return [str(key) for key in route_roadblock_correction(StateSE2(*origin), map_api, blocks)]
 
 
+def _roadblock(map_api, key):
+    from nuplan.common.maps.maps_datatypes import SemanticMapLayer
+
+    obj = map_api.get_map_object(str(key), SemanticMapLayer.ROADBLOCK)
+    return obj if obj is not None else map_api.get_map_object(str(key), SemanticMapLayer.ROADBLOCK_CONNECTOR)
+
+
+def _route_order_connected(map_api, order):
+    """Check the public directed roadblock sequence without inventing links."""
+    blocks = []
+    for key in order:
+        if blocks and str(blocks[-1].id) == str(key):
+            continue
+        obj = _roadblock(map_api, key)
+        if obj is None:
+            return False
+        blocks.append(obj)
+    return bool(blocks) and all(str(right.id) in {str(edge.id) for edge in left.outgoing_edges}
+                                for left, right in zip(blocks, blocks[1:]))
+
+
+def _link_public_route(map_api, order):
+    """Only insert directed map links between ordered public waypoints.
+
+    Use the same bounded BFS as official PDM's interior-link repair, without
+    its off-route prefix selection or polygon-based removal of the public tail.
+    """
+    if _route_order_connected(map_api, order):
+        return order[:]
+    from navsim.planning.simulation.planner.pdm_planner.utils.graph_search.bfs_roadblock import BreadthFirstSearchRoadBlock
+
+    objects = {str(key): _roadblock(map_api, key) for key in order}
+    if not objects or any(obj is None for obj in objects.values()):
+        return None
+    result = [str(order[0])]
+    for key in map(str, order[1:]):
+        previous = result[-1]
+        if key == previous:
+            continue
+        if key in {str(edge.id) for edge in objects[previous].outgoing_edges}:
+            result.append(key)
+            continue
+        graph = BreadthFirstSearchRoadBlock(previous, map_api, forward_search=True)
+        (path, ids), found = graph.search(key, max_depth=30)
+        ids = [str(value) for value in ids]
+        if (not found or len(ids) < 2 or ids[0] != previous or ids[-1] != key
+                or [str(obj.id) for obj in path] != ids
+                or any(value in objects for value in ids[1:-1])):
+            return None
+        result.extend(ids[1:])
+    return result if _route_order_connected(map_api, result) else None
+
+
 def _map_packet(map_api, origin, roadblock_ids, desired_speed_mps, map_radius_m):
     from nuplan.common.actor_state.state_representation import Point2D
     from nuplan.common.maps.maps_datatypes import SemanticMapLayer
@@ -128,7 +181,11 @@ def _map_packet(map_api, origin, roadblock_ids, desired_speed_mps, map_radius_m)
         return (row["heading_error_rad"] > math.pi / 2, not row["polygon_covers_rear_axle"],
                 row["projection_error_m"] + row["heading_error_rad"])
     def select(route_order):
-        candidates = [lane for lane in lanes if block(lane["id"]) in set(route_order)]
+        # A wide lane polygon can cover ego while its baseline is much
+        # farther away than a valid predecessor. Apply the existing association
+        # limits before coverage ranking, rather than abort on that invalid winner.
+        candidates = [lane for lane in lanes if block(lane["id"]) in set(route_order)
+                      and not nearest(lane)[0] and nearest(lane)[2] <= 8]
         return min(candidates, key=nearest) if candidates else None
     current = select(order)
     initial_lane = None if current is None else current["id"]
@@ -136,12 +193,28 @@ def _map_packet(map_api, origin, roadblock_ids, desired_speed_mps, map_radius_m)
     # when ego already lies on it: interior links can be missing as well as the
     # prefix. Never substitute an unrelated nearby lane for this graph search.
     order = _correct_route_order(map_api, origin, order)
+    attempted_order = order[:]
+    rejection_reason = None
     current = select(order)
+    if current is None:
+        # The official correction can start on an overlapping opposite branch
+        # and remove a valid public suffix as a loop. Keep the public route only
+        # if its current association and every directed map link are verified.
+        public_current = select(public_order)
+        if public_current is not None:
+            linked_public = _link_public_route(map_api, public_order)
+            if linked_public is not None:
+                order, current = linked_public, public_current
+                rejection_reason = "corrected_route_has_no_valid_current_association;connected_public_route_retained"
     if current is None or nearest(current)[0] or nearest(current)[2] > 8:
         raise ValueError("Current ego pose cannot be associated with the mapped route after topology correction")
     allowed = set(order)
     current_id = current["id"]
     route_evidence = dict(public_roadblock_ids=public_order, used_roadblock_ids=order,
+        attempted_roadblock_ids=attempted_order, topology_correction_rejection_reason=rejection_reason,
+        used_route_source=("public_route_order_with_verified_directed_map_links" if rejection_reason else
+                           "pinned_official_pdm_route_roadblock_correction"),
+        public_route_inserted_roadblock_ids=([key for key in order if key not in public_order] if rejection_reason else []),
         topology_correction_attempted=True, topology_correction_changed=order != public_order,
         correction_source="pinned_official_pdm_route_roadblock_correction_current_pose_map_public_route",
         initial_lane_id=initial_lane, current_lane_id=current_id, **associations[current_id])

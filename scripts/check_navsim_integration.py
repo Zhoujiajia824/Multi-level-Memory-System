@@ -8,7 +8,7 @@ import sys
 import tempfile
 from types import ModuleType, SimpleNamespace as NS
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 from shapely.geometry import GeometryCollection, LineString, Point, Polygon, box
@@ -166,7 +166,7 @@ class NavsimContractTests(unittest.TestCase):
         self.assertGreater(LineString(result[1]).length - adapter._project(result[1], np.zeros(2))[0], 240.)
         fix.assert_called_once_with(unittest.mock.ANY, origin, ["R0", "R2"])
 
-    def test_opposing_connector_coverage_cannot_mask_nearby_directed_route(self):
+    def test_invalid_connector_coverage_cannot_mask_nearby_directed_route(self):
         def lane(key, block_id, points, bounds):
             line = LineString(points)
             return NS(id=key, get_roadblock_id=lambda: block_id, polygon=box(*bounds),
@@ -174,22 +174,174 @@ class NavsimContractTests(unittest.TestCase):
                 left_boundary=NS(linestring=LineString([(x,y+1.75) for x,y in points])),
                 right_boundary=NS(linestring=LineString([(x,y-1.75) for x,y in points])),
                 speed_limit_mps=10., adjacent_edges=(None,None), outgoing_edges=[])
-        opposing = lane("opposing", "R0", [(10,0),(-10,0)], [-10,-1.75,10,1.75])
         directed = lane("directed", "R1", [(-10,3.3),(300,3.3)], [-10,1.55,300,5.05])
         layers = NS(LANE="lane", LANE_CONNECTOR="connector", CROSSWALK="crosswalk",
                     ROADBLOCK="roadblock", INTERSECTION="intersection", CARPARK_AREA="carpark")
         nearby = {value: [] for value in vars(layers).values()}
-        nearby[layers.LANE_CONNECTOR] = [opposing,directed]
         modules = {name: ModuleType(name) for name in ("nuplan", "nuplan.common", "nuplan.common.actor_state",
             "nuplan.common.actor_state.state_representation", "nuplan.common.maps", "nuplan.common.maps.maps_datatypes")}
         modules["nuplan.common.actor_state.state_representation"].Point2D = lambda *args: args
         modules["nuplan.common.maps.maps_datatypes"].SemanticMapLayer = layers
-        with patch.dict(sys.modules, modules), patch.object(adapter,"_correct_route_order",return_value=["R0","R1"]):
-            result = adapter._map_packet(NS(get_proximal_map_objects=lambda *args: nearby),np.zeros(3),["R0","R1"],10.,160.)
-        self.assertEqual(result[3],"directed")
-        self.assertFalse(result[-1]["polygon_covers_rear_axle"])
-        self.assertAlmostEqual(result[-1]["projection_error_m"],3.3)
-        self.assertEqual(result[-1]["heading_error_rad"],0.)
+        # The second case models an observed wide intersection connector whose
+        # polygon covers ego but baseline residual already exceeds the 8m gate.
+        for points in ([(10,0),(-10,0)], [(-10,9.3),(300,9.3)]):
+            with self.subTest(points=points):
+                invalid = lane("invalid", "R0", points, [-10,-1.75,300,12])
+                nearby[layers.LANE_CONNECTOR] = [invalid,directed]
+                with patch.dict(sys.modules, modules), patch.object(adapter,"_correct_route_order",return_value=["R0","R1"]):
+                    result = adapter._map_packet(NS(get_proximal_map_objects=lambda *args: nearby),np.zeros(3),["R0","R1"],10.,160.)
+                self.assertEqual(result[3],"directed")
+                self.assertFalse(result[-1]["polygon_covers_rear_axle"])
+                self.assertAlmostEqual(result[-1]["projection_error_m"],3.3)
+                self.assertEqual(result[-1]["heading_error_rad"],0.)
+
+    def _correction_loses_valid_public_route_fixture(self):
+        def lane(key, block, points, bounds):
+            line = LineString(points)
+            return NS(id=key, get_roadblock_id=lambda: block, polygon=box(*bounds),
+                baseline_path=NS(linestring=line, discrete_path=[NS(x=x, y=y) for x, y in points]),
+                left_boundary=NS(linestring=LineString([(x, y + 1.75) for x, y in points])),
+                right_boundary=NS(linestring=LineString([(x, y - 1.75) for x, y in points])),
+                speed_limit_mps=10., adjacent_edges=(None, None), outgoing_edges=[])
+        # Hazelwood 38e9599c6c91e204f: an overlapping opposing connector makes
+        # official correction prepend a wrong branch, then loop removal drops
+        # the valid public-route suffix. Public residual remains within the
+        # original gate and its direction agrees with the current pose.
+        current = lane("public_current", "R0", [(-30, 3.7), (15, 3.7)], [-30, 1.95, 15, 5.45])
+        following = lane("public_following", "R1", [(15, 3.7), (300, 3.7)], [15, 1.95, 300, 5.45])
+        wrong = lane("opposing", "wrong", [(10, 0), (-10, 0)], [-10, -1.75, 10, 1.75])
+        current.outgoing_edges = [following]
+        layers = NS(LANE="lane", LANE_CONNECTOR="connector", CROSSWALK="crosswalk",
+                    ROADBLOCK="roadblock", INTERSECTION="intersection", CARPARK_AREA="carpark")
+        nearby = {value: [] for value in vars(layers).values()}
+        nearby[layers.LANE] = [current, following]
+        nearby[layers.LANE_CONNECTOR] = [wrong]
+        modules = {name: ModuleType(name) for name in ("nuplan", "nuplan.common", "nuplan.common.actor_state",
+            "nuplan.common.actor_state.state_representation", "nuplan.common.maps", "nuplan.common.maps.maps_datatypes")}
+        modules["nuplan.common.actor_state.state_representation"].Point2D = lambda *args: args
+        modules["nuplan.common.maps.maps_datatypes"].SemanticMapLayer = layers
+        return modules, NS(get_proximal_map_objects=lambda *args: nearby)
+
+    def test_invalid_correction_retains_only_connected_valid_public_route(self):
+        modules, map_api = self._correction_loses_valid_public_route_fixture()
+        origin = np.zeros(3)
+        public_order, attempted_order = ["R0", "R1"], ["wrong"]
+        with patch.dict(sys.modules, modules), \
+                patch.object(adapter, "_correct_route_order", return_value=attempted_order) as correction, \
+                patch.object(adapter, "_link_public_route", return_value=public_order) as linked:
+            result = adapter._map_packet(map_api, origin, public_order, 10., 160.)
+        correction.assert_called_once_with(map_api, origin, public_order)
+        linked.assert_called_once_with(map_api, public_order)
+        self.assertEqual(result[3], "public_current")
+        self.assertEqual(result[2], ["public_current", "public_following"])
+        audit = result[-1]
+        self.assertTrue(audit["topology_correction_attempted"])
+        self.assertFalse(audit["topology_correction_changed"])
+        self.assertEqual(audit["public_roadblock_ids"], public_order)
+        self.assertEqual(audit["used_roadblock_ids"], public_order)
+        self.assertEqual(audit["attempted_roadblock_ids"], attempted_order)
+        self.assertEqual(audit["topology_correction_rejection_reason"],
+            "corrected_route_has_no_valid_current_association;connected_public_route_retained")
+        self.assertEqual(audit["initial_lane_id"], "public_current")
+        self.assertEqual(audit["current_lane_id"], "public_current")
+        self.assertAlmostEqual(audit["projection_error_m"], 3.7)
+        self.assertEqual(audit["heading_error_rad"], 0.)
+        self.assertFalse(audit["polygon_covers_rear_axle"])
+
+    def test_invalid_correction_cannot_retain_disconnected_public_route(self):
+        modules, map_api = self._correction_loses_valid_public_route_fixture()
+        with patch.dict(sys.modules, modules), \
+                patch.object(adapter, "_correct_route_order", return_value=["wrong"]), \
+                patch.object(adapter, "_link_public_route", return_value=None) as linked:
+            with self.assertRaisesRegex(ValueError, "after topology correction"):
+                adapter._map_packet(map_api, np.zeros(3), ["R0", "R1"], 10., 160.)
+        linked.assert_called_once_with(map_api, ["R0", "R1"])
+
+    def test_public_route_connectivity_checks_directed_edges_without_global_deduplication(self):
+        first, connector, last = [NS(id=key, outgoing_edges=[]) for key in ("A", "B", "C")]
+        first.outgoing_edges, connector.outgoing_edges, last.outgoing_edges = [connector], [last], [first]
+        layers = NS(ROADBLOCK="roadblock", ROADBLOCK_CONNECTOR="connector")
+        objects = {("A", layers.ROADBLOCK): first, ("B", layers.ROADBLOCK_CONNECTOR): connector,
+                   ("C", layers.ROADBLOCK): last}
+        queries = []
+        def get_object(key, layer):
+            queries.append((key, layer))
+            return objects.get((key, layer))
+        map_api = NS(get_map_object=get_object)
+        modules = {name: ModuleType(name) for name in
+            ("nuplan", "nuplan.common", "nuplan.common.maps", "nuplan.common.maps.maps_datatypes")}
+        modules["nuplan.common.maps.maps_datatypes"].SemanticMapLayer = layers
+        cases = [([], False), (["A"], True), (["A", "A", "B", "B", "C"], True),
+                 (["A", "C"], False), (["B", "A"], False), (["A", "missing"], False),
+                 (["A", "B", "A"], False), (["A", "B", "C", "A"], True)]
+        with patch.dict(sys.modules, modules):
+            for order, expected in cases:
+                with self.subTest(order=order):
+                    self.assertEqual(adapter._route_order_connected(map_api, order), expected)
+            # A graph edge alone does not authenticate the corresponding map object.
+            del objects[("B", layers.ROADBLOCK_CONNECTOR)]
+            self.assertFalse(adapter._route_order_connected(map_api, ["A", "B"]))
+        self.assertIn(("B", layers.ROADBLOCK), queries)
+        self.assertIn(("B", layers.ROADBLOCK_CONNECTOR), queries)
+
+    def _public_route_link_fixture(self, path_ids=None, found=True):
+        nodes = {key: NS(id=key, outgoing_edges=[]) for key in ("R0", "link", "R1", "R2", "wrong")}
+        nodes["R0"].outgoing_edges = [nodes["link"]]
+        nodes["link"].outgoing_edges = [nodes["R1"]]
+        nodes["R1"].outgoing_edges = [nodes["R2"]]
+        layers = NS(ROADBLOCK="roadblock", ROADBLOCK_CONNECTOR="connector")
+        def get_object(key, layer):
+            expected_layer = layers.ROADBLOCK_CONNECTOR if key == "link" else layers.ROADBLOCK
+            return nodes.get(key) if layer == expected_layer else None
+        map_api = NS(get_map_object=get_object)
+        path_ids = ["R0", "link", "R1"] if path_ids is None else path_ids
+        search = Mock(return_value=(([nodes[key] for key in path_ids], path_ids), found))
+        constructor = Mock(return_value=NS(search=search))
+        modules = {name: ModuleType(name) for name in (
+            "nuplan", "nuplan.common", "nuplan.common.maps", "nuplan.common.maps.maps_datatypes",
+            "navsim", "navsim.planning", "navsim.planning.simulation", "navsim.planning.simulation.planner",
+            "navsim.planning.simulation.planner.pdm_planner", "navsim.planning.simulation.planner.pdm_planner.utils",
+            "navsim.planning.simulation.planner.pdm_planner.utils.graph_search",
+            "navsim.planning.simulation.planner.pdm_planner.utils.graph_search.bfs_roadblock")}
+        modules["nuplan.common.maps.maps_datatypes"].SemanticMapLayer = layers
+        modules["navsim.planning.simulation.planner.pdm_planner.utils.graph_search.bfs_roadblock"].BreadthFirstSearchRoadBlock = constructor
+        return modules, map_api, constructor, search, nodes
+
+    def test_public_route_link_inserts_only_missing_forward_blocks_in_public_order(self):
+        modules, map_api, constructor, search, _ = self._public_route_link_fixture()
+        public_order = ["R0", "R1", "R2"]
+        with patch.dict(sys.modules, modules):
+            linked = adapter._link_public_route(map_api, public_order)
+        self.assertEqual(linked, ["R0", "link", "R1", "R2"])
+        self.assertEqual([key for key in linked if key in public_order], public_order)
+        constructor.assert_called_once_with("R0", map_api, forward_search=True)
+        search.assert_called_once_with("R1", max_depth=30)
+
+    def test_public_route_link_rejects_failed_invalid_or_reordered_paths(self):
+        cases = [
+            ("not_found", ["R0", "link", "R1"], False),
+            ("wrong_start", ["wrong", "link", "R1"], True),
+            ("wrong_end", ["R0", "link", "wrong"], True),
+            ("public_waypoint_inserted_early", ["R0", "R2", "R1"], True),
+            ("path_not_directed", ["R0", "wrong", "R1"], True),
+        ]
+        for name, path_ids, found in cases:
+            with self.subTest(reason=name):
+                modules, map_api, constructor, search, _ = self._public_route_link_fixture(path_ids, found)
+                with patch.dict(sys.modules, modules):
+                    self.assertIsNone(adapter._link_public_route(map_api, ["R0", "R1", "R2"]))
+                constructor.assert_called_once_with("R0", map_api, forward_search=True)
+                search.assert_called_once_with("R1", max_depth=30)
+
+    def test_public_route_link_rejects_mismatched_path_objects_and_final_graph(self):
+        modules, map_api, _, search, nodes = self._public_route_link_fixture()
+        search.return_value = (([nodes["R0"], nodes["wrong"], nodes["R1"]], ["R0", "link", "R1"]), True)
+        with patch.dict(sys.modules, modules):
+            self.assertIsNone(adapter._link_public_route(map_api, ["R0", "R1", "R2"]))
+        modules, map_api, _, _, _ = self._public_route_link_fixture()
+        # Even plausible returned IDs cannot bypass final adjacency validation.
+        with patch.dict(sys.modules, modules), patch.object(adapter, "_route_order_connected", return_value=False):
+            self.assertIsNone(adapter._link_public_route(map_api, ["R0", "R1", "R2"]))
 
     def test_official_cache_path_normalization(self):
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:

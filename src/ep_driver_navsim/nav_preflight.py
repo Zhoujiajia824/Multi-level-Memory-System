@@ -199,8 +199,11 @@ def inspect_navigation(settings, loader, map_checker=None):
         scope=SCOPE, official_metric_cache=False, phase="verifying_sources"))
     contract = cache_contract(settings, tokens)
     contract_sha = digest(contract)
+    metric_root = filesystem_path(settings["metric_cache_path"])
     cache_base = filesystem_path(settings.get("navigation_preflight_cache") or
-                      Path(settings["metric_cache_path"]) / "ep_navigation_preflight")
+                      metric_root.with_name(metric_root.name + "_ep_navigation_preflight"))
+    if cache_base.is_relative_to(metric_root):
+        raise ValueError("Navigation preflight cache must be outside the official metric cache")
     cache_dir = cache_base / contract_sha
     cache_dir.mkdir(parents=True, exist_ok=True)
     results, reused, computed = {}, 0, 0

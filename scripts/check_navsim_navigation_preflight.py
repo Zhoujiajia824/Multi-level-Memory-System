@@ -63,7 +63,7 @@ class NavigationCheckpointTests(unittest.TestCase):
         return json.loads((Path((settings or self.settings)["output_dir"]) / "navigation_preflight.json").read_text())
 
     def cache_files(self):
-        return sorted(filesystem_path(self.root / "official_cache/ep_navigation_preflight").glob("*/*.json"))
+        return sorted(filesystem_path(self.root / "official_cache_ep_navigation_preflight").glob("*/*.json"))
 
     def test_complete_and_cross_group_reuse_without_official_metric_cache(self):
         calls = []
@@ -81,6 +81,17 @@ class NavigationCheckpointTests(unittest.TestCase):
         self.assertEqual(result["reused_tokens"], 3)
         self.assertEqual(self.report(other)["topology_corrected_tokens"][0]["token"], "b")
         self.assertFalse((self.root / "official_cache/metadata").exists())
+        self.assertFalse((self.root / "official_cache").exists())
+        # A successful check must not prevent first-time official cache creation.
+        from ep_driver_navsim.launch import verify_cache_contract
+        self.assertEqual(verify_cache_contract(self.settings, creating=True),
+                         Path(self.settings["metric_cache_path"]) / "ep_navsim_cache_contract.json")
+
+    def test_explicit_navigation_cache_cannot_pollute_official_cache(self):
+        settings = dict(self.settings, navigation_preflight_cache=str(self.root / "official_cache" / "custom"))
+        with self.assertRaisesRegex(ValueError, "outside the official"):
+            self.run_check(settings=settings)
+        self.assertFalse((self.root / "official_cache").exists())
 
     def test_partial_interruption_is_not_passed_and_resumes_remaining(self):
         def stop(task, contract):
