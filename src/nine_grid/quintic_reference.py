@@ -73,3 +73,85 @@ def initial_lateral_state(scene, reference, s, d, heading):
     second = (curvature*(denominator**2+slope**2)**1.5
               -k*denominator**2-kp*d*slope-2*k*slope**2)/denominator
     return float(d),float(slope),float(second)
+
+
+class ContinuousReference:
+    """Interpolating geometry for a sampled reference, with consistent normals.
+
+    The parameter remains the frozen polyline's metre-labelled arc coordinate;
+    source nodes are interpolated exactly. It is not a replacement task route
+    or a change to the model's original Frenet target definition.
+    """
+    def __init__(self, reference):
+        from scipy.interpolate import make_interp_spline
+        self.points=clean_polyline(reference)
+        self.arc=polyline_lengths(self.points)
+        self.total=float(self.arc[-1])
+        degree=5 if len(self.points)>=6 else 3 if len(self.points)>=4 else len(self.points)-1
+        self.spline=make_interp_spline(self.arc,self.points,k=degree,axis=0)
+        self.degree=degree
+
+    def derivative(self, parameter, order=0):
+        parameter=np.asarray(parameter,float)
+        if order>self.degree:
+            return np.zeros(parameter.shape+(2,))
+        return np.asarray(self.spline(parameter,nu=order),float)
+
+    def geometry(self, parameter):
+        first=self.derivative(parameter,1);second=self.derivative(parameter,2);third=self.derivative(parameter,3)
+        speed=np.linalg.norm(first,axis=-1)
+        if np.any(speed<1e-6):
+            raise ValueError('连续参考出现退化切向，不能生成五次目标连接')
+        tangent=first/speed[...,None]
+        normal=np.stack((-tangent[...,1],tangent[...,0]),axis=-1)
+        cross=first[...,0]*second[...,1]-first[...,1]*second[...,0]
+        curvature=cross/speed**3
+        derivative=(first[...,0]*third[...,1]-first[...,1]*third[...,0])/speed**3
+        derivative-=3.*cross*np.sum(first*second,axis=-1)/speed**5
+        return dict(position=self.derivative(parameter),tangent=tangent,normal=normal,
+            speed=speed,speed_derivative=np.sum(first*second,axis=-1)/speed,
+            curvature=curvature,curvature_derivative=derivative)
+
+    def project(self, positions, initial):
+        """Local closest-point refinement; never jump a loop or parallel road."""
+        positions=np.asarray(positions,float)
+        q=np.asarray(initial,float).copy()
+        radius=max(1.,float(np.max(np.diff(self.arc)))*1.5)
+        lower=np.maximum(0.,q-radius);upper=np.minimum(self.total,q+radius)
+        for _ in range(10):
+            delta=self.derivative(q)-positions
+            first=self.derivative(q,1);second=self.derivative(q,2)
+            denominator=np.sum(first*first+delta*second,axis=-1)
+            if np.any(denominator<=1e-8):
+                raise ValueError('连续参考局部投影失效，不允许跨段重定位')
+            change=np.sum(delta*first,axis=-1)/denominator
+            q=np.clip(q-change,lower,upper)
+            if np.max(np.abs(change))<1e-10:break
+        return q
+
+
+def continuous_initial_lateral_state(scene, curve, parameter, lateral):
+    """Actual heading/curvature boundary in the continuous reference parameter."""
+    frame=curve.geometry(float(parameter))
+    h=float(frame['speed']);hp=float(frame['speed_derivative'])
+    k=float(frame['curvature']);kp=float(frame['curvature_derivative'])
+    heading=float(np.arctan2(frame['tangent'][1],frame['tangent'][0]))
+    velocity=np.asarray(scene.ego.velocity,float);speed=float(np.linalg.norm(velocity))
+    course=float(np.arctan2(velocity[1],velocity[0])) if speed>.3 else float(scene.ego.heading)
+    denominator=1.-k*lateral
+    if denominator<=.05 or abs(float(wrap_angle(course-heading)))>=1.2:
+        raise ValueError('当前状态不满足连续参考单值前向连接条件')
+    a=h*denominator;slope=a*np.tan(float(wrap_angle(course-heading)))
+    control=np.asarray(scene.diagnostics.get('previous_control',[]),float)
+    if control.shape==(2,) and np.isfinite(control).all():
+        wheelbase=scene.ego.wheelbase_m or scene.ego.length
+        rear=scene.ego.rear_axle_to_center_m or wheelbase/2.
+        curvature=np.sin(np.arctan(rear/wheelbase*np.tan(float(control[1]))))/rear
+    elif speed>.3 and np.isfinite(scene.ego.acceleration).all():
+        ax,ay=np.asarray(scene.ego.acceleration,float)
+        curvature=(velocity[0]*ay-velocity[1]*ax)/speed**3
+    else:
+        curvature=k/denominator
+    tangential_second=hp*denominator-h*kp*lateral-2.*h*k*slope
+    second=(curvature*(a*a+slope*slope)**1.5+slope*tangential_second)/a-h*h*k*denominator
+    return float(lateral),float(slope),float(second)

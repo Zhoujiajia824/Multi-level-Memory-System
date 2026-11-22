@@ -1,0 +1,41 @@
+{
+  "schema": "ep-driver-fail2drive-runtime-v1",
+  "official_commit": "bceb18afb7d62e06e990739e013e750d92ad7a88",
+  "execution_mode": "B_model",
+  "worker_python": "python",
+  "parameters_path": "config/parameters.json",
+  "models_path": "config/fail2drive.models.example.yaml",
+  "prompts_path": "config/prompts.yaml",
+  "output_dir": "outputs/fail2drive",
+  "planner_hz": 10,
+  "model_hz": 1,
+  "worker_timeout_s": 240,
+  "dino_device": "cpu",
+  "dino_cpu_threads": 2,
+  "speed_normalization_mps": 1.0,
+  "video": true,
+  "camera_width": 800,
+  "camera_height": 450,
+  "public_state": {
+    "public_capture_radius_m": 120.0,
+    "map_resolution_m": 2.0,
+    "desired_speed_mps": 10.0
+  },
+  "execution": {
+    "acceleration_min": -6.0,
+    "acceleration_max": 3.0,
+    "steering_max": 0.6,
+    "steering_rate": 0.8,
+    "longitudinal": {
+      "throttle_full_acceleration_mps2": 6.0,
+      "brake_full_deceleration_mps2": 8.0,
+      "speed_kp": 1.5,
+      "acceleration_kp": 0.2,
+      "acceleration_ki": 0.4,
+      "integral_limit_mps2": 1.0,
+      "stop_hold_brake": 0.5,
+      "stop_speed_mps": 0.1,
+      "intent_deadband_mps2": 0.05
+    }
+  }
+}

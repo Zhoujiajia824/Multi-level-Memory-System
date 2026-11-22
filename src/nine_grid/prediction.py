@@ -376,7 +376,7 @@ class Predictor:
 
     def _mapped_once(self, actor, scene, track, free, times, required_distance):
         lanes = {l.id: l for l in scene.lanes}
-        if actor.lane_id not in lanes or actor.kind == 'pedestrian':
+        if actor.lane_id not in lanes or actor.kind == 'pedestrian' or actor.motion_model == 'free':
             return free, {'map_applied': False, 'valid':True,'reason':'行人或无机动车道关联，使用观测物理运动'}
         lane = lanes[actor.lane_id]
         last_lane=lanes.get(track.get('observed_lane'))
@@ -588,8 +588,14 @@ class Predictor:
             if not actor.visible:
                 continue
             actors[actor.id] = actor
-            if actor.kind == 'static_obstacle':
+            if actor.motion_model not in (None, 'free', 'stationary'):
+                raise ValueError('未知对象运动模型：'+str(actor.motion_model))
+            if actor.motion_model == 'stationary' or (actor.kind == 'static_obstacle' and actor.motion_model != 'free'):
                 trajectories[actor.id] = np.tile([*actor.position,actor.heading,0.],(len(times),1))
+                trajectories[actor.id][0,3] = np.linalg.norm(actor.velocity)
+                diag[actor.id] = dict(map_applied=False, valid=True, map_valid=False,
+                    trajectory_source='observed_stationary_entity', motion_model=actor.motion_model,
+                    kinematic_valid=True)
                 continue
             track = self._observe(actor,scene.time)
             z, p = track['z'].copy(), track['p'].copy()
@@ -610,6 +616,7 @@ class Predictor:
             info['map_valid']=bool(info.get('map_applied') and info.get('valid'))
             info['trajectory_source']='map_conditioned_ekf' if info['map_valid'] else ('singer' if actor.kind=='pedestrian' else 'ctra_ekf')
             info['kinematic_valid']=bool(np.isfinite(output).all() and np.all(output[:,3]>=-1e-8))
+            info['motion_model']=actor.motion_model
             if not info['kinematic_valid']:
                 raise ValueError(f'对象 {actor.id} 的物理预测包含非法数值')
             trajectories[actor.id],diag[actor.id]=output,info

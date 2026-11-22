@@ -26,7 +26,7 @@ def prepare_planning_context(scene, config, answer=None, predictor=None, existin
                 continue
             old = existing.actors.get(actor.id)
             trajectory = np.asarray(existing.trajectories[actor.id], float)
-            if (old is None or old.kind != actor.kind or old.length != actor.length
+            if (old is None or old.kind != actor.kind or old.motion_model != actor.motion_model or old.length != actor.length
                     or old.width != actor.width or old.radius != actor.radius
                     or not np.allclose(old.position, actor.position, rtol=0, atol=1e-8)
                     or not np.allclose(old.velocity, actor.velocity, rtol=0, atol=1e-8)

@@ -1,0 +1,11 @@
+# 复用服务器已部署的兼容 OpenAI 视觉服务；密钥仅从环境变量读取。
+# 此模板不启动或修改服务。独立个人配置可使用 config/models.yaml（不提交）。
+fast:
+  backend: server
+  base_url: http://127.0.0.1:8000/v1
+  model: Qwen2.5-VL-3B-Instruct
+  api_key_env: FAST_VLM_API_KEY
+  timeout_s: 60
+  max_tokens: 4096
+reflection:
+  backend: off

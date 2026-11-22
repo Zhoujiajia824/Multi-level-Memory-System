@@ -1,4 +1,90 @@
-# EP-Driver 运行指令与参数
+# EP-Driver-Fail2Drive
+
+本分支从 `EP-Driver` 的 `6b4853d` 建立，接入固定版本的官方 Fail2Drive（`bceb18afb7d62e06e990739e013e750d92ad7a88`）。以下 Fail2Drive 入口使用 **B：基础规划＋服务器模型**，不检索、不写记忆、不反思。后面的 highway 说明保留作原项目参考。
+
+官方 evaluator 独占世界推进、演员生命周期、终止条件与评分；使用官方同步 20Hz，不设置项目单轮 60 秒上限。Agent 阻塞等待冻结源帧的规划结果，规划可选 1/2/10Hz，模型按仿真时间 1Hz 调用。官方墙钟 watchdog 保留；模型默认最多两次、每次 60 秒，数值 worker 总等待上限 240 秒，不能无限等候。
+
+这是 **MAP／范围内当前真值输入** 适配。使用当前对象状态、公开地图和官方导航，不读取场景未来事件或周车隐藏路线，不能称为纯视觉感知提交。模型输入是六路同帧 RGB、BEV 和筛选后的候选真值。BEV、OCC、八向张量、DINO、独立参照与内部质量评分保留；它们的评分不代替官方成绩。
+
+## Fail2Drive 环境与身份
+
+服务器专用安装位置：
+
+| 用途 | 路径／环境 |
+|---|---|
+| 官方未修改源码 | `/data/zjj/code/EP-Driver/fail2drive-devkit` |
+| 定制 CARLA | `/data/zjj/carla_fail2drive` |
+| 评测、Agent、定制 SDK | Conda `ep-fail2drive`，Python 3.10 |
+| 数值规划与 CPU DINO | Conda `ep-driver-fail2drive`，Python 3.12 |
+| 服务器模型 | `http://127.0.0.1:8000/v1`，`Qwen2.5-VL-3B-Instruct` |
+
+启动入口核验官方源码、模拟器安装清单、启动脚本／服务器二进制／wheel 哈希，并将实际导入的 SDK 扩展与该 wheel 的内容哈希绑定。普通 CARLA 0.9.15 的版本号相同不代表定制资产相同。`--dry-run` 仅查本地文件、导入 SDK 和打印计划，不连接 CARLA。
+
+`config/fail2drive.example.json` 是独立运行配置，模型模板为 `config/fail2drive.models.example.yaml`；个人地址和认证可放在忽略的 `config/models.yaml` 并用 `--models-path` 指定。DINO 必须是实际权重而非 LFS 指针。数值 worker 固定隐藏 CUDA，默认两个 CPU 线程；服务器模型仍由已有服务执行。
+
+对象车道范围使用 `config/parameters.json` 的 `planning_objects`（默认前40米、后20米），候选范围继续遵循车道集合与当前 BEV 集合的并集。Fail2Drive 将已确认的物理异常实体也纳入 BEV 候选和障碍占据通道；围栏、墙、杆不会因 `static` 前缀被统一当作障碍物。移动异常实体明确保存 `motion_model=free`，不套用静止障碍预测或机动车道先验。实际车体碰撞检查保留。
+
+该分支配置明确使用 `speed_normalization_mps=1.0` 校准速度代价；未修改主分支默认参数或 MPC/APF 公式。模型目标连接采用连续插值参考与五次偏移，消除稀疏参考法向产生的伪折点，精确保留原始目标世界坐标，仍检查实际曲率、车体、道路和不可跨线。
+
+## Fail2Drive 单条与完整评测
+
+下面命令在本分支项目根目录执行。专用 CARLA 必须另行在可用 GPU 启动，RPC 为39000、streaming为39001、secondary为39002，Traffic Manager为39003；本入口不会启动模拟器，也不管理旧22000服务。
+
+先做不连接世界的安装与配置检查：
+
+```bash
+python scripts/run_fail2drive.py \
+  --fail2drive-root /data/zjj/code/EP-Driver/fail2drive-devkit \
+  --simulator-root /data/zjj/carla_fail2drive \
+  --evaluator-python /home/zjj/miniconda3/envs/ep-fail2drive/bin/python \
+  --worker-python /home/zjj/miniconda3/envs/ep-driver-fail2drive/bin/python \
+  --routes fail2drive_split/Base_Animals_0075.xml \
+  --seed 1 --planner-hz 10 --video --record \
+  --output-dir outputs/fail2drive/B_model_smoke --dry-run
+```
+
+单条真实评测使用同一命令去掉 `--dry-run`，不添加 `--duration`。`--video` 录制六路相机拼图，原视频和 H.264 结果同时保留，编码后核验解码帧数。另一个展示相机采用官方 `viz_path_agent.py` 示例相机参数，按官方示例的图片布局归档在 `viz/`；它不进入模型。项目视频编码与已有 `ep_agent_viewer` 不属于官方独立网页查看器。
+
+完整运行把 `--routes` 改为 `fail2drive_split`、`--seed 1` 改为 `--seeds 1 2 3`、输出目录改为正式目录：200条原始 XML × 3种子，共600个独立 evaluator 任务。可用 `--route-ids 75 1075` 同时选择一对原始路线进行联调；这是子集测试，不能写成完整基准成绩。
+
+每个 XML 单独以官方 `--repetitions=1` 执行。重复种子与 Traffic Manager 种子不同：后者严格为 `route_id % 1000 + 10000 * repetition_seed`，使 Base/Generalization 配对。成绩保存在 `<方法根>/<种子>/res/####_res.json`；内部规划与视频在同种子的 `agent_runs/####/agent/<路线运行>/planning/`，官方录像在 `recorder/`。可用既有 viewer 只读打开方法根目录；相机与规划以严格源帧关联，未提供标定的相机不伪装为可做3D投影。
+
+`--resume` 沿用官方检查点，要求已启动任务的代码、参数、路线及种子指纹一致；批量中未启动的任务正常新建。更换方法或配置请使用新的方法根目录，不能混写旧成绩。运行失败仍保留官方错误和内部执行证据，不伪造成功。
+
+完整成绩由原始官方脚本汇总：
+
+```bash
+/home/zjj/miniconda3/envs/ep-fail2drive/bin/python \
+  /data/zjj/code/EP-Driver/fail2drive-devkit/tools/f2d_result_parser.py \
+  outputs/fail2drive/B_model_formal --method EP-Driver-B --strict
+```
+
+当前回归包含真实 CPU DINO、实际数值子进程、本地 HTTP 模型协议替身、执行映射、源帧绑定和公开规则适配；这些不等于部署模型与真实 CARLA 闭环验证。公开停牌和红黄灯已接入；Yield 路权明确标为尚未覆盖，不能声称完整道路规则已验证。
+
+## 服务器画面转发
+
+`scripts/watch_fail2drive.py` 使用 Python 标准库，在已有 `ep-fail2drive` 环境运行即可。它只读评测 Agent 保存的官方展示相机 JPEG 与同名源帧清单，不连接 CARLA、不新增传感器，也不推进世界。清单在 JPEG 原子落盘后发布，包含实际帧号、仿真时间和图像哈希，转发端不从文件名猜测物理帧。
+
+服务器辅助目录为 `/data/zjj/code/fiil2drive_test/`，私有运行配置为 `fail2drive.server.json`、模型配置为 `models.yaml`、观看入口为 `watch_fail2drive.sh`，输出放在 `outputs/`。这里的 `fiil2drive_test` 沿用用户指定拼写。脚本本体随 Git 分支维护，辅助入口调用它，避免另存一份实现。
+
+服务器端观看服务：
+
+```bash
+conda activate ep-fail2drive
+bash /data/zjj/code/fiil2drive_test/watch_fail2drive.sh
+```
+
+本机新开终端建立 SSH 转发，然后在浏览器打开 `http://127.0.0.1:39080`：
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:39080:127.0.0.1:39080 zjj@172.28.133.34
+```
+
+服务只监听服务器回环地址，无需开放公网端口。页面自动发现最新路线，展示实际帧号、仿真时间与距最近保存画面的墙钟时长。展示相机沿用官方示例的每10个物理帧归档一次，即仿真2Hz；同步等待模型或规划时画面可能静止，页面不会把旧帧循环发送冒充实时帧，也不会据此判定仿真故障。无评测运行时显示等待画面。完整六路20Hz相机录像仍由 Agent 独立保存。
+
+---
+
+# 原 EP-Driver 运行指令与参数
 
 > 当前实现边界：正常行驶候选除软跟踪代价外，仍需满足窄跟踪带硬资格（允许误差为 `0.25m + 初始横向偏差 × exp(-路径进度/15m)`）；制动候选不使用此项硬资格。尚未实现“车道中心仅作为软偏好”的后续调整。CARLA物理仿真效果仍需服务器验证。
 

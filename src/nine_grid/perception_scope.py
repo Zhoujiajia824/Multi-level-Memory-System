@@ -17,7 +17,7 @@ from .geometry import actor_shape, ego_to_world, world_to_ego
 from .object_scope import select_scope_objects
 
 
-VERSION = 'lane-plus-bev-dynamic-perception-1.0'
+VERSION = 'lane-plus-bev-physical-perception-2.0'
 DYNAMIC_KINDS = ('vehicle', 'bicycle', 'pedestrian')
 # 与既有BEV绘制逐像素一致。配置文件的其它bev取值此前没有改变实际图像。
 BEV_VIEWPORT = dict(front_m=70., rear_m=30., left_m=25., right_m=25.,
@@ -55,7 +55,7 @@ def _selected_signature(scene, actors):
                     velocity=actor.velocity, acceleration=actor.acceleration,
                     heading=actor.heading, length=actor.length, width=actor.width,
                     radius=actor.radius, visible=bool(actor.visible), lane_id=actor.lane_id,
-                    history=actor.history)
+                    history=actor.history, motion_model=actor.motion_model)
 
     def numeric(value):
         if isinstance(value, np.ndarray):
@@ -80,6 +80,10 @@ def _selected_signature(scene, actors):
 def select_perception_objects(scene, config=None):
     """选择全部当前候选，既不预测未来，也不恢复已被上游删除的真值。"""
     previous = scene.diagnostics.get('perception_scope')
+    bev_obstacles = ((config or {}).get('perception', {}).get('bev_physical_obstacles', False)
+                     if config is not None else
+                     'static_obstacle' in (previous.get('bev_kinds', []) if isinstance(previous, dict) else []))
+    bev_kinds = DYNAMIC_KINDS + (('static_obstacle',) if bev_obstacles else ())
     attention_options=(config or {}).get('planning_objects')
     if attention_options is None:
         attention_options=previous.get('attention_policy',{}) if isinstance(previous,dict) else {}
@@ -107,6 +111,8 @@ def select_perception_objects(scene, config=None):
                     raise ValueError('已筛选感知场景不能用新配置重解释车道范围，须从完整冻结帧重新构建')
                 if attention_policy != previous.get('attention_policy',attention_policy):
                     raise ValueError('已筛选感知场景不能用新配置重解释关注扩展，须从完整冻结帧重新构建')
+                if list(bev_kinds) != previous.get('bev_kinds'):
+                    raise ValueError('已筛选感知场景不能改变BEV物理对象类别，须从完整冻结帧重新构建')
             return list(scene.actors), deepcopy(previous)
 
     if config is None and isinstance(previous, dict) and 'object_scope' not in scene.diagnostics:
@@ -116,7 +122,7 @@ def select_perception_objects(scene, config=None):
     viewport = bev_viewport_polygon(scene.ego)
     dynamic_ids = set()
     for actor in scene.actors:
-        if actor.id == scene.ego.id or not actor.visible or actor.kind not in DYNAMIC_KINDS:
+        if actor.id == scene.ego.id or not actor.visible or actor.kind not in bev_kinds:
             continue
         # 行人绘图使用24段圆周，保持边缘部分可见准入与实际BEV相同。
         body = (Point(actor.position).buffer(actor.radius or actor.width/2, quad_segs=24)
@@ -128,7 +134,7 @@ def select_perception_objects(scene, config=None):
     excluded = {row['id']: row['reason'] for row in lane_scope['excluded'] if row['id'] not in selected_ids}
     for actor in scene.actors:
         if (actor.id not in selected_ids and actor.id != scene.ego.id
-                and actor.visible and actor.kind in DYNAMIC_KINDS):
+                and actor.visible and actor.kind in bev_kinds):
             excluded[actor.id] = 'outside_lane_scope_and_current_bev_viewport'
     objects = {}
     for actor in selected:
@@ -142,6 +148,7 @@ def select_perception_objects(scene, config=None):
         coordinates=scene.coordinates, settings=dict(lane=deepcopy(lane_scope['settings']), bev=bev_viewport_settings()),
         lane_scope=lane_scope, lane_scope_ids=sorted(lane_ids), bev_dynamic_ids=sorted(dynamic_ids),
         attention_policy=attention_policy,
+        bev_kinds=list(bev_kinds),
         outside_lane_ids=sorted(dynamic_ids-lane_ids), selected_ids=sorted(selected_ids),
         selected_count=len(selected_ids), input_count=len(scene.actors), objects=objects,
         excluded=[dict(id=key, reason=excluded[key]) for key in sorted(excluded)],

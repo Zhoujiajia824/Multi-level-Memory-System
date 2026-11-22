@@ -112,7 +112,10 @@ class VisionClient:
             content.append({'type':'image_url','image_url':{'url':f'data:{mime};base64,{raw}'}})
         system=self.system_prompt
         logger.info('%s 模型输入\n系统：%s\n场景：%s\n图像：%s',self.role,system,prompt,[str(x) for x in image_paths])
-        for attempt in range(6):
+        max_attempts=self.settings.get('max_total_attempts',6)
+        if type(max_attempts) is not int or not 1<=max_attempts<=6:
+            raise ValueError('模型尝试次数必须为1到6的整数')
+        for attempt in range(max_attempts):
             self.attempts+=1
             started=time.monotonic()
             try:
@@ -129,8 +132,8 @@ class VisionClient:
                 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
                 retryable=isinstance(exc,(CommunicationFailure,TimeoutError,ConnectionError,APIConnectionError,APITimeoutError,InternalServerError,RateLimitError))
                 # 不输出远端异常文本：其中可能含 URL 认证信息或请求头。
-                logger.warning('%s 调用失败：%s，尝试 %d/6',self.role,type(exc).__name__,attempt+1)
-                if not retryable or attempt==5:
+                logger.warning('%s 调用失败：%s，尝试 %d/%d',self.role,type(exc).__name__,attempt+1,max_attempts)
+                if not retryable or attempt==max_attempts-1:
                     raise CommunicationFailure(f'{self.role} 调用失败，类型 {type(exc).__name__}，尝试 {attempt+1} 次') from None
                 self.sleeper(2**attempt)
         raise AssertionError('不可达分支')
@@ -239,8 +242,11 @@ def local_line(points,origin,radius=120.):
 
 def _current_actor(actor):
     """模型只接收对象当前物理状态，内部车道、可见性和历史记录不外发。"""
-    return {key:getattr(actor,key) for key in
+    result = {key:getattr(actor,key) for key in
             ('id','kind','position','velocity','acceleration','heading','length','width','radius')}
+    if actor.motion_model is not None:
+        result['motion_model'] = actor.motion_model
+    return result
 
 
 def scene_text(scene,representations):
@@ -254,6 +260,8 @@ def scene_text(scene,representations):
         '图像说明':'BEV自车朝上，x前y左，刻度为米；红为自车、蓝为车辆、橙为自行车、紫为行人、黄为道路障碍。细灰虚线是虚拟车道中心参考，不是真实标线；绿色虚线是固定目标参考，s+表示道路弧长。历史轨迹只表示已观测运动。'}
     if scene.diagnostics.get('observation_policy')=='range_limited_ground_truth_no_occlusion-1.0':
         data['观测说明']+='本帧候选真值不判断遮挡，不因RGB遮挡删除给定状态。'
+    if any(actor.motion_model == 'free' and actor.kind == 'static_obstacle' for actor in scene.actors):
+        data['观测说明']+='static_obstacle是障碍物语义通道名，不保证静止；motion_model=free的实体具有当前观测运动，按给定速度理解。'
     cameras=_camera_entries(scene)
     if any(item['view']=='highway_env_topdown' for item in cameras):
         data['图像说明']+=' highway_env_topdown为原生俯视图：世界x右y下，自车不固定朝上；不套用BEV坐标和配色。'

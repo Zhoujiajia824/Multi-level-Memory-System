@@ -452,7 +452,7 @@ class Planner:
             rear_s=actor_s-along
             longitudinal_speed=sample[:,3]*np.cos(phi)
             lateral_speed=sample[:,3]*np.sin(phi)
-            stationary=(sample[:,3]<=stationary_speed)|(actor.kind=='static_obstacle')
+            stationary=(sample[:,3]<=stationary_speed)|((actor.kind=='static_obstacle')&(actor.motion_model!='free'))
             same_direction=longitudinal_speed>np.abs(lateral_speed)
             # 横穿/对向仍参与逐时实体避碰和路权，让行不等于同向跟驰。
             # 预测切入后同向的阶段、已停在通道内的实体才进入跟车包络。

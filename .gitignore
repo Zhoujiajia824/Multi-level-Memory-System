@@ -49,6 +49,13 @@
 !/src/nine_grid/
 /src/nine_grid/*
 !/src/nine_grid/*.py
+!/src/ep_driver_fail2drive/
+/src/ep_driver_fail2drive/*
+!/src/ep_driver_fail2drive/*.py
+!/scripts/run_fail2drive.py
+!/scripts/watch_fail2drive.py
+!/config/fail2drive.example.json
+!/config/fail2drive.models.example.yaml
 
 # 仅发布运行需要的DINOv2 Base，权重由Git LFS管理。
 /models/*

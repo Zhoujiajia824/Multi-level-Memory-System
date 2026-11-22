@@ -9,7 +9,8 @@ from shapely.geometry import Point, Polygon, LineString
 
 from .geometry import (clean_polyline, polyline_lengths, project_polyline,
                        sample_polyline, rectangle_corners, wrap_angle)
-from .quintic_reference import quintic_offsets, initial_lateral_state, spatial_samples
+from .quintic_reference import (quintic_offsets, spatial_samples,
+                                ContinuousReference, continuous_initial_lateral_state)
 
 
 DEFAULTS = {
@@ -18,6 +19,7 @@ DEFAULTS = {
     'projection_window_m': 120., 'attraction_weight': 3.,
     'longitudinal_scale_m': 30., 'lateral_scale_m': 15., 'potential_shift': 6.,
 }
+GOAL_GEOMETRY_VERSION='continuous-reference-quintic-exact-goal-1.0'
 
 
 def _digest(value):
@@ -80,10 +82,12 @@ def build_goal_reference(scene, config=None, request_version=0):
         reference_rejection='当前已确认车道缺少公开几何；不接纳本帧语义目标'
     version = scene.diagnostics.get('reference_revision', 0)
     identity = _digest({'points': reference.tolist(), 'lanes': scene.route_lane_ids,
-                        'stable_lane': source_lane, 'revision': version})
+                        'stable_lane': source_lane, 'revision': version,
+                        'seed_geometry_version':GOAL_GEOMETRY_VERSION})
     return {'frame_id': scene.frame_id, 'time': float(scene.time),
         'reference_id': identity, 'reference_version': version,
         'request_version': int(request_version), 'points': reference.tolist(),
+        'seed_geometry_version':GOAL_GEOMETRY_VERSION,
         's_ego_m': float(s), 'd_ego_m': float(d), 'source_lane_id': source_lane,
         'reported_lane_id':reported_lane,'lane_confirmation':confirmation,
         'semantic_reference_valid':reference_valid,'reference_rejection':reference_rejection,
@@ -168,14 +172,18 @@ def goal_seed_path(scene, goal):
     该处合法车道平稳归中，仅提供必要道路几何。真实通过后由GoalManager
     释放，不能把本函数结果锁成下一帧仍有效的目标。
     """
+    from scipy.interpolate import make_interp_spline
     reference = np.asarray(goal['goal_reference']['points'], float)
-    s0, d0, heading = project_polyline(scene.ego.position, reference,
+    original_s, _, heading = project_polyline(scene.ego.position, reference,
         previous_s=goal.get('last_s', goal['goal_reference']['s_ego_m']), heading=scene.ego.heading)
-    end = min(polyline_lengths(reference)[-1], max(goal['s_goal_m']+20., s0+120.))
+    curve=ContinuousReference(reference)
+    s0=float(curve.project(scene.ego.position,original_s))
+    source_frame=curve.geometry(s0)
+    d0=float((scene.ego.position-source_frame['position'])@source_frame['normal'])
+    end = min(curve.total, max(goal['s_goal_m']+20., s0+120.))
     arc = spatial_samples(max(0.,s0-5.),end,.5,anchors=(s0,goal['s_goal_m']))
-    base = sample_polyline(reference, arc)
-    headings = project_polyline(base, reference, previous_s=s0, window=160.)[2]
-    normal = np.c_[-np.sin(headings), np.cos(headings)]
+    frames=curve.geometry(arc)
+    base,normal=frames['position'],frames['normal']
     span = float(goal['s_goal_m']-s0)
     if span<=1e-6:
         raise ValueError('已纵向通过的目标不能重新生成活动参考')
@@ -184,15 +192,20 @@ def goal_seed_path(scene, goal):
     lanes={lane.id:lane for lane in scene.lanes}
     target=lanes.get(goal.get('target_lane_id'))
     center_d=np.full(len(arc),float(goal['local_goal']['d_m']))
-    if target is not None:
+    if target is not None and target.id!=goal['goal_reference']['source_lane_id']:
         target_path=manager._continuation(scene,target,lanes)
         target_s=project_polyline(base,target_path,heading=heading)[0]
-        target_points=sample_polyline(target_path,target_s)
+        target_curve=ContinuousReference(target_path)
+        target_s=target_curve.project(base,target_s)
+        target_points=target_curve.derivative(target_s)
         center_d=np.sum((target_points-base)*normal,axis=1)
-    first=np.gradient(center_d,arc);second=np.gradient(first,arc)
+    elif target is not None:
+        center_d=np.zeros(len(arc))
+    degree=5 if len(arc)>=6 else 3 if len(arc)>=4 else len(arc)-1
+    center_curve=make_interp_spline(arc,center_d,k=degree)
     sg=float(goal['s_goal_m']);dg=float(goal['local_goal']['d_m'])
-    finish=(dg,float(np.interp(sg,arc,first)),float(np.interp(sg,arc,second)))
-    start=initial_lateral_state(scene,reference,s0,d0,heading)
+    finish=(dg,float(center_curve(sg,nu=1)),float(center_curve(sg,nu=2)))
+    start=continuous_initial_lateral_state(scene,curve,s0,d0)
     offset=quintic_offsets(arc-s0,span,start,finish)
     before=arc<s0
     offset[before]=start[0]+(arc[before]-s0)*start[1]+.5*(arc[before]-s0)**2*start[2]
@@ -201,12 +214,33 @@ def goal_seed_path(scene, goal):
     tail=min(end-sg,max(20.,float(np.linalg.norm(scene.ego.velocity))*2.))
     if after.any() and tail>1e-6:
         final_s=sg+tail
-        final=(float(np.interp(final_s,arc,center_d)),float(np.interp(final_s,arc,first)),
-               float(np.interp(final_s,arc,second)))
+        final=(float(center_curve(final_s)),float(center_curve(final_s,nu=1)),
+               float(center_curve(final_s,nu=2)))
         offset[after]=quintic_offsets(arc[after]-sg,tail,finish,final)
         finished=arc>=final_s
         offset[finished]=center_d[finished]
-    return clean_polyline(base+normal*offset[:, None])
+    path=base+normal*offset[:, None]
+    # The frozen model target still belongs to the original polyline Frenet
+    # convention. Continuous interpolation must not silently move that target.
+    # A C2 quintic residual meets the exact original world point and decays back
+    # to zero after it; its first/second derivatives vanish at both joins.
+    original_goal=sample_polyline(reference,sg)
+    original_heading=project_polyline(original_goal,reference,previous_s=sg,window=5.)[2]
+    original_goal=original_goal+dg*np.array([-np.sin(original_heading),np.cos(original_heading)])
+    world_goal=np.asarray(goal.get('world_goal',original_goal),float)
+    goal_frame=curve.geometry(sg)
+    at_goal=goal_frame['position']+goal_frame['normal']*dg
+    correction_end=world_goal-at_goal
+    correction_start=scene.ego.position-(source_frame['position']+source_frame['normal']*start[0])
+    correction=np.column_stack([quintic_offsets(arc-s0,span,(correction_start[i],0.,0.),
+                                                 (correction_end[i],0.,0.)) for i in range(2)])
+    correction[before]=correction_start
+    if after.any() and tail>1e-6:
+        correction[after]=np.column_stack([quintic_offsets(arc[after]-sg,tail,
+            (correction_end[i],0.,0.),(0.,0.,0.)) for i in range(2)])
+        correction[arc>=sg+tail]=0.
+    path+=correction
+    return clean_polyline(path)
 
 
 def validate_local_goal(scene, reference, value):
@@ -264,7 +298,8 @@ def validate_local_goal(scene, reference, value):
             raise ValueError('目标被拒绝：'+'；'.join(dict.fromkeys(rejected_reasons)))
         raise ValueError('目标车体不属于合法且导航相容的车道走廊')
     payload = {'local_goal': dict(value), 'goal_reference': deepcopy(reference),
-        'world_goal': world, 'target_lane_id': target.id, 's_goal_m': sg}
+        'world_goal': world, 'target_lane_id': target.id, 's_goal_m': sg,
+        'seed_geometry_version':GOAL_GEOMETRY_VERSION}
     seed = goal_seed_path(scene, payload)
     seed_s=project_polyline(seed,line,previous_s=reference['s_ego_m'],window=160.)[0]
     # 只检查原帧当前中心开始的未来连接，不能把初值查询用的身后段算作未来折弯。

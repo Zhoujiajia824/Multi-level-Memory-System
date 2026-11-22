@@ -28,6 +28,9 @@ class Actor:
     # CARLA几何中心运动学参数；None保持原highway车体模型，不把车长当真实轴距。
     wheelbase_m: float | None = None
     rear_axle_to_center_m: float | None = None
+    # 语义类别和运动先验分离；异常实体仍用障碍物占据通道。
+    # None=既有类别模型，stationary=固定实体，free=观测自由空间运动。
+    motion_model: str | None = None
 
 
 @dataclass
