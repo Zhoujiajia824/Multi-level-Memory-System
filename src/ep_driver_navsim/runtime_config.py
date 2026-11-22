@@ -41,6 +41,7 @@ def generate(base, destination, profile, revision, base_url, model, split="warmu
         raise ValueError("profile must be local or server")
     settings = dict(template, split=split, resume=True, model_revision=revision,
         timeout_s=3600.0, bev_video=True,
+        navigation_preflight_workers=8 if profile == "server" else 1,
         model_service=dict(image_limit=9, max_pixels_per_image=602112, max_model_len=16384),
         models_config=model_reference)
     destination.mkdir(parents=True, exist_ok=True)

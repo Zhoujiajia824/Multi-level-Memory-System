@@ -131,10 +131,65 @@ class NavsimContractTests(unittest.TestCase):
         with patch.dict(sys.modules, modules), patch.object(adapter, "_correct_route_order", return_value=["R1"]):
             with self.assertRaisesRegex(ValueError, "after topology correction"):
                 adapter._map_packet(map_api, origin, ["R1"], 10., 160.)
-        with patch.dict(sys.modules, modules), patch.object(adapter, "_correct_route_order") as fix:
+        with patch.dict(sys.modules, modules), patch.object(adapter, "_correct_route_order", return_value=["R0", "R1"]) as fix:
             result = adapter._map_packet(map_api, origin, ["R0", "R1"], 10., 160.)
-            self.assertFalse(result[-1]["topology_correction_attempted"])
-            fix.assert_not_called()
+            self.assertTrue(result[-1]["topology_correction_attempted"])
+            self.assertFalse(result[-1]["topology_correction_changed"])
+            fix.assert_called_once_with(map_api, origin, ["R0", "R1"])
+
+    def test_on_route_initialization_repairs_interior_link_and_counts_only_forward_length(self):
+        def lane(key, block_id, start, end):
+            return NS(id=key, get_roadblock_id=lambda: block_id, polygon=box(start, -1.75, end, 1.75),
+                baseline_path=NS(linestring=LineString([(start, 0), (end, 0)]),
+                                 discrete_path=[NS(x=start, y=0), NS(x=end, y=0)]),
+                left_boundary=NS(linestring=LineString([(start, 1.75), (end, 1.75)])),
+                right_boundary=NS(linestring=LineString([(start, -1.75), (end, -1.75)])),
+                speed_limit_mps=10., adjacent_edges=(None, None), outgoing_edges=[])
+        current, link, following = lane("L0", "R0", -300, 5), lane("L1", "R1", 5, 20), lane("L2", "R2", 20, 300)
+        current.outgoing_edges, link.outgoing_edges = [link], [following]
+        layers = NS(LANE="lane", LANE_CONNECTOR="connector", CROSSWALK="crosswalk",
+                    ROADBLOCK="roadblock", INTERSECTION="intersection", CARPARK_AREA="carpark")
+        nearby = {value: [] for value in vars(layers).values()}
+        nearby[layers.LANE] = [current, link, following]
+        modules = {name: ModuleType(name) for name in ("nuplan", "nuplan.common", "nuplan.common.actor_state",
+            "nuplan.common.actor_state.state_representation", "nuplan.common.maps", "nuplan.common.maps.maps_datatypes")}
+        modules["nuplan.common.actor_state.state_representation"].Point2D = lambda *args: args
+        modules["nuplan.common.maps.maps_datatypes"].SemanticMapLayer = layers
+        origin = np.zeros(3)
+        with patch.dict(sys.modules, modules), patch.object(adapter, "_correct_route_order", return_value=["R0", "R1", "R2"]) as fix:
+            result = adapter._map_packet(NS(get_proximal_map_objects=lambda *args: nearby), origin, ["R0", "R2"], 10., 160.)
+        self.assertEqual(result[2], ["L0", "L1", "L2"])
+        self.assertEqual(result[3], "L0")
+        self.assertTrue(result[-1]["topology_correction_changed"])
+        self.assertTrue(result[-1]["polygon_covers_rear_axle"])
+        self.assertEqual(result[-1]["used_roadblock_ids"], ["R0", "R1", "R2"])
+        self.assertGreater(LineString(result[1]).length - adapter._project(result[1], np.zeros(2))[0], 240.)
+        fix.assert_called_once_with(unittest.mock.ANY, origin, ["R0", "R2"])
+
+    def test_opposing_connector_coverage_cannot_mask_nearby_directed_route(self):
+        def lane(key, block_id, points, bounds):
+            line = LineString(points)
+            return NS(id=key, get_roadblock_id=lambda: block_id, polygon=box(*bounds),
+                baseline_path=NS(linestring=line, discrete_path=[NS(x=x, y=y) for x,y in points]),
+                left_boundary=NS(linestring=LineString([(x,y+1.75) for x,y in points])),
+                right_boundary=NS(linestring=LineString([(x,y-1.75) for x,y in points])),
+                speed_limit_mps=10., adjacent_edges=(None,None), outgoing_edges=[])
+        opposing = lane("opposing", "R0", [(10,0),(-10,0)], [-10,-1.75,10,1.75])
+        directed = lane("directed", "R1", [(-10,3.3),(300,3.3)], [-10,1.55,300,5.05])
+        layers = NS(LANE="lane", LANE_CONNECTOR="connector", CROSSWALK="crosswalk",
+                    ROADBLOCK="roadblock", INTERSECTION="intersection", CARPARK_AREA="carpark")
+        nearby = {value: [] for value in vars(layers).values()}
+        nearby[layers.LANE_CONNECTOR] = [opposing,directed]
+        modules = {name: ModuleType(name) for name in ("nuplan", "nuplan.common", "nuplan.common.actor_state",
+            "nuplan.common.actor_state.state_representation", "nuplan.common.maps", "nuplan.common.maps.maps_datatypes")}
+        modules["nuplan.common.actor_state.state_representation"].Point2D = lambda *args: args
+        modules["nuplan.common.maps.maps_datatypes"].SemanticMapLayer = layers
+        with patch.dict(sys.modules, modules), patch.object(adapter,"_correct_route_order",return_value=["R0","R1"]):
+            result = adapter._map_packet(NS(get_proximal_map_objects=lambda *args: nearby),np.zeros(3),["R0","R1"],10.,160.)
+        self.assertEqual(result[3],"directed")
+        self.assertFalse(result[-1]["polygon_covers_rear_axle"])
+        self.assertAlmostEqual(result[-1]["projection_error_m"],3.3)
+        self.assertEqual(result[-1]["heading_error_rad"],0.)
 
     def test_official_cache_path_normalization(self):
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:

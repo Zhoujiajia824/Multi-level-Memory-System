@@ -122,30 +122,33 @@ def _map_packet(map_api, origin, roadblock_ids, desired_speed_mps, map_radius_m)
     associations = {lane["id"]: association(lane) for lane in lanes}
     def nearest(lane):
         row = associations[lane["id"]]
-        return (not row["polygon_covers_rear_axle"], row["heading_error_rad"] > math.pi / 2,
+        # Overlapping connector polygons can contain opposing directions.
+        # Reject direction-incompatible candidates before preferring coverage;
+        # otherwise an opposite connector masks a nearby valid route branch.
+        return (row["heading_error_rad"] > math.pi / 2, not row["polygon_covers_rear_axle"],
                 row["projection_error_m"] + row["heading_error_rad"])
     def select(route_order):
         candidates = [lane for lane in lanes if block(lane["id"]) in set(route_order)]
         return min(candidates, key=nearest) if candidates else None
     current = select(order)
     initial_lane = None if current is None else current["id"]
-    # Never snap to an unrelated nearby lane to hide a missing route prefix.
-    # The official directed graph correction must first establish a connection.
-    corrected = current is None or not associations[current["id"]]["polygon_covers_rear_axle"]
-    if corrected:
-        order = _correct_route_order(map_api, origin, order)
-        current = select(order)
-    if current is None or nearest(current)[1] or nearest(current)[2] > 8:
+    # PDM corrects the public route at every independent initialization, even
+    # when ego already lies on it: interior links can be missing as well as the
+    # prefix. Never substitute an unrelated nearby lane for this graph search.
+    order = _correct_route_order(map_api, origin, order)
+    current = select(order)
+    if current is None or nearest(current)[0] or nearest(current)[2] > 8:
         raise ValueError("Current ego pose cannot be associated with the mapped route after topology correction")
     allowed = set(order)
     current_id = current["id"]
     route_evidence = dict(public_roadblock_ids=public_order, used_roadblock_ids=order,
-        topology_correction_attempted=corrected, topology_correction_changed=order != public_order,
+        topology_correction_attempted=True, topology_correction_changed=order != public_order,
         correction_source="pinned_official_pdm_route_roadblock_correction_current_pose_map_public_route",
         initial_lane_id=initial_lane, current_lane_id=current_id, **associations[current_id])
     route, ids, visited = np.asarray(current["center"], float), [current_id], {current_id}
+    ego_route_s = _project(route, np.zeros(2))[0]
     current_block_index = order.index(block(current_id)) if block(current_id) in order else -1
-    while len(ids) < 128 and LineString(route).length < map_radius_m * 1.5:
+    while len(ids) < 128 and LineString(route).length - ego_route_s < map_radius_m * 1.5:
         choices = [table[key] for key in current["successors"] if key in table and key not in visited
                    and (not allowed or block(key) in allowed)]
         if not choices:

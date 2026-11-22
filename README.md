@@ -24,7 +24,9 @@ python scripts/run_navsim.py evaluate
 
 默认 `warmup_two_stage` 含16个原始锚点和204个合成锚点。`smoke` 只对其中原始/合成各一个执行官方模拟和评分，明确不产生完整两阶段成绩。正式 `navhard_two_stage` 含450个原始锚点和5462个响应合成锚点，运行 `check/cache/evaluate` 时均加 `--split navhard_two_stage --output-dir outputs/navsim/navhard/A_base`。不能只评450个原始锚点后声称完成两阶段官方测评。
 
-`check/evaluate` 在长时间评分前检查所选集合的全部当前位姿、地图和导航连接，结果保存为 `navigation_preflight.json`。官方合成样本可能仍在公开导航首段的前驱车道上；适配器使用固定版本 PDM 的当前位姿/地图拓扑纠正函数补接导航，证据写入输入包的 `route_association`，不读取未来轨迹或评分缓存。车道交集中的零面积线/点从势场面域中排除，不缓冲扩大车道。任一样本预检失败会停止，不以删样本或替代分数完成评测。
+`check/evaluate` 在长时间评分前检查所选集合的全部当前位姿、地图和导航连接，结果保存为 `navigation_preflight.json`。每个样本的成功或失败即时落盘，未检查完的报告不会标作通过；复用结果必须匹配实际适配源码、官方SDK、地图、几何依赖、完整样本集合及当前位姿/公开路线。导航检查缓存位于 `metric_cache_path/ep_navigation_preflight`，属于本项目检查元数据，不替代官方评分缓存。`navigation_preflight_workers` 默认1；生成的服务器配置为8个独立进程，Windows仍串行。它只并行地图检查，不调用模型、规划器或评分器。
+
+适配器在每个独立锚点调用固定版本 PDM 的当前位姿/地图拓扑纠正函数，既可补接公开导航首段前驱，也可修复中间连接。重叠路口首先排除方向不兼容的候选，再比较覆盖和投影距离；不移动实际自车位姿。参考路径的前向长度不包含自车后方弧长。证据写入输入包的 `route_association`，不读取未来轨迹或评分缓存。车道交集中的零面积线/点从势场面域中排除，不缓冲扩大车道。任一样本预检失败会停止，不以删样本或替代分数完成评测。
 
 `smoke/evaluate` 默认开启 `bev_video: true`（命令行 `--bev-video`）；逐样本保存 `samples/<摘要ID>/official_replay/official_bev.mp4`、首帧图、压缩执行记录及独立导出状态，完成后打开输出目录下 `visualizations/index.html` 选择播放。动画使用本次官方控制器实际模拟的自车轨迹和本次响应交通策略返回的对象轨迹，叠加提交规划、记录人类参考和官方红灯区域；不是把数据集未来帧冒充算法执行。原始事件诊断与人类违规过滤后的官方整段指标分开显示，不虚构逐帧 EPDMS 或完整两阶段成绩。0至4秒的41个实际状态按10帧/秒编码，视频编码时长4.1秒；不同锚点不拼成连续驾驶。
 

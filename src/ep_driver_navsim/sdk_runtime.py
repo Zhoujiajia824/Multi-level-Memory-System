@@ -93,39 +93,8 @@ def check_cache(settings):
 
 
 def inspect_navigation(settings, loader):
-    """Check every official token, not only the two smoke anchors.
-
-    Uses current pose/public route/map only. Detect disconnected synthetic
-    route prefixes before spending a full run on planning and official scoring.
-    No score is computed, skipped or filled in by this preflight.
-    """
-    from .input_adapter import _map_packet
-
-    tokens = sorted(settings["evaluation_tokens"])
-    failures, corrected = [], []
-    started = time.perf_counter()
-    for index, token in enumerate(tokens, 1):
-        try:
-            scene = loader.get_scene_from_token(token)
-            now = scene.frames[3]
-            result = _map_packet(scene.map_api, np.asarray(now.ego_status.ego_pose, float),
-                now.roadblock_ids, settings["desired_speed_mps"], settings["map_radius_m"])
-            evidence = result[-1]
-            if evidence["topology_correction_changed"]:
-                corrected.append(dict(token=token, **evidence))
-        except Exception as exc:
-            failures.append(dict(token=token, error=type(exc).__name__ + ": " + str(exc)))
-        if index % 50 == 0 or index == len(tokens):
-            print("Navigation preflight: %d/%d; failed=%d" % (index, len(tokens), len(failures)), flush=True)
-    report = dict(status="failed" if failures else "passed", checked_tokens=len(tokens),
-        failed_tokens=failures, topology_corrected_tokens=corrected,
-        elapsed_s=time.perf_counter() - started, benchmark_result=False,
-        scope="all_current_poses_public_routes_and_local_maps;no_future_trajectory_or_metric_cache")
-    write_json(Path(settings["output_dir"]) / "navigation_preflight.json", report)
-    if failures:
-        raise RuntimeError("NAVSIM navigation preflight failed for %d/%d tokens; see navigation_preflight.json" %
-                           (len(failures), len(tokens)))
-    return dict(checked_tokens=len(tokens), failed_tokens=0, topology_corrected_tokens=len(corrected))
+    from .nav_preflight import inspect_navigation as checkpointed_inspection
+    return checkpointed_inspection(settings, loader)
 
 
 def smoke(settings, loader):

@@ -55,6 +55,7 @@
 !/scripts/check_navsim_warmup_recovery.py
 !/scripts/check_navsim_resume_storage.py
 !/scripts/check_navsim_official_style.py
+!/scripts/check_navsim_navigation_preflight.py
 !/scripts/export_navsim_test_assets.py
 !/scripts/prepare_navsim_runtime.py
 !/scripts/sync_navsim_viewer.py

@@ -16,5 +16,6 @@
   "desired_speed_mps": 10.0,
   "map_radius_m": 160.0,
   "timeout_s": 600.0,
-  "bev_video": true
+  "bev_video": true,
+  "navigation_preflight_workers": 1
 }
