@@ -519,11 +519,13 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
                 quality=evaluate(planning_input,plan,reference,predictions,config)
                 timing['quality_s']=time.perf_counter()-stage_started
                 timing_samples['quality'].append(timing['quality_s'])
-                logger.info('仿真 %.1fs：轨迹可执行=%s，安全条件满足=%s，候选=%s，主求解=%.1fms（%s），预测=%.1fms，表示=%.1fms，参照=%.1fms，评分=%.1fms，质量=%s，预碰撞=%s，完整场景对象=%d，范围内对象=%d，实际规划对象=%d',
+                logger.info('仿真 %.1fs：轨迹可执行=%s，安全条件满足=%s，候选=%s，主求解=%.1fms（%s），预测=%.1fms，表示=%.1fms，参照=%.1fms，评分=%.1fms，质量=%s，预碰撞=%s，完整场景对象=%d，车道范围对象=%d，感知/EKF候选=%d，实际优化对象=%s',
                     scene.time,plan.valid,plan.diagnostics.get('safety_feasible'),plan.diagnostics.get('candidate_source'),
                     timing['mpc_s']*1000,'首次' if timing['mpc_cold_start'] else '后续',
                     timing['prediction_s']*1000,timing['representations_s']*1000,timing['reference_s']*1000,
-                    timing['quality_s']*1000,quality.score,quality.precollision,len(scene.actors),object_scope['selected_count'],len(planning_input.actors))
+                    timing['quality_s']*1000,quality.score,quality.precollision,len(scene.actors),
+                    perception_scope['lane_scope']['selected_count'],perception_scope['selected_count'],
+                    plan.diagnostics.get('planning_object_selection',{}).get('selected_count','未记录'))
                 initial_failures=plan.diagnostics.get('optimizer_skipped_initial_failures',[])
                 if initial_failures:
                     logger.warning('初态不合格项=%s；跳过无法改写初态的QP迭代，制动仍独立验收；速度证据=%s',
