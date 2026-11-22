@@ -18,15 +18,22 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 import numpy as np
 import shapely
 
-from .protocol import digest, trajectory_from_centers, validate_packet, write_json
+from .protocol import (digest, trajectory_from_centers, validate_packet, write_json, horizon_contract,
+                       relative_asset_path, HORIZON_S, PLANNING_STEP_S, PLANNING_STEPS)
+from .archive import write_input_packet, serialize_retrieval
+from .resume import (build_run_identity, sample_identity, load_completed_sample,
+                     begin_sample, complete_sample)
+from .memory import check_memory_disjoint, load_memory_snapshot
+from .model import StructuredServerVisionClient, structured_response_format
 from nine_grid.contracts import Actor, Lane, SceneSnapshot, RetrievalResult, plain
 from nine_grid.configuration import validate_config
-from nine_grid.models import VisionClient, load_system_prompts, build_prompt, parse_answer, model_image_paths
-from nine_grid.memory import MemoryStore
-from nine_grid.object_scope import scope_scene
+from nine_grid.models import (VisionClient, load_system_prompts, build_prompt, parse_answer,
+                              model_image_paths, _goal_reference)
+from nine_grid.perception_scope import perception_scene
 from nine_grid.planner_factory import create_planner
 from nine_grid.planning_context import prepare_planning_context
 from nine_grid.quality import evaluate, execution_audit
+from nine_grid.paths import filesystem_path
 from nine_grid.representations import DINOExtractor, NineGridBuilder, build_representations, render_goal_overlay
 from nine_grid.retrieval import retrieve
 
@@ -36,14 +43,19 @@ def planning_config(parameters, dino_model):
     config["platform"] = "navsim"
     config["scenario"] = "navsim"
     config["perception"]["fully_occluded_in_current_planning"] = True
-    config["mpc"]["horizon_steps"] = 40
-    config["mpc"]["step_s"] = 0.1
-    config["prediction"]["horizon_s"] = 4.0
-    config["prediction"]["step_s"] = 0.1
-    config["prediction"]["diagnostic_horizon_s"] = 4.9
+    config["mpc"]["horizon_steps"] = PLANNING_STEPS
+    config["mpc"]["step_s"] = PLANNING_STEP_S
+    config["prediction"]["horizon_s"] = HORIZON_S
+    config["prediction"]["step_s"] = PLANNING_STEP_S
+    # Retain the real TTC tail beyond the four-second planning/reference horizon.
+    # Predictor.predict reads this diagnostic horizon when no override is supplied.
+    config["prediction"]["diagnostic_horizon_s"] = HORIZON_S + max(
+        config.get("quality", {}).get("ttc_offsets_s", [0, .3, .6, .9]))
     config["dino"]["model"] = str(Path(dino_model).resolve())
     config["memory"].update(write_enabled=False, mode="formal")
-    return validate_config(config)
+    config = validate_config(config)
+    horizon_contract(config)
+    return config
 
 
 def snapshot_from_packet(packet, config):
@@ -71,33 +83,6 @@ def snapshot_from_packet(packet, config):
         diagnostics=diagnostics)
 
 
-def _provenance_values(value, keys):
-    """Read provenance only; arbitrary experience prose is not a token list."""
-    found = set()
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if key in keys and isinstance(child, (str, int)):
-                found.add(str(child))
-            if key in ("source", "provenance", "source_metadata", "situation", "dataset", "metadata", "frame"):
-                found.update(_provenance_values(child, keys))
-    return found
-
-
-def check_memory_disjoint(records, evaluation_logs, evaluation_tokens):
-    for record in records:
-        logs = _provenance_values(record, {"log_name", "source_log_name", "log_id", "source_log"})
-        tokens = _provenance_values(record, {"token", "source_token", "anchor_token", "initial_token",
-                                            "source_anchor_token", "scene_token", "source_scene_token"})
-        if logs & set(evaluation_logs) or tokens & set(evaluation_tokens):
-            raise ValueError("Frozen memory overlaps evaluation logs/tokens: " + record["id"])
-        # Records from real data need auditable source IDs. Simulator experiences
-        # have an explicit simulator origin and can be distinguished from NAVSIM.
-        origins = _provenance_values(record, {"platform", "simulator", "record_origin"})
-        simulator_source = bool(origins & {"highway", "highway-env", "carla", "online_highway", "online_carla"})
-        if not logs and not tokens and not simulator_source:
-            raise ValueError("Memory has no auditable source log/token: " + record["id"])
-
-
 class NumericalPipeline:
     def __init__(self, settings):
         import yaml
@@ -108,54 +93,91 @@ class NumericalPipeline:
             if hashlib.sha256(Path(settings[key]).read_bytes()).hexdigest() != expected:
                 raise ValueError("Configuration changed after benchmark settings were frozen: " + key)
         self.settings = settings
+        structured = settings.get("structured_model_output", False)
+        if type(structured) is not bool or (structured and settings["fast"] != "server"):
+            raise ValueError("structured_model_output must be boolean and requires the server backend")
         self.config = planning_config(json.loads(Path(settings["parameters"]).read_text(encoding="utf-8")),
                                       settings["dino_model"])
         self.config["dino"]["device"] = settings["dino_device"]
         prompts = load_system_prompts(settings["prompts_config"])
         models = yaml.safe_load(Path(settings["models_config"]).read_text(encoding="utf-8"))
         fast = dict(models["fast"], backend=settings["fast"], system_prompt=prompts["fast"])
-        self.fast = VisionClient("fast", fast)
-        self.extractor = DINOExtractor(self.config["dino"]["model"],
-            device=self.config["dino"].get("device"), local_files_only=True)
-        self.store = MemoryStore(settings.get("memory_read_dir") if settings["retrieve"] else None, None)
-        self.records = self.store.snapshot()
-        if self.store.snapshot_id != settings["memory_snapshot_id"]:
+        if settings["retrieve"]:
+            self.records, self.memory_snapshot_id, selection = load_memory_snapshot(
+                settings["memory_read_dir"], settings["evaluation_logs"], settings["evaluation_tokens"])
+            if selection != settings["memory_selection"]:
+                raise ValueError("Memory selection changed after the benchmark snapshot was frozen")
+        else:
+            self.records, self.memory_snapshot_id = [], hashlib.sha256(b"[]").hexdigest()
+        if self.memory_snapshot_id != settings["memory_snapshot_id"]:
             raise ValueError("Memory changed after the benchmark snapshot was frozen")
         check_memory_disjoint(self.records, settings["evaluation_logs"], settings["evaluation_tokens"])
         if settings["retrieve"] and not self.records:
             raise ValueError("Retrieval requested but no compatible audited memory was loaded")
+        self.run_identity = build_run_identity(settings, self.config, fast, prompts, self.memory_snapshot_id)
+        self.resume_enabled = settings.get("resume", True)
+        self.fast = (StructuredServerVisionClient if structured else VisionClient)("fast", fast)
+        self.extractor = DINOExtractor(self.config["dino"]["model"],
+            device=self.config["dino"].get("device"), local_files_only=True)
 
     def compute(self, packet, output_dir):
         started = time.perf_counter()
-        root = Path(output_dir)
+        root = filesystem_path(output_dir)
         root.mkdir(parents=True, exist_ok=True)
+        packet = validate_packet(packet)
+        identity = sample_identity(packet, self.run_identity)
+        if self.resume_enabled:
+            cached = load_completed_sample(root, identity)
+            if cached is not None:
+                return cached
+        begin_sample(root)
         scene = snapshot_from_packet(packet, self.config)
-        write_json(root / "input_packet.json", packet)
+        packet_path = write_input_packet(root, packet)
         config_hash = digest(self.config)
         timing = {}
         tick = time.perf_counter()
         reps = build_representations(scene, root / "representations", self.extractor, NineGridBuilder(self.config))
         timing["representations_s"] = time.perf_counter() - tick
-        retrieved = RetrievalResult(scene.frame_id, snapshot_id=self.store.snapshot_id, time=0.0)
+        retrieved = RetrievalResult(scene.frame_id, snapshot_id=self.memory_snapshot_id, time=0.0)
         if self.settings["retrieve"]:
             tick = time.perf_counter()
-            retrieved = retrieve(reps, self.records, self.store.snapshot_id, self.config)
+            retrieved = retrieve(reps, self.records, self.memory_snapshot_id, self.config)
             timing["retrieval_s"] = time.perf_counter() - tick
-        answer, model_error, raw = None, None, None
-        scoped_for_model, _ = scope_scene(scene, self.config)
+        answer, model_error, model_error_detail, raw = None, None, None, None
+        response_format = None
+        scoped_for_model, _ = perception_scene(scene, self.config)
         if self.fast.enabled:
+            structured = self.settings.get("structured_model_output", False)
+            # Cache before build_prompt: prompt, request schema and strict parser
+            # must use this exact original-frame reference and configured limits.
+            reference = _goal_reference(scoped_for_model, self.config) if structured else None
+            if structured:
+                response_format = structured_response_format(scoped_for_model, self.config, reference)
+                write_json(root / "model_response_format.json", response_format)
             prompt = ("评测输入条件：NAVSIM特权输入基线，使用当前及历史交通对象、车道地图、导航和当前灯态真值。"
-                      "不判断遮挡；只使用已给出的车道范围内对象，禁止推测任何未来真值。\n"
+                      "不判断遮挡；对象候选为道路范围全部对象与当前BEV内车辆、自行车、行人的并集，"
+                      "最多关注其中3个对象；八向最近代表用于检索，不是关注对象白名单。禁止推测任何未来真值。\n"
                       + build_prompt(scoped_for_model, reps, retrieved))
             (root / "model_prompt.txt").write_text(prompt, encoding="utf-8")
             tick = time.perf_counter()
             try:
-                raw = self.fast.call(prompt, model_image_paths(scene, reps))
-                answer = parse_answer(raw, scoped_for_model, config=self.config)
+                images = model_image_paths(scene, reps)
+                raw = (self.fast.call_structured(prompt, images, response_format) if structured
+                       else self.fast.call(prompt, images))
             except Exception as exc:
                 # Follow existing EP-Driver failure policy. It remains visible in
                 # evidence, and official evaluation still scores the base fallback.
-                model_error = type(exc).__name__ + ": " + str(exc)
+                # Exception text may contain provider URLs or credentials.
+                model_error = type(exc).__name__
+            else:
+                try:
+                    answer = parse_answer(raw, scoped_for_model, config=self.config, reference=reference)
+                except ValueError as exc:
+                    # Local validation reasons are inspectable; remote exception
+                    # text is never copied into evidence or worker replies.
+                    model_error, model_error_detail = type(exc).__name__, str(exc)
+                except Exception as exc:
+                    model_error = type(exc).__name__
             timing["model_s"] = time.perf_counter() - tick
         tick = time.perf_counter()
         scoped, predictions = prepare_planning_context(scene, self.config, answer=answer)
@@ -175,20 +197,32 @@ class NumericalPipeline:
         audit = execution_audit(scoped, plan, predictions, self.config)
         timing["internal_quality_s"] = time.perf_counter() - tick
         if audit.get("alarm") and plan.valid:
-            plan = planner.emergency_brake(scoped, predictions, "independent_predicted_execution_alarm")
+            plan = planner.emergency_brake(scoped, predictions, "independent_predicted_execution_alarm", answer=answer)
             quality = evaluate(scoped, plan, baseline, predictions, self.config)
             audit = execution_audit(scoped, plan, predictions, self.config)
+        checked_horizon = horizon_contract(self.config,
+            plans=dict(plan=plan, reference=baseline),
+            predictions=dict(prediction=predictions, reference_prediction=base_predictions))
+        representation_paths = dict(bev=Path(reps.bev_path), feature=Path(reps.feature_image_path),
+            grid=Path(reps.grid_path), occupancy=Path(reps.bev_path).with_name(
+                Path(reps.bev_path).name.replace("_bev.png", "_occupancy.npz")))
         render_goal_overlay(scene, plan).save(root / "trajectory_bev.png")
         evidence = dict(identity=packet["identity"], input_condition=packet["input_condition"],
             parameters_sha256=config_hash, parameters=self.config, timing_s=timing,
-            model_answer=plain(answer), model_error=model_error, model_raw=raw,
-            retrieval=plain(retrieved), memory_snapshot_id=self.store.snapshot_id,
+            model_answer=plain(answer), model_error=model_error, model_error_detail=model_error_detail, model_raw=raw,
+            structured_model_output=self.settings.get("structured_model_output", False),
+            model_response_format_sha256=digest(response_format) if response_format else None,
+            retrieval=serialize_retrieval(retrieved, root), memory_snapshot_id=self.memory_snapshot_id,
             dino_signature=self.extractor.signature, plan=plain(plan), reference=plain(baseline),
             predictions=plain(predictions),
+            reference_prediction_times_s=base_predictions.times.tolist(),
+            horizon_contract=checked_horizon,
+            representation_assets={key: relative_asset_path(value, root)
+                                   for key, value in representation_paths.items()},
             internal_quality=plain(quality), predicted_execution_audit=plain(audit),
             official_score=None, internal_quality_is_official_metric=False,
             sample_state_policy="independent_anchor_reset_no_online_memory_writes",
-            input_packet_sha256=digest(packet))
+            input_packet_sha256=digest(packet), resume_identity_sha256=digest(identity))
         write_json(root / "planning_evidence.json", evidence)
         if not plan.valid:
             raise RuntimeError("Planner did not produce an executable trajectory: " + plan.reason)
@@ -198,7 +232,22 @@ class NumericalPipeline:
         result = dict(poses=poses.tolist(), frame_id=scene.frame_id, sampling=dict(horizon_s=4.0, interval_s=0.5),
                       execution_mode=plan.diagnostics.get("execution_mode"), timing_s=timing,
                       safety_feasible=plan.diagnostics.get("safety_feasible"), evidence=str(root / "planning_evidence.json"))
+        result["condition_audit"] = dict(model_requested=self.fast.enabled, model_answer_valid=answer is not None,
+            model_error=model_error, model_error_detail=model_error_detail,
+            structured_model_output=self.settings.get("structured_model_output", False),
+            retrieval_enabled=self.settings["retrieve"],
+            retrieved_memory_ids=[record["id"] for record in retrieved.records])
+        result["resume"] = dict(reused=False, identity_sha256=digest(identity))
         write_json(root / "trajectory.json", result)
+        artifact_paths = [packet_path, root / "planning_evidence.json", root / "trajectory.json",
+                          root / "trajectory_bev.png", root / "retrieval_diagnostics.json.gz",
+                          *representation_paths.values(),
+                          *(Path(row["path"]) for row in packet["camera_images"])]
+        if self.fast.enabled:
+            artifact_paths.append(root / "model_prompt.txt")
+        if response_format is not None:
+            artifact_paths.append(root / "model_response_format.json")
+        complete_sample(root, identity, artifact_paths)
         return result
 
 

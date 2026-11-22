@@ -1,4 +1,4 @@
-"""Render captured official scoring states, without importing or running NAVSIM.
+"""Export captured official scoring states with the pinned NAVSIM plotting SDK.
 
 This module consumes evaluation-side evidence only. It never infers missing
 traffic, reruns a planner, or substitutes recorded traffic for the official
@@ -11,15 +11,20 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
+import subprocess
+import tempfile
 import uuid
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from shapely import wkt
+from nine_grid.paths import filesystem_path
 
 
 VERSION = "navsim-official-replay-1.0"
+RENDERER_VERSION = "navsim-sdk-plots-1.0"
 COLORS = {
     "background": "#f1f5f9", "road": "#d4dde5", "lane": "#dce5ec",
     "border": "#a9b8c7", "ink": "#183248", "muted": "#506a7e",
@@ -60,7 +65,7 @@ def footprint(pose, length_m, width_m, rear_axle_to_center_m=0.0):
 
 def load_replay(path):
     """Reject incomplete/misaligned captures instead of inventing frames."""
-    with gzip.open(path, "rt", encoding="utf-8") as stream:
+    with gzip.open(filesystem_path(path), "rt", encoding="utf-8") as stream:
         value = json.load(stream)
     if value.get("version") != VERSION:
         raise ValueError("Unsupported official replay version")
@@ -323,39 +328,69 @@ class _Canvas:
         return image
 
 
-def render_replay(replay_path, output_dir=None, *, size=900):
-    """Write and decode-check one MP4; failures are explicit and never simulated.
+def _encode_h264(frames, destination, size):
+    """Stream RGB frames to the browser-compatible H.264/yuv420p encoder."""
+    destination = filesystem_path(destination)
+    executable = os.environ.get("EP_NAVSIM_FFMPEG") or shutil.which("ffmpeg")
+    if not executable:
+        raise RuntimeError("BEV export requires ffmpeg with libx264 on PATH, or EP_NAVSIM_FFMPEG; official scores are unchanged")
+    command = [executable, "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo",
+               "-pix_fmt", "rgb24", "-s", "%dx%d" % (size, size), "-r", "10", "-i", "pipe:0",
+               "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-threads", "2",
+               "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(destination)]
+    count = 0
+    with tempfile.TemporaryFile() as errors:
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errors,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        try:
+            for frame in frames:
+                array = np.asarray(frame)
+                if array.shape != (size, size, 3) or array.dtype != np.uint8:
+                    raise ValueError("H.264 export requires full-size uint8 RGB frames")
+                process.stdin.write(array.tobytes())
+                count += 1
+            process.stdin.close()
+            if process.wait(timeout=60) != 0:
+                errors.seek(0)
+                raise RuntimeError("H.264 encoding failed: " + errors.read().decode("utf-8", errors="replace")[-2000:])
+        except BrokenPipeError:
+            process.wait(timeout=10)
+            errors.seek(0)
+            raise RuntimeError("H.264 encoder stopped; check ffmpeg/libx264: " +
+                               errors.read().decode("utf-8", errors="replace")[-2000:]) from None
+        finally:
+            if not process.stdin.closed:
+                try:
+                    process.stdin.close()
+                except BrokenPipeError:
+                    pass
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+    return count
 
-    ``replay_path`` is gzip JSON using VERSION. Output contains official_bev.mp4,
-    official_bev_first.png and render_status.json. Returned status includes the
-    exact actual frame count, simulation span and encoded duration.
-    """
-    replay_path = Path(replay_path).resolve()
-    destination = Path(output_dir).resolve() if output_dir is not None else replay_path.parent
-    if type(size) is not int or size < 600 or size > 2000 or size % 2:
-        raise ValueError("BEV video size must be an even integer between 600 and 2000")
-    replay = load_replay(replay_path)
+
+def _render_captured(replay_path, destination, replay, canvas, size, metadata, *, publish_status=True):
+    """Shared H.264 export/verification; canvas controls only presentation."""
+    # Normalize directory entries before appending artifact or temporary names.
+    # The extended prefix must reach PIL, FFmpeg, OpenCV and atomic renames.
+    replay_path, destination = filesystem_path(replay_path), filesystem_path(destination)
     destination.mkdir(parents=True, exist_ok=True)
-    canvas = _Canvas(replay, size)
     token = uuid.uuid4().hex[:12]
-    # Worktrees plus sample hashes already make long Windows paths. Keep atomic
-    # temporary basenames shorter than the final names, including status files.
     temporary = destination / (".v_" + token + ".mp4")
     video = destination / "official_bev.mp4"
     status_path = destination / "render_status.json"
-    writer = cv2.VideoWriter(str(temporary), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (size, size))
-    count = 0
-    try:
-        if not writer.isOpened():
-            raise RuntimeError("OpenCV mp4v encoder did not open")
+    def frames():
         for index in range(len(canvas.states)):
             frame = canvas.frame(index)
             if index == 0:
                 frame.save(destination / "official_bev_first.png")
-            writer.write(cv2.cvtColor(np.asarray(frame), cv2.COLOR_RGB2BGR))
-            count += 1
-    finally:
-        writer.release()
+            yield frame
+    try:
+        count = _encode_h264(frames(), temporary, size)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
     if count != len(canvas.states):
         raise RuntimeError("Incomplete official scoring BEV encoding")
     capture = cv2.VideoCapture(str(temporary))
@@ -379,13 +414,83 @@ def render_replay(replay_path, output_dir=None, *, size=900):
     status = dict(status="complete", token=replay["token"], replay_version=VERSION,
                   stage=replay.get("stage"), replay_path=str(replay_path),
                   video=str(video), preview=str(destination / "official_bev_first.png"),
-                  frames=count, decoded_frames=decoded, playback_verified=True,
-                  fps=fps, size=[size, size], codec="mp4v", simulated_span_s=4.0,
+                  frames=count, decoded_frames=decoded, playback_verified=True, decode_verified=True,
+                  fps=fps, size=[size, size], codec="h264", pixel_format="yuv420p", faststart=True,
+                  verification_scope="full OpenCV decode/count/fps; browser-compatible H.264 encoding", simulated_span_s=4.0,
                   encoded_duration_s=count / fps, source="actual_official_scoring_execution",
                   note="41 endpoint-inclusive samples over 4.0s; video is 4.1s at 10fps; final metrics are not instantaneous")
-    temporary_status = destination / (".s_" + token + ".tmp")
-    temporary_status.write_text(json.dumps(status, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
-    os.replace(temporary_status, status_path)
+    status.update(metadata)
+    if publish_status:
+        temporary_status = destination / (".s_" + token + ".tmp")
+        temporary_status.write_text(json.dumps(status, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+        os.replace(temporary_status, status_path)
+    return status
+
+
+def _find_settings(replay_path, settings=None):
+    if settings:
+        path = filesystem_path(settings)
+        if not path.is_file():
+            raise FileNotFoundError("Replay settings not found: " + str(path))
+        return path
+    for parent in filesystem_path(replay_path).parents:
+        path = parent / "run_settings.json"
+        if path.is_file():
+            return path
+    raise FileNotFoundError("Official SDK rendering requires run_settings.json; supply --settings")
+
+
+def render_replay(replay_path, output_dir=None, *, size=900, settings=None,
+                  sdk_root=None, sdk_python=None, maps_root=None, data_root=None,
+                  packet=None, renderer="official"):
+    """Write and decode-check one MP4; failures are explicit and never simulated.
+
+    ``replay_path`` is gzip JSON using VERSION. Output contains official_bev.mp4,
+    official_bev_first.png and render_status.json. Returned status includes the
+    exact actual frame count, simulation span and encoded duration.
+    """
+    replay_path = filesystem_path(replay_path)
+    destination = filesystem_path(output_dir) if output_dir is not None else replay_path.parent
+    if type(size) is not int or size < 600 or size > 2000 or size % 2:
+        raise ValueError("BEV video size must be an even integer between 600 and 2000")
+    replay = load_replay(replay_path)
+    if renderer == "legacy":
+        return _render_captured(replay_path, destination, replay, _Canvas(replay, size), size,
+            dict(renderer_version="legacy-custom-bev-1.0", official_visualization=False))
+    if renderer != "official":
+        raise ValueError("Unknown replay renderer: " + str(renderer))
+    settings_path = _find_settings(replay_path, settings)
+    frozen = json.loads(settings_path.read_text(encoding="utf-8"))
+    executable = sdk_python or os.environ.get("EP_NAVSIM_SDK_PYTHON") or frozen.get("sdk_python")
+    sdk_root = sdk_root or os.environ.get("EP_NAVSIM_SDK_ROOT") or frozen.get("sdk_root")
+    if not executable or not sdk_root:
+        raise ValueError("Official SDK rendering requires sdk_python and sdk_root")
+    command = [str(executable), "-m", "ep_driver_navsim.official_render", "--replay", str(replay_path),
+               "--output-dir", str(destination), "--settings", str(settings_path),
+               "--size", str(size), "--sdk-root", str(sdk_root)]
+    for option, value in (("maps-root", maps_root), ("data-root", data_root), ("packet", packet)):
+        if value:
+            command.extend(["--" + option, str(value)])
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join([str(Path(__file__).resolve().parents[1]),
+                                                str(sdk_root), environment.get("PYTHONPATH", "")])
+    destination.mkdir(parents=True, exist_ok=True)
+    try:
+        with (destination / "official_render.log").open("w", encoding="utf-8") as log:
+            result = subprocess.run(command, env=environment, stdout=log, stderr=subprocess.STDOUT,
+                timeout=float(frozen.get("bev_render_timeout_s", 180)),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if result.returncode:
+            raise RuntimeError("Official SDK renderer failed; see " + str(destination / "official_render.log"))
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        from .protocol import write_json
+        write_json(destination / "render_status.json", dict(status="failed", token=replay["token"],
+            renderer_version=RENDERER_VERSION, official_visualization=False, error=str(exc),
+            official_score_unchanged=True, failure_scope="visualization_only"))
+        raise
+    status = json.loads((destination / "render_status.json").read_text(encoding="utf-8"))
+    if status.get("renderer_version") != RENDERER_VERSION or not status.get("official_visualization"):
+        raise RuntimeError("Renderer did not produce the requested official SDK visualization")
     return status
 
 
@@ -394,8 +499,16 @@ def main():
     parser.add_argument("--replay", required=True)
     parser.add_argument("--output-dir")
     parser.add_argument("--size", type=int, default=900)
+    parser.add_argument("--settings", help="Frozen run_settings.json; otherwise found above the trace")
+    parser.add_argument("--sdk-root")
+    parser.add_argument("--sdk-python")
+    parser.add_argument("--maps-root")
+    parser.add_argument("--data-root")
+    parser.add_argument("--packet", help="Optional archived input_packet.json[.gz]")
     args = parser.parse_args()
-    print(json.dumps(render_replay(args.replay, args.output_dir, size=args.size), ensure_ascii=False), flush=True)
+    print(json.dumps(render_replay(args.replay, args.output_dir, size=args.size, settings=args.settings,
+        sdk_root=args.sdk_root, sdk_python=args.sdk_python, maps_root=args.maps_root,
+        data_root=args.data_root, packet=args.packet), ensure_ascii=False), flush=True)
 
 
 if __name__ == "__main__":

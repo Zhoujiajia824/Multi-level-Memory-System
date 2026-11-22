@@ -18,6 +18,7 @@ from highway_env.vehicle.kinematics import Vehicle
 from nine_grid.highway import HighwayAdapter
 from nine_grid.models import scene_text
 from nine_grid.object_scope import scope_scene
+from nine_grid.perception_scope import perception_scene
 from nine_grid.planning_objects import planning_scene
 
 
@@ -58,16 +59,18 @@ def main():
         prompt = json.loads(scene_text(scene, SimpleNamespace(grid={})))
         representatives = prompt['八向图']['对象']
         others = prompt['范围内其他对象']
-        assert {r['id'] for r in representatives+others} == expected
+        perceived, perception = perception_scene(scene, cfg)
+        assert {r['id'] for r in representatives+others} == set(rows.values())
+        assert {a.id for a in perceived.actors} == set(rows.values())
         assert rows['behind_blocker'] in {r['id'] for r in others}
         planned, diagnostic = planning_scene(scene, cfg)
-        assert {a.id for a in planned.actors} == {rows['near_blocker'], rows['rear_inside']}
+        assert {a.id for a in planned.actors} == expected
         assert not set(diagnostic['selected_ids'])-expected
         print(json.dumps({'passed': True, 'raw_objects': len(scene.actors),
-                          'model_objects': len(expected), 'base_planning_objects': len(planned.actors),
+                          'model_objects': len(perceived.actors), 'base_planning_objects': len(planned.actors),
                           'legacy_radius_m': 5, 'lane_scope': scope['settings'],
                           'occluded_front_35m_preserved': True,
-                          'range_outside_and_nonadjacent_not_sent': True,
+                          'bev_dynamic_outside_lane_scope_preserved': True,
                           'physics_steps': adapter.env.steps, 'model_calls': 0}, ensure_ascii=False, indent=2))
     finally:
         adapter.close()

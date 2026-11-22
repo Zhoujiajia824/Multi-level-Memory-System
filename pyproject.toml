@@ -12,7 +12,7 @@ dependencies = ["numpy>=2", "scipy>=1.15", "casadi==3.7.2", "shapely>=2", "highw
 
 [project.optional-dependencies]
 vision = ["torch>=2.6", "transformers>=4.48"]
-dev = ["pytest>=8", "ruff>=0.9"]
+dev = ["pytest>=8", "ruff>=0.9", "jsonschema>=4"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

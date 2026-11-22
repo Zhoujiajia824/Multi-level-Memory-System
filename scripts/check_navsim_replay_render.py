@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from ep_driver_navsim.replay_render import VERSION, COLORS, _Canvas, footprint, load_replay, render_replay
+from nine_grid.paths import filesystem_path
 
 
 def fixture():
@@ -39,8 +40,8 @@ class ReplayRenderChecks(unittest.TestCase):
     def setUp(self):
         temp_root = ROOT / "outputs/navsim_check_temp"
         temp_root.mkdir(parents=True, exist_ok=True)
-        self.temporary = tempfile.TemporaryDirectory(dir=temp_root)
-        self.directory = Path(self.temporary.name)
+        self.temporary = tempfile.TemporaryDirectory(dir=filesystem_path(temp_root))
+        self.directory = ROOT / Path(self.temporary.name).relative_to(filesystem_path(ROOT))
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -102,11 +103,16 @@ class ReplayRenderChecks(unittest.TestCase):
     def test_mp4_frames_exactly_match_actual_endpoint_inclusive_samples(self):
         replay = fixture()
         expected = copy.deepcopy(replay)
-        path = self.save(replay)
-        # Exercise long worktree/sample paths: final basenames fit MAX_PATH,
-        # while verbose 32-character UUID temporary names would exceed it.
-        destination = self.directory / ("n" * max(1, 225 - len(str(self.directory)) - 1))
-        status = render_replay(path, destination, size=900)
+        # Both source and output exceed MAX_PATH, including Unicode components.
+        # Pass ordinary public paths so renderer entry points must normalize all
+        # file I/O, PIL saves, FFmpeg output, OpenCV decode and atomic replaces.
+        destination = self.directory / ("n" * 75) / ("回放" * 35) / "official_replay"
+        self.assertGreater(len(str(destination)), 300)
+        filesystem_path(destination).mkdir(parents=True)
+        path = destination / "trace.json.gz"
+        with gzip.open(filesystem_path(path), "wt", encoding="utf-8") as stream:
+            json.dump(replay, stream)
+        status = render_replay(path, destination, size=900, renderer="legacy")
         self.assertEqual(status["decoded_frames"], 41)
         self.assertEqual(status["simulated_span_s"], 4.)
         self.assertEqual(status["encoded_duration_s"], 4.1)
@@ -126,8 +132,9 @@ class ReplayRenderChecks(unittest.TestCase):
         self.assertEqual(len(frames), 41)
         self.assertEqual(frames[0].shape, (900, 900, 3))
         self.assertGreater(np.mean(np.abs(frames[0].astype(float) - frames[-1].astype(float))), .1)
-        recorded = json.loads((destination / "render_status.json").read_text(encoding="utf-8"))
+        recorded = json.loads((filesystem_path(destination) / "render_status.json").read_text(encoding="utf-8"))
         self.assertEqual(recorded["source"], "actual_official_scoring_execution")
+        self.assertTrue((filesystem_path(destination) / "official_bev_first.png").is_file())
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 
 import yaml
 
@@ -111,7 +112,8 @@ def prepare_settings(config_path, split_override=None, output_override=None, bev
     defaults = dict(parameters="config/parameters.json", models_config="config/models.example.yaml",
                     prompts_config="config/prompts.yaml", split="warmup_two_stage", fast="off", retrieve=False,
                     memory_read_dir=None, desired_speed_mps=10.0, map_radius_m=160.0,
-                    dino_device="cpu", timeout_s=600.0, bev_video=True)
+                    dino_device="cpu", timeout_s=600.0, bev_video=True, resume=True,
+                    model_revision=None, model_service={}, structured_model_output=False)
     settings = dict(defaults, **settings)
     if split_override:
         settings["split"] = split_override
@@ -121,10 +123,18 @@ def prepare_settings(config_path, split_override=None, output_override=None, bev
         settings["bev_video"] = bev_video_override
     if type(settings["bev_video"]) is not bool:
         raise ValueError("bev_video must be true or false")
+    if type(settings["resume"]) is not bool:
+        raise ValueError("resume must be true or false")
+    if type(settings["structured_model_output"]) is not bool:
+        raise ValueError("structured_model_output must be true or false")
+    if not isinstance(settings["model_service"], dict):
+        raise ValueError("model_service must describe the declared server preprocessing")
     if settings["split"] not in ("warmup_two_stage", "navhard_two_stage"):
         raise ValueError("Only pinned v2.2 warmup_two_stage/navhard_two_stage are supported")
     if settings["fast"] not in ("off", "api", "server") or type(settings["retrieve"]) is not bool:
         raise ValueError("Invalid model/retrieval mode")
+    if settings["structured_model_output"] and settings["fast"] != "server":
+        raise ValueError("structured_model_output requires fast=server")
     if settings["retrieve"] and (settings["fast"] == "off" or not settings["memory_read_dir"]):
         raise ValueError("Frozen retrieval requires an enabled fast model and memory_read_dir")
     for key in required | {"parameters", "models_config", "prompts_config"}:
@@ -139,6 +149,16 @@ def prepare_settings(config_path, split_override=None, output_override=None, bev
             raise FileNotFoundError(key + ": " + settings[key])
     settings["config_file_sha256"] = {key: hashlib.sha256(Path(settings[key]).read_bytes()).hexdigest()
                                      for key in ("parameters", "models_config", "prompts_config")}
+    if settings["fast"] != "off":
+        if settings["resume"] and (not isinstance(settings["model_revision"], str)
+                                   or not settings["model_revision"].strip()):
+            raise ValueError("Model resume requires an explicit model_revision; use resume=false for an unpinned API model")
+        model = yaml.safe_load(Path(settings["models_config"]).read_text(encoding="utf-8"))["fast"]
+        if not model.get("model") or not model.get("base_url"):
+            raise ValueError("Enabled fast model requires model and base_url in models_config")
+        if settings["fast"] == "api" and not os.environ.get(model.get("api_key_env", "")):
+            raise ValueError("Set the fast model API key environment variable before starting: " +
+                             str(model.get("api_key_env", "<missing api_key_env>")))
     data = Path(settings["data_root"])
     for name in ("maps", "navsim_logs/test", "sensor_blobs/test", settings["split"] + "/sensor_blobs",
                  settings["split"] + "/synthetic_scene_pickles"):
@@ -148,14 +168,17 @@ def prepare_settings(config_path, split_override=None, output_override=None, bev
     settings.update(split_contract(settings["sdk_root"], settings["split"]))
     settings.update(memory_snapshot_id=hashlib.sha256(b"[]").hexdigest(), memory_record_count=0)
     if settings["retrieve"]:
-        from nine_grid.memory import MemoryStore
-        from .worker import check_memory_disjoint
-        store = MemoryStore(settings["memory_read_dir"], None)
-        records = store.snapshot()
-        check_memory_disjoint(records, settings["evaluation_logs"], settings["evaluation_tokens"])
+        from .memory import load_memory_snapshot
+        started = time.perf_counter()
+        print("Validating the frozen memory library and excluding evaluation sources; large libraries may take several minutes.", flush=True)
+        records, snapshot_id, selection = load_memory_snapshot(
+            settings["memory_read_dir"], settings["evaluation_logs"], settings["evaluation_tokens"])
         if not records:
             raise ValueError("Retrieval requested but no compatible audited memory was loaded")
-        settings.update(memory_snapshot_id=store.snapshot_id, memory_record_count=len(records))
+        settings.update(memory_snapshot_id=snapshot_id, memory_record_count=len(records), memory_selection=selection)
+        print("Frozen memory: selected=%d source=%d excluded_overlap=%d reader_rejected=%d validation_s=%.1f" %
+              (len(records), selection["source_records"], len(selection["excluded_records"]),
+               len(selection["reader_rejected_records"]), time.perf_counter()-started), flush=True)
     check_weight_file(settings["dino_model"])
     settings["map_source_sha256"] = stage_maps(data, settings["maps_runtime_root"])
     settings.update(input_condition=INPUT_CONDITION, standard_sensor_only_comparable=False,
@@ -194,7 +217,7 @@ def scoring_environment(settings):
 
 
 def render_existing(config_path, output_override=None, token=None):
-    """Render saved scoring traces without inference, simulation or SDK imports."""
+    """Render saved traces with official SDK plotting, without inference/scoring."""
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))
     output = Path(output_override or config["output_dir"])
     if not output.is_absolute():
@@ -305,10 +328,27 @@ def verify_scores(settings, csv_path):
     if invalid or combined.get("valid", "").lower() != "true" or not math.isfinite(value):
         raise RuntimeError("Official run is not a complete valid benchmark: failed=%d; aggregation_valid=%s" %
                            (len(invalid), combined.get("valid")))
-    return dict(status="complete", official_csv=str(csv_path), official_two_stage_epdms=value,
+    result = dict(status="complete", official_csv=str(csv_path), official_two_stage_epdms=value,
                 evaluated_tokens=len(expected), failed_tokens=0, input_condition=INPUT_CONDITION,
                 standard_sensor_only_comparable=False, official_commit=OFFICIAL_COMMIT,
                 split=settings["split"], settings_sha256=digest(settings))
+    result["trajectory_sampling"] = dict(horizon_s=4.0, interval_s=0.5, poses=8,
+                                         short_plan_padding_allowed=False)
+    if settings.get("fast") in ("api", "server"):
+        audits = []
+        for token in sorted(expected):
+            path = Path(settings["output_dir"]) / "samples" / digest(token)[:24] / "trajectory.json"
+            audit = json.loads(path.read_text(encoding="utf-8")).get("condition_audit")
+            if not audit or audit.get("model_requested") is not True:
+                raise RuntimeError("Model-enabled benchmark lacks per-sample condition evidence: " + token)
+            audits.append(audit)
+        valid = sum(audit.get("model_answer_valid") is True for audit in audits)
+        hits = sum(bool(audit.get("retrieved_memory_ids")) for audit in audits)
+        result["condition_audit"] = dict(model_requested=len(audits), valid_model_answers=valid,
+            base_fallback_samples=len(audits)-valid, samples_with_retrieved_memories=hits,
+            all_samples_received_valid_model_answer=valid == len(audits),
+            memory_snapshot_id=settings["memory_snapshot_id"], memory_record_count=settings["memory_record_count"])
+    return result
 
 
 def main():

@@ -26,7 +26,14 @@ class CoreProcess:
         worker_keys = ("parameters", "dino_model", "dino_device", "prompts_config", "models_config", "fast",
                        "retrieve", "memory_read_dir", "memory_snapshot_id", "config_file_sha256", "numerical_source_sha256",
                        "evaluation_logs", "evaluation_tokens", "output_dir")
-        write_json(settings_path, {key: settings[key] for key in worker_keys})
+        worker_settings = {key: settings[key] for key in worker_keys}
+        worker_settings.update(resume=settings.get("resume", True),
+                               model_revision=settings.get("model_revision"),
+                               model_service=settings.get("model_service", {}),
+                               structured_model_output=settings.get("structured_model_output", False))
+        if settings["retrieve"]:
+            worker_settings["memory_selection"] = settings["memory_selection"]
+        write_json(settings_path, worker_settings)
         self.log = (self.path / (settings_path.stem + ".log")).open("a", encoding="utf-8")
         env = dict(os.environ)
         env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1]) + os.pathsep + env.get("PYTHONPATH", "")

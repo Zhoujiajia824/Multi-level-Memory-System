@@ -1,6 +1,6 @@
 {
   "theory_version": "nine-grid-rag-mpc-1.0",
-  "parameter_version": "development-1.2.0-lane-frenet-apf",
+  "parameter_version": "development-1.3.0-bev-perception-lane-all-planning",
   "status": "initial_validation_values_not_optimal",
   "clock": {
     "physics_hz": 50,
@@ -403,7 +403,7 @@
     "metric": "observed_soft_iou_with_confirmed_empty"
   },
   "planning_objects": {
-    "version": "frenet-eight-planning-3.0",
+    "version": "lane-all-attention-planning-4.0",
     "front_m": 40.0,
     "rear_m": 20.0,
     "lateral_m": 25.0,

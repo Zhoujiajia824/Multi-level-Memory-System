@@ -1,6 +1,7 @@
 """Offline regressions for the privileged NAVSIM adapter; no simulator/API calls."""
 import copy
 import csv
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -22,6 +23,7 @@ from ep_driver_navsim import input_adapter as adapter
 from ep_driver_navsim.protocol import trajectory_from_centers, validate_packet, transform_points
 from ep_driver_navsim.launch import verify_scores, normalize_cache_metadata
 from ep_driver_navsim.worker import planning_config, snapshot_from_packet, check_memory_disjoint
+from ep_driver_navsim.memory import select_memory
 from nine_grid.potential_domain import polygonal_area
 
 
@@ -245,6 +247,52 @@ class NavsimContractTests(unittest.TestCase):
             save(rows)
             with self.assertRaisesRegex(RuntimeError, "not a complete"):
                 verify_scores(settings, path)
+
+    def test_offline_memory_uses_authenticated_source_and_excludes_whole_log(self):
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
+            root = Path(directory)
+            def record(identity, log, token):
+                folder = root / identity
+                (folder / "audit").mkdir(parents=True)
+                task = dict(id=identity, anchor_frame_id=log+":"+token,
+                            capture=dict(source="openscene", source_log_name=log),
+                            timeline=[dict(frame_id=log+":"+token)])
+                raw = json.dumps(task).encode()
+                (folder / "audit/task.json").write_bytes(raw)
+                return dict(id=identity, frame_id=task["anchor_frame_id"], source="openscene",
+                    record_origin="offline_retrospective", _asset_root=str(folder),
+                    checksums={"audit/task.json":hashlib.sha256(raw).hexdigest()})
+            train, test = record("train", "train_log", "train_token"), record("test", "test_log", "another_token")
+            # A different anchor from the same test log is still excluded.
+            selected, snapshot, audit = select_memory([train, test], "source_hash", ["test_log"], ["test_token"])
+            self.assertEqual([r["id"] for r in selected], ["train"])
+            self.assertEqual(audit["excluded_records"][0]["id"], "test")
+            check_memory_disjoint(selected, ["test_log"], ["test_token"])
+            with self.assertRaisesRegex(ValueError, "overlaps"):
+                check_memory_disjoint([test], ["test_log"], ["test_token"])
+            self.assertNotEqual(snapshot, select_memory([train, test], "changed_source", ["test_log"], ["test_token"])[1])
+            (root / "train/audit/task.json").write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "audit changed"):
+                select_memory([train], "source_hash", ["test_log"], [])
+
+    def test_model_fallback_is_reported_separately_from_official_validity(self):
+        from ep_driver_navsim.protocol import digest
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as directory:
+            root = Path(directory)
+            path = root / "official.csv"
+            path.write_text("token,valid,score\na,True,0.5\nb,True,0.5\nextended_pdm_score_combined,True,0.5\n", encoding="utf-8")
+            settings = dict(evaluation_tokens=["a", "b"], split="warmup_two_stage", fast="api",
+                            output_dir=str(root), memory_snapshot_id="frozen", memory_record_count=1)
+            for token in ("a", "b"):
+                target = root / "samples" / digest(token)[:24] / "trajectory.json"
+                target.parent.mkdir(parents=True)
+                target.write_text(json.dumps(dict(condition_audit=dict(model_requested=True,
+                    model_answer_valid=token == "a", retrieved_memory_ids=["memory"]))), encoding="utf-8")
+            result = verify_scores(settings, path)
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(result["condition_audit"]["valid_model_answers"], 1)
+            self.assertEqual(result["condition_audit"]["base_fallback_samples"], 1)
+            self.assertFalse(result["condition_audit"]["all_samples_received_valid_model_answer"])
 
 
 if __name__ == "__main__":

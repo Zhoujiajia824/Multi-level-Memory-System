@@ -128,12 +128,13 @@ class ScopeTests(unittest.TestCase):
         s.actors=[actor('rear',-16,lane='prev'),actor('rear_far',-25,lane='prev')]
         self.assertEqual(ids(s)[0],{'rear'})
 
-    def test_attention_and_conflict_cannot_expand_range(self):
+    def test_attention_can_expand_to_bev_without_changing_lane_scope(self):
         s=straight();s.ego.velocity=np.array([30.,0.]);s.actors=[actor('close',20),actor('far',45),actor('fast_rear',-25,speed=50)]
         answer=SimpleNamespace(attention=[dict(rank=1,id='far'),dict(rank=2,id='fast_rear')])
         out,d=planning_scene(s,{'planning_objects':{'adaptive_front':True}},answer)
-        self.assertEqual({a.id for a in out.actors},{'close'})
-        self.assertEqual(len(d['attention_rejected']),2)
+        self.assertEqual({a.id for a in out.actors},{'close','far','fast_rear'})
+        self.assertEqual(d['lane_scope_ids'],['close'])
+        self.assertEqual(d['attention_rejected'],[])
         self.assertFalse(d['adaptive_expansion'])
 
     def test_rule_cache_cannot_restore_outside_actors(self):

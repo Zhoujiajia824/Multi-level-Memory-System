@@ -2,11 +2,19 @@
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
+import tempfile
 
 import numpy as np
+from nine_grid.paths import filesystem_path
 
 from . import INPUT_PROTOCOL, INPUT_CONDITION
+
+HORIZON_S = 4.0
+PLANNING_STEP_S = 0.1
+PLANNING_STEPS = 40
+OUTPUT_INTERVAL_S = 0.5
 
 
 def digest(value):
@@ -14,10 +22,77 @@ def digest(value):
                                      ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
 
 
-def write_json(path, value):
-    path = Path(path)
+def write_bytes(path, payload):
+    """Publish a file atomically; a killed writer never exposes a partial JSON."""
+    path = filesystem_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix="." + path.name + ".",
+                                         suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def write_json(path, value):
+    write_bytes(path, json.dumps(value, ensure_ascii=False, indent=2,
+                                allow_nan=False).encode("utf-8"))
+
+
+def relative_asset_path(path, root):
+    """Compare resolved filesystem paths in the same Windows path namespace.
+
+    Both ordinary and extended drive/UNC paths receive the same normalization.
+    Path.relative_to still enforces the directory boundary after symlink and '..'
+    resolution; stripping a prefix or using a textual prefix test would not.
+    """
+    relative = filesystem_path(path).relative_to(filesystem_path(root))
+    if not relative.parts:
+        raise ValueError("An asset must be a file inside its sample directory")
+    return relative.as_posix()
+
+
+def horizon_contract(config, plans=None, predictions=None):
+    """Check the actual grids, including the predictor's diagnostic horizon."""
+    diagnostic_horizon = HORIZON_S + max(config.get("quality", {}).get("ttc_offsets_s", [0, .3, .6, .9]))
+    if (config["mpc"]["horizon_steps"] != PLANNING_STEPS
+            or not math.isclose(config["mpc"]["step_s"], PLANNING_STEP_S, abs_tol=1e-10)
+            or any(not math.isclose(config["prediction"][key], expected, abs_tol=1e-10)
+                   for key, expected in (("horizon_s", HORIZON_S),
+                                         ("diagnostic_horizon_s", diagnostic_horizon),
+                                         ("step_s", PLANNING_STEP_S)))):
+        raise ValueError("NAVSIM planning, reference and prediction must use 40 x 0.1s = four seconds")
+    report = dict(horizon_s=HORIZON_S, main_horizon_s=HORIZON_S,
+                  diagnostic_horizon_s=diagnostic_horizon, step_s=PLANNING_STEP_S,
+                  horizon_steps=PLANNING_STEPS, state_count=PLANNING_STEPS + 1,
+                  output_interval_s=OUTPUT_INTERVAL_S, output_poses=8,
+                  extrapolation=False, plans={}, predictions={})
+    for name, plan in (plans or {}).items():
+        states = np.asarray(plan.states, float)
+        controls = np.asarray(plan.controls, float)
+        if (states.shape != (PLANNING_STEPS + 1, 4) or not np.isfinite(states).all()
+                or controls.shape != (PLANNING_STEPS, 2) or not np.isfinite(controls).all()):
+            raise ValueError(name + " does not contain a complete finite four-second plan")
+        report["plans"][name] = dict(state_count=len(states), control_count=len(controls), horizon_s=HORIZON_S)
+    times = np.arange(round(diagnostic_horizon / PLANNING_STEP_S) + 1) * PLANNING_STEP_S
+    for name, bundle in (predictions or {}).items():
+        actual = np.asarray(bundle.times, float)
+        if actual.shape != times.shape or not np.allclose(actual, times, rtol=0, atol=1e-10):
+            raise ValueError(name + " does not cover the four-second plan and configured TTC diagnostic grid")
+        for trajectory in bundle.trajectories.values():
+            values = np.asarray(trajectory, float)
+            if values.shape != (len(times), 4) or not np.isfinite(values).all():
+                raise ValueError(name + " contains an incomplete/nonfinite actor prediction")
+        report["predictions"][name] = dict(state_count=len(actual), horizon_s=float(actual[-1]),
+            main_horizon_s=HORIZON_S, main_state_count=PLANNING_STEPS + 1,
+            diagnostic_horizon_s=diagnostic_horizon, actor_count=len(bundle.trajectories))
+    return report
 
 
 def wrap(angle):

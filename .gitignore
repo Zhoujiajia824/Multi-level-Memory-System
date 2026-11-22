@@ -53,6 +53,11 @@
 !/scripts/check_navsim_replay_render.py
 !/scripts/check_navsim_replay_official.py
 !/scripts/check_navsim_warmup_recovery.py
+!/scripts/check_navsim_resume_storage.py
+!/scripts/check_navsim_official_style.py
+!/scripts/export_navsim_test_assets.py
+!/scripts/prepare_navsim_runtime.py
+!/scripts/sync_navsim_viewer.py
 !/scripts/capture_highway.py
 !/scripts/memory_admin.py
 
@@ -64,6 +69,11 @@
 !/src/ep_driver_navsim/*.py
 /src/nine_grid/*
 !/src/nine_grid/*.py
+
+# Standalone, read-only viewer shipped with the evaluation branch.
+!/tools/
+/tools/*
+!/tools/ep_agent_viewer/
 
 # 仅发布运行需要的DINOv2 Base，权重由Git LFS管理。
 /models/*
@@ -100,3 +110,5 @@ __pycache__/
 *.swp
 .DS_Store
 Thumbs.db
+
+!/scripts/regression_model_perception_scope.py

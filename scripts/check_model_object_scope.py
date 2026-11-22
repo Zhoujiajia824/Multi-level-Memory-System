@@ -1,9 +1,10 @@
-"""验证模型文字、关注ID与基础规划共享范围；不连接服务器或调用模型。"""
+"""验证模型BEV候选、八向范围与关注ID；不连接服务器或调用模型。"""
 from pathlib import Path
 import sys
 import json
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,7 +25,7 @@ def bind(scene, config=None):
 
 
 def payload(scene):
-    # 故意给出较宽的检索图，模型范围仍须独立受约束。
+    # 检索八向与模型动态候选范围独立；数值真值只发送一次。
     return json.loads(scene_text(scene, SimpleNamespace(grid=build_grid(scene))))
 
 
@@ -44,30 +45,40 @@ class ModelScopeTests(unittest.TestCase):
                     actor('pole', 10, kind='pole'), actor('two_lanes', 12, 7, lane='far')]
         bind(s)
         value = payload(s)
-        expected = {'near', 'second', 'rear', 'bike', 'pedestrian', 'road_obstacle'}
+        expected = {'near', 'second', 'far', 'rear', 'rear_far', 'bike', 'pedestrian',
+                    'road_obstacle', 'two_lanes'}
         self.assertEqual(model_ids(value), expected)
         self.assertEqual(attention_ids(s), expected)
         self.assertNotIn('其他可见对象', value)
-        self.assertEqual(value['对象输入范围']['对象数量'], 6)
+        self.assertEqual(value['对象输入范围']['对象数量'], 9)
+        self.assertEqual(set(value['对象输入范围']['八向范围外BEV对象ID']),
+                         {'far', 'rear_far', 'two_lanes'})
+        rows=value['八向图']['对象']+value['范围内其他对象']
+        self.assertEqual(len(rows),len(expected))
         self.assertEqual(len(s.actors), 11)  # 原始审计快照不被原地删改。
         from nine_grid.representations import _bev_label_actors
         self.assertLessEqual({a.id for a in _bev_label_actors(s)} - {'ego'}, expected)
         planned, _ = planning_scene(s)
         self.assertLessEqual({a.id for a in planned.actors}, expected)
 
-    def test_configured_range_applies_to_text_attention_and_plan(self):
+    def test_configured_lane_range_does_not_crop_bev_candidates(self):
         s = straight(); s.actors = [actor('inside', 18), actor('beyond', 22), actor('rear_out', -6)]
         config = {'planning_objects': {'front_m': 20., 'rear_m': 5.}}
         bind(s, config)
-        self.assertEqual(model_ids(payload(s)), {'inside'})
-        self.assertEqual(attention_ids(s), {'inside'})
+        value=payload(s)
+        self.assertEqual(model_ids(value), {'inside', 'beyond', 'rear_out'})
+        self.assertEqual(attention_ids(s), {'inside', 'beyond', 'rear_out'})
+        self.assertEqual(value['对象输入范围']['front_m'],20.)
+        self.assertEqual(value['对象输入范围']['rear_m'],5.)
+        self.assertEqual(value['对象输入范围']['八向范围对象ID'],['inside'])
         planned, _ = planning_scene(s, config)
         self.assertEqual({a.id for a in planned.actors}, {'inside'})
 
     def test_forbidden_lane_and_unknown_permission(self):
         s = straight(False); s.actors = [actor('neighbor', 12, 3.5, lane='l')]
         bind(s); value = payload(s)
-        self.assertFalse(model_ids(value))
+        self.assertEqual(model_ids(value),{'neighbor'})
+        self.assertEqual(value['对象输入范围']['八向范围外BEV对象ID'],['neighbor'])
         self.assertIn('自车左侧相邻车道前方区域', value['八向图']['相邻车道存在但当前位置禁止跨越的区域'])
         s = straight(); s.lanes[0].left = 'r'; s.lanes[0].right = None
         bind(s); value = payload(s)
@@ -75,11 +86,29 @@ class ModelScopeTests(unittest.TestCase):
         self.assertNotIn('自车左侧相邻车道前方区域', value['八向图']['未发现可见对象的区域'])
 
     def test_invalid_attention_rejected_before_goal(self):
-        s = straight(); s.actors = [actor('far', 65)]; bind(s)
+        s = straight(); s.actors = [actor('far', 85)]; bind(s)
         raw = json.dumps({'attention': [{'id': 'far', 'rank': 1, 'reason': 'test'}],
                           'local_goal': {'delta_s_m': 15., 'd_m': 0.}, 'explanation': {key: 'test' for key in ('情境', '依据', '参考答案', '适用条件')}})
         with self.assertRaisesRegex(ValueError, '关注 ID'):
             parse_answer(raw, s)
+
+    def test_outside_lane_bev_attention_accepted_without_fabricated_region(self):
+        s=straight(False)
+        s.actors=[actor('opposing',12,3.5,heading=np.pi,lane='l',speed=8)]
+        bind(s)
+        value=payload(s)
+        self.assertFalse(value['八向图']['对象'])
+        self.assertEqual([row['id'] for row in value['范围内其他对象']],['opposing'])
+        raw=json.dumps({'attention':[{'id':'opposing','rank':1,'reason':'接近左转通道'}],
+                        'local_goal':{'delta_s_m':15.,'d_m':0.},
+                        'explanation':{key:'test' for key in ('情境','依据','参考答案','适用条件')}})
+        goal=dict(local_goal={'delta_s_m':15.,'d_m':0.},world_goal=np.array([15.,0.]),
+                  goal_reference={},goal_id='test-goal',target_lane_id='c')
+        with patch('nine_grid.models._goal_reference',return_value={}), \
+                patch('nine_grid.goals.validate_local_goal',return_value=goal):
+            answer=parse_answer(raw,s)
+        self.assertEqual(answer.attention[0]['id'],'opposing')
+        self.assertEqual(answer.frame_id,s.frame_id)
 
     def test_body_intrusion_gets_same_region_as_planner(self):
         s = straight(); s.lanes = s.lanes[:1]; s.lanes[0].left = s.lanes[0].right = None

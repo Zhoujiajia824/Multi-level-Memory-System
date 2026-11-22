@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>EP-Driver · Agent Observatory</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23132835'/%3E%3Cpath d='M44 18H21v28h23M22 32h17' fill='none' stroke='%2367e3d3' stroke-width='5'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+  <script type="importmap">{"imports":{"three":"/vendor/three.module.js","three/addons/":"/vendor/"}}</script>
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/" aria-label="EP-Driver 展示台"><span class="brand-icon">E<span>↗</span></span><span>EP<span class="brand-dot">·</span>DRIVER<small>AGENT OBSERVATORY</small></span></a>
+  <div class="top-divider"></div><span class="header-caption">驾驶智能体 · 运行与回放</span>
+  <div class="header-right"><a class="mini-button" href="/memory">离线记忆库</a><span id="connection" class="badge"><i></i>连接中</span><span class="readonly">只读观察</span><button id="fullscreen" class="icon-button" title="全屏展示" aria-label="全屏展示">⛶</button></div>
+</header>
+<div class="workspace">
+  <aside class="sidebar">
+    <div class="section-label">WORKSPACE <span>01</span></div>
+    <label class="field-label" for="episode-select">实验轮次</label>
+    <div class="select-row"><select id="episode-select"><option>正在读取实验…</option></select><button id="refresh" class="icon-button" title="刷新实验列表" aria-label="刷新实验列表">↻</button></div>
+    <div id="episode-meta" class="episode-meta">加载运行产物</div>
+    <div class="mode-card"><div><span class="tiny-label">EXECUTION MODE</span><strong id="run-mode">—</strong></div><span id="run-status" class="status-dot"></span></div>
+    <div class="sidebar-separator"></div>
+    <div class="section-label">SCENE LAYERS <span>02</span></div>
+    <label class="layer"><span><i class="swatch lane"></i>道路与导航</span><input type="checkbox" data-layer="roads" checked></label>
+    <label class="layer"><span><i class="swatch region"></i>八向车道区域</span><input type="checkbox" data-layer="regions" checked></label>
+    <label class="layer"><span><i class="swatch object"></i>交通对象</span><input type="checkbox" data-layer="objects" checked></label>
+    <label class="layer"><span><i class="swatch source"></i>八向代表标注</span><input type="checkbox" data-layer="grid_matches" checked></label>
+    <label class="layer"><span><i class="swatch source"></i>势场来源对象</span><input type="checkbox" data-layer="sources" checked></label>
+    <label class="layer"><span><i class="swatch attention"></i>模型关注对象</span><input type="checkbox" data-layer="attention" checked></label>
+    <label class="layer" title="按原始规划时序着色：首点绿色，末点黄色"><span><i class="swatch path"></i>规划轨迹</span><input type="checkbox" data-layer="trajectory" checked></label>
+    <label class="layer" title="半透明黄色面，不描绘走廊边界"><span><i class="swatch corridor"></i>行车走廊</span><input type="checkbox" data-layer="corridor" checked></label>
+    <label class="layer"><span><i class="swatch goal"></i>局部引导点</span><input type="checkbox" data-layer="goal" checked></label>
+    <div class="sidebar-separator"></div>
+    <div class="section-label">FRAME EVIDENCE <span>03</span></div>
+    <dl class="evidence-mini"><div><dt>源帧</dt><dd id="frame-id">—</dd></div><div><dt>状态与规划</dt><dd id="alignment">等待数据</dd></div><div><dt>投影标定</dt><dd id="calibration">—</dd></div><div><dt>对象几何</dt><dd id="geometry-quality">—</dd></div></dl>
+    <details class="provenance"><summary>数据来源与显示说明</summary><p id="data-root">仅读取指定实验目录。</p><p>前端不推进仿真，不发送车辆控制。图层来源缺失时显示缺失，不生成替代状态。</p><p>行车走廊是轨迹中心两侧各半个车宽的连续带，不代表独立安全保证。</p><p>自车展示模型：CARLA 0.9.15 原版 Tesla Model 3，黑色车漆并按归档外廓尺寸适配；不表示实验车辆品牌。<a href="/assets/CREDITS.txt" target="_blank" rel="noopener">素材署名</a></p></details>
+    <div class="sidebar-bottom"><span class="live-indicator"></span><span>READ-ONLY ARTIFACT STREAM</span></div>
+  </aside>
+
+  <main class="main">
+    <div class="scene-header"><div><div class="eyebrow">PERCEPTION · PLANNING · MEMORY</div><h1 id="scene-title">驾驶现场</h1></div><div class="scene-stats"><div><span>仿真时间</span><strong id="sim-time">0.00<small>s</small></strong></div><div><span>自车速度</span><strong id="ego-speed">—<small>km/h</small></strong></div><div><span>规划对象</span><strong id="actor-count">—<small>个</small></strong></div></div></div>
+    <section class="scene-panel panel">
+      <div class="panel-toolbar"><div class="tab-group" id="view-tabs"><button data-view="scene" class="active">空间场景</button><button data-view="video">原始录像</button><button data-view="bev">BEV图</button></div><div class="scene-actions"><button id="potential-toggle" class="mini-button">◉ 车道势场</button><button id="topdown" class="mini-button" aria-pressed="false">俯视</button><button id="reset-view" class="icon-button" title="回到自车" aria-label="回到自车">⌖</button><button id="capture" class="icon-button" title="保存场景截图" aria-label="保存场景截图">▣</button></div></div>
+      <div class="stage" id="stage">
+        <canvas id="scene-canvas" aria-label="可拖动旋转和缩放的驾驶场景"></canvas>
+        <div id="stage-empty" class="empty-state"><span class="empty-icon">⌁</span><strong>等待实验数据</strong><p>选择一次运行，或保持跟随以观察新帧。</p></div>
+        <div id="stage-badges" class="stage-badges"><span class="badge subtle">3D SCENE</span><span id="plan-safety" class="badge">—</span></div>
+        <div id="object-tooltip" class="object-tooltip" hidden></div>
+        <div id="stage-help" class="stage-help"><span>拖动旋转</span><span>Shift + 拖动平移</span><span>滚轮缩放</span></div>
+        <div id="video-view" class="media-view" hidden><video id="video" controls playsinline preload="metadata"></video><img id="video-preview" alt="归档执行视频的首帧" hidden style="max-height:90%;max-width:100%;object-fit:contain"><div class="video-footer"><div id="video-status" class="media-note">等待录像</div><button id="repair-video" class="mini-button" hidden>生成浏览器兼容副本</button></div></div>
+        <div id="bev-view" class="media-view" hidden><img id="bev-image" alt="当前帧BEV"><div id="bev-status" class="media-note">无当前帧BEV</div></div>
+      </div>
+      <div id="warnings" class="warnings" hidden></div>
+      <div class="scene-caption"><span id="scene-description">显示来自原始运行产物的当前状态</span><span class="coord-note">世界坐标 · 米</span></div>
+    </section>
+    <details id="navsim-panel" class="panel" hidden style="padding:16px;margin-top:14px">
+      <summary>辅助诊断：三轨迹对照（非官方绘图）</summary>
+      <p id="navsim-note" class="context-caption"></p>
+      <div id="navsim-plot" style="height:260px" aria-label="源规划中心、提交后轴及官方仿真后轴三条真实轨迹"></div>
+      <p class="context-caption">坐标固定于源帧后轴：x向前、y向左，单位米。绿色为源规划车身中心；橙色为提交的8个未来后轴姿态（0.5–4秒）；蓝色为官方评分仿真后轴。参考点不同，中心与后轴的偏移是真实车体几何。</p>
+    </details>
+    <section id="potential-panel" class="panel potential-panel" hidden>
+      <div class="panel-heading"><div><span class="eyebrow">LANE-FRENET POTENTIAL</span><h2>沿车道的吸引与排斥势场</h2></div><span id="potential-status" class="badge">等待计算</span><button id="expand-potential" class="icon-button" aria-label="放大势场" title="放大势场">⛶</button><button id="close-potential" class="icon-button" aria-label="关闭势场">×</button></div>
+      <div class="field-controls"><div class="tab-group" id="field-view"><button data-field-view="top" class="active">二维等势线</button><button data-field-view="surface">三维势面</button></div><label>显示数值 <select id="field-quantity"><option value="raw">原始叠加势能 U</option><option value="weighted">MPC 加权势场项</option></select></label><span id="field-frame">等待源帧</span></div>
+      <div id="potential-plot" aria-label="可缩放的车道吸引排斥叠加势场"></div>
+      <div class="field-caption"><p id="potential-note">按归档对象、参数和实际车道域重建，不添加示意势场。</p><span>紫色低谷 · 绿色过渡 · 黄色高峰</span></div>
+    </section>
+    <section class="camera-section"><div class="section-heading"><h2>相机观测 <span id="camera-count">0 VIEWS</span></h2><button id="next-camera-frame" class="text-button">跳至下一归档相机帧 ↗</button></div><div id="camera-grid" class="camera-grid"><div class="camera-empty">当前帧无归档图像。相机归档与规划频率可能不同，仅叠加同帧状态。</div></div></section>
+  </main>
+
+  <aside class="inspector panel">
+    <div class="inspector-header"><div class="agent-avatar">✧</div><div><strong>EP-Driver Agent</strong><span id="agent-subtitle">决策与记忆观察</span></div><span id="agent-mode-badge" class="badge subtle">待连接</span></div>
+    <div class="inspector-tabs" id="inspector-tabs"><button data-tab="dialogue" class="active">智能体对话</button><button data-tab="memory">检索记忆 <span id="memory-count">0</span></button><button data-tab="metrics">执行证据</button></div>
+    <div id="dialogue-panel" class="inspector-body"><div class="empty-state small"><span class="empty-icon">✧</span><strong>等待当前帧记录</strong></div></div>
+    <div id="memory-panel" class="inspector-body" hidden></div>
+    <div id="metrics-panel" class="inspector-body" hidden></div>
+    <div class="inspector-footer"><span class="privacy-dot"></span>忠实展示实际输入输出 · 不补写推理</div>
+  </aside>
+</div>
+
+<footer class="transport"><div class="play-controls"><button id="previous-frame" class="icon-button" aria-label="上一帧">Ⅰ‹</button><button id="play" class="play-button" aria-label="播放">▶</button><button id="next-frame" class="icon-button" aria-label="下一帧">›Ⅰ</button><select id="playback-rate" aria-label="播放速度"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></div><div class="timeline"><div class="timeline-labels"><span id="timeline-current">00:00.00</span><span id="timeline-frame">FRAME — / —</span><span id="timeline-end">00:00.00</span></div><input id="timeline" type="range" min="0" max="0" value="0" step="1" aria-label="逐帧时间轴"><div id="timeline-events" class="timeline-events"></div></div><div class="transport-extra"><button id="next-event" class="mini-button" title="下一个模型调用帧">✧ 模型事件</button><button id="follow-live" class="live-button" aria-pressed="false"><i></i>跟随最新</button></div></footer>
+<dialog id="camera-modal"><div class="modal-header"><strong id="camera-modal-title">相机观测</strong><button id="close-camera" class="icon-button" aria-label="关闭相机">×</button></div><div id="camera-modal-content"></div><div id="camera-modal-note" class="media-note"></div></dialog>
+<div id="toast" class="toast" role="status" hidden></div>
+<script type="module" src="/app.js"></script>
+</body>
+</html>
