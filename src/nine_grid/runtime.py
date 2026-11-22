@@ -41,8 +41,8 @@ class EpisodeWriter:
 
 def make_record(scene,reps,answer,quality,asset_path=None):
     # 经验正文只保存本帧实际允许给模型的对象；完整原帧仍留在审计资产中。
-    from .object_scope import scope_scene
-    scene, scope = scope_scene(scene)
+    from .perception_scope import perception_scene
+    scene, scope = perception_scene(scene)
     situation={'frame_id':scene.frame_id,'time':scene.time,'scenario':scene.scenario,
         '坐标':'local_goal使用历史原帧固定Frenet参考：delta_s_m相对该帧自车投影，d_m相对参考线绝对偏移；不可复制为当前目标',
         '原点世界姿态':[*scene.ego.position,scene.ego.heading],

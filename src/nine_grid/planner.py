@@ -256,10 +256,12 @@ class Planner:
                     stop_s=proposed;reason=f"向可见高优先级交通对象 {identity} 让行（公开通路首次入口）"
         return stop_s,reason
 
-    def emergency_brake(self,scene,predictions,reason):
+    def emergency_brake(self,scene,predictions,reason,answer=None):
         """执行前重审失败时，从当前物理状态单独生成制动，不借用旧控制。"""
         braking_planner=Planner(self.config)
-        result=braking_planner.solve(scene,predictions,None,_brake_only=True)
+        # 保留本帧关注带来的实体约束，但制动实例不激活模型目标。
+        scoped, scoped_predictions, _ = planning_view(scene,predictions,self.config,answer)
+        result=braking_planner.solve(scoped,scoped_predictions,None,_brake_only=True)
         result.diagnostics['emergency_request_reason']=str(reason)
         result.diagnostics['emergency_generation']='fresh_current_state_braking'
         return result
@@ -397,17 +399,31 @@ class Planner:
             sample=np.stack([np.interp(np.arange(n+1)*dt,predictions.times,trajectory[:,j]) for j in range(4)],axis=1)
             sample[:,:2]=world_to_ego(sample[:,:2],origin,angle);sample[:,2]-=angle
             targets.append((actor,sample,body_vertices(sample[1:],actor.length,actor.width)))
-        source_projections={}
+        source_projections={};source_anchors={}
         for actor,sample,_ in targets:
-            matched=object_selection['selected_state'][actor.id]['memberships']
-            membership=min(matched.values(),key=lambda row:abs(row['delta_s_m']))
-            offset=float(membership['delta_s_m'])
+            matched=object_selection['selected_state'][actor.id].get('memberships',{})
+            if matched:
+                membership=min(matched.values(),key=lambda row:abs(row['delta_s_m']))
+                offset=float(membership['delta_s_m'])
+                anchor=float(np.clip(potential_s0+offset,0.,potential_geometry.length))
+                source='lane_scope_membership'
+            else:
+                # 外部关注对象不伪造八向角色，只投影到本次导航图表。
+                bev=scene.diagnostics.get('perception_scope',{}).get('settings',{}).get('bev',{})
+                window=max(20.,float(bev.get('front_m',70.))+float(bev.get('rear_m',30.)))
+                projected=potential_geometry.project(sample[0,:2],anchors=potential_s0,
+                    require_domain=False,window_m=window)
+                anchor=float(projected['s'][0]);offset=anchor-potential_s0
+                source='bev_attention_current_center_on_navigation_chart'
+            source_anchors[actor.id]=dict(source=source,anchor_s_m=anchor,
+                has_eight_region_membership=bool(matched))
             source_projections[actor.id]=potential_geometry.project_sequence(sample[:,:2],
-                np.clip(potential_s0+offset,0.,potential_geometry.length),require_domain=False,
+                anchor,require_domain=False,
                 initial_window_m=min(20.,max(10.,5.+.25*abs(offset))))
         source_coverage={key:int((~value['coordinate_valid']).sum()) for key,value in source_projections.items()
                          if not np.all(value['coordinate_valid'])}
-        attention={str(a.get('id',a.get('entity_id',''))):1/max(1,int(a.get('rank',i+1))) for i,a in enumerate(answer.attention)} if answer else {}
+        attention_rows=answer.attention if answer is not None else object_selection.get('attention_signature',[])
+        attention={str(a.get('id',a.get('entity_id',''))):1/max(1,int(a.get('rank',i+1))) for i,a in enumerate(attention_rows)}
         clearance=float(risk_cfg.get('body_clearance_margin_m',.05))
         increment=float(risk_cfg.get('attention_increment',1.))
         max_a=float(p.get('acceleration_max_mps2',3));min_a=float(p.get('acceleration_min_mps2',-6))
@@ -1084,6 +1100,10 @@ class Planner:
                 'geometry':potential_geometry.diagnostics,'source_projection_uncovered_samples':source_coverage,
                 'source_projection_policy':'outside_confirmed_reference_no_APF;physical_collision_constraints_retained',
                 'classes':risk_cfg['classes'],'attention_increment':increment,
+                'source_ids':sorted(actor.id for actor,_,_ in targets),
+                'attention_gain_by_id':{actor.id:1.+increment*attention.get(actor.id,0.) for actor,_,_ in targets},
+                'source_anchors':source_anchors,
+                'collision_constraint_ids':sorted(actor.id for actor,_,_ in targets),
                 'outer_risk_weight':float(weights.get('risk',2)),
                 'goal_event':'legacy_frozen_polyline_first_crossing; energy_on_same_smooth_Frenet_projection'},
             'emergency':execution_mode=='emergency_unverified',
@@ -1136,7 +1156,8 @@ class Planner:
             'initial_constraints':initial_diagnostics,
             'map_rejections':[{'actor_id':identity,'reason':info.get('reason'),
                                'trajectory_source':info.get('trajectory_source'),'kinematic_valid':info.get('kinematic_valid')}
-                              for identity,info in predictions.diagnostics.items() if info.get('valid') is False],
+                              for identity,info in predictions.diagnostics.items()
+                              if identity in predictions.actors and isinstance(info,dict) and info.get('valid') is False],
             'last_optimizer_constraints':None if last is None else {'minimum_by_group':last['minima'],'cost':last['objective']}}
         states=accepted['states'].copy();controls=accepted['controls'].copy()
         states[:,:2]=ego_to_world(states[:,:2],origin,angle);states[:,2]+=angle;self.previous=controls.copy();self.previous_time=scene.time

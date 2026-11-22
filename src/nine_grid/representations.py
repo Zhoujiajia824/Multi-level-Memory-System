@@ -105,8 +105,12 @@ def _local(points, ego):
 
 
 def _pixel(points, ego):
+    from .perception_scope import BEV_VIEWPORT
     p = _local(points, ego)
-    return np.column_stack((250 - p[:, 1] * 10, 700 - p[:, 0] * 10))
+    scale = 1./BEV_VIEWPORT['meters_per_pixel']
+    # 保持既有math三角函数及乘法顺序，无字DINO底图不因范围重构改变。
+    return np.column_stack((BEV_VIEWPORT['ego_pixel'][0]-p[:,1]*scale,
+                            BEV_VIEWPORT['ego_pixel'][1]-p[:,0]*scale))
 
 
 def _reference_data(reference):
@@ -637,14 +641,11 @@ def _bev_label_actors(scene):
 
     机动车和弱势交通参与者分别保留名额，按真实车体净距选择；ID仅用于同分排序。
     """
-    from .object_scope import select_scope_objects
-    permitted, _ = select_scope_objects(scene)
-    permitted_ids = {actor.id for actor in permitted}
     options=bev_label_config(scene.diagnostics.get('bev_label_options'))
     ego_shape=_shape(scene.ego)
     candidates=[]
     for actor in scene.actors:
-        if actor.id not in permitted_ids or not actor.visible or actor.id==scene.ego.id or actor.kind not in ('vehicle','bicycle','pedestrian'):
+        if not actor.visible or actor.id==scene.ego.id or actor.kind not in ('vehicle','bicycle','pedestrian'):
             continue
         point=_pixel([actor.position],scene.ego)[0]
         if np.all(np.isfinite(point)) and 0<=point[0]<500 and 0<=point[1]<1000:
