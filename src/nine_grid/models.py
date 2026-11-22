@@ -8,7 +8,6 @@ import math
 import os
 import re
 import time
-from dataclasses import replace
 from pathlib import Path
 import numpy as np
 import yaml
@@ -244,96 +243,24 @@ def _current_actor(actor):
             ('id','kind','position','velocity','acceleration','heading','length','width','radius')}
 
 
-_REGION_NAMES = {
-    'left_front':'自车左侧相邻车道前方区域',
-    'front':'自车车道前方区域',
-    'right_front':'自车右侧相邻车道前方区域',
-    'left_side':'自车左侧相邻车道侧方区域',
-    'right_side':'自车右侧相邻车道侧方区域',
-    'left_rear':'自车左侧相邻车道后方区域',
-    'rear':'自车车道后方区域',
-    'right_rear':'自车右侧相邻车道后方区域',
-}
-
-
-def _eight_direction_context(scene,grid,perception=None):
-    """八向代表与额外BEV候选分开；每个对象只发送一份当前真值。"""
-    from .representations import build_grid
-    if perception is None:
-        scene, perception = perception_scene(scene)
-    scope=perception['lane_scope']
-    lane_ids=set(scope['selected_ids'])
-    lane_scene=replace(scene,actors=[actor for actor in scene.actors if actor.id in lane_ids])
-    # 检索八向仍描述较宽的图像上下文，不能直接将其代表对象塞入模型真值表。
-    # 模型角色按同一车道拓扑、当前物理车道和本次限定弧长重新确定。
-    grid = build_grid(lane_scene, object_range=scope['settings'], include_static=True)
-    actors={a.id:a for a in scene.actors if a.visible}
-    available=bool(grid.get('valid',False))
-    regions={}
-    result={'区域描述可用':available,'对象':[],
-            '未发现可见对象的区域':[],'不存在相邻同向车道的区域':[],
-            '相邻车道存在但当前位置禁止跨越的区域':[],'未知区域':[]}
-    for slot,label in _REGION_NAMES.items():
-        info=grid.get('slots',{}).get(slot,{}) if available else {}
-        state=info.get('state')
-        identity=info.get('id')
-        candidates=[]
-        for key,row in scope['objects'].items():
-            member=row['memberships'].get(slot)
-            if key in actors and member is not None:
-                gap=member['side_gap_m'] if slot.endswith('side') else member['longitudinal_gap_m']
-                candidates.append((gap,abs(member['delta_s_m']),key))
-        if candidates:
-            identity=min(candidates)[2]
-            state='occupied'
-        elif state=='occupied':
-            state='unknown'
-        if state=='occupied' and identity in actors:
-            regions.setdefault(identity,[]).append(label)
-        elif state=='empty':
-            result['未发现可见对象的区域'].append(label)
-        elif (state=='not_applicable' and info.get('reason')=='no_adjacent_lane'
-              and slot not in ('front','rear')):
-            result['不存在相邻同向车道的区域'].append(label)
-        elif (state=='not_applicable' and info.get('reason')=='noncrossable_boundary'
-              and slot not in ('front','rear')):
-            result['相邻车道存在但当前位置禁止跨越的区域'].append(label)
-        else:
-            # 缺证据或对象已不在可见集合时，不把未知格描述成没有车辆。
-            result['未知区域'].append(label)
-    for identity,labels in regions.items():
-        result['对象'].append({**_current_actor(actors[identity]),'所在区域':labels})
-    others=[_current_actor(actor) for actor in scene.actors if actor.visible and actor.id not in regions]
-    return result,others
-
-
 def scene_text(scene,representations):
-    """有限BEV动态对象与车道范围对象入模；不发送全地图环境物件。"""
-    scene, perception = perception_scene(scene)
-    scope=perception['lane_scope']
-    context,others=_eight_direction_context(scene,representations.grid,perception)
+    """模型只接收统一候选列表、必要图像说明与合法目标参考。"""
+    scene, _ = perception_scene(scene)
     from .goals import goal_reference_context
-    data={'自车':_current_actor(scene.ego),'八向图':context,'范围内其他对象':others,
-        '对象输入范围':{'version':perception['version'], **scope['settings'],
-            '距离定义':'八向车道范围按对象中心沿允许车道链的弧长差；BEV补充范围按本帧自车坐标矩形视口，不是圆形半径',
-            '类型':['vehicle','bicycle','pedestrian','static_obstacle'],
-            '障碍物定义':'明确类别的道路阻塞物且实际进入准入车道；不含围栏、护栏、墙、杆和泛化Static/Other',
-            '对象数量':len(scene.actors),
-            '车道':{side:None if chain is None else chain['lane_ids'] for side,chain in scope['chains'].items()},
-            'BEV动态对象范围':perception['settings']['bev'],
-            '八向范围对象ID':perception['lane_scope_ids'],
-            '八向范围外BEV对象ID':perception['outside_lane_ids'],
-            '关注扩展约束':perception.get('attention_policy',{'include_attention':True,'max_attention_objects':3}),
-            '说明':'当前对象为八向车道范围内全部交通对象与本帧BEV视口内全部车辆、自行车、行人的去重并集；额外BEV对象不要求位于可跨越车道。所有列出ID均可关注，最多3个；八向代表用于检索，不能代替全部候选。未列出ID不能编造，纳入观察不授予自车跨线或逆行权限。'},
+    data={'自车':_current_actor(scene.ego),
+        '候选对象':[_current_actor(actor) for actor in scene.actors],
         '规划参考':goal_reference_context(scene,_goal_reference(scene)),
-        '图像解释':'自车固定朝上，横纵轴为米。非行驶区白色，道路为NAVSIM浅灰，人行横道为30%透明紫色；车道边界线和分割线不绘制，细深灰短虚线表示虚拟车道中心线及连接参考路径，不得将其视作交通标线。模型图的绿色虚线是本次固定Frenet参考，s+距离标签表示从原帧自车投影开始的道路弧长，不等于BEV前向x距离；这些参考标签不进入DINO特征图。颜色不是风险或关注度。自车红色、其他车辆蓝色、自行车橙色、行人紫色、静态障碍黄色；图中历史轨迹保持类别色相和高亮度，速度越高饱和度越高，固定范围0至120km/h。历史只含已观测样本，不是未来预测。范围内其他对象同时包含未成为八向代表的车道内对象和八向范围外BEV动态对象，均可关注；不能把未占八向槽理解为无冲突。'}
+        '观测说明':'候选对象均为本帧提供的当前状态；只从列表ID选择关注对象，观察到对象不代表其所在空间允许自车驶入。',
+        '图像说明':'BEV自车朝上，x前y左，刻度为米；红为自车、蓝为车辆、橙为自行车、紫为行人、黄为道路障碍。细灰虚线是虚拟车道中心参考，不是真实标线；绿色虚线是固定目标参考，s+表示道路弧长。历史轨迹只表示已观测运动。'}
     if scene.diagnostics.get('observation_policy')=='range_limited_ground_truth_no_occlusion-1.0':
-        data['输入权限']='提供限定车道范围对象与当前BEV视口动态对象的当前真值，不判断遮挡；不等同于实际传感器感知。不得依据RGB遮挡编造或删除给定状态，也不得恢复候选集合外对象或隐藏未来。'
+        data['观测说明']+='本帧候选真值不判断遮挡，不因RGB遮挡删除给定状态。'
     cameras=_camera_entries(scene)
     if any(item['view']=='highway_env_topdown' for item in cameras):
-        data['图像解释']+=' highway_env_topdown是原生环境俯视图：世界x向右、y向下，自车不固定朝上，配色由环境定义；不含规划线，不按BEV刻度读数。'
+        data['图像说明']+=' highway_env_topdown为原生俯视图：世界x右y下，自车不固定朝上；不套用BEV坐标和配色。'
+    if any(item['view']=='multi_camera_mosaic' for item in cameras):
+        data['图像说明']+=' multi_camera_mosaic六相机拼图：上排左前、正前、右前，下排左后、正后、右后；不同视角可包含同一对象，透视图不按BEV刻度读距。'
     if cameras:
-        data['图像解释']+=' 当前输入图像依次为：'+ '、'.join(item['view'] for item in cameras)+'、当前BEV。相机图像与上述状态属于同一冻结帧；摄像头视角不能按BEV坐标直接读数。'
+        data['图像说明']+='当前图像顺序：'+'、'.join(item['view'] for item in cameras)+'、BEV；均绑定本帧状态。'
     return json.dumps(plain(data),ensure_ascii=False,allow_nan=False)
 
 
@@ -351,6 +278,7 @@ def _reflection_diagnostics(value):
     value=plain(value)
     excluded={'visible','history','observed','object_scope','perception_scope','prediction_scope','planning_object_selection',
               'planning_scope','road_rule_observations','excluded','actor_classification',
+              'potential_field','rule_observation_scope',
               '仿真时间秒','坐标','导航路线世界坐标','导航路线当前自车坐标','规则','地图边界',
               'historical_only_objects','只供历史回顾且不可选为当前关注对象',
               'rules','rule_evidence','desired_speed','must_wait','wait_reason','stop_s','speed_limit',
@@ -382,7 +310,7 @@ def build_prompt(scene,reps,retrieval=None,reflection=None):
     if retrieval is not None and retrieval.records:
         examples=[]
         origins={score['id']:score.get('matched_channels',[]) for score in retrieval.scores}
-        channel_labels={'bev':'BEV视觉布局','occupancy':'OCC面积占据','grid':'车道八向交互'}
+        channel_labels={'bev':'BEV视觉布局','occupancy':'OCC面积占据','grid':'交通交互相似'}
         for record in retrieval.records:
             if record.get('record_origin')=='offline_retrospective':
                 example={'经验来源':'离线回顾经验，已人工审核；模型整理内容不是因果或最优驾驶真值',

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import numpy as np
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
@@ -30,7 +31,7 @@ def payload(scene):
 
 
 def model_ids(value):
-    return {row['id'] for row in value['八向图']['对象'] + value['范围内其他对象']}
+    return {row['id'] for row in value['候选对象']}
 
 
 class ModelScopeTests(unittest.TestCase):
@@ -50,11 +51,10 @@ class ModelScopeTests(unittest.TestCase):
         self.assertEqual(model_ids(value), expected)
         self.assertEqual(attention_ids(s), expected)
         self.assertNotIn('其他可见对象', value)
-        self.assertEqual(value['对象输入范围']['对象数量'], 9)
-        self.assertEqual(set(value['对象输入范围']['八向范围外BEV对象ID']),
-                         {'far', 'rear_far', 'two_lanes'})
-        rows=value['八向图']['对象']+value['范围内其他对象']
+        self.assertNotIn('八向', json.dumps(value, ensure_ascii=False))
+        rows=value['候选对象']
         self.assertEqual(len(rows),len(expected))
+        self.assertFalse(any('所在区域' in row for row in rows))
         self.assertEqual(len(s.actors), 11)  # 原始审计快照不被原地删改。
         from nine_grid.representations import _bev_label_actors
         self.assertLessEqual({a.id for a in _bev_label_actors(s)} - {'ego'}, expected)
@@ -68,9 +68,9 @@ class ModelScopeTests(unittest.TestCase):
         value=payload(s)
         self.assertEqual(model_ids(value), {'inside', 'beyond', 'rear_out'})
         self.assertEqual(attention_ids(s), {'inside', 'beyond', 'rear_out'})
-        self.assertEqual(value['对象输入范围']['front_m'],20.)
-        self.assertEqual(value['对象输入范围']['rear_m'],5.)
-        self.assertEqual(value['对象输入范围']['八向范围对象ID'],['inside'])
+        _, diagnostic=scope_scene(s, config)
+        self.assertEqual(diagnostic['settings'], {'front_m':20., 'rear_m':5.})
+        self.assertEqual(diagnostic['selected_ids'],['inside'])
         planned, _ = planning_scene(s, config)
         self.assertEqual({a.id for a in planned.actors}, {'inside'})
 
@@ -78,12 +78,15 @@ class ModelScopeTests(unittest.TestCase):
         s = straight(False); s.actors = [actor('neighbor', 12, 3.5, lane='l')]
         bind(s); value = payload(s)
         self.assertEqual(model_ids(value),{'neighbor'})
-        self.assertEqual(value['对象输入范围']['八向范围外BEV对象ID'],['neighbor'])
-        self.assertIn('自车左侧相邻车道前方区域', value['八向图']['相邻车道存在但当前位置禁止跨越的区域'])
+        _, diagnostic=scope_scene(s)
+        self.assertFalse(diagnostic['roads']['left']['crossable'])
+        self.assertEqual(diagnostic['selected_ids'],[])
         s = straight(); s.lanes[0].left = 'r'; s.lanes[0].right = None
+        s.actors=[actor('neighbor',12,3.5,lane='l')]
         bind(s); value = payload(s)
-        self.assertIn('自车左侧相邻车道前方区域', value['八向图']['未知区域'])
-        self.assertNotIn('自车左侧相邻车道前方区域', value['八向图']['未发现可见对象的区域'])
+        _, diagnostic=scope_scene(s)
+        self.assertFalse(diagnostic['roads']['left']['known'])
+        self.assertEqual(model_ids(value),{'neighbor'})
 
     def test_invalid_attention_rejected_before_goal(self):
         s = straight(); s.actors = [actor('far', 85)]; bind(s)
@@ -97,8 +100,8 @@ class ModelScopeTests(unittest.TestCase):
         s.actors=[actor('opposing',12,3.5,heading=np.pi,lane='l',speed=8)]
         bind(s)
         value=payload(s)
-        self.assertFalse(value['八向图']['对象'])
-        self.assertEqual([row['id'] for row in value['范围内其他对象']],['opposing'])
+        self.assertEqual([row['id'] for row in value['候选对象']],['opposing'])
+        self.assertNotIn('所在区域',value['候选对象'][0])
         raw=json.dumps({'attention':[{'id':'opposing','rank':1,'reason':'接近左转通道'}],
                         'local_goal':{'delta_s_m':15.,'d_m':0.},
                         'explanation':{key:'test' for key in ('情境','依据','参考答案','适用条件')}})
@@ -114,7 +117,8 @@ class ModelScopeTests(unittest.TestCase):
         s = straight(); s.lanes = s.lanes[:1]; s.lanes[0].left = s.lanes[0].right = None
         s.actors = [actor('intrusion', 10, 2.2, kind='static_obstacle', lane=None)]
         bind(s); value = payload(s)
-        self.assertEqual(value['八向图']['对象'][0]['所在区域'], ['自车车道前方区域'])
+        self.assertEqual([row['id'] for row in value['候选对象']],['intrusion'])
+        self.assertNotIn('所在区域',value['候选对象'][0])
         _, d = planning_scene(s)
         self.assertEqual(d['region_objects']['front'], 'intrusion')
 
@@ -133,10 +137,24 @@ class ModelScopeTests(unittest.TestCase):
 
     def test_reflection_does_not_repeat_excluded_objects(self):
         result = _reflection_diagnostics({'plan': {'planning_object_selection': {'excluded': [{'id': 'far'}]},
+                                                  'potential_field': {'source': '八向势场内部诊断'},
+                                                  'rule_observation_scope': {'source': '八向规则内部诊断'},
                                                   'safety_feasible': True},
                                           'quality': {'metrics': {'planning_scope': {'excluded': [{'id': 'far'}]}}}})
         self.assertNotIn('far', json.dumps(result))
+        self.assertNotIn('八向', json.dumps(result, ensure_ascii=False))
         self.assertTrue(result['plan']['safety_feasible'])
+
+    def test_system_prompts_are_compact_and_focus_on_task_and_output(self):
+        prompts=yaml.safe_load((ROOT/'config/prompts.yaml').read_text(encoding='utf-8'))
+        for name in ('fast','reflection'):
+            with self.subTest(prompt=name):
+                system=prompts[name]['system']
+                self.assertLessEqual(len(system),2000)
+                for term in ('八向','势场','检索算法'):
+                    self.assertNotIn(term,system)
+                for field in ('scene','decision','attention','local_goal','delta_s_m','d_m'):
+                    self.assertIn(field,system)
 
 
 if __name__ == '__main__':

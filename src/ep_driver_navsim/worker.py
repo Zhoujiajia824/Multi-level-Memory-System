@@ -155,8 +155,8 @@ class NumericalPipeline:
                 response_format = structured_response_format(scoped_for_model, self.config, reference)
                 write_json(root / "model_response_format.json", response_format)
             prompt = ("评测输入条件：NAVSIM特权输入基线，使用当前及历史交通对象、车道地图、导航和当前灯态真值。"
-                      "不判断遮挡；对象候选为道路范围全部对象与当前BEV内车辆、自行车、行人的并集，"
-                      "最多关注其中3个对象；八向最近代表用于检索，不是关注对象白名单。禁止推测任何未来真值。\n"
+                      "本帧候选真值不判断遮挡；只从给定候选ID中选择最多3个关注对象。"
+                      "禁止推测任何未提供的未来真值。\n"
                       + build_prompt(scoped_for_model, reps, retrieved))
             (root / "model_prompt.txt").write_text(prompt, encoding="utf-8")
             tick = time.perf_counter()

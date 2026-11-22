@@ -276,6 +276,18 @@ class ResumeStorageTests(unittest.TestCase):
         _, reference, response_format, payload = self.schema_fixture(perception)
         ids = response_format["json_schema"]["schema"]["properties"]["attention"]["items"]["properties"]["id"]["enum"]
         self.assertIn(side.id, ids)
+        # Real NAVSIM text and strict transport must expose the same current
+        # candidates, including a BEV object outside the base lane corridor.
+        from nine_grid.models import build_prompt
+        prompt = build_prompt(perception, NS(grid={}))
+        text = json.loads(prompt.split("\n", 1)[1])
+        self.assertEqual({row["id"] for row in text["候选对象"]}, set(ids))
+        self.assertEqual(len(text["候选对象"]), len(ids))
+        self.assertNotIn("八向图", text)
+        self.assertNotIn("范围内其他对象", text)
+        self.assertNotIn("对象输入范围", text)
+        self.assertNotIn("势场", prompt)
+        self.assertIn("cam_f0", text["图像说明"])
         scoped, prediction = worker.prepare_planning_context(scene, self.config)
         self.assertIn(side.id, prediction.trajectories)
         base, _, _ = planning_view(scoped, prediction, self.config)

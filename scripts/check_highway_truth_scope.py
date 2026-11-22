@@ -57,12 +57,13 @@ def main():
         assert {a.id for a in scoped.actors} == expected
         scene.diagnostics['object_scope'] = scope
         prompt = json.loads(scene_text(scene, SimpleNamespace(grid={})))
-        representatives = prompt['八向图']['对象']
-        others = prompt['范围内其他对象']
+        candidates = prompt['候选对象']
         perceived, perception = perception_scene(scene, cfg)
-        assert {r['id'] for r in representatives+others} == set(rows.values())
+        assert {r['id'] for r in candidates} == set(rows.values())
+        assert len(candidates) == len(rows)
+        assert '八向' not in json.dumps(prompt,ensure_ascii=False)
         assert {a.id for a in perceived.actors} == set(rows.values())
-        assert rows['behind_blocker'] in {r['id'] for r in others}
+        assert rows['behind_blocker'] in {r['id'] for r in candidates}
         planned, diagnostic = planning_scene(scene, cfg)
         assert {a.id for a in planned.actors} == expected
         assert not set(diagnostic['selected_ids'])-expected

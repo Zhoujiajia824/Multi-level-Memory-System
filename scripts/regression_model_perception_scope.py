@@ -65,7 +65,7 @@ def answer(scene, ids):
 
 def model_objects(scene):
     text = json.loads(scene_text(scene, SimpleNamespace(grid=build_grid(scene))))
-    rows = text['八向图']['对象'] + text['范围内其他对象']
+    rows = text['候选对象']
     return {row['id'] for row in rows}, rows, text
 
 
@@ -117,6 +117,7 @@ class PerceptionSetTests(unittest.TestCase):
         self.assertEqual(model_objects(scene)[0], expected)
         self.assertEqual(attention_ids(scene), expected)
         self.assertEqual(len(model_objects(scene)[1]), len(expected))  # one truth record per ID
+        self.assertNotIn('八向',json.dumps(model_objects(scene)[2],ensure_ascii=False))
         self.assertEqual([a.id for a in scene.actors], original)
         self.assertFalse(d['lane_scope']['roads']['left']['crossable'])
 
@@ -343,8 +344,8 @@ class PredictionAndPlannerSetTests(unittest.TestCase):
         self.assertIn('object_00003', attention_ids(observed))
         model_ids, _, text = model_objects(scene)
         self.assertIn('object_00003', model_ids)
-        self.assertNotIn('object_00003', {row['id'] for row in text['八向图']['对象']})
-        self.assertIn('object_00003', {row['id'] for row in text['范围内其他对象']})
+        self.assertIn('object_00003', {row['id'] for row in text['候选对象']})
+        self.assertFalse(any('所在区域' in row for row in text['候选对象']))
         prepared, predictions = prepare_planning_context(scene, config())
         self.assertIn('object_00003', predictions.trajectories)
         base, base_d = planning_scene(scene, config())
