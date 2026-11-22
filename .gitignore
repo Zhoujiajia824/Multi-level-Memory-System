@@ -85,3 +85,5 @@ __pycache__/
 *.swp
 .DS_Store
 Thumbs.db
+
+!/scripts/regression_model_perception_scope.py

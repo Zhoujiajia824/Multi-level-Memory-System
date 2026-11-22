@@ -1,7 +1,7 @@
-"""轻量 Frenet 八向规划对象筛选；与检索九宫格的表示和观测掩码分开。
+"""优化对象为车道范围内全部实体与最多三个模型关注对象的并集。
 
-本模块在EKF之前缩小规划实体集合，预测、MPC、评分和执行验收使用同一集合。
-先执行与模型一致的车道范围准入，再选八向代表。完整场景仅供图像和审计。
+八向代表只描述检索角色，不再截断势场/碰撞约束。BEV感知与EKF集合
+在 perception_scope 中独立构建，独立执行审计可检查更大的感知集合。
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import numpy as np
 from .lane_roles import ASSIGNMENT_PROTOCOL
 
 
-VERSION = 'frenet-eight-planning-3.0'
+VERSION = 'lane-all-attention-planning-4.0'
 DEFAULTS = {
     'version': VERSION,
     'front_m': 40.,
@@ -36,10 +36,10 @@ RULE_OBSERVATION_VERSION = 'road-rule-current-observations-1.0'
 
 
 def road_rule_observations(scene):
-    """冻结车道范围内、八向选代表之前的路权对象，不恢复范围外真值。"""
+    """冻结当前感知候选中的公开路权对象，不读取BEV/车道范围外真值。"""
     if scene.diagnostics.get('planning_scope') is None:
-        from .object_scope import scope_scene
-        scene, _ = scope_scene(scene)
+        from .perception_scope import perception_scene
+        scene, _ = perception_scene(scene)
     if not scene.rules.get('road_priority_available'):
         return None
     lane_ids={lane.id for lane in scene.lanes}
@@ -90,7 +90,7 @@ def validate_planning_object_config(options=None):
     if not isinstance(options, dict) or set(options)-set(DEFAULTS):
         raise ValueError('planning_objects 包含未知字段或不是配置字典')
     result = {**DEFAULTS, **options}
-    if result['version'] not in (VERSION, 'frenet-eight-planning-2.0'):
+    if result['version'] not in (VERSION, 'frenet-eight-planning-3.0', 'frenet-eight-planning-2.0'):
         raise ValueError('planning_objects.version 不受支持')
     result['version'] = VERSION
     for key, maximum, allow_zero in (('front_m', 200., False), ('rear_m', 100., True),
@@ -141,13 +141,32 @@ def _selected_input_signature(scene, actors):
     return hashlib.sha256(raw).hexdigest()
 
 
+def _attention_signature(answer):
+    if answer is None:
+        return []
+    items = answer.attention
+    if not isinstance(items, list) or len(items) > 3:
+        raise ValueError('规划关注对象最多三个')
+    identities, ranks, rows = set(), set(), []
+    for item in items:
+        identity, rank = item.get('id'), item.get('rank')
+        if (not isinstance(identity, str) or not identity or identity in identities
+                or type(rank) is not int or rank not in (1, 2, 3) or rank in ranks):
+            raise ValueError('规划关注对象ID和rank必须唯一且合法')
+        identities.add(identity); ranks.add(rank)
+        rows.append(dict(id=identity, rank=rank))
+    return sorted(rows, key=lambda row: (row['rank'], row['id']))
+
+
 def select_planning_objects(scene, config=None, answer=None):
-    """只在已准入车道/弧长范围内选八向代表、冲突补充和最多3关注对象。"""
-    from .object_scope import scope_scene, scope_settings, ROLES
+    """八向范围内全部对象 + 感知候选中最多三个关注对象，按ID去重。"""
+    from .object_scope import scope_settings, ROLES
+    from .perception_scope import perception_scene
     started = time.perf_counter()
     options = (config or {}).get('planning_objects')
     existing = scene.diagnostics.get('planning_scope')
-    if isinstance(existing, dict) and existing.get('assignment_protocol') != ASSIGNMENT_PROTOCOL:
+    if isinstance(existing, dict) and (existing.get('assignment_protocol') != ASSIGNMENT_PROTOCOL
+                                     or existing.get('version') != VERSION):
         raise ValueError('已筛选规划场景的对象归属协议已改变，须从完整冻结帧重新筛选')
     if options is None:
         options = (existing['settings'] if isinstance(existing,dict) and existing.get('version') == VERSION
@@ -159,11 +178,15 @@ def select_planning_objects(scene, config=None, answer=None):
             and existing.get('selected_ids') == sorted(a.id for a in scene.actors)):
         if existing.get('selected_input_signature') != _selected_input_signature(scene, scene.actors):
             raise ValueError('已筛选规划场景的当前对象或车道几何发生变化，须从新的完整冻结帧重新筛选')
-        # 验明身份后保留原选择中的冲突/关注补充，不从子集重选而缩掉对象。
+        if answer is not None and _attention_signature(answer) != existing.get('attention_signature'):
+            raise ValueError('已筛选规划场景不能重解释关注对象，须从完整冻结帧重新筛选')
+        # 验明身份后保留原选择；子集不能冒充完整感知候选。
         return list(scene.actors), deepcopy(existing)
-    scoped, scope = scope_scene(scene, config)
-    within = {actor.id: actor for actor in scoped.actors}
-    excluded = {row['id']: row['reason'] for row in scope['excluded']}
+    perceived, perception = perception_scene(scene, config)
+    scope = perception['lane_scope']
+    available = {actor.id: actor for actor in perceived.actors}
+    within = {key: available[key] for key in perception['lane_scope_ids']}
+    excluded = {row['id']: row['reason'] for row in perception['excluded']}
     candidates = {role: [] for role in ROLES}
     exceptions = {}
     speed = float(np.linalg.norm(scene.ego.velocity))
@@ -187,10 +210,11 @@ def select_planning_objects(scene, config=None, answer=None):
             exceptions[identity] = sorted(set(reasons))
     winners = {role: min(rows)[2] if rows else None for role, rows in candidates.items()}
     base_ids = sorted({key for key in winners.values() if key is not None})
-    selected_ids = set(base_ids) | set(exceptions)
+    selected_ids = set(within)
     exception_added = sorted(set(exceptions)-set(base_ids))
     attention_selected, attention_added, attention_rejected = [], [], []
     if answer is not None:
+        _attention_signature(answer)  # 包括已在范围内的关注也不能绕过三个上限。
         seen = set()
         for item in sorted(answer.attention, key=lambda row: (row['rank'], row['id'])):
             identity = item['id']
@@ -199,8 +223,8 @@ def select_planning_objects(scene, config=None, answer=None):
             seen.add(identity)
             if identity in selected_ids:
                 attention_selected.append(identity)
-            elif identity not in within:
-                attention_rejected.append(dict(id=identity, reason=excluded.get(identity, 'outside_current_object_scope')))
+            elif identity not in available:
+                attention_rejected.append(dict(id=identity, reason=excluded.get(identity, 'outside_current_perception_scope')))
             elif not settings['include_attention']:
                 attention_rejected.append(dict(id=identity, reason='attention_expansion_disabled'))
             elif len(attention_added) >= settings['max_attention_objects']:
@@ -209,15 +233,20 @@ def select_planning_objects(scene, config=None, answer=None):
                 selected_ids.add(identity)
                 attention_selected.append(identity)
                 attention_added.append(identity)
-    for identity in within:
+    for identity in available:
         if identity not in selected_ids:
-            excluded[identity] = 'not_nearest_in_any_eight_role'
+            excluded[identity] = 'bev_prediction_only_not_model_attention'
     diagnostic = dict(version=VERSION, settings=settings, frame_id=scene.frame_id, time=float(scene.time),
         reference='each_permitted_lane_chain_arc;s_forward;meter',
         object_scope_version=scope['version'], assignment_protocol=scope['assignment_protocol'],
         road=dict(source_lane_id=scene.ego.lane_id,
                   candidate_corridor_lane_ids=sorted({key for trace in scope['chains'].values() if trace for key in trace['lane_ids']})),
         region_objects=winners, base_selected_ids=base_ids, base_selected_count=len(base_ids),
+        lane_scope_ids=sorted(within), lane_scope_count=len(within),
+        perception_ids=perception['selected_ids'], perception_count=perception['selected_count'],
+        prediction_only_ids=sorted(set(available)-selected_ids),
+        optimization_policy='all_lane_scope_objects_union_model_attention;representatives_for_retrieval_only',
+        attention_signature=_attention_signature(answer),
         effective_front_m=scope['settings']['front_m'], effective_rear_m=scope['settings']['rear_m'],
         stopping_distance_m=speed*settings['reaction_s']+speed**2/(2*settings['braking_mps2'])+settings['stopping_margin_m'],
         adaptive_expansion=False, legacy_adaptive_front_requested=settings['adaptive_front'],
@@ -228,21 +257,22 @@ def select_planning_objects(scene, config=None, answer=None):
         attention_selected_ids=attention_selected, attention_rejected=attention_rejected,
         selected_ids=sorted(selected_ids), selected_count=len(selected_ids),
         visible_count=sum(a.visible for a in scene.actors), within_range_count=len(within),
-        selected_roles={key:scope['objects'][key]['roles'] for key in sorted(selected_ids)},
-        selected_state={key:deepcopy(scope['objects'][key]) for key in sorted(selected_ids)},
+        selected_roles={key:scope['objects'].get(key, {}).get('roles', []) for key in sorted(selected_ids)},
+        selected_state={key:deepcopy(perception['objects'][key]) for key in sorted(selected_ids)},
         excluded=[dict(id=key,reason=excluded[key]) for key in sorted(excluded)],
         selection_seconds=time.perf_counter()-started,
-        limitation='固定车道弧长范围和八向代表不保证覆盖范围外或未纳入对象的危险')
-    selected = [within[key] for key in sorted(selected_ids)]
+        limitation='BEV内未关注且不在车道范围的对象只预测；不声称全部感知对象均参与势场优化')
+    selected = [available[key] for key in sorted(selected_ids)]
     diagnostic['selected_input_signature'] = _selected_input_signature(scene, selected)
     return selected, diagnostic
 
 
 def planning_scene(scene, config=None, answer=None):
-    """先限定共同车道范围，再缩为EKF集合；原始场景留给图像及审计。"""
-    from .object_scope import scope_scene
+    """仅建立优化局部视图，不截断上游完整感知预测集合。"""
+    from .perception_scope import perception_scene
     existing = scene.diagnostics.get('planning_scope')
-    if isinstance(existing, dict) and existing.get('assignment_protocol') != ASSIGNMENT_PROTOCOL:
+    if isinstance(existing, dict) and (existing.get('assignment_protocol') != ASSIGNMENT_PROTOCOL
+                                     or existing.get('version') != VERSION):
         raise ValueError('已筛选规划场景的对象归属协议已改变，须从完整冻结帧重新筛选')
     if isinstance(existing,dict) and existing.get('version') == VERSION:
         # 必须在scope删除越界对象之前验证；否则变动对象可能被删掉后绕过签名，
@@ -254,7 +284,9 @@ def planning_scene(scene, config=None, answer=None):
         options = (config or {}).get('planning_objects')
         if options is not None and validate_planning_object_config(options) != existing['settings']:
             raise ValueError('已筛选规划场景不能用新配置扩大或重解释范围，须从完整原帧重新筛选')
-    scene, object_scope = scope_scene(scene, config)
+        selected, diagnostic = select_planning_objects(scene, config, answer)
+        return replace(scene, actors=selected), diagnostic
+    scene, perception = perception_scene(scene, config)
     rule_observations=road_rule_observations(scene)
     selected,diagnostic=select_planning_objects(scene,config,answer)
     diagnostics={**scene.diagnostics,'planning_scope':deepcopy(diagnostic)}

@@ -113,13 +113,14 @@ class BodyIntrusionTests(unittest.TestCase):
         self.assertEqual(scope['objects']['intruder']['roles'], ['front'])
         self.assertFalse(scope['roads']['left']['crossable'])
 
-    def test_nearest_representative_and_conflict_exception_are_unchanged(self):
+    def test_nearest_representative_does_not_truncate_all_lane_planning(self):
         scene = straight()
         scene.actors = [actor('near', 10, 2.2, lane='l', speed=10),
                         actor('far', 18, 2.2, lane='l', speed=10)]
         scope, planning, grid = summaries(scene)
         self.assertEqual(scope['selected_ids'], ['far', 'near'])
-        self.assertEqual(planning['selected_ids'], ['near'])
+        self.assertEqual(planning['selected_ids'], ['far', 'near'])
+        self.assertEqual(planning['base_selected_ids'], ['near'])
         self.assertEqual(grid['slots']['front']['id'], 'near')
         scene.actors[1].velocity[1] = -1.
         _, planning, grid = summaries(scene)

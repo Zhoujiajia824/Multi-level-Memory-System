@@ -147,10 +147,26 @@ def evaluate(scene, plan, baseline, predictions, config=None):
         and np.max(abs(yaw_acc))<=c.get('yaw_accel_abs_max_radps2',1.93))
     progress=float(max(0.,route_s[-1]-route_s[0]))
     reference=None
+    reference_collisions=set()
+    if baseline.valid and predictions.trajectories:
+        baseline_times=np.arange(len(baseline.states))*dt
+        if baseline_times[-1]>predictions.times[-1]+1e-7:
+            reasons.append('参照轨迹所需预测尾段缺失')
+        else:
+            baseline_headings=np.unwrap(baseline.states[:,2])
+            for t in np.arange(0,baseline_times[-1]+.001,.02):
+                xy=np.array([np.interp(t,baseline_times,baseline.states[:,j]) for j in (0,1)])
+                yaw=float(np.interp(t,baseline_times,baseline_headings))
+                body=actor_shape(scene.ego,xy,yaw)
+                for identity in predictions.trajectories:
+                    if intersects(xy,yaw,body,identity,t):
+                        reference_collisions.add(identity)
     progress_score=None
     if (not baseline.valid or baseline.diagnostics.get('safety_feasible') is False
-            or baseline.diagnostics.get('emergency', False)):
+            or baseline.diagnostics.get('emergency', False) or reference_collisions):
         reasons.append('无语义物理参照没有安全解，紧急制动不能作满分参照')
+        if reference_collisions:
+            reasons.append('参照轨迹与感知预测对象碰撞，不能作安全进度参照')
     else:
         reference=_progress(scene,baseline.states)
         if rules.get('must_wait',False) and rules.get('wait_reason') and rule_ok:
@@ -163,8 +179,10 @@ def evaluate(scene, plan, baseline, predictions, config=None):
     gates={'collision_free':not collision,'on_road':onroad,'correct_direction':direction_ok,'rules':rule_ok,
            'planner_safety':planner_safety}
     metrics.update(gates=gates,progress_m=progress,reference_progress_m=reference,progress=progress_score,ttc=float(ttc_ok),comfort=float(comfort),
-        planning_scope=scene.diagnostics.get('planning_scope'), evaluated_actor_ids=sorted(expected),
-        evaluation_scope='筛选后的道路对象及安全例外；不声称评估未纳入对象')
+        planning_scope=plan.diagnostics.get('planning_object_selection',scene.diagnostics.get('planning_scope')),
+        perception_scope=scene.diagnostics.get('perception_scope'), evaluated_actor_ids=sorted(expected),
+        reference_perception_collision_ids=sorted(reference_collisions),
+        evaluation_scope='全部当前感知预测候选的独立几何审计；与MPC势场/约束目标集合分开记录')
     valid=not reasons
     weights=cfg.get('weights',dict(progress=5,ttc=5,comfort=2))
     score=(float(all(gates.values()))*sum(weights[k]*metrics[k] for k in weights)/sum(weights.values())) if valid else None
@@ -231,6 +249,8 @@ def execution_audit(scene,plan,predictions,config=None):
                 if intersects(state[:2],state[2],ego_shape,identity,t):
                     collisions.append(identity)
     return {'available':True,'alarm':bool(collisions or offroad),'collision_ids':sorted(set(collisions)),
+            'evaluated_actor_ids':sorted(predictions.trajectories),
+            'optimization_actor_ids':plan.diagnostics.get('planning_object_selection',{}).get('selected_ids',[]),
             'offroad':offroad,'executed_policy':'正常解报警转制动；无安全解仅执行单列紧急制动','sample_step_s':dt/substeps,
             'execution_duration_s':duration,'executed_control_count':prefix_count,
             'audit_samples':prefix_count*substeps}
