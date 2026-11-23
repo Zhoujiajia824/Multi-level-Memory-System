@@ -1,0 +1,72 @@
+THIRD-PARTY VISUAL ASSET AND RUNTIME CREDITS
+
+Active ego model: CARLA Tesla Model 3 (ego-tesla-model3.glb)
+Author: CARLA Simulator / Computer Vision Center (CVC), UAB and contributors.
+Original distribution: CARLA 0.9.15 WindowsNoEditor asset content.
+Original mesh paths relative to CarlaUE4/Content:
+Carla/Static/Car/4Wheeled/Tesla/SM_TeslaM3_v2 (LOD0 body, wheels and interior)
+Carla/Static/Car/4Wheeled/Tesla/SM_TeslaM3_v2_Lights (LOD0 lamp geometry)
+Original 2048px Tesla bodywork, details, wheels and CARLA license-plate
+textures are included in this self-contained GLB. 14,820 triangles total.
+Source project: https://github.com/carla-simulator/carla/tree/0.9.15
+CARLA asset license: Creative Commons Attribution 4.0 International.
+https://creativecommons.org/licenses/by/4.0/
+CARLA's official asset-license statement:
+https://carla.org/2019/04/03/release-0.9.5/#open-source-assets
+https://github.com/carla-simulator/carla#licenses
+Full asset license: ../vendor/CARLA-ASSET-LICENSE-CC-BY-4.0.txt
+Conversion: original meshes exported read-only with UE Viewer build 1590,
+by Konstantin Nosov (Gildor), https://github.com/gildor2/UEViewer (MIT).
+No CARLA program, actor, world or original asset file was modified.
+Viewer modifications: Unreal layered shaders converted to standard glTF
+PBR with clearcoat; bodywork alpha paint mask tinted black; original
+DirectX normal maps converted to glTF normal convention; original 2048px
+textures embedded as WebP. The original mesh geometry is unchanged.
+The renderer scales the display model to the recorded ego dimensions.
+This browser PBR conversion does not reproduce Unreal's complete lighting
+or dynamic vehicle-lamp simulation. Using the Tesla asset for another
+recorded ego vehicle does not claim that record used a Tesla.
+No endorsement by CARLA, CVC, UAB or Tesla is implied.
+
+Legacy unused asset: Ferrari 458 Italia illustration model (ego-car.glb)
+Author: vicent091036
+Original model: https://sketchfab.com/models/57bf6cc56931426e87494f554df1dab6
+Distributed source: three.js r187, examples/models/gltf/ferrari.glb
+https://github.com/mrdoob/three.js/blob/r187/examples/models/gltf/ferrari.glb
+Author credit in the official example:
+https://github.com/mrdoob/three.js/blob/r187/examples/webgl_materials_car.html
+License: Creative Commons Attribution 4.0 International (CC BY 4.0).
+https://creativecommons.org/licenses/by/4.0/
+The three.js asset-license inventory identifies this model as CC BY 4.0:
+https://github.com/mrdoob/three.js/issues/23089
+Full license: ../vendor/FERRARI-LICENSE-CC-BY-4.0.txt
+Viewer modifications: the body is rendered with a white/silver material,
+and the glass is tinted for dashboard visibility;
+the model is rotated and scaled to the recorded ego bounding dimensions.
+These presentation changes are applied at runtime. This is an illustrative
+vehicle model, not the exact CARLA actor, sensor calibration, or recorded
+physical vehicle mesh. No endorsement by the model author is implied.
+
+Three.js r187 and bundled addons
+Copyright (c) 2010-2026 three.js authors. MIT license.
+https://github.com/mrdoob/three.js/tree/r187
+Full license: ../vendor/THREE-LICENSE.txt
+
+Draco WebAssembly glTF decoder
+Copyright Google Inc. Licensed under the Apache License, Version 2.0.
+https://github.com/google/draco
+Files: ../vendor/draco/draco_wasm_wrapper.js and draco_decoder.wasm;
+distributed with three.js r187, examples/jsm/libs/draco/gltf/.
+Full license and bundled third-party notices: ../vendor/DRACO-LICENSE.txt
+The decoder files have not been modified.
+
+Plotly.js v3.6.0
+Copyright 2012-2026 Plotly, Inc. Licensed under the MIT license.
+https://github.com/plotly/plotly.js/tree/v3.6.0
+Bundled from the installed Python Plotly 6.8.0 distribution. The JavaScript
+version is v3.6.0, as recorded in plotly.min.js, not the Python package version.
+Full license: ../vendor/PLOTLY-LICENSE.txt
+
+AutoAgent0 and CW-Net were consulted as visual design references only.
+Their page images, demonstration videos and proprietary renderer were not
+copied into this viewer's distributed web assets.

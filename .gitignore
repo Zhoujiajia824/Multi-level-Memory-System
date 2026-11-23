@@ -54,6 +54,8 @@
 !/src/ep_driver_fail2drive/*.py
 !/scripts/run_fail2drive.py
 !/scripts/watch_fail2drive.py
+!/scripts/view_fail2drive.py
+!/scripts/sync_fail2drive_viewer.py
 !/config/fail2drive.example.json
 !/config/fail2drive.models.example.yaml
 
@@ -94,3 +96,18 @@ __pycache__/
 Thumbs.db
 
 !/scripts/regression_model_perception_scope.py
+
+# 独立结果查看器只发布运行源码、前端及本地第三方资产。
+!/tools/
+/tools/*
+!/tools/ep_agent_viewer/
+/tools/ep_agent_viewer/*
+!/tools/ep_agent_viewer/run_viewer.py
+!/tools/ep_agent_viewer/README.md
+!/tools/ep_agent_viewer/requirements.txt
+!/tools/ep_agent_viewer/epviz/
+/tools/ep_agent_viewer/epviz/*
+!/tools/ep_agent_viewer/epviz/*.py
+!/tools/ep_agent_viewer/web/
+/tools/ep_agent_viewer/.cache/
+/test/
