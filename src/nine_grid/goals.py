@@ -38,6 +38,12 @@ def build_goal_reference(scene, config=None, request_version=0):
     reported_lane=source_lane;confirmation='平台已确认车道'
     reference_valid=True;reference_rejection=None
     confirmed=next((lane for lane in scene.lanes if lane.id==source_lane),None)
+    from .navigation_initialization import initialization_lane
+    recovery_lane = initialization_lane(scene, {lane.id:lane for lane in scene.lanes})
+    if recovery_lane is not None:
+        confirmed = recovery_lane
+        source_lane = confirmed.id
+        confirmation = ('当前状态与公开导航的初始化参考；参考车辆可行性单列诊断，原生占道事实保留在观测中')
     if confirmed is not None and source_lane not in scene.route_lane_ids:
         # 环道连接重叠区的原生lane_index可能短暂落入另一公开分支。
         # 仅在非平行邻道重叠时按自车已知导航确认；不能掩盖尚未更新的平行换道参考。
@@ -99,6 +105,10 @@ def build_goal_reference(scene, config=None, request_version=0):
 
 def _source_lane(scene, reference):
     lanes = {lane.id: lane for lane in scene.lanes}
+    from .navigation_initialization import initialization_lane
+    recovery_lane = initialization_lane(scene, lanes)
+    if recovery_lane is not None and reference['source_lane_id']==recovery_lane.id:
+        return recovery_lane, lanes
     lane = lanes.get(reference['source_lane_id'])
     if lane is None:
         lane = lanes.get(scene.ego.lane_id)
@@ -124,6 +134,21 @@ def _candidate_lanes(scene, reference):
     return result
 
 
+def _native_forward_evidence(scene,lane_id):
+    if scene.scenario!='navsim':
+        return None
+    recovery=scene.diagnostics.get('navigation_initialization',{})
+    if recovery.get('status') in ('active','reference_only_unverified') and lane_id==recovery.get('navigation_lane_id'):
+        return (scene.diagnostics.get('native_navigation_validation',{}).get('center') or
+                recovery.get('native_seam_validation',{}).get('roles',{}).get('center'))
+    current=next((lane for lane in scene.lanes if lane.id==scene.ego.lane_id),None)
+    if current is None:
+        return None
+    role=('center' if lane_id==current.id else 'left' if lane_id==current.left
+          else 'right' if lane_id==current.right else None)
+    return scene.diagnostics.get('native_navigation_validation',{}).get(role)
+
+
 def goal_reference_context(scene, reference):
     """只外发解释目标所需的参考摘要，不发送完整地图或内部控制缓存。"""
     line = np.asarray(reference['points'], float)
@@ -136,6 +161,10 @@ def goal_reference_context(scene, reference):
         candidates.append({'lane_id': lane.id, 'center_d_m': float(lateral),
             'width_m': float(lane.width), 'goal_candidate_legal': reason is None,
             'rejection': reason})
+        native = _native_forward_evidence(scene,lane.id)
+        if native is not None:
+            candidates[-1].update(forward_geometry_verified=native['forward_valid'],
+                verified_forward_until_m=native['verified_forward_until_m'])
     samples = []
     for distance in (0., 10., 20., 40., 70.):
         arc = reference['s_ego_m']+distance
@@ -251,6 +280,12 @@ def validate_local_goal(scene, reference, value):
             continue
         # 当前车道的已核查导航含连接段；邻道只能沿相容公开后继。
         path = line if lane.id == reference['source_lane_id'] else manager._continuation(scene, lane, lanes)
+        native = _native_forward_evidence(scene,lane.id)
+        if native is not None:
+            target_delta=project_polyline(world,path)[0]-project_polyline(scene.ego.position,path)[0]
+            if target_delta>=native['verified_forward_until_m']-1e-6:
+                rejected_reasons.append('目标跨过尚未验证的NAVSIM原生车道连接')
+                continue
         _, lateral, tangent = project_polyline(world, path, heading=heading)
         if abs(lateral) > lane.width/2-scene.ego.width/2+1e-6:
             continue

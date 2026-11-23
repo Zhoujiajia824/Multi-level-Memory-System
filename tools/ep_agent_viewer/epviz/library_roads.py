@@ -167,7 +167,9 @@ def build_library_roads(scene, ground_z=0., half_extent_m=80.):
         "axis_aligned_rectangle_lane_count": int(bbox_count), "wide_archived_lane_values": estimated_widths,
         "invalid_lane_polygon_ids": invalid_shapes,
         "note": "只裁剪存档路面；中心拓扑为示意，不代表实漆线。矩形/面积除中心线所得宽度不可视为精确车道边界"}
-    return {"road_surface": {"polygons": geometry._surfaces(local, ground_z), "source": source,
+    return {"semantic_surfaces": geometry._semantic_surfaces(
+                {"scene": scene, "rules": scene.get("rules") or {}}, ground_z, viewport),
+        "road_surface": {"polygons": geometry._surfaces(local, ground_z), "source": source,
             "recorded_area_m2": float(road.area), "display_area_m2": float(local.area),
             "holes_preserved": True, "recorded_surface_only": True},
         "markings": markings, "connections": [], "rejected_connections": unresolved,

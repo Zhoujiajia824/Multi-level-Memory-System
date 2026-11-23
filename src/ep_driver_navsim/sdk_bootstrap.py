@@ -6,7 +6,25 @@ import sys
 import types
 
 
+def configure_evaluation_processes():
+    """Keep each official process isolated while inheriting replay observation."""
+    workers = int(os.environ.get("EP_NAVSIM_EVALUATION_WORKERS", "1"))
+    if not 1 <= workers <= 8:
+        raise ValueError("EP_NAVSIM_EVALUATION_WORKERS must be between 1 and 8")
+    if workers > 1:
+        if not sys.platform.startswith("linux"):
+            raise RuntimeError("Parallel official evaluation requires Linux fork; use evaluation_workers=1")
+        import multiprocessing
+        method = multiprocessing.get_start_method(allow_none=True)
+        if method is None:
+            multiprocessing.set_start_method("fork")
+        elif method != "fork":
+            raise RuntimeError("Official replay observer requires fork inheritance; use evaluation_workers=1")
+    return workers
+
+
 def platform_setup():
+    workers = configure_evaluation_processes()
     if os.name == "nt":
         # Official Linux-produced scene pickles contain pathlib.PosixPath.
         # Interpret serialized paths using native Windows filesystem semantics.
@@ -24,6 +42,7 @@ def platform_setup():
         sys.modules["fcntl"] = module
     return {"platform": sys.platform, "windows_import_guard": os.name == "nt",
             "serialized_posix_paths_use_native_path": os.name == "nt",
+            "evaluation_workers": workers,
             "scoring_source_modified": False}
 
 

@@ -10,7 +10,7 @@ const roleNames={left_front:'左前',front:'前方',right_front:'右前',left_si
 const channelNames={s_m:'纵向位置 s / m',s:'纵向位置 s / m',delta_s:'相对纵向距离 Δs / m',delta_s_m:'相对纵向距离 Δs / m',d:'横向位置 d / m',d_m:'横向位置 d / m',delta_d:'相对横向距离 Δd / m',delta_d_m:'相对横向距离 Δd / m',v_s:'纵向速度 / m·s⁻¹',v_d:'横向速度 / m·s⁻¹',vs_mps:'纵向速度 / m·s⁻¹',vd_mps:'横向速度 / m·s⁻¹',a_s:'纵向加速度 / m·s⁻²',a_d:'横向加速度 / m·s⁻²',as_mps2:'纵向加速度 / m·s⁻²',ad_mps2:'横向加速度 / m·s⁻²',heading_rad:'航向 / rad',heading:'航向 / rad',theta:'航向 / rad'};
 const state={summary:null,records:[],total:0,offset:0,limit:40,selected:null,evidence:0,detail:null,listEpoch:0,detailEpoch:0,listController:null,detailController:null,tab:'experience',requestedId:new URLSearchParams(location.search).get('record'),sceneEpoch:0,sceneController:null,sceneKey:null,scenePayload:null,sceneTopdown:false,sceneView:'scene',cameraView:null};
 let debounceTimer,toastTimer,sceneRenderer,sceneModulePromise;
-const memoryLayers={roads:true,topology:false,objects:true,grid_matches:true,regions:true,trajectory:true,corridor:true,attention:false,sources:false,goal:false};
+const memoryLayers={roads:true,sidewalk:true,junction:true,crosswalk:true,topology:false,objects:true,grid_matches:true,regions:true,trajectory:true,corridor:true,attention:false,sources:false,goal:false};
 const memoryGallery=new CameraGallery($('memory-front-gallery'),$('memory-camera-modal'),{assetUrl:path=>`/api/library/asset?id=${encodeURIComponent(state.selected||'')}&path=${encodeURIComponent(path||'')}`,layers:memoryLayers,fitToContainer:true,elements:{title:$('memory-camera-modal-title'),content:$('memory-camera-modal-content'),note:$('memory-camera-modal-note')}});
 
 function toast(text){$('toast').textContent=text;$('toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').hidden=true,4800);}
@@ -23,16 +23,16 @@ function evidenceLabel(evidence){const offset=evidence?.offset_s;return finite(o
 function selectedEvidence(detail=state.detail){const evidence=detail?.evidence||[];return evidence.find(item=>Number(item.index)===Number(detail.selected_evidence??state.evidence))||evidence[0];}
 
 async function initialize(){
-  $('library-state').textContent='正在读取并校验发布清单';$('result-count').textContent='正在读取并校验发布清单';
+  $('library-state').textContent='读取中';$('result-count').textContent='读取经验…';
   try{const summary=await request('/api/library');state.summary=summary;
     if(summary.experiments_configured===false){const link=document.querySelector('nav a[href="/"]');link.textContent='未加载实验';link.removeAttribute('href');link.setAttribute('aria-disabled','true');link.title='如需实验回放，启动时增加 --root 实验结果目录';}
     if(summary.available===false||summary.configured===false){$('library-browser').hidden=true;$('unconfigured').hidden=false;$('unconfigured-reason').textContent=summary.reason||'';$('library-state').textContent='未配置';return;}
     $('library-count').textContent=Number(summary.count??0).toLocaleString('zh-CN');
     const freezeFailed=summary.freeze_valid===false,freezeVerified=summary.frozen&&summary.freeze_valid===true;
-    $('library-state').textContent=freezeFailed?'冻结完整性校验未通过':freezeVerified?'冻结清单 · 已校验 · 只读':summary.frozen?'冻结清单 · 校验状态待确认':'已发布清单 · 只读';$('library-state').className=`badge ${freezeFailed?'warning':freezeVerified?'good':'muted'}`;
+    $('library-state').textContent=freezeFailed?'完整性校验未通过':freezeVerified?'清单已校验':summary.frozen?'冻结清单待校验':'已发布清单';$('library-state').className=`badge ${freezeFailed?'warning':freezeVerified?'good':'muted'}`;
     $('library-path').textContent=summary.root||'指定经验库';$('library-path').title=summary.root||'';const hash=summary.manifest_sha256;$('library-fingerprint').textContent=hash?`manifest SHA-256 ${hash.slice(0,16)}…`:'';$('library-fingerprint').title=hash||'';
     const compatibility=summary.compatibility||{},verified=compatibility.verification_status==='verified'&&compatibility.main_reader_compatible===true;
-    $('compatibility').textContent=verified?'主程序兼容性已验证':'主程序兼容性未验证';$('compatibility').className=`badge ${verified?'good':'warning'}`;
+    $('compatibility').textContent=verified?'检索兼容已验证':'检索兼容未验证';$('compatibility').className=`badge ${verified?'good':'warning'}`;
     const sources=Array.isArray(summary.sources)?summary.sources:Object.keys(summary.source_counts||{});for(const source of sources){const key=typeof source==='string'?source:source.source||source.id;const count=summary.source_counts?.[key];$('source-filter').append(new Option(`${sourceName(key)}${count!==undefined?' · '+count:''}`,key));}
     const statuses=Array.isArray(summary.statuses)?summary.statuses:Object.keys(summary.status_counts||{});for(const status of statuses){const key=typeof status==='string'?status:status.status||status.id;$('status-filter').append(new Option(statusName(key),key));}
     const warnings=[...(summary.warnings||[])];if(freezeFailed)warnings.unshift('冻结完整性校验未通过。此状态不代表记录可安全用于正式检索。');
@@ -51,8 +51,8 @@ async function loadList(){
   }catch(error){if(error.name==='AbortError'||epoch!==state.listEpoch)return;$('result-count').textContent='查询失败';$('record-list').replaceChildren(node('div','empty-list error',error.message));}
 }
 function renderList(){
-  const list=$('record-list');list.replaceChildren();$('result-count').textContent=`${state.total.toLocaleString('zh-CN')} 条匹配经验`;
-  for(const record of state.records){const button=node('button',`record-item ${record.id===state.selected?'active':''}`);button.type='button';button.dataset.record=record.id;const top=node('div','item-top');top.append(node('span','source-label',sourceName(record.source)),badge(statusName(record.status)));button.append(top,node('strong',null,record.id));
+  const list=$('record-list');list.replaceChildren();$('result-count').textContent=`${state.total.toLocaleString('zh-CN')} 条经验`;
+  for(const record of state.records){const button=node('button',`record-item ${record.id===state.selected?'active':''}`);button.type='button';button.dataset.record=record.id;button.title=record.id;const top=node('div','item-top');top.append(node('span','source-label',sourceName(record.source)),badge(statusName(record.status)));button.append(top,node('strong',null,String(record.id).length>22?String(record.id).slice(0,18)+'…':record.id));
     const preview=record.text_preview||record.preview;button.append(node('p','item-preview',preview||'没有保存经验原文预览'));button.append(node('div','item-clip',record.clip_id?`clip · ${record.clip_id}`:record.frame_id?`frame · ${record.frame_id}`:'帧来源未登记'));button.addEventListener('click',()=>loadDetail(record.id,0));list.append(button);}
   if(!state.records.length)list.append(node('div','empty-list','没有匹配的已发布记录'));
   const page=Math.floor(state.offset/state.limit)+1,pages=Math.max(1,Math.ceil(state.total/state.limit));$('page-number').textContent=`${page} / ${pages}`;$('previous-page').disabled=state.offset===0;$('next-page').disabled=state.offset+state.limit>=state.total;
@@ -68,19 +68,19 @@ async function loadDetail(id,evidence=0,{direct=false}={}){
   finally{if(epoch===state.detailEpoch)$('record-detail').setAttribute('aria-busy','false');}
 }
 function renderDetail(detail){
-  const record=detail.record||{};$('detail-empty').hidden=true;$('record-detail').hidden=false;$('record-title').textContent=detail.id||record.id||state.selected;
-  const badges=$('record-badges');badges.replaceChildren(badge('离线回顾经验'),badge(statusName(record.status)),badge(sourceName(record.source)),badge(record.mpc_tested===true?'MPC已测试 · 结果见元数据':'MPC未验证',record.mpc_tested===true?'muted':'warning'));
-  if(record.pdm_tested===true)badges.append(badge('PDM已测试 · 结果见元数据'));
-  $('record-subtitle').textContent=`clip · ${record.clip_id||'未登记'}\nframe · ${record.frame_id||'未登记'}\n来源时间 · ${timestamp(record.time)} s`;
+  const record=detail.record||{},identity=detail.id||record.id||state.selected;$('detail-empty').hidden=true;$('record-detail').hidden=false;$('record-title').textContent='驾驶经验';$('record-title').title=identity;
+  const badges=$('record-badges');badges.replaceChildren(badge(sourceName(record.source)),badge(statusName(record.status)));
+  $('record-subtitle').textContent=`记录 · ${identity}\n片段 · ${record.clip_id||'未登记'}\n源帧 · ${record.frame_id||'未登记'}\n时间 · ${timestamp(record.time)} s\nMPC验证 · ${record.mpc_tested===true?'已测试，详见记录元数据':'未验证'}${record.pdm_tested===true?'\nPDM验证 · 已测试，详见记录元数据':''}`;
   const integrity=detail.integrity;
-  $('record-integrity').textContent=`发布清单内可浏览；主程序检索兼容性按库级验证状态单独判断。${record.retrieval_eligibility?.eligible===true?'记录自述 eligible=true，不等于本展示已验证检索兼容。':''}${detail.warnings?.length?'\n'+detail.warnings.join(' · '):''}`;$('record-integrity').title=integrity?stringify(integrity):'';
+  const integrityWarnings=[...(detail.warnings||[])];if(integrity&&['freeze_valid','checksums_verified','record_verified','text_verified'].some(key=>integrity[key]===false)&&!integrityWarnings.length)integrityWarnings.push('记录完整性未通过校验，请检查记录详情。');
+  $('record-integrity').textContent=integrityWarnings.join(' · ');$('record-integrity').hidden=!integrityWarnings.length;$('record-integrity').title=integrity?stringify(integrity):'';
   $('experience-text').textContent=detail.experience||'此记录没有保存 experience.txt 原文。';$('record-metadata').textContent=stringify(record);
   renderEvidence(detail);renderFeatures(detail);setTab(state.tab);
 }
 
 function renderEvidence(detail){
   renderEvidenceTimes(detail,$('evidence-times'));renderEvidenceTimes(detail,$('scene-evidence-times'));
-  const current=selectedEvidence(detail),future=finite(current?.offset_s)&&current.offset_s>1e-5,context=$('evidence-context');context.className=`notice evidence-context ${future?'future':''}`;context.textContent=future?`${evidenceLabel(current)} · 真实归档的后续观察，供离线回顾理解行为结果。\n不能把它当作当时在线可见状态、在线预测或当前检索输入。`:'情境当下的归档证据。原生图/源相机用于证据浏览；DINO等检索输入以特征元数据的实际登记为准。';
+  const current=selectedEvidence(detail),future=finite(current?.offset_s)&&current.offset_s>1e-5,context=$('evidence-context');context.className=`notice evidence-context ${future?'future':''}`;context.textContent=future?`${evidenceLabel(current)} · 历史回顾，不是在线预测。`:'情境当下 · 原始归档图像';
   const images=$('evidence-images');images.replaceChildren();const assets=detail.assets||{},entries=Object.entries(assets).filter(([,asset])=>asset&&(typeof asset==='string'||asset.url));
   for(const [key,value]of entries){const asset=typeof value==='string'?{url:value}:value;const label=asset.label||asset.view||({bev:'BEV俯视图',native:'原生 / 源数据图',grid:'八向图归档图',feature:'DINO特征输入图'})[key]||(/^source_/.test(key)?`源相机 ${key.replace('source_','')}`:key);const card=node('button','image-card');card.type='button';const image=node('img');image.loading='lazy';image.decoding='async';image.src=asset.url;image.alt=label;
     const caption=node('div','image-caption');caption.append(node('strong',null,label),node('span',null,`${evidenceLabel(current)}${finite(asset.time_offset_s)?' · 曝光偏移 '+format(asset.time_offset_s*1000)+' ms':''}`));card.append(image,caption);card.addEventListener('click',()=>openImage(asset,label,current));image.addEventListener('error',()=>{image.hidden=true;caption.append(node('span','error','归档图片不可读取'));});images.append(card);}
@@ -97,7 +97,7 @@ function openImage(asset,label,evidence){
 }
 
 function renderFeatures(detail){
-  const current=selectedEvidence(detail);$('feature-context').textContent=`正在查看：${evidenceLabel(current)}。${current?.offset_s>0?'这些特征属于后续证据帧自身，不能冒充情境当下的检索输入。':'当前证据帧特征；是否作为主程序检索输入，应以库级兼容验证及渠道元数据为准。'}`;
+  const current=selectedEvidence(detail);$('feature-context').textContent=`${evidenceLabel(current)} · ${current?.offset_s>0?'后续帧特征，不是当前检索输入':'当前帧特征，兼容状态见页头'}`;
   const grid=detail.grid,summary=$('grid-summary'),matrix=$('grid-tensor');summary.replaceChildren();matrix.replaceChildren();$('grid-cell-detail').hidden=true;
   const hasSlots=Array.isArray(grid?.slots)&&grid.slots.length===3&&grid.slots.every(row=>Array.isArray(row)&&row.length===3),hasValues=Array.isArray(grid?.values)&&grid.values.length===3&&grid.values.every(row=>Array.isArray(row)&&row.length===3);
   if(grid&&grid.available!==false&&(hasSlots||hasValues)){
@@ -190,8 +190,9 @@ function captureSceneView(){
 }
 function renderSceneMetadata(frame){
   const current=selectedEvidence(),future=Number(current?.offset_s)>0;
-  $('scene-context').className=`notice evidence-context ${future?'future':''}`;$('scene-context').textContent=`${evidenceLabel(current)} · ${future?'真实归档的后续观察，仅供离线回顾，不是在线预测。':'情境当下的归档观察。'}\n三维视图依据该证据帧的场景快照重建，不代表原始相机曝光或像素投影。`;
+  $('scene-context').className=`notice evidence-context ${future?'future':''}`;$('scene-context').textContent=`${evidenceLabel(current)} · ${future?'归档回顾，非在线预测':'归档静帧'}`;
   const vis=frame.visualization||{},library=frame.library_scene||{},objects=vis.objects||[],regions=vis.regions||[],metadata=$('memory-scene-metadata');metadata.replaceChildren();
+  for(const name of['sidewalk','junction','crosswalk']){const input=document.querySelector(`[data-memory-layer="${name}"]`),layer=vis.render_geometry?.semantic_surfaces?.[name];input.disabled=!layer?.polygons?.length;input.parentElement.classList.toggle('unavailable',input.disabled);input.parentElement.title=input.disabled?(layer?.reason||'当前归档未提供此地图图层'):layer.source||'归档地图图层';memoryLayers[name]=Boolean(input.checked&&!input.disabled);sceneRenderer?.setLayer(name,memoryLayers[name]);}
   const add=(label,value)=>{const cell=node('div');cell.append(node('span',null,label),node('strong',null,value));metadata.append(cell);};
   add('记录ID',frame.record_id??frame.id??'未登记');add('证据 / 帧号',`${frame.evidence_index??'—'} / ${frame.frame_id??'未登记'}`);add('源时间',`${timestamp(frame.time)} s`);add('几何来源',typeof frame.scene_source==='string'?frame.scene_source:stringify(frame.scene_source||'未登记'));
   const provenance=vis.trajectory_provenance||{},capabilities=library.capabilities||{},recorded=provenance.kind==='recorded_future_execution',hasTrajectory=recorded&&(vis.trajectory_segments?.some(segment=>segment.length>1)||vis.trajectory?.length>1),hasCorridor=hasTrajectory&&Boolean(vis.corridor_ribbon?.polygons?.length),topology=vis.topology||vis.render_geometry?.topology||{};
@@ -199,7 +200,7 @@ function renderSceneMetadata(frame){
   for(const[id,layer,available]of[['memory-trajectory-control','trajectory',hasTrajectory],['memory-corridor-control','corridor',hasCorridor]]){const control=$(id),input=control.querySelector('input');input.disabled=!available;control.classList.toggle('unavailable',!available);control.title=available?(layer==='trajectory'?'离线归档的后续真实行驶，不是规划结果':'沿归档实驶线的车辆宽度扫掠，未作安全认证'):capabilities.recorded_future_trajectory?.reason||'所选证据之后的有效归档点不足';memoryLayers[layer]=Boolean(available&&input.checked);sceneRenderer?.setLayer(layer,memoryLayers[layer]);}
   const topologyInput=document.querySelector('[data-memory-layer="topology"]');topologyInput.disabled=!topology.edges?.length;topologyInput.parentElement.classList.toggle('unavailable',topologyInput.disabled);topologyInput.parentElement.title=topology.note||'仅显示归档道路中心拓扑，不是道路漆线';memoryLayers.topology=topologyInput.checked&&!topologyInput.disabled;sceneRenderer?.setLayer('topology',memoryLayers.topology);
   $('memory-trajectory-note').textContent=hasTrajectory?`${provenance.title||'归档未来实际行驶轨迹'} · 仅离线审计，不是在线规划或预测。${provenance.sampling_note?'\n'+provenance.sampling_note:''}${provenance.anchor_frame_id?'\n未来来源锚点：'+provenance.anchor_frame_id:''}\n几何走廊仅按车辆宽度构造；不代表可通行或安全认证。`:capabilities.recorded_future_trajectory?.reason||'该证据之后没有足够的有效归档实驶点。未绘制替代轨迹或几何走廊。';
-  const regionControl=$('memory-region-control'),regionInput=regionControl.querySelector('input'),hasRegions=Array.isArray(regions)&&regions.some(region=>region.polygons?.length),regionReason=vis.region_status?.reason||library.region_status?.reason||'没有归档八向区域多边形；不从对象坐标重算填色区域';
+  const regionControl=$('memory-region-control'),regionInput=regionControl.querySelector('input'),hasRegions=Array.isArray(regions)&&regions.some(region=>(region.surfaces||region.polygons)?.length),regionReason=vis.region_status?.reason||library.region_status?.reason||'没有归档八向区域多边形；不从对象坐标重算填色区域';
   regionInput.disabled=!hasRegions;regionControl.classList.toggle('unavailable',!hasRegions);regionControl.title=hasRegions?'显示归档八向区域':regionReason;regionControl.querySelector('span').textContent=hasRegions?'八向区域':'八向区域未归档';memoryLayers.regions=Boolean(hasRegions&&regionInput.checked);sceneRenderer?.setLayer('regions',memoryLayers.regions);
   const messages=[];if(frame.available===false)messages.push(frame.reason||'场景快照不可读取');else{
     if(!hasRegions)messages.push(regionReason);

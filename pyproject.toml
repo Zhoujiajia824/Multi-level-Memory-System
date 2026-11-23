@@ -18,7 +18,9 @@ dev = ["pytest>=8", "ruff>=0.9", "jsonschema>=4"]
 where = ["src"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["test"]
+pythonpath = ["src", "tools/ep_agent_viewer", "test"]
+cache_dir = "test/.pytest_cache"
 addopts = "--tb=short"
 markers = ["integration: 实际物理仿真，需要较长运行时间"]
 

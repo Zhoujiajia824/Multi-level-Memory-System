@@ -1,6 +1,6 @@
 import * as THREE from '/vendor/three.module.js';
 
-export const COLORS={road:0x27323e,ground:0x0b131d,marking:0xdde4e9,path:0x7dffda,source:0x64eea0,attention:0xc499ff,object:0x93b7d3,match:0xffb65d,topology:0x71b7f1,goal:0xffd87a};
+export const COLORS={road:0x27323e,ground:0x0b131d,marking:0xdde4e9,path:0x7dffda,source:0x64eea0,attention:0xc499ff,object:0x93b7d3,match:0xffb65d,topology:0x71b7f1,goal:0x69c5ff};
 export const REGION_COLORS={left_front:0x64aaca,front:0x60caba,right_front:0x6da7c5,left_side:0x9b9ce5,right_side:0x80afce,left_rear:0x7795ca,rear:0x7799b4,right_rear:0x709aac};
 export const REGION_NAMES={front:'前方',rear:'后方',left_front:'左前',right_front:'右前',left_side:'左侧',right_side:'右侧',left_rear:'左后',right_rear:'右后',ego:'自车',center:'自车'};
 export const shortId=value=>{const text=String(value??'未知ID').replace(/^carla_/,'');return text.length>16?`${text.slice(0,6)}…${text.slice(-4)}`:text;};
@@ -36,9 +36,10 @@ export class WorldGeometry{
   point(p,offset=0){const s=this.owner;return new THREE.Vector3(p[0]-s.origin[0],number(p[2],s.ground)-s.origin[2]+offset,-(p[1]-s.origin[1]));}
   polygon(polygon,material,offset=0){
     const s=this.owner,outer=polygon?.outer||polygon;if(!Array.isArray(outer)||outer.length<3||!outer.every(validPoint))return null;
-    const shape=new THREE.Shape(outer.map(p=>new THREE.Vector2(p[0]-s.origin[0],p[1]-s.origin[1])));
-    for(const ring of polygon.holes||[])if(ring.length>=3&&ring.every(validPoint))shape.holes.push(new THREE.Path(ring.map(p=>new THREE.Vector2(p[0]-s.origin[0],p[1]-s.origin[1]))));
-    const geometry=new THREE.ShapeGeometry(shape);geometry.rotateX(-Math.PI/2);const z=outer.reduce((sum,p)=>sum+number(p[2],s.ground),0)/outer.length;geometry.translate(0,z-s.origin[2]+offset,0);geometry.computeVertexNormals();const mesh=new THREE.Mesh(geometry,material);mesh.receiveShadow=true;return mesh;
+    // Triangulate in map XY while retaining each recorded vertex's elevation.
+    // Averaging Z would flatten slopes, raised sidewalks and separate decks.
+    const openRing=ring=>ring.length>3&&ring[0][0]===ring.at(-1)[0]&&ring[0][1]===ring.at(-1)[1]?ring.slice(0,-1):ring.slice(),rings=[openRing(outer),...(polygon.holes||[]).filter(r=>r.length>=3&&r.every(validPoint)).map(openRing)],flat=rings.flat(),vectors=rings.map(r=>r.map(p=>new THREE.Vector2(p[0]-s.origin[0],p[1]-s.origin[1]))),faces=THREE.ShapeUtils.triangulateShape(vectors[0],vectors.slice(1));
+    if(!faces.length)return null;const geometry=new THREE.BufferGeometry();geometry.setAttribute('position',new THREE.Float32BufferAttribute(flat.flatMap(p=>this.point(p,offset).toArray()),3));geometry.setIndex(faces.flat());geometry.computeVertexNormals();const mesh=new THREE.Mesh(geometry,material);mesh.receiveShadow=true;return mesh;
   }
   line(points,color,opacity=1,offset=0,dashed=false){
     if(!Array.isArray(points)||points.length<2||!points.every(validPoint))return null;const geometry=new THREE.BufferGeometry().setFromPoints(points.map(p=>this.point(p,offset)));

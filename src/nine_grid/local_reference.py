@@ -66,7 +66,17 @@ class LocalReferenceManager:
         parts = str(lane_id).rsplit("|", 1)
         return parts[0] if len(parts) == 2 else str(lane_id)
 
+    def _group(self, scene, lane_id):
+        # nuPlan IDs are opaque: adjacent lanes share a roadblock, not an ID
+        # prefix. CARLA/highway keep their existing road/section grouping.
+        groups = scene.diagnostics.get("navigation_lane_groups", {})
+        return str(groups.get(str(lane_id), self._segment(lane_id)))
+
     def _lane(self, scene, lanes):
+        from .navigation_initialization import initialization_lane
+        recovery = initialization_lane(scene, lanes)
+        if recovery is not None:
+            return recovery
         # 已完成换道时优先使用实际几何所在车道，不等待平台稳定标签更新。
         def distance(lane):
             if lane is None:return None
@@ -117,19 +127,23 @@ class LocalReferenceManager:
             return clean_polyline(scene.route).copy()
         path = np.asarray(lane.center, float).copy()
         ordered = scene.route_lane_ids
-        own_segment = self._segment(lane.id)
+        own_segment = self._group(scene, lane.id)
         index = next((i for i, key in enumerate(ordered)
-                      if self._segment(key) == own_segment), None)
+                      if self._group(scene, key) == own_segment), None)
         if index is None:
+            if scene.scenario == "navsim" and len(scene.route) >= 2:
+                # A crossing connector can cover ego yet lead away from the
+                # supplied navigation. It cannot silently become a turn intent.
+                return clean_polyline(scene.route).copy()
             return path
         current = lane
         for key in ordered[index+1:]:
             intended = lanes.get(key)
             if intended is None:
                 break
-            segment = self._segment(key)
+            segment = self._group(scene, key)
             allowed = [lanes[k] for k in current.successors if k in lanes
-                       and self._segment(k) == segment]
+                       and self._group(scene, k) == segment]
             if not allowed:
                 break
             end_heading = project_polyline(current.center[-1], current.center)[2]
@@ -146,18 +160,18 @@ class LocalReferenceManager:
         return clean_polyline(path)
 
     def _navigation_compatible(self, scene, source, target, lanes):
-        if self._segment(source.id) != self._segment(target.id):
+        if self._group(scene, source.id) != self._group(scene, target.id):
             return False
         ordered = scene.route_lane_ids
         index = next((i for i, key in enumerate(ordered)
-                      if self._segment(key) == self._segment(source.id)), None)
+                      if self._group(scene, key) == self._group(scene, source.id)), None)
         if index is None:
             return False
         if index == len(ordered)-1:
             return True
-        required = self._segment(ordered[index+1])
+        required = self._group(scene, ordered[index+1])
         choices = [lanes[key] for key in target.successors
-                   if key in lanes and self._segment(key) == required]
+                   if key in lanes and self._group(scene, key) == required]
         if not choices:
             return False
         # 不跨接横向断开的车道，也不允许转到另一个导航道路分支。
@@ -357,7 +371,7 @@ class LocalReferenceManager:
         lines = []
         for lane in scene.lanes:
             for boundary in lane.boundaries:
-                if boundary.get("crossable", False):
+                if boundary.get("crossable", False) or boundary.get('kind')=='virtual_lane_boundary':
                     continue
                 points = np.asarray(boundary.get("points", []), float)
                 if len(points)<2 or np.any(np.max(points, axis=0)<lo) or np.any(np.min(points, axis=0)>hi):
@@ -432,7 +446,7 @@ class LocalReferenceManager:
         cached_keep = self.state.get("keep_path")
         completed_target = (self.state["phase"] == "complete"
                             and self.state["target_lane_id"] == current.id)
-        same_navigation_road=any(self._segment(current.id)==self._segment(key) for key in scene.route_lane_ids)
+        same_navigation_road=any(self._group(scene,current.id)==self._group(scene,key) for key in scene.route_lane_ids)
         if not same_navigation_road and not completed_target:
             # 路口车道关联可能暂指向重叠的另一分支。无主动换道承诺时，
             # 始终保留已知导航连接，不能把该关联自动变成局部转向意图。
@@ -447,7 +461,8 @@ class LocalReferenceManager:
         self.state["keep_path"] = path.tolist()
         self.state["keep_lane_id"] = current.id
         selected = current
-        chosen_source = "navigation"
+        chosen_source = ("navigation_initialization_recovery" if
+            scene.diagnostics.get('navigation_initialization',{}).get('status') in ('active','reference_only_unverified') else "navigation")
         can_change = (self.state["last_completed_at"] is None
                       or scene.time-self.state["last_completed_at"]>=self.p["dwell_s"])
         can_change = can_change and (self.state.get("last_cancelled_at") is None

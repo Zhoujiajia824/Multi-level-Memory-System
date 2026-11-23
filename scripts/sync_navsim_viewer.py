@@ -2,7 +2,6 @@
 import argparse
 import hashlib
 from pathlib import Path
-import shutil
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -10,11 +9,27 @@ ROOT = Path(__file__).resolve().parents[1]
 def selected(source):
     files = [source / name for name in ("run_viewer.py", "README.md", "requirements.txt")]
     files += list((source / "epviz").rglob("*.py"))
-    files += list((source / "tests").rglob("*.py"))
-    files += list((source / "tests").rglob("*.cjs"))
     files += [p for p in (source / "web").rglob("*") if p.is_file()]
     return sorted(p for p in files if p.is_file() and "__pycache__" not in p.parts
                   and not p.name.endswith((".log", ".pid", ".tmp")))
+
+
+def deployment_content(original):
+    """Ship runtime documentation without references to local-only tests."""
+    if original.name != "README.md":
+        return original.read_bytes()
+    paragraphs = original.read_text(encoding="utf-8").split("\n\n")
+    result = []
+    in_validation = False
+    for paragraph in paragraphs:
+        if paragraph.startswith("## 验证"):
+            in_validation = True
+        elif in_validation and paragraph.startswith("## "):
+            in_validation = False
+        if in_validation or paragraph.startswith(("NAVSIM 回归测试：", "可选浏览器回归：")):
+            continue
+        result.append(paragraph)
+    return ("\n\n".join(result).rstrip() + "\n").encode("utf-8")
 
 
 def sync(source, check=False):
@@ -28,12 +43,13 @@ def sync(source, check=False):
     changed = []
     for original in files:
         output = target / original.relative_to(source)
-        digest = hashlib.sha256(original.read_bytes()).digest()
+        content = deployment_content(original)
+        digest = hashlib.sha256(content).digest()
         if not output.is_file() or hashlib.sha256(output.read_bytes()).digest() != digest:
             changed.append(original.relative_to(source).as_posix())
             if not check:
                 output.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(original, output)
+                output.write_bytes(content)
     # Deliberately never delete files in either directory.
     print("Viewer files:", len(files), "changed:", len(changed), "check:", check)
     if check and changed:

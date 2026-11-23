@@ -13,13 +13,88 @@ from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
 from . import INPUT_PROTOCOL, INPUT_CONDITION
-from .protocol import transform_points, rotate_vectors, validate_packet, wrap
+from .protocol import transform_points, rotate_vectors, validate_packet, wrap, HORIZON_S
 
 CAMERAS = ("cam_f0", "cam_l0", "cam_l1", "cam_l2", "cam_r0", "cam_r1", "cam_r2", "cam_b0")
 KINDS = {"vehicle": "vehicle", "bicycle": "bicycle", "pedestrian": "pedestrian",
          "traffic_cone": "static_obstacle", "czone_sign": "static_obstacle",
          "barrier": "static_obstacle"}
 # Generic-object labels do not establish that an object is a road obstruction.
+
+
+def navigation_command(value):
+    """Preserve the official current command, without deriving it from future poses."""
+    if value is None:
+        return dict(one_hot=None, label="unknown", source="not_available")
+    raw = np.asarray(value)
+    if (raw.shape != (4,) or not np.isfinite(raw).all()
+            or not np.isin(raw, [0, 1]).all() or int(raw.sum()) != 1):
+        raise ValueError("NAVSIM current driving_command must contain four one-hot values")
+    return dict(one_hot=raw.astype(int).tolist(),
+                label=("left", "straight", "right", "unknown")[int(np.argmax(raw))],
+                source="NAVSIM_current_ego_status.driving_command")
+
+
+def required_forward_reference(desired_speed_mps, current_speed_mps=0.0):
+    """Require a usable reference for the submitted horizon, even when starting slowly."""
+    values = np.asarray([desired_speed_mps, current_speed_mps], float)
+    if not np.isfinite(values).all() or np.any(values < 0):
+        raise ValueError("Invalid current/desired speed for navigation coverage")
+    return max(15.0, HORIZON_S * float(max(values)) + 5.0)
+
+
+def navigation_ego(rear_axle_velocity, yaw_rate, vehicle=None):
+    """The identical current Pacifica state used by packet and map preflight."""
+    if vehicle is None:
+        from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters
+        vehicle = get_pacifica_parameters()
+    velocity = np.asarray(rear_axle_velocity,float).copy()
+    if velocity.shape != (2,) or not np.isfinite(velocity).all() or not math.isfinite(yaw_rate):
+        raise ValueError('NAVSIM current rear-axle velocity/yaw rate is invalid')
+    rear = float(vehicle.rear_axle_to_center)
+    velocity[1] += rear*float(yaw_rate)
+    return dict(id='ego',kind='vehicle',position=[rear,0.],velocity=velocity.tolist(),heading=0.,
+        length=float(vehicle.length),width=float(vehicle.width),lane_id=None,
+        wheelbase_m=float(vehicle.wheel_base),rear_axle_to_center_m=rear)
+
+
+def validate_navigation_initialization(ego, lanes, route, ids, road, association, yaw_rate, token):
+    """One producer/validator path for full packets and image-free preflight."""
+    from types import SimpleNamespace as NS
+    from nine_grid.navigation_initialization import build_initialization,initialization_geometry
+    route,record = build_initialization(ego,lanes,route,ids,road,association,yaw_rate=yaw_rate)
+    snapshot = NS(scenario='navsim',frame_id=str(token),time=0.,assets={},
+        ego=NS(**dict(ego,position=np.asarray(ego['position'],float))),
+        lanes=[NS(**dict(row,center=np.asarray(row['center'],float),polygon=np.asarray(row['polygon'],float)))
+               for row in lanes],route=np.asarray(route,float),route_lane_ids=ids,
+        drivable=road,diagnostics=dict(navigation_initialization=record,route_association=association,
+                                     lane_map_complete=True))
+    initialization_geometry(snapshot)
+    # Ordinary on-navigation frames need the identical short native seam
+    # validation too; initialization recovery must not be the only entry point.
+    from nine_grid.object_scope import lane_role_geometry
+    snapshot.coordinates='world_xy_m'
+    traces,_,_ = lane_role_geometry(snapshot,front_m=120.,rear_m=20.)
+    record['native_seam_validation'] = dict(front_m=120.,rear_m=20.,
+        connections=[dict(from_lane_id=link['from_lane_id'],to_lane_id=link['to_lane_id'])
+            for trace in traces.values() if trace is not None
+            for link in trace.get('navigation_connections',[])
+            if link.get('kind')=='validated_short_directed_native_navigation_gap'],
+        rejected_connections=[rejection for trace in traces.values() if trace is not None
+                              for rejection in trace.get('native_connection_rejections',[])],
+        roles=snapshot.diagnostics.get('native_navigation_validation',{}))
+    reasons=list(record.get('reference_quality_reasons',[]))+association.get('reference_quality_reasons',[])
+    for trace in traces.values():
+        if trace is None:continue
+        if trace.get('native_forward_valid') is False:reasons.append('native_forward_geometry_unverified')
+        for link in trace.get('navigation_connections',[]):
+            quality=link.get('reference_quality',{})
+            if quality.get('full_body_on_road') is False:reasons.append('reference_body_outside_actual_road')
+            if (quality.get('maximum_steering_rad') or 0.)>.61:reasons.append('reference_steering_exceeds_limit')
+    record['reference_quality_reasons']=sorted(set(reasons))
+    record['input_contract']='causal_finite_current_state_directed_public_topology_and_coordinate_attachments'
+    record['reference_feasibility_is_input_gate']=False
+    return route,record
 
 
 def _local_shape(shape, origin):
@@ -118,7 +193,8 @@ def _link_public_route(map_api, order):
     return result if _route_order_connected(map_api, result) else None
 
 
-def _map_packet(map_api, origin, roadblock_ids, desired_speed_mps, map_radius_m):
+def _map_packet(map_api, origin, roadblock_ids, desired_speed_mps, map_radius_m,
+                current_speed_mps=0.0, driving_command=None):
     from nuplan.common.actor_state.state_representation import Point2D
     from nuplan.common.maps.maps_datatypes import SemanticMapLayer
 
@@ -156,15 +232,18 @@ def _map_packet(map_api, origin, roadblock_ids, desired_speed_mps, map_radius_m)
         for side, adjacent in (("left", left), ("right", right)):
             boundary = getattr(obj, side + "_boundary")
             points = transform_points(np.asarray(boundary.linestring.coords), origin)
-            lane["boundaries"].append(dict(id=key + ":" + side, kind="lane_boundary",
+            lane["boundaries"].append(dict(id=key + ":" + side, kind="virtual_lane_boundary",
                 points=points.tolist(), crossable=neighbor(adjacent) is not None,
-                permission_source="nuplan_directed_lane_adjacency_assumption_no_paint_labels"))
+                permission_source="nuplan_directed_lane_adjacency_assumption_no_paint_labels",
+                marking="unknown", geometry_source="nuplan_vector_lane_boundary_not_painted_line"))
         lanes.append(lane)
     if not lanes:
         raise ValueError("No usable NAVSIM map lanes near the current frame")
     table = {lane["id"]: lane for lane in lanes}
     public_order = [str(key) for key in roadblock_ids]
     order = public_order
+    command = navigation_command(driving_command)
+    required_forward = required_forward_reference(desired_speed_mps, current_speed_mps)
     def block(key):
         return str(lane_objects[key].get_roadblock_id())
     def association(lane):
@@ -173,6 +252,48 @@ def _map_packet(map_api, origin, roadblock_ids, desired_speed_mps, map_radius_m)
         return dict(projection_error_m=error, heading_error_rad=abs(float(wrap(heading))),
                     polygon_covers_rear_axle=bool(covers))
     associations = {lane["id"]: association(lane) for lane in lanes}
+    chains = {}
+    def chain(lane, route_order):
+        cache_key = (lane["id"], tuple(route_order))
+        if cache_key in chains:
+            return chains[cache_key]
+        path, ids, visited = np.asarray(lane["center"], float), [lane["id"]], {lane["id"]}
+        current, allowed = lane, set(route_order)
+        index = route_order.index(block(lane["id"]))
+        ego_s = _project(path, np.zeros(2))[0]
+        while len(ids) < 128 and LineString(path).length - ego_s < map_radius_m * 1.5:
+            choices = []
+            for key in current["successors"]:
+                if key not in table or key in visited or block(key) not in allowed:
+                    continue
+                indices = [i for i, value in enumerate(route_order) if value == block(key) and i >= index]
+                if indices and np.linalg.norm(np.asarray(table[key]["center"])[0] - path[-1]) <= 2.0:
+                    choices.append((min(indices), table[key]))
+            if not choices:
+                break
+            end_heading = math.atan2(*(path[-1] - path[-2])[::-1])
+            def rank(item):
+                next_index, candidate = item
+                center = np.asarray(candidate["center"])
+                heading = math.atan2(*(center[1] - center[0])[::-1])
+                return next_index, abs(float(wrap(heading - end_heading))), candidate["id"]
+            index, current = min(choices, key=rank)
+            path = _clean(np.vstack([path, current["center"]]))
+            visited.add(current["id"])
+            ids.append(current["id"])
+        line = LineString(path)
+        forward = float(line.length - line.project(Point(0, 0)))
+        probe_s = min(line.length, line.project(Point(0, 0)) + required_forward)
+        tangent_start = np.array(line.interpolate(max(0.0, probe_s - .05)).coords[0])
+        tangent_end = np.array(line.interpolate(min(line.length, probe_s + .05)).coords[0])
+        turn = float(wrap(math.atan2(*(tangent_end - tangent_start)[::-1])))
+        # Commands include lane changes and sharp curves; only a directly
+        # opposing turn is a disagreement, not the absence of an immediate turn.
+        disagreement = ((command["label"] == "straight" and abs(turn) > math.pi / 3)
+                        or (command["label"] == "left" and turn < -math.pi / 3)
+                        or (command["label"] == "right" and turn > math.pi / 3))
+        chains[cache_key] = path, ids, forward, turn, bool(disagreement)
+        return chains[cache_key]
     def nearest(lane):
         row = associations[lane["id"]]
         # Overlapping connector polygons can contain opposing directions.
@@ -186,7 +307,13 @@ def _map_packet(map_api, origin, roadblock_ids, desired_speed_mps, map_radius_m)
         # limits before coverage ranking, rather than abort on that invalid winner.
         candidates = [lane for lane in lanes if block(lane["id"]) in set(route_order)
                       and not nearest(lane)[0] and nearest(lane)[2] <= 8]
-        return min(candidates, key=nearest) if candidates else None
+        # An ended predecessor can be geometrically closer than the current
+        # connector. Prefer a reachable forward route before residual distance;
+        # otherwise a behind-only reference passes with hundreds of old points.
+        def route_rank(lane):
+            _, _, forward, _, disagreement = chain(lane, route_order)
+            return forward <= 1., forward < required_forward, disagreement, nearest(lane)
+        return min(candidates, key=route_rank) if candidates else None
     current = select(order)
     initial_lane = None if current is None else current["id"]
     # PDM corrects the public route at every independent initialization, even
@@ -196,20 +323,32 @@ def _map_packet(map_api, origin, roadblock_ids, desired_speed_mps, map_radius_m)
     attempted_order = order[:]
     rejection_reason = None
     current = select(order)
-    if current is None:
+    if current is None or chain(current, order)[2] < required_forward:
         # The official correction can start on an overlapping opposite branch
         # and remove a valid public suffix as a loop. Keep the public route only
         # if its current association and every directed map link are verified.
         public_current = select(public_order)
         if public_current is not None:
             linked_public = _link_public_route(map_api, public_order)
-            if linked_public is not None:
+            # Inserted links can change which nearby lane has a complete
+            # forward continuation; rank again against the verified order.
+            public_current = select(linked_public) if linked_public is not None else None
+            if (linked_public is not None
+                    and public_current is not None
+                    and (chain(public_current, linked_public)[2] >= required_forward
+                         or (chain(public_current, linked_public)[2]>1.
+                             and (current is None or chain(current,order)[2]<=1.)))):
                 order, current = linked_public, public_current
                 rejection_reason = "corrected_route_has_no_valid_current_association;connected_public_route_retained"
     if current is None or nearest(current)[0] or nearest(current)[2] > 8:
         raise ValueError("Current ego pose cannot be associated with the mapped route after topology correction")
-    allowed = set(order)
     current_id = current["id"]
+    route, ids, forward, route_turn, command_disagreement = chain(current, order)
+    if len(route)<2 or not np.isfinite(route).all() or LineString(route).length<=1e-6:
+        raise ValueError('Mapped navigation has no finite nondegenerate directed reference')
+    observed = [lane for lane in lanes if associations[lane["id"]]["polygon_covers_rear_axle"]
+                and not nearest(lane)[0]]
+    observed_current = min(observed, key=nearest) if observed else current
     route_evidence = dict(public_roadblock_ids=public_order, used_roadblock_ids=order,
         attempted_roadblock_ids=attempted_order, topology_correction_rejection_reason=rejection_reason,
         used_route_source=("public_route_order_with_verified_directed_map_links" if rejection_reason else
@@ -217,38 +356,20 @@ def _map_packet(map_api, origin, roadblock_ids, desired_speed_mps, map_radius_m)
         public_route_inserted_roadblock_ids=([key for key in order if key not in public_order] if rejection_reason else []),
         topology_correction_attempted=True, topology_correction_changed=order != public_order,
         correction_source="pinned_official_pdm_route_roadblock_correction_current_pose_map_public_route",
-        initial_lane_id=initial_lane, current_lane_id=current_id, **associations[current_id])
-    route, ids, visited = np.asarray(current["center"], float), [current_id], {current_id}
-    ego_route_s = _project(route, np.zeros(2))[0]
-    current_block_index = order.index(block(current_id)) if block(current_id) in order else -1
-    while len(ids) < 128 and LineString(route).length - ego_route_s < map_radius_m * 1.5:
-        choices = [table[key] for key in current["successors"] if key in table and key not in visited
-                   and (not allowed or block(key) in allowed)]
-        if not choices:
-            break
-        end_heading = math.atan2(*(route[-1] - route[-2])[::-1])
-        def rank(lane):
-            rb = block(lane["id"])
-            indices = [i for i, value in enumerate(order) if value == rb and i >= current_block_index]
-            index = min(indices, default=len(order))
-            center = np.asarray(lane["center"])
-            heading = math.atan2(*(center[1] - center[0])[::-1])
-            return index, abs(float(wrap(heading - end_heading))), lane["id"]
-        nxt = min(choices, key=rank)
-        center = np.asarray(nxt["center"])
-        # Join genuine map endpoints only, without inventing a shortcut curve.
-        if np.linalg.norm(center[0] - route[-1]) > 2.0:
-            raise ValueError("Mapped navigation has an unsupported endpoint gap")
-        route = _clean(np.vstack([route, center]))
-        current = nxt
-        visited.add(current["id"])
-        ids.append(current["id"])
-        if block(current["id"]) in order:
-            indices = [i for i, value in enumerate(order) if value == block(current["id"]) and i >= current_block_index]
-            if indices:
-                current_block_index = indices[0]
-    road = unary_union([_local_shape(obj.polygon, origin) for layer in road_layers for obj in nearby[layer]]
-                       + [Polygon(lane["polygon"]) for lane in lanes])
+        initial_lane_id=initial_lane, current_lane_id=current_id,
+        observed_current_lane_id=observed_current["id"],
+        forward_reference_m=forward, required_forward_reference_m=required_forward,
+        reference_coverage_complete=bool(forward+1e-6>=required_forward),
+        reference_quality_reasons=([] if forward+1e-6>=required_forward else ['public_forward_reference_short']),
+        navigation_command=command, reference_heading_ahead_rad=route_turn,
+        command_disagreement=command_disagreement,
+        lane_roadblock_ids={key: block(key) for key in table},
+        **associations[current_id])
+    # Match official PDM's DAC authorization. LANE/CONNECTOR polygons are
+    # navigation semantics, not additional independently drivable surfaces.
+    road = unary_union([_local_shape(obj.polygon, origin) for layer in road_layers for obj in nearby[layer]])
+    if road.is_empty or not road.is_valid or road.area <= 0:
+        raise ValueError('NAVSIM official drivable road layers are empty or invalid')
     crosswalks = [np.asarray(_local_shape(obj.polygon, origin).exterior.coords).tolist()
                   for obj in nearby[SemanticMapLayer.CROSSWALK]]
     return lanes, route, ids, current_id, road, crosswalks, lane_objects, skipped, route_evidence
@@ -338,13 +459,17 @@ def build_packet(agent_input, scene, camera_dir, desired_speed_mps=10.0, map_rad
             velocity=rotate_vectors(history_velocity, pose[2] - origin[2]).tolist(),
             acceleration=rotate_vectors(history_acceleration, pose[2] - origin[2]).tolist(),
             heading=float(wrap(pose[2] - origin[2])), observed=True))
-    ego = dict(id="ego", kind="vehicle", position=[rear, 0.0], velocity=velocity.tolist(),
-               acceleration=acceleration.tolist(), heading=0.0, length=float(vehicle.length),
-               width=float(vehicle.width), lane_id=None, visible=True, history=ego_history,
-               radius=None, wheelbase_m=float(vehicle.wheel_base), rear_axle_to_center_m=rear)
+    ego = navigation_ego(now.ego_status.ego_velocity,omega,vehicle)
+    ego.update(acceleration=acceleration.tolist(),visible=True,history=ego_history,radius=None)
+    command = navigation_command(now.ego_status.driving_command)
     lanes, route, ids, current, road, crosswalks, objects, skipped, route_evidence = _map_packet(
-        scene.map_api, origin, now.roadblock_ids, desired_speed_mps, map_radius_m)
-    ego["lane_id"] = current
+        scene.map_api, origin, now.roadblock_ids, desired_speed_mps, map_radius_m,
+        current_speed_mps=float(np.linalg.norm(velocity)), driving_command=command["one_hot"])
+    # Physical lane occupancy and the lane that can continue the public route
+    # are different facts near junctions and before a necessary lane change.
+    ego["lane_id"] = route_evidence["observed_current_lane_id"]
+    route, initialization = validate_navigation_initialization(
+        ego,lanes,route,ids,road,route_evidence,omega,now.token)
     actors, ignored = _history_actors(frames, origin)
     for actor in actors:
         matches = []
@@ -403,6 +528,7 @@ def build_packet(agent_input, scene, camera_dir, desired_speed_mps=10.0, map_rad
                      wheelbase_m=float(vehicle.wheel_base), rear_axle_to_center_m=rear),
         ego=ego, actors=actors, lanes=lanes, route=route.tolist(), route_lane_ids=ids, drivable_wkt=road.wkt,
         rules=dict(desired_speed=min(desired_speed_mps, speed_limit), speed_limit=speed_limit,
+                   navigation_command=command,
                    must_wait=stop_s is not None, wait_reason="red_light" if stop_s is not None else None,
                    stop_s=stop_s, crosswalks=crosswalks, traffic_lights=signals,
                    map_available=dict(crosswalk=True, traffic_light=True, stop_line=True),
@@ -417,6 +543,8 @@ def build_packet(agent_input, scene, camera_dir, desired_speed_mps=10.0, map_rad
             acceleration_source="current_ego_body_state_and_history_track_velocity_difference",
             source_rear_axle_global_pose=origin.tolist(), ignored_annotation_types=ignored, skipped_map_lanes=skipped,
             route_association=route_evidence,
+            navigation_initialization=initialization,
+            navigation_lane_groups=route_evidence["lane_roadblock_ids"],
             lane_crossability_source="nuplan_directed_adjacency_not_lane_paint_annotations",
             route_source="current_privileged_roadblock_ids_and_map_topology_no_future_ego_poses"),
         camera_images=cameras))

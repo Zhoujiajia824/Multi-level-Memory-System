@@ -89,12 +89,12 @@ tensor, continuous_mask = grid_tensor16(grid)
 
 ## 6. 验证命令
 
-在对应分支目录和项目Python环境执行：
+在本地开发工作区和项目Python环境执行；`test/` 中的回归脚本不随分支发布：
 
 ```bash
-python scripts/check_grid_storage.py
-python scripts/check_grid_memory_io.py
-python scripts/check_grid_vector_retrieval.py
+python test/check_grid_storage.py
+python test/check_grid_memory_io.py
+python test/check_grid_vector_retrieval.py
 ```
 
 这些检查不调用模型、不连接CARLA、不修改正式记忆库。性能测试报告单列匹配计算耗时；磁盘压缩体量和实际速度取决于记录内容与库规模，不将本地构造基准当成服务器实验结果。

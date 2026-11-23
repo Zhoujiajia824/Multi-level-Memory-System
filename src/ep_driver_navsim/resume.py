@@ -113,6 +113,44 @@ def _local_asset(root, name):
     return path
 
 
+def _unsent_semantic_preparation(result, evidence):
+    """Only a fully evidenced local NoLegal condition can omit a request schema."""
+    fallback = evidence.get("model_preparation_fallback")
+    audit = result.get("condition_audit", {})
+    if not isinstance(audit, dict):
+        raise ValueError("Checkpoint model condition audit must be a mapping")
+    if fallback is None and audit.get("model_preparation_fallback") is None:
+        return False
+    required = {"reason", "detail", "stage", "request_sent", "policy"}
+    if (not isinstance(fallback, dict) or set(fallback) != required
+            or not isinstance(fallback.get("reason"), str)
+            or fallback["reason"] not in {"semantic_reference_invalid", "empty_longitudinal_goal_interval"}
+            or not isinstance(fallback.get("detail"), str) or not fallback["detail"].strip()
+            or fallback.get("stage") != "structured_request_preparation"
+            or fallback.get("request_sent") is not False
+            or fallback.get("policy") != "same_base_mpc_without_model_semantics"
+            or audit.get("model_preparation_fallback") != fallback
+            or audit.get("model_requested") is not True
+            or audit.get("model_answer_valid") is not False
+            or audit.get("model_answer_parsed_valid") is not False
+            or audit.get("model_semantics_applied") is not False
+            or evidence.get("model_semantics_applied") is not False
+            or evidence.get("model_answer") is not None or evidence.get("model_raw") is not None
+            or evidence.get("model_planning_fallback") is not None
+            or audit.get("model_planning_fallback") is not None
+            or evidence.get("model_response_format_sha256") is not None):
+        raise ValueError("Checkpoint unsent semantic preparation evidence is incomplete")
+    for record in (audit, evidence):
+        if (record.get("structured_model_output") is not True
+                or record.get("model_error") != "NoLegalGoalReference"
+                or record.get("model_error_detail") != fallback["detail"]
+                or type(record.get("model_call_attempts")) is not int
+                or record["model_call_attempts"] != 0
+                or record.get("model_request_sent") is not False):
+            raise ValueError("Checkpoint unsent semantic preparation transport evidence differs")
+    return True
+
+
 def _validate_output(root, identity, assets):
     required = {"trajectory.json", "planning_evidence.json", "trajectory_bev.png",
                 "retrieval_diagnostics.json.gz"}
@@ -120,16 +158,19 @@ def _validate_output(root, identity, assets):
     required.add(packet_name)
     if not required.issubset(assets):
         raise ValueError("Checkpoint is missing required evidence")
-    if identity["run"].get("structured_model_output"):
-        if "model_response_format.json" not in assets:
-            raise ValueError("Checkpoint is missing the structured model request schema")
     packet = read_input_packet(root / packet_name)
     if sample_identity(packet, identity["run"]) != identity:
         raise ValueError("Checkpoint packet/camera content differs")
     result = read_json(root / "trajectory.json")
     evidence = read_json(root / "planning_evidence.json")
     if identity["run"].get("structured_model_output"):
-        if digest(read_json(root / "model_response_format.json")) != evidence["model_response_format_sha256"]:
+        unsent = _unsent_semantic_preparation(result, evidence)
+        has_schema = "model_response_format.json" in assets
+        if not has_schema and not unsent:
+            raise ValueError("Checkpoint is missing the structured model request schema")
+        if has_schema and unsent:
+            raise ValueError("Checkpoint unsent semantic preparation must not claim a request schema")
+        if has_schema and digest(read_json(root / "model_response_format.json")) != evidence["model_response_format_sha256"]:
             raise ValueError("Checkpoint structured model request evidence differs")
     if (result["frame_id"] != packet["identity"]["token"]
             or result["sampling"] != dict(horizon_s=4.0, interval_s=0.5)

@@ -164,7 +164,9 @@ def evaluate(scene, plan, baseline, predictions, config=None):
     progress_score=None
     if (not baseline.valid or baseline.diagnostics.get('safety_feasible') is False
             or baseline.diagnostics.get('emergency', False) or reference_collisions):
-        reasons.append('无语义物理参照没有安全解，紧急制动不能作满分参照')
+        reasons.append('无语义参照存在安全诊断问题，不能作安全进度参照'
+                       if baseline.diagnostics.get('postsolve_safety_policy')=='audit_only'
+                       else '无语义物理参照没有安全解，紧急制动不能作满分参照')
         if reference_collisions:
             reasons.append('参照轨迹与感知预测对象碰撞，不能作安全进度参照')
     else:
@@ -211,11 +213,12 @@ def reflection_reasons(quality,invalid_answer=False,threshold=.7):
     return reasons
 
 
-def execution_audit(scene,plan,predictions,config=None):
-    """审计重规划前全部控制前缀；正常解报警须重新计算制动。
+def execution_audit(scene,plan,predictions,config=None,*,execution_horizon_s=None):
+    """审计全部实际执行窗口，不在此函数内替换轨迹。
 
     重规划 10Hz 时仍只检查首个 0.1s；重规划 1Hz、MPC 网格
     0.1s 时检查前十段，不重置对象预测时间，也不将首控制保持一秒。
+    数据集评测可显式指定完整提交时域；调用方决定报警是否参与执行。
     """
     from .planner import propagate
     from .control_clock import execution_prefix_count
@@ -224,7 +227,18 @@ def execution_audit(scene,plan,predictions,config=None):
     cfg=(config or {}).get('mpc',{})
     dt=cfg.get('step_s',.1)
     substeps=cfg.get('physics_substeps',5)
-    prefix_count=execution_prefix_count(config)
+    if execution_horizon_s is None:
+        prefix_count=execution_prefix_count(config)
+    else:
+        # A dataset evaluator can execute an entire submission rather than the
+        # simulator's configured replan prefix. Never change the shared clock to
+        # pretend that such an evaluator replans at 10Hz.
+        if (type(execution_horizon_s) not in (int,float)
+                or not np.isfinite(execution_horizon_s) or execution_horizon_s<=0):
+            raise ValueError('独立执行审核时域必须为有限正秒数')
+        prefix_count=int(round(execution_horizon_s/dt))
+        if prefix_count<1 or not np.isclose(prefix_count*dt,execution_horizon_s,rtol=0,atol=1e-8):
+            raise ValueError('独立执行审核时域必须覆盖完整控制段')
     controls=np.asarray(plan.controls,float)
     if (controls.ndim!=2 or controls.shape[1]!=2 or len(controls)<prefix_count
             or not np.isfinite(controls[:prefix_count]).all()):

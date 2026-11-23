@@ -38,6 +38,16 @@ def build_lane_potential_domain(scene, front_m=120., rear_m=20.):
     for trace in traces.values():
         if trace is None:
             continue
+        if trace.get('validated_corridor') is not None:
+            # NAVSIM registers this exact road-clipped narrow reference band
+            # and retained native suffix, without certifying vehicle motion.
+            # Rebuilding whole native lanes here
+            # would restore the prefix explicitly replaced by that contract.
+            parts.append(trace['validated_corridor'])
+            selected.update(trace['lane_ids'])
+            connections.update((link['from_lane_id'],link['to_lane_id'])
+                               for link in trace.get('navigation_connections', []))
+            continue
         for identity in trace['lane_ids']:
             if identity in selected or identity not in cache:
                 continue
@@ -69,6 +79,12 @@ def build_lane_potential_domain(scene, front_m=120., rear_m=20.):
         'chains': {side: None if trace is None else trace['lane_ids'] for side, trace in traces.items()},
         'current_lane_association': (traces['center'].get('current_lane_association')
                                      if traces.get('center') is not None else None),
+        'initialization_recovery': (scene.diagnostics.get('navigation_initialization', {}).get('status') in ('active','reference_only_unverified')
+                                    and scene.scenario=='navsim'),
+        'initialization_reference_status': (scene.diagnostics.get('navigation_initialization',{}).get('status')
+                                             if scene.scenario=='navsim' else None),
+        'reference_quality': (scene.diagnostics.get('native_navigation_validation',{}) if scene.scenario=='navsim' else None),
+        'domain_registration_is_vehicle_safety_certificate': False,
         'adjacent_permissions': permissions,
         'navigation_connections': [{'from_lane_id': pair[0], 'to_lane_id': pair[1]} for pair in sorted(connections)],
         'geometry': 'union(actual_lane_polygon intersect centerline_half_width_band;confirmed_traversed_navigation_connection_band) intersect drivable',

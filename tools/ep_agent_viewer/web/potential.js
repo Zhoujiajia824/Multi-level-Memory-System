@@ -1,6 +1,6 @@
 // Same archived lane potential, two views. No display-only source or target.
 const finite=v=>typeof v==='number'&&Number.isFinite(v);
-const COLORS={text:'#d5e0ec',muted:'#8fa6bd',paper:'#101824',road:'#b2bfcd',mark:'#ffffff'};
+const COLORS={text:'#111827',muted:'#6b7280',paper:'#ffffff',road:'#9ca3af',mark:'#ffffff'};
 function range(z){let lo=Infinity,hi=-Infinity;for(const row of z||[])for(const v of row)if(finite(v)){lo=Math.min(lo,v);hi=Math.max(hi,v);}return [lo,hi];}
 function scatterLine(points,color,width=1,dash='solid',name='道路边界'){
   return {type:'scatter',mode:'lines',x:points.map(p=>p[0]),y:points.map(p=>p[1]),

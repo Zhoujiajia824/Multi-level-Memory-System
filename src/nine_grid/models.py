@@ -252,6 +252,13 @@ def scene_text(scene,representations):
         '规划参考':goal_reference_context(scene,_goal_reference(scene)),
         '观测说明':'候选对象均为本帧提供的当前状态；只从列表ID选择关注对象，观察到对象不代表其所在空间允许自车驶入。',
         '图像说明':'BEV自车朝上，x前y左，刻度为米；红为自车、蓝为车辆、橙为自行车、紫为行人、黄为道路障碍。细灰虚线是虚拟车道中心参考，不是真实标线；绿色虚线是固定目标参考，s+表示道路弧长。历史轨迹只表示已观测运动。'}
+    if scene.scenario=='navsim':
+        data['坐标说明']='本帧对象状态采用当前锚点后轴为原点、x前y左的局部米制坐标；局部引导点仍使用规划参考的delta_s_m、d_m。'
+        command=scene.rules.get('navigation_command')
+        directions={'left':'左向','straight':'直行','right':'右向','unknown':'未知'}
+        if isinstance(command,dict) and command.get('label') in directions:
+            data['导航指令']={'方向':directions[command['label']],
+                '说明':'当前帧官方导航意图；左向和右向也可能表示变道或急弯，具体路径沿规划参考，不要求立即转向。'}
     if scene.diagnostics.get('observation_policy')=='range_limited_ground_truth_no_occlusion-1.0':
         data['观测说明']+='本帧候选真值不判断遮挡，不因RGB遮挡删除给定状态。'
     cameras=_camera_entries(scene)

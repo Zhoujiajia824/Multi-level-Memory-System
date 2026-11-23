@@ -53,10 +53,6 @@ ssh -N -L 8765:127.0.0.1:8765 user@server
 
 本机浏览器打开 `http://127.0.0.1:8765/`。这些是启动示例，查看器不会自行连接或启动远端服务。
 
-NAVSIM 回归测试：在本目录执行 `python -m unittest discover -s tests -p test_navsim.py -v`。可选设置 `EPVIZ_NAVSIM_REAL_ROOT` 为现有整轮输出，额外离线发现并读取每个已保存锚点；不运行模型、仿真或评分。
-
-可选浏览器回归：在已有 Playwright、Chrome 和 viewer Python 环境下，设置 `EPVIZ_NAVSIM_REAL_ROOT`、`EPVIZ_PYTHON`（可选 `EPVIZ_CHROME`），执行 `node tests/navsim_ui.cjs`。覆盖默认视频、旧/新renderer标签、视频定位同步、折叠诊断、同token不同run视频隔离与其他平台默认视图；只使用本地临时HTTP服务和已有视频。
-
 ## 离线记忆库浏览
 
 支持单独打开离线发布库，也可以与实验结果一起打开。使用本地 PowerShell：
@@ -111,13 +107,3 @@ python "D:/code/AutoDriver_Agent_memory_system/Multi-level Memory System for Int
 具体数据集适配器不与主程序耦合。将数据整理到上述单轮产物格式即可接入：每帧 `frame_id` / `time`，自车与对象的统一世界坐标、heading（弧度）、length / width / height，规划状态 `[x,y,yaw,speed]`；相机保存图像路径、宽高、FOV 或内参、同帧世界到相机变换。
 
 当前相机接口遵循 CARLA 的 `world_to_camera_ue`（UE 相机前方为 x，右方为 y，上方为 z），内部驾驶坐标为 x / y 向左 / z 向上。其他数据集必须先转换坐标与相机轴，不能直接套用矩阵。没有三维真值或标定时只播放图像，不从图片猜测“准确三维框”。
-
-## 验证
-
-从本目录运行：
-
-```powershell
-python -m unittest discover -s tests -v
-```
-
-测试覆盖增量读取、部分行、日志截断、严格帧关联、跨机器资产路径、资产目录边界、视频 Range 请求，以及几何和相机投影。验证使用临时产物，不运行模拟器。

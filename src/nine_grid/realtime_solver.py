@@ -67,18 +67,22 @@ class Dynamics:
 
 
 class QuadraticSolver:
-    """OSQP 只负责当前线性化子问题；最终执行资格由真实几何复核决定。"""
-    def __init__(self,n,maximum_iterations=600,tolerance=1e-6):
+    """OSQP solves the linearized subproblem and exposes its numerical residuals."""
+    def __init__(self,n,maximum_iterations=600,tolerance=1e-6,*,require_feasible_iterate=False):
         self.n=n;self.maximum_iterations=maximum_iterations;self.tolerance=tolerance
+        self.require_feasible_iterate=bool(require_feasible_iterate)
         self.solvers={}
         self.cache_builds=0;self.cache_hits=0;self.setup_seconds=0.
         self.last_diagnostics={}
 
     def solve(self,hessian,gradient,matrix,lower,upper,step_lower,step_upper):
         begin=time.perf_counter()
+        original_matrix=np.asarray(matrix,float)
+        original_lower=np.asarray(lower,float);original_upper=np.asarray(upper,float)
         # 空的物理控制箱与信赖域交集没有可解QP，不能交给CasADi抛异常，
         # 更不能交换上下界或裁剪边界来掩盖不可行。调用方仍只可执行已验收候选。
-        self.last_diagnostics={'valid':False,'scaled_stationarity_inf':None,'scaled_primal_violation':None}
+        self.last_diagnostics={'valid':False,'scaled_stationarity_inf':None,'scaled_primal_violation':None,
+            'unscaled_stationarity_inf':None,'unscaled_primal_violation':None}
         invalid_box=np.flatnonzero(np.asarray(step_lower)>np.asarray(step_upper))
         if len(invalid_box):
             self.last_diagnostics['invalid_step_bound_indices']=invalid_box.tolist()
@@ -122,21 +126,43 @@ class QuadraticSolver:
         z=result['x'].full().ravel();step=z*scale
         dual_rows=result['lam_a'].full().ravel();dual_box=result['lam_x'].full().ravel()
         # 这些是当前缩放QP的残差，不是非线性MPC已达全局最优的证明。
-        self.last_diagnostics={'valid':False,'scaled_stationarity_inf':None,'scaled_primal_violation':None}
+        self.last_diagnostics={'valid':False,'scaled_stationarity_inf':None,'scaled_primal_violation':None,
+            'unscaled_stationarity_inf':None,'unscaled_primal_violation':None}
         if np.all(np.isfinite(z)) and np.all(np.isfinite(dual_rows)) and np.all(np.isfinite(dual_box)):
             stationarity=scaled_hessian@z+scaled_gradient+scaled.T@dual_rows+dual_box
             values=scaled@z
             stationarity_norm=float(np.max(np.abs(stationarity)))
             primal_violation=float(max(0.,np.max(lower-values,initial=0.),
                 np.max(values-upper,initial=0.),np.max(low_box-z),np.max(z-high_box)))
+            original_values=original_matrix@step
+            unscaled_primal=float(max(0.,np.max(original_lower-original_values,initial=0.),
+                np.max(original_values-original_upper,initial=0.),np.max(step_lower-step),
+                np.max(step-step_upper)))
             if np.isfinite(stationarity_norm) and np.isfinite(primal_violation):
                 self.last_diagnostics.update(valid=True,scaled_stationarity_inf=stationarity_norm,
-                    scaled_primal_violation=primal_violation)
+                    scaled_primal_violation=primal_violation,
+                    unscaled_stationarity_inf=float(np.max(np.abs(stationarity/scale))),
+                    unscaled_primal_violation=unscaled_primal,
+                    unscaled_primal_note='original mixed constraint units; scaled residual controls iterate eligibility')
         stats=solver.stats()
         status=str(stats.get('return_status','未知'))
-        # 固定迭代RTI允许检查已优化但未达到QP终止精度的迭代点；
-        # 只有后续原动力学、实体、道路与全部控制边界验收合格才能执行。
+        # The legacy platforms still independently certify nonlinear safety.
+        # NAVSIM audit-only must not accept an unconverged QP iterate with an
+        # arbitrary primal residual merely because it contains finite numbers.
         eligible=bool(stats.get('success',False)) or status in ('maximum iterations reached','solved inaccurate')
+        primal_limit=max(1e-5,10*self.tolerance)
+        if self.require_feasible_iterate:
+            eligible=bool(eligible and self.last_diagnostics['valid']
+                and self.last_diagnostics['scaled_primal_violation']<=primal_limit)
+        self.last_diagnostics.update(candidate_eligible=eligible,
+            feasible_iterate_required=self.require_feasible_iterate,
+            scaled_primal_limit=primal_limit if self.require_feasible_iterate else None,
+            solver_reported_success=bool(stats.get('success',False)),
+            candidate_rejection_reason=(None if eligible else
+                'nonfinite_qp_iterate_or_residual' if not self.last_diagnostics['valid'] else
+                'scaled_primal_residual_exceeds_limit' if self.require_feasible_iterate
+                    and self.last_diagnostics['scaled_primal_violation']>primal_limit else
+                'solver_status_not_eligible'))
         return step,eligible,status,time.perf_counter()-begin
 
 

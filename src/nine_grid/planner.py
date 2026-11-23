@@ -1,4 +1,4 @@
-"""参考走廊跟踪MPC：正常轨迹安全优先；无安全解时单列最小风险制动。"""
+"""参考走廊跟踪MPC；NAVSIM可显式采用不替换候选的规划后诊断策略。"""
 from __future__ import annotations
 
 import time
@@ -100,6 +100,91 @@ def _project_executable_controls(controls,speed,dt,min_a,max_a,max_delta):
         result[index,1]=np.clip(result[index,1],-max_delta,max_delta)
         speed=max(0.,speed+result[index,0]*dt)
     return result
+
+
+def _project_navsim_execution_controls(controls,speed,dt,min_a,max_a,max_delta,
+                                      previous_control,max_jerk,max_rate,max_lat,wheelbase,rear):
+    """Project control intent into reachable actuator bounds, never road/collision audits.
+
+    Lateral acceleration uses the same centre bicycle equation as Dynamics,
+    at both ends of each constant-acceleration segment. An already infeasible
+    observed state cannot be repaired instantaneously: record the reachable
+    recovery rather than silently jumping steering or acceleration.
+    """
+    result=np.asarray(controls,float).copy();last=np.asarray(previous_control,float).copy()
+    if (result.ndim!=2 or result.shape[1]!=2 or not np.isfinite(result).all()
+            or last.shape!=(2,) or not np.isfinite(last).all()):
+        raise ValueError('NAVSIM执行控制及前次控制必须有限')
+    ratio=rear/wheelbase;recovery=[]
+    def lateral_steering_limit(peak_speed):
+        if peak_speed<=1e-10:return max_delta
+        sine=min(1.,max_lat*rear/peak_speed**2)
+        return min(max_delta,float(np.arctan(np.tan(np.arcsin(sine))/ratio)))
+    for index,wanted in enumerate(result.copy()):
+        release=brake_acceleration_limit(max(0.,speed),dt,max_jerk)
+        physical_lower=max(min_a,-release)
+        low_a=max(physical_lower,last[0]-max_jerk*dt)
+        high_a=min(max_a,last[0]+max_jerk*dt)
+        issues=[]
+        if low_a>high_a+1e-10:
+            acceleration=float(np.clip(last[0],physical_lower,max_a))
+            issues.append('observed_acceleration_outside_nonreverse_jerk_release_envelope')
+            low_a=high_a=acceleration
+        else:
+            acceleration=float(np.clip(wanted[0],low_a,max(low_a,high_a)))
+        low_d=max(-max_delta,last[1]-max_rate*dt)
+        high_d=min(max_delta,last[1]+max_rate*dt)
+        if low_d>high_d+1e-10:
+            low_d=high_d=float(np.clip(last[1],-max_delta,max_delta))
+            issues.append('observed_steering_outside_box_rate_reachability')
+        straightest=float(np.clip(0.,low_d,high_d))
+        peak=max(speed,speed+acceleration*dt)
+        limit=lateral_steering_limit(peak)
+        if max(low_d,-limit)>min(high_d,limit)+1e-10:
+            # Positive acceleration must not create an avoidable lateral-limit
+            # conflict. Initial speed, however, is a fixed observation.
+            curvature=abs(np.sin(np.arctan(ratio*np.tan(straightest))))/rear
+            reachable_speed=np.sqrt(max_lat/curvature) if curvature>1e-14 else np.inf
+            acceleration=float(np.clip(min(acceleration,(reachable_speed-speed)/dt),low_a,high_a))
+            peak=max(speed,speed+acceleration*dt);limit=lateral_steering_limit(peak)
+        low_lat=max(low_d,-limit);high_lat=min(high_d,limit)
+        if low_lat>high_lat+1e-10:
+            steering=straightest
+            issues.append('observed_speed_steering_requires_rate_limited_lateral_recovery')
+        else:
+            steering=float(np.clip(wanted[1],low_lat,max(low_lat,high_lat)))
+        result[index]=[acceleration,steering]
+        if issues:
+            beta=np.arctan(ratio*np.tan(steering))
+            recovery.append({'step':index,'reasons':issues,'source_speed_mps':float(speed),
+                'previous_control':last.tolist(),'selected_control':result[index].tolist(),
+                'jerk_mps3':float((acceleration-last[0])/dt),
+                'steering_rate_radps':float((steering-last[1])/dt),
+                'lateral_acceleration_peak_mps2':float(peak**2/rear*abs(np.sin(beta)))})
+        speed=max(0.,speed+acceleration*dt);last=result[index].copy()
+    return result,{'policy':'reachable_control_projection_v1','recovery_steps':recovery,
+        'recovery_required':bool(recovery),'road_collision_rule_audits_used':False}
+
+
+def _navsim_speed_recovery_envelope(n,speed,dt,speed_limit,min_a,max_a,max_delta,
+                                    previous_control,max_jerk,max_rate,max_lat,wheelbase,rear):
+    """Earliest reachable legal speed, without pretending the observation is legal.
+
+    This changes only the hard QP bound during unavoidable initial overspeed.
+    The actual speed-limit residual, objective and safety diagnostics stay true.
+    """
+    requested=np.tile([min_a,0.],(n,1))
+    braking,projection=_project_navsim_execution_controls(requested,speed,dt,min_a,max_a,
+        max_delta,previous_control,max_jerk,max_rate,max_lat,wheelbase,rear)
+    minimum_speed=np.maximum(0.,speed+np.cumsum(braking[:,0])*dt)
+    upper=np.maximum(speed_limit,minimum_speed)
+    return upper,{'policy':'earliest_jerk_limited_speed_recovery_v1',
+        'initial_speed_mps':float(speed),'true_speed_limit_mps':float(speed_limit),
+        'hard_upper_speed_mps':upper.tolist(),'minimum_reachable_speed_mps':minimum_speed.tolist(),
+        'braking_controls':braking.tolist(),'initial_overspeed_mps':max(0.,float(speed-speed_limit)),
+        'first_legal_step':next((i+1 for i,v in enumerate(minimum_speed) if v<=speed_limit+1e-8),None),
+        'actuator_recovery_required':projection['recovery_required'],
+        'true_limit_diagnostics_and_cost_unchanged':True,'road_collision_constraints_unchanged':True}
 
 
 def _validate_prediction_input(scene, predictions, horizon):
@@ -266,6 +351,21 @@ class Planner:
 
     def solve(self,scene,predictions,answer=None,*,_brake_only=False):
         started=time.perf_counter();p=self.p;n=self.n;dt=self.dt
+        navsim=self.config.get('platform')=='navsim'
+        execution_policy=self.config.get('navsim_execution',{}) if navsim else {}
+        postsolve_policy=execution_policy.get('postsolve_safety_policy','enforce')
+        if postsolve_policy not in ('enforce','audit_only'):
+            raise ValueError('未知的规划后安全审核策略')
+        audit_only=postsolve_policy=='audit_only'
+        actor_tracking_reserve_m=execution_policy.get('actor_tracking_margin_m',0.)
+        if (type(actor_tracking_reserve_m) not in (int,float)
+                or not np.isfinite(actor_tracking_reserve_m) or actor_tracking_reserve_m<0.):
+            raise ValueError('实体跟踪裕量必须是有限非负米数')
+        road_tracking_reserve_m=execution_policy.get('road_tracking_margin_m',0.)
+        if (type(road_tracking_reserve_m) not in (int,float)
+                or not np.isfinite(road_tracking_reserve_m) or road_tracking_reserve_m<0.):
+            raise ValueError('道路执行跟踪裕量必须是有限非负米数')
+        original_scene,original_predictions=scene,predictions
         _validate_prediction_input(scene,predictions,n*dt)
         # 完整输入必须先验明；局部MPC视图不污染模型、检索、反思和独立审计。
         scene,predictions,object_selection=planning_view(scene,predictions,self.config,answer)
@@ -283,7 +383,8 @@ class Planner:
         dynamics_key=(n,dt,self.substeps,wheelbase,rear)
         if not hasattr(self,'dynamics') or self.dynamics_key!=dynamics_key:
             self.dynamics=Dynamics(n,dt,self.substeps,scene.ego.length,wheelbase,rear);self.dynamics_key=dynamics_key
-            self.qp=QuadraticSolver(2*n,int(p.get('qp_max_iterations',600)),float(p.get('qp_tolerance',1e-6)))
+            self.qp=QuadraticSolver(2*n,int(p.get('qp_max_iterations',600)),float(p.get('qp_tolerance',1e-6)),
+                require_feasible_iterate=bool(navsim and audit_only))
             build_seconds=self.dynamics.build_seconds
         ego_s=project_polyline(origin,scene.route,scene.diagnostics.get("route_s"),angle)[0]
         full_arc=polyline_lengths(scene.route)
@@ -303,15 +404,38 @@ class Planner:
                 self.previous=None
         if _brake_only:
             lane_table={lane.id:lane for lane in scene.lanes}
-            own_lane=self.references._lane(scene,lane_table)
+            # NAVSIM's route is the public navigation path. A geometrically
+            # nearby lane label can belong to another junction branch.
+            own_lane=None if navsim else self.references._lane(scene,lane_table)
             seed_world=scene.route if own_lane is None else self.references._continuation(scene,own_lane,lane_table)
-            selection=LocalReferenceResult(seed_world,0,{'phase':'brake_only','selected_source':'navigation_consistent_current_lane','maneuver_active':False})
+            selection=LocalReferenceResult(seed_world,0,{'phase':'brake_only',
+                'selected_source':'public_navigation' if navsim else 'navigation_consistent_current_lane','maneuver_active':False})
         elif active_goal is not None:
             try:
                 seed_world=goal_seed_path(scene,active_goal)
             except (ValueError,FloatingPointError) as error:
                 self.goals._end(active_goal,'invalid','当前物理状态无法连接原目标：'+str(error),scene)
                 self.references.reset_intent()
+                if audit_only:
+                    # A rejected model geometry is not a braking decision.
+                    # Restart base planning from the original perception bundle,
+                    # so model-attention filtering cannot leak into the fallback.
+                    goal_evidence=self.goals.diagnostics()
+                    self.clear_semantic_guidance()
+                    self._has_solved=not cold_start
+                    # No answer and no active goal make this retry terminal with
+                    # respect to semantic fallback; numerical errors still fail.
+                    result=self.solve(original_scene,original_predictions,None)
+                    self.goals.events=goal_evidence['events']+self.goals.events
+                    result.diagnostics.update(goal_state=self.goals.diagnostics(),goal_events=self.goals.events,
+                        semantic_enabled=False,active_goal=False,
+                        semantic_fallback={'reason':'local_goal_geometry_invalid','error_type':type(error).__name__,
+                            'detail':str(error),'policy':'clear_entire_semantics_same_mpc_base',
+                            'source_goal_id':active_goal['goal_id'],'model_semantics_applied':False,
+                            'goal_state_before_base':goal_evidence,'input_scope':'original_perception_before_planning_view'})
+                    result.diagnostics['planning_seconds']=time.perf_counter()-started
+                    result.diagnostics['deadline_missed']=result.diagnostics['planning_seconds']>result.diagnostics['deadline_budget_seconds']
+                    return result
                 result=self.emergency_brake(scene,predictions,'目标几何连接失效：'+str(error))
                 result.diagnostics['goal_state']=self.goals.diagnostics()
                 result.diagnostics['goal_events']=self.goals.events
@@ -420,10 +544,17 @@ class Planner:
         attention_rows=answer.attention if answer is not None else object_selection.get('attention_signature',[])
         attention={str(a.get('id',a.get('entity_id',''))):1/max(1,int(a.get('rank',i+1))) for i,a in enumerate(attention_rows)}
         clearance=float(risk_cfg.get('body_clearance_margin_m',.05))
+        # Reserve for execution tracking error applies to traffic entities only;
+        # it must not silently expand lane markings or shrink the drivable map.
+        actor_clearance=clearance+actor_tracking_reserve_m
         increment=float(risk_cfg.get('attention_increment',1.))
         max_a=float(p.get('acceleration_max_mps2',3));min_a=float(p.get('acceleration_min_mps2',-6))
         max_delta=float(p.get('steering_abs_max_rad',.6));max_jerk=float(p.get('jerk_abs_max_mps3',8));max_rate=float(p.get('steering_rate_abs_max_radps',.8));max_lat=float(p.get('lateral_acceleration_abs_max_mps2',4.89))
         max_speed=min(float(p.get('maximum_speed_mps',33.3333333)),float(scene.rules.get('speed_limit',33.3333333)))
+        speed_hard_upper=np.full(n,max_speed);speed_recovery=None
+        if navsim and speed>max_speed+speed_tolerance:
+            speed_hard_upper,speed_recovery=_navsim_speed_recovery_envelope(n,speed,dt,max_speed,
+                min_a,max_a,max_delta,previous_control,max_jerk,max_rate,max_lat,wheelbase,rear)
         weights=p.get('weights',{});norm=p.get('normalization',{})
         penalties={'actor_clearance':2000.,'road_clearance':500.,'noncrossable_line_clearance':100.,
                    'yield_stop_line':100.,'speed_limit':10.,'lateral_acceleration':5.,'following_headway':20.}
@@ -564,7 +695,11 @@ class Planner:
         shifted_steps=min(n-1,max(0,int(round(age/dt)))) if warm else 0
         controls=(np.vstack((cached[shifted_steps:],np.repeat(cached[-1:],shifted_steps,axis=0)))
                   if warm else seed())
-        project=lambda value:_project_executable_controls(value,speed,dt,min_a,max_a,max_delta)
+        def execution_projection(value):
+            return _project_navsim_execution_controls(value,speed,dt,min_a,max_a,max_delta,
+                previous_control,max_jerk,max_rate,max_lat,wheelbase,rear)
+        project=(lambda value:execution_projection(value)[0]) if navsim else (
+            lambda value:_project_executable_controls(value,speed,dt,min_a,max_a,max_delta))
         controls=project(controls)
         initial_body=shapely.polygons(body_vertices(initial[None,:],scene.ego.length,scene.ego.width))[0]
         initial_safety={'on_road':bool(shapely.covers(accepted_road,initial_body)),
@@ -575,7 +710,7 @@ class Planner:
                 gap,_=circle_gap(initial[None,:],sample[:1,:2],actor.radius or actor.width/2,scene.ego.length,scene.ego.width)
             else:
                 gap,_=rectangle_gap(initial[None,:],sample[:1],scene.ego.length,scene.ego.width,actor.length,actor.width)
-            initial_safety['actor_clearance:'+actor.id]=bool(gap[0]>=clearance-tolerance)
+            initial_safety['actor_clearance:'+actor.id]=bool(gap[0]>=actor_clearance-tolerance)
         initial_safety['noncrossable_line']=all(initial_body.distance(item['geometry'])>=clearance-tolerance for item in physical_lines.values())
         if stop_local is not None:
             initial_safety['yield_stop_line']=bool(np.max(project_polyline(np.asarray(initial_body.exterior.coords)[:4],global_reference)[0])<=stop_local+tolerance)
@@ -605,8 +740,8 @@ class Planner:
                     distance,_=circle_gap(dense,other[:,:2],actor.radius or actor.width/2,scene.ego.length,scene.ego.width)
                 else:
                     distance,_=rectangle_gap(dense,other,scene.ego.length,scene.ego.width,actor.length,actor.width)
-                minimum=min(minimum,float(np.min(distance-clearance)))
-                actor_ok &= distance>=clearance-tolerance
+                minimum=min(minimum,float(np.min(distance-actor_clearance)))
+                actor_ok &= distance>=actor_clearance-tolerance
                 hit=np.flatnonzero(distance<0.)
                 if len(hit):
                     index=int(hit[0]);normal=other[index,:2]-dense[index,:2]
@@ -682,13 +817,16 @@ class Planner:
                 factor=np.sqrt(float(weight)/n)/scale
                 residuals.append(np.asarray(value)*factor);jacobians.append((jac,factor))
                 components[name]=components.get(name,0.)+float(weight)*float(np.sum(np.asarray(value)**2))/n/scale**2
-            def penalty(name,margin,jac,scale=1.):
+            def penalty(name,margin,jac,scale=1.,constraint_margin=None):
                 # 正部平方在零点一阶连续；穿透时保留几何导数，不使用截断APF的零梯度。
                 margin=np.asarray(margin);active=margin<0.
                 derivative=lambda c:(jac(c) if callable(jac) else np.asarray(jac))*active[:,None]
                 residual('penalty_'+name,np.minimum(margin,0.),derivative,penalties.get(name,100.),scale)
-                rows.append(jac);lower.append(-margin);upper.append(np.full(len(margin),np.inf))
-            penalty('road_clearance',road_distance.ravel()+tolerance,road_jac)
+                hard_margin=margin if constraint_margin is None else np.asarray(constraint_margin)
+                rows.append(jac);lower.append(-hard_margin);upper.append(np.full(len(margin),np.inf))
+            # Reserve is an optimization preference/constraint, never a change
+            # to the real drivable polygon or an independent postsolve veto.
+            penalty('road_clearance',road_distance.ravel()-road_tracking_reserve_m+tolerance,road_jac)
             domain_inside=field_projection['domain_valid'][1:]
             domain_margin,domain_normal=potential_geometry.domain_clearance(current[:,:2])
             penalty('potential_domain',domain_margin,
@@ -707,7 +845,8 @@ class Planner:
                         partial[:,axis]=(positive-negative)/(2*epsilon*scene.ego.width)
                     return np.einsum('ni,nij->nj',partial,c['sens'][uncovered])
                 residual('penalty_road_clearance',areas/scene.ego.width,outside_area_jac,penalties['road_clearance'])
-            penalty('speed_limit',max_speed-current[:,3],lambda c:-c['sens'][:,3],scales['speed_mps'])
+            penalty('speed_limit',max_speed-current[:,3],lambda c:-c['sens'][:,3],scales['speed_mps'],
+                    constraint_margin=speed_hard_upper-current[:,3])
             penalty('lateral_acceleration',max_lat-np.abs(lateral),
                     lambda c:-np.sign(lateral)[:,None]*lateral_jac(c),max_lat)
             rows.extend([difference@accel_selector,difference@steer_selector])
@@ -785,9 +924,9 @@ class Planner:
                     gap,partial=circle_gap(current,sample[1:,:2],actor.radius or actor.width/2,scene.ego.length,scene.ego.width)
                 else:
                     gap,partial=rectangle_gap(current,sample[1:],scene.ego.length,scene.ego.width,actor.length,actor.width)
-                penalty('actor_clearance',gap-clearance+tolerance,
+                penalty('actor_clearance',gap-actor_clearance+tolerance,
                         lambda c,partial=partial:np.einsum('ni,nij->nj',partial,c['sens']))
-                minima.append(float((gap-clearance).min()))
+                minima.append(float((gap-actor_clearance).min()))
                 source_projection={key:value[1:] for key,value in source_projections[actor.id].items()}
                 field=potential_geometry.repulsion_from_projection(field_query,source_projection,class_risk,
                     attention_gain=1.+increment*attention.get(actor.id,0.))
@@ -886,6 +1025,18 @@ class Planner:
             metrics['control_box']=control_margin
             valid=(np.isfinite(states).all() and np.isfinite(controls).all() and minima[1]>=-1e-8
                    and control_margin>=-1e-8 and np.isfinite(objective))
+            execution_constraints=None
+            if navsim:
+                projected_controls,execution_constraints=execution_projection(controls)
+                execution_constraints.update(
+                    control_projection_residual=float(np.max(np.abs(projected_controls-controls))),
+                    jerk_limit_mps3=max_jerk,steering_rate_limit_radps=max_rate,
+                    lateral_acceleration_limit_mps2=max_lat,
+                    within_nominal_limits=all(metrics[key]>=-1e-8 for key in
+                        ('nonnegative_speed','control_box','jerk','steering_rate','lateral_acceleration')),
+                    minimum_by_group={key:metrics[key] for key in ('nonnegative_speed','control_box',
+                        'jerk','steering_rate','lateral_acceleration')})
+                valid=bool(valid and execution_constraints['control_projection_residual']<=1e-8)
             dense=dense_check(controls,dense_states)
             safety_feasible=(all(initial_safety.values()) and all(value>=-(speed_tolerance if key=='speed_limit' else tolerance) for key,value in metrics.items()
                              if key!='tracking_corridor' or not is_brake)
@@ -897,6 +1048,7 @@ class Planner:
                 lower=np.concatenate(lower),upper=np.concatenate(upper),minima=metrics,valid=bool(valid),polygons=polygons,
                 following_headway_minimum=(float(np.min(headway_margin)) if np.isfinite(headway_margin).any() else None),
                 safety_feasible=bool(safety_feasible),dense_validation=dense,is_brake=bool(is_brake),
+                execution_constraints=execution_constraints,
                 violation=max(0.,-min(metrics.values()),-control_margin),goal_evidence=goal_evidence,
                 potential_invalid_samples=field_invalid)
             def linearize():
@@ -922,6 +1074,11 @@ class Planner:
 
         solver_started=time.perf_counter();budget=float(p.get('cold_start_budget_s',.5) if cold_start else p.get('solver_wall_budget_s',.1));deadline=started+budget
         def preference(value):
+            if audit_only:
+                # Keep collision, road, rule and control terms/linearized
+                # constraints in MPC. Independent nonlinear audits describe the
+                # finite optimizer candidate without acting as another planner.
+                return (not value['valid'],value['objective'])
             # 正常安全解永远优于低成本不安全解；不可行名义点只用于寻找可行改进。
             return (not value['safety_feasible'],0. if value['safety_feasible'] else value['violation'],value['objective'])
         qp_before=(self.qp.cache_builds,self.qp.cache_hits,self.qp.setup_seconds)
@@ -933,7 +1090,7 @@ class Planner:
                 'minimum_by_group':value['minima'],'cost':value['objective'],'cost_terms':value['components']})
         record_initial(nominal,nominal_source)
         initial_reselection={'evaluated':False,'selected':False}
-        if not nominal['safety_feasible']:
+        if not nominal['valid'] or (not audit_only and not nominal['safety_feasible']):
             initial_reselection.update(evaluated=True,original_violation=nominal['violation'])
             alternatives=[(nominal_source,nominal)]
             if warm:
@@ -975,6 +1132,10 @@ class Planner:
                 restoration.update(eligible=True,source=nominal_source)
         trust=np.tile([float(p.get('sqp_trust_acceleration_mps2',1.5)),float(p.get('sqp_trust_steering_rad',.15))],n)
         last_iteration_seconds=0.;iteration_history=[];termination='iteration_limit'
+        failed_qp_reseed={'policy':'same_objective_once_after_first_qp_residual',
+            'eligible':bool(audit_only and not _brake_only),'evaluated':False,'selected':False,
+            'maximum_restarts':1,'restart_count':0,'safety_audits_used_for_selection':False,
+            'shares_original_wall_budget':True,'candidates':[]}
         recovery_speed=float(p.get('warm_start_recovery_speed_mps',.3))
         recovery={'eligible':bool(warm and stop_local is None and speed<recovery_speed),
                   'speed_threshold_mps':recovery_speed,'evaluated':False,'selected':False}
@@ -995,7 +1156,51 @@ class Planner:
                 termination='qp_failure';break
             statuses.append(status);qp_seconds+=spent;iterations+=1
             if not success or not np.all(np.isfinite(step)):
-                termination='qp_failure';break
+                if (audit_only and iteration==0 and not success
+                        and getattr(self.qp,'last_diagnostics',{}).get('candidate_eligible') is False
+                        and status in ('maximum iterations reached','solved inaccurate')):
+                    failed_qp_reseed.update(trigger_status=status,
+                        trigger_qp_residuals=dict(self.qp.last_diagnostics),
+                        remaining_budget_before_s=max(0.,deadline-time.perf_counter()))
+                    if time.perf_counter()<deadline:
+                        # Reuse existing MPC initializations at the same source
+                        # frame and objective. This is neither an audit veto nor
+                        # a separate braking planner; a seed may still be unsafe.
+                        failed_qp_reseed['evaluated']=True
+                        alternatives=[(nominal_source,accepted)]
+                        seeds=([('navigation_seed',1.)] if warm else [])
+                        seeds.append(('braking_navigation_seed',0.))
+                        for source,scale in seeds:
+                            if time.perf_counter()>=deadline:break
+                            value=terms(project(seed(scale)));record_initial(value,source+'_after_rejected_qp')
+                            alternatives.append((source+'_after_rejected_qp',value))
+                        failed_qp_reseed['candidates']=[dict(source=source,
+                            objective=float(value['objective']),valid_control=bool(value['valid']))
+                            for source,value in alternatives]
+                        feasible=[item for item in alternatives if item[1]['valid']]
+                        if feasible:
+                            source,value=min(feasible,key=lambda item:preference(item[1]))
+                            if preference(value)<preference(accepted):
+                                failed_qp_reseed.update(selected=True,restart_count=1,selected_source=source,
+                                    original_objective=float(accepted['objective']),
+                                    selected_seed_objective=float(value['objective']),
+                                    selection_reason='lower_same_mpc_objective_with_valid_controls')
+                                nominal_source=source;controls=value['controls'];nominal=value;accepted=value
+                                value['initialization_source']=source
+                                value['candidate_source']='objective_reseed_initialization'
+                                failed_qp_reseed['remaining_budget_after_s']=max(0.,deadline-time.perf_counter())
+                                if iteration+1<int(p.get('solver_max_iterations',4)) and time.perf_counter()<deadline:
+                                    failed_qp_reseed['continued_sqp']=True
+                                    continue
+                                failed_qp_reseed['continued_sqp']=False
+                            else:
+                                failed_qp_reseed['selection_reason']='no_lower_objective_valid_seed'
+                    else:
+                        failed_qp_reseed['selection_reason']='original_wall_budget_exhausted'
+                termination=('qp_iterate_primal_residual' if navsim and
+                    getattr(self.qp,'last_diagnostics',{}).get('candidate_eligible') is False
+                    and status in ('maximum iterations reached','solved inaccurate') else 'qp_failure')
+                break
             candidates=[]
             evaluation_seconds=0.
             for search in range(int(p.get('sqp_line_search_steps',3))):
@@ -1053,11 +1258,11 @@ class Planner:
             if step_norm<1e-5:
                 termination='small_qp_step';break
         emergency_candidates=[]
-        if _brake_only or not accepted['safety_feasible']:
+        if _brake_only or not accepted['valid'] or (not audit_only and not accepted['safety_feasible']):
             # 与语义目标无关的本车道制动，重新积分本帧，不复用未经验收的旧控制。
             brake_reference=global_reference
             lane_table={lane.id:lane for lane in scene.lanes}
-            own=self.references._lane(scene,lane_table)
+            own=None if navsim else self.references._lane(scene,lane_table)
             if own is not None:
                 # 交叉口几何最近标签可能是直行连接段。制动仍沿已知导航
                 # 相容中心延伸，不能突然跟随错误分支，也不继承VLM目标。
@@ -1096,7 +1301,11 @@ class Planner:
                         np.clip(desired_steer,last[1]-max_rate*dt,last[1]+max_rate*dt)])
                     command=np.clip(command,[min_a,-max_delta],[max_a,max_delta])
                     trajectory.append(command);state=propagate(state,command,scene.ego.length,dt,self.substeps,wheelbase,rear);last=command
-                return np.asarray(trajectory),release_conflicts
+                commands=np.asarray(trajectory)
+                if navsim:
+                    commands,execution_recovery=execution_projection(commands)
+                    release_conflicts.extend(execution_recovery['recovery_steps'])
+                return commands,release_conflicts
             for label,deceleration,follow_lane in [('lane_service_brake',min(braking,-min_a),True),
                     ('lane_maximum_brake',-min_a,True),('heading_maximum_brake',-min_a,False)]:
                 braking_controls,release_conflicts=brake_controls(deceleration,follow_lane)
@@ -1129,10 +1338,26 @@ class Planner:
                 raise RuntimeError('当前状态不能形成有限有界制动控制，拒绝伪造有效轨迹')
             accepted=min(emergency_candidates,key=lambda item:item[0])[1]
             termination='validated_brake' if accepted['safety_feasible'] else 'emergency_braking_no_certified_solution'
-        execution_mode=('safe_brake' if accepted.get('is_brake') else 'normal') if accepted['safety_feasible'] else 'emergency_unverified'
+        execution_mode=(('safe_brake' if accepted.get('is_brake') else 'normal') if accepted['safety_feasible']
+                        else ('emergency_unverified' if accepted.get('is_brake') else 'diagnostic_unverified'))
         elapsed=time.perf_counter()-started
         diagnostics={'solver_seconds':time.perf_counter()-solver_started,'planning_seconds':elapsed,'solver_status':statuses,
             'planning_object_selection':object_selection,'execution_mode':execution_mode,
+            'postsolve_safety_policy':postsolve_policy,'postsolve_rejection_enabled':not audit_only,
+            'diagnostic_only_safety_failure':bool(audit_only and not accepted['safety_feasible'] and not accepted.get('is_brake')),
+            'braking_reference_source':'public_navigation' if navsim else 'navigation_consistent_current_lane',
+            'execution_constraints':accepted.get('execution_constraints'),
+            'initial_speed_recovery':speed_recovery,
+            'failed_qp_reseed':failed_qp_reseed,
+            'road_execution_tracking':{'reserved_margin_m':road_tracking_reserve_m,
+                'actual_min_clearance_m':accepted['minima']['road_clearance'],
+                'reserve_remaining_m':accepted['minima']['road_clearance']-road_tracking_reserve_m,
+                'reserve_is_certified_bound':False,'real_drivable_polygon_unchanged':True,
+                'actual_offroad_samples':accepted['dense_validation']['offroad_samples'],
+                'scope':'MPC_road_cost_and_linearized_constraints_only;not_independent_audit'},
+            'actor_clearance':{'body_margin_m':clearance,'execution_tracking_reserve_m':actor_tracking_reserve_m,
+                'total_margin_m':actor_clearance,'scope':'traffic_entities_only',
+                'tracking_reserve_is_certified_bound':False},
             'potential_field':{'version':'lane-frenet-center-ellipse-1.0','coordinates':'lane_frenet',
                 'kernel':'(1-rho)^3*(1+3*rho+6*rho^2) for rho<1; zero otherwise',
                 'sampling_point':'ego_center','source_shape':'lane_aligned_center_ellipse',
@@ -1175,6 +1400,7 @@ class Planner:
             'vehicle_dynamics':{'reference_point':'geometric_center','wheelbase_m':wheelbase,
                 'rear_axle_to_center_m':rear,'geometry_source':'platform' if scene.ego.wheelbase_m is not None else 'highway_legacy'},
             'solver_backend':'casadi_osqp_realtime_sqp','symbolic_build_seconds':build_seconds,'qp_seconds':qp_seconds,'sqp_iterations':iterations,
+            'last_qp_residuals':dict(getattr(self.qp,'last_diagnostics',{})),
             'optimizer_termination':termination,'iteration_history':iteration_history,
             'warm_start_recovery':recovery,
             'initial_guess_source':initial_guess_source,'infeasible_initial_reselection':initial_reselection,
@@ -1207,7 +1433,7 @@ class Planner:
             accepted_initialization_source=accepted['initialization_source'],
             minimum_constraint=min(accepted['minima'].values()),constraint_minima=accepted['minima'],semantic_enabled=answer is not None,
             active_goal=active_goal is not None,goal_evaluation=accepted.get('goal_evidence'),
-            constraint_policy='safety_first_tracking_v2',trajectory_available=True,
+            constraint_policy='optimizer_constraints_with_diagnostic_postsolve_v1' if audit_only else 'safety_first_tracking_v2',trajectory_available=True,
             safety_feasible=accepted['safety_feasible'],initial_safety_checks=initial_safety,
             speed_numerical_tolerance_mps=speed_tolerance,
             hard_constraint_groups=['dynamics','acceleration','steering','nonnegative_speed','jerk','steering_rate',

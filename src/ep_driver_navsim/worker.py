@@ -24,7 +24,7 @@ from .archive import write_input_packet, serialize_retrieval
 from .resume import (build_run_identity, sample_identity, load_completed_sample,
                      begin_sample, complete_sample)
 from .memory import check_memory_disjoint, load_memory_snapshot
-from .model import StructuredServerVisionClient, structured_response_format
+from .model import NoLegalGoalReference, StructuredServerVisionClient, structured_response_format
 from nine_grid.contracts import Actor, Lane, SceneSnapshot, RetrievalResult, plain
 from nine_grid.configuration import validate_config
 from nine_grid.models import (VisionClient, load_system_prompts, build_prompt, parse_answer,
@@ -42,6 +42,28 @@ def planning_config(parameters, dino_model):
     config = copy.deepcopy(parameters)
     config["platform"] = "navsim"
     config["scenario"] = "navsim"
+    # NAVSIM executes the submitted four-second trajectory. Its independent
+    # audits describe that whole submission; they do not replace the optimizer's
+    # finite best candidate with a second, separately selected braking plan.
+    supplied_policy = config.get("navsim_execution", {})
+    if not isinstance(supplied_policy, dict):
+        raise ValueError("NAVSIM execution policy must be a mapping")
+    policy = {"postsolve_safety_policy": "audit_only", "audit_horizon_s": HORIZON_S,
+              "actor_tracking_margin_m": .75, "road_tracking_margin_m": .2, **supplied_policy}
+    if set(policy) != {"postsolve_safety_policy", "audit_horizon_s", "actor_tracking_margin_m", "road_tracking_margin_m"}:
+        raise ValueError("Unknown NAVSIM execution policy setting")
+    if policy["postsolve_safety_policy"] != "audit_only":
+        raise ValueError("NAVSIM postsolve_safety_policy must be audit_only")
+    if (type(policy["audit_horizon_s"]) not in (int, float)
+            or not np.isclose(policy["audit_horizon_s"], HORIZON_S, rtol=0, atol=1e-10)):
+        raise ValueError("NAVSIM execution audit must cover the complete four-second submission")
+    margin = policy["actor_tracking_margin_m"]
+    if type(margin) not in (int, float) or not np.isfinite(margin) or margin < 0:
+        raise ValueError("NAVSIM actor tracking margin must be finite and nonnegative")
+    road_margin = policy["road_tracking_margin_m"]
+    if type(road_margin) not in (int, float) or not np.isfinite(road_margin) or road_margin < 0:
+        raise ValueError("NAVSIM road tracking margin must be finite and nonnegative")
+    config["navsim_execution"] = policy
     config["perception"]["fully_occluded_in_current_planning"] = True
     config["mpc"]["horizon_steps"] = PLANNING_STEPS
     config["mpc"]["step_s"] = PLANNING_STEP_S
@@ -144,40 +166,56 @@ class NumericalPipeline:
             retrieved = retrieve(reps, self.records, self.memory_snapshot_id, self.config)
             timing["retrieval_s"] = time.perf_counter() - tick
         answer, model_error, model_error_detail, raw = None, None, None, None
+        model_preparation_fallback = None
+        model_call_attempts = 0
+        model_request_sent = False
         response_format = None
         scoped_for_model, _ = perception_scene(scene, self.config)
         if self.fast.enabled:
+            tick = time.perf_counter()
+            attempts_before = int(getattr(self.fast, "attempts", 0))
             structured = self.settings.get("structured_model_output", False)
             # Cache before build_prompt: prompt, request schema and strict parser
             # must use this exact original-frame reference and configured limits.
             reference = _goal_reference(scoped_for_model, self.config) if structured else None
-            if structured:
-                response_format = structured_response_format(scoped_for_model, self.config, reference)
-                write_json(root / "model_response_format.json", response_format)
+            # Frame/source/image integrity remains a hard input error, even if a
+            # valid numerical base plan could be produced without model semantics.
+            images = model_image_paths(scene, reps)
             prompt = ("评测输入条件：NAVSIM特权输入基线，使用当前及历史交通对象、车道地图、导航和当前灯态真值。"
                       "本帧候选真值不判断遮挡；只从给定候选ID中选择最多3个关注对象。"
                       "禁止推测任何未提供的未来真值。\n"
                       + build_prompt(scoped_for_model, reps, retrieved))
             (root / "model_prompt.txt").write_text(prompt, encoding="utf-8")
-            tick = time.perf_counter()
             try:
-                images = model_image_paths(scene, reps)
-                raw = (self.fast.call_structured(prompt, images, response_format) if structured
-                       else self.fast.call(prompt, images))
-            except Exception as exc:
-                # Follow existing EP-Driver failure policy. It remains visible in
-                # evidence, and official evaluation still scores the base fallback.
-                # Exception text may contain provider URLs or credentials.
-                model_error = type(exc).__name__
+                if structured:
+                    response_format = structured_response_format(scoped_for_model, self.config, reference)
+            except NoLegalGoalReference as exc:
+                # Only an explicitly unavailable semantic reference/goal interval
+                # skips HTTP. It does not request braking or alter the base MPC.
+                model_error, model_error_detail = type(exc).__name__, str(exc)
+                model_preparation_fallback = dict(reason=exc.reason_code,
+                    detail=exc.detail, stage="structured_request_preparation", request_sent=False,
+                    policy="same_base_mpc_without_model_semantics")
+                (root / "model_prompt.txt").write_text(prompt + "\n模型请求未发送：" +
+                    json.dumps(model_preparation_fallback, ensure_ascii=False), encoding="utf-8")
             else:
+                if response_format is not None:
+                    write_json(root / "model_response_format.json", response_format)
                 try:
-                    answer = parse_answer(raw, scoped_for_model, config=self.config, reference=reference)
-                except ValueError as exc:
-                    # Local validation reasons are inspectable; remote exception
-                    # text is never copied into evidence or worker replies.
-                    model_error, model_error_detail = type(exc).__name__, str(exc)
+                    raw = (self.fast.call_structured(prompt, images, response_format) if structured
+                           else self.fast.call(prompt, images))
                 except Exception as exc:
+                    # Remote exception text may contain URLs or credentials.
                     model_error = type(exc).__name__
+                else:
+                    try:
+                        answer = parse_answer(raw, scoped_for_model, config=self.config, reference=reference)
+                    except ValueError as exc:
+                        model_error, model_error_detail = type(exc).__name__, str(exc)
+                    except Exception as exc:
+                        model_error = type(exc).__name__
+            model_call_attempts = int(getattr(self.fast, "attempts", 0)) - attempts_before
+            model_request_sent = model_call_attempts > 0
             timing["model_s"] = time.perf_counter() - tick
         tick = time.perf_counter()
         scoped, predictions = prepare_planning_context(scene, self.config, answer=answer)
@@ -194,12 +232,14 @@ class NumericalPipeline:
         timing["reference_s"] = time.perf_counter() - tick
         tick = time.perf_counter()
         quality = evaluate(scoped, plan, baseline, predictions, self.config)
-        audit = execution_audit(scoped, plan, predictions, self.config)
+        audit = execution_audit(scoped, plan, predictions, self.config,
+            execution_horizon_s=self.config["navsim_execution"]["audit_horizon_s"])
         timing["internal_quality_s"] = time.perf_counter() - tick
-        if audit.get("alarm") and plan.valid:
-            plan = planner.emergency_brake(scoped, predictions, "independent_predicted_execution_alarm", answer=answer)
-            quality = evaluate(scoped, plan, baseline, predictions, self.config)
-            audit = execution_audit(scoped, plan, predictions, self.config)
+        audit.update(policy="diagnostic_only", veto_enabled=False,
+                     submission_replaced=False, source="submitted_optimizer_candidate",
+                     executed_policy="完整四秒提交独立诊断；不否决或替换MPC输出")
+        semantic_fallback=plan.diagnostics.get("semantic_fallback")
+        model_semantics_applied=answer is not None and semantic_fallback is None
         checked_horizon = horizon_contract(self.config,
             plans=dict(plan=plan, reference=baseline),
             predictions=dict(prediction=predictions, reference_prediction=base_predictions))
@@ -210,6 +250,9 @@ class NumericalPipeline:
         evidence = dict(identity=packet["identity"], input_condition=packet["input_condition"],
             parameters_sha256=config_hash, parameters=self.config, timing_s=timing,
             model_answer=plain(answer), model_error=model_error, model_error_detail=model_error_detail, model_raw=raw,
+            model_preparation_fallback=model_preparation_fallback,
+            model_call_attempts=model_call_attempts, model_request_sent=model_request_sent,
+            model_semantics_applied=model_semantics_applied, model_planning_fallback=plain(semantic_fallback),
             structured_model_output=self.settings.get("structured_model_output", False),
             model_response_format_sha256=digest(response_format) if response_format else None,
             retrieval=serialize_retrieval(retrieved, root), memory_snapshot_id=self.memory_snapshot_id,
@@ -232,7 +275,11 @@ class NumericalPipeline:
         result = dict(poses=poses.tolist(), frame_id=scene.frame_id, sampling=dict(horizon_s=4.0, interval_s=0.5),
                       execution_mode=plan.diagnostics.get("execution_mode"), timing_s=timing,
                       safety_feasible=plan.diagnostics.get("safety_feasible"), evidence=str(root / "planning_evidence.json"))
-        result["condition_audit"] = dict(model_requested=self.fast.enabled, model_answer_valid=answer is not None,
+        result["condition_audit"] = dict(model_requested=self.fast.enabled, model_answer_valid=model_semantics_applied,
+            model_answer_parsed_valid=answer is not None, model_semantics_applied=model_semantics_applied,
+            model_planning_fallback=plain(semantic_fallback),
+            model_preparation_fallback=model_preparation_fallback,
+            model_call_attempts=model_call_attempts, model_request_sent=model_request_sent,
             model_error=model_error, model_error_detail=model_error_detail,
             structured_model_output=self.settings.get("structured_model_output", False),
             retrieval_enabled=self.settings["retrieve"],

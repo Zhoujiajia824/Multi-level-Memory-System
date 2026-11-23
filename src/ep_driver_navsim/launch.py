@@ -19,6 +19,13 @@ from .protocol import digest, write_json
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def evaluation_worker_count(value=1, platform=None):
+    """Bound official process parallelism; Windows remains sequential."""
+    if type(value) is not int or not 1 <= value <= 8:
+        raise ValueError("evaluation_workers must be an integer between 1 and 8")
+    return 1 if (platform or sys.platform) == "win32" else value
+
+
 def source_fingerprint(root, subdir="navsim"):
     root = Path(root).resolve()
     files = sorted((p for p in (root / subdir).rglob("*") if p.is_file() and p.suffix in (".py", ".yaml")),
@@ -113,8 +120,10 @@ def prepare_settings(config_path, split_override=None, output_override=None, bev
                     prompts_config="config/prompts.yaml", split="warmup_two_stage", fast="off", retrieve=False,
                     memory_read_dir=None, desired_speed_mps=10.0, map_radius_m=160.0,
                     dino_device="cpu", timeout_s=600.0, bev_video=True, resume=True,
-                    model_revision=None, model_service={}, structured_model_output=False)
+                    model_revision=None, model_service={}, structured_model_output=False,
+                    evaluation_workers=1)
     settings = dict(defaults, **settings)
+    settings["evaluation_workers"] = evaluation_worker_count(settings["evaluation_workers"])
     if split_override:
         settings["split"] = split_override
     if output_override:
@@ -197,6 +206,7 @@ def prepare_settings(config_path, split_override=None, output_override=None, bev
 def environment(settings):
     env = dict(os.environ)
     env.pop("EP_NAVSIM_REPLAY_SETTINGS", None)
+    env.pop("EP_NAVSIM_EVALUATION_WORKERS", None)
     env.update(OPENSCENE_DATA_ROOT=settings["data_root"], NUPLAN_MAPS_ROOT=settings["maps_runtime_root"],
                NUPLAN_MAP_VERSION="nuplan-maps-v1.0", NAVSIM_DEVKIT_ROOT=settings["sdk_root"],
                NAVSIM_EXP_ROOT=str(Path(settings["output_dir"]).parent),
@@ -207,6 +217,7 @@ def environment(settings):
 
 def scoring_environment(settings):
     env = environment(settings)
+    env["EP_NAVSIM_EVALUATION_WORKERS"] = str(evaluation_worker_count(settings.get("evaluation_workers", 1)))
     # This observer only exports the official scorer's already computed output.
     # It is installed before the unchanged official script imports pdm_score.
     if settings["bev_video"]:
@@ -294,9 +305,11 @@ def official_command(settings, cache=False):
     # These are direct Hydra overrides of the official entry point; no local
     # scoring formula, custom aggregation or changed traffic policy is used.
     quote = lambda value: json.dumps(str(value).replace("\\", "/"))
+    workers = 1 if cache else evaluation_worker_count(settings.get("evaluation_workers", 1))
     command = [settings["sdk_python"], "-m", "ep_driver_navsim.sdk_bootstrap",
         str(sdk / "navsim/planning/script" / script),
-        "train_test_split=" + settings["split"], "worker=sequential", "gpu=false",
+        "train_test_split=" + settings["split"],
+        "worker=" + ("single_machine_thread_pool" if workers > 1 else "sequential"), "gpu=false",
         "navsim_log_path=" + quote(Path(settings["data_root"]) / "navsim_logs/test"),
         "original_sensor_path=" + quote(Path(settings["data_root"]) / "sensor_blobs/test"),
         "synthetic_sensor_path=" + quote(Path(settings["data_root"]) / settings["split"] / "sensor_blobs"),
@@ -305,6 +318,8 @@ def official_command(settings, cache=False):
     if cache:
         command += ["force_feature_computation=false"]
     else:
+        if workers > 1:
+            command += ["worker.use_process_pool=true", "worker.max_workers=" + str(workers)]
         command += ["agent._target_=ep_driver_navsim.agent.EPDriverPrivilegedAgent",
                     "+agent.settings_path=" + quote(settings["settings_path"]),
                     "+agent.core_python=" + quote(settings["core_python"]),
@@ -377,6 +392,8 @@ def main():
         return render_existing(args.config, args.output_dir, args.token)
     if args.token:
         parser.error("--token only applies to rendering saved traces")
+    if args.action == "smoke" and args.output_dir is None:
+        args.output_dir = str(ROOT / "test" / "artifacts" / "navsim" / ("smoke_" + str(time.time_ns())))
     settings = prepare_settings(args.config, args.split, args.output_dir, args.bev_video)
     print("Input condition:", INPUT_CONDITION, "(NOT standard sensor-only)", flush=True)
     print("Official split:", settings["split"], "original:", settings["original_count"],

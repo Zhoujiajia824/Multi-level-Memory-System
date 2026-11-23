@@ -34,7 +34,7 @@ def generate(base, destination, profile, revision, base_url, model, split="warmu
         # The generated files will be copied/published under the branch's config directory.
         model_reference = "config/" + model_path.name
     elif profile == "local":
-        output = "outputs/navsim/bringup/" + split
+        output = "test/artifacts/navsim/local/" + split
         memory = "E:/driving_memory_workspace/libraries/driving_experience"
         model_reference = str(model_path)
     else:
@@ -42,11 +42,12 @@ def generate(base, destination, profile, revision, base_url, model, split="warmu
     settings = dict(template, split=split, resume=True, model_revision=revision,
         timeout_s=3600.0, bev_video=True,
         navigation_preflight_workers=8 if profile == "server" else 1,
+        evaluation_workers=4 if profile == "server" else 1,
         model_service=dict(image_limit=9, max_pixels_per_image=602112, max_model_len=16384),
         models_config=model_reference)
     destination.mkdir(parents=True, exist_ok=True)
     models = dict(fast=dict(backend="server", base_url=base_url, model=model,
-                           api_key_env="FAST_VLM_API_KEY", timeout_s=180, max_tokens=1024),
+                           api_key_env="FAST_VLM_API_KEY", timeout_s=180, max_tokens=4096),
                   reflection=dict(backend="off"))
     model_path.write_text(yaml.safe_dump(models, allow_unicode=True, sort_keys=False), encoding="utf-8")
     for path, name, enabled, retrieve in zip(files[1:], ("A_base", "B_model", "C_model_memory"),
@@ -60,7 +61,7 @@ def generate(base, destination, profile, revision, base_url, model, split="warmu
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-config", default="config/navsim.local.json")
-    parser.add_argument("--destination", default="config")
+    parser.add_argument("--destination", help="Defaults to test/config for local bringup, config for server")
     parser.add_argument("--profile", choices=("local", "server"), required=True)
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
@@ -68,7 +69,8 @@ def main():
     parser.add_argument("--split", choices=("warmup_two_stage", "navhard_two_stage"), default="warmup_two_stage")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
-    for path in generate(args.base_config, args.destination, args.profile, args.model_revision,
+    destination = args.destination or ("test/config" if args.profile == "local" else "config")
+    for path in generate(args.base_config, destination, args.profile, args.model_revision,
                          args.base_url, args.model, args.split, args.overwrite):
         print(path)
 

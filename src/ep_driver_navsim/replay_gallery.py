@@ -3,7 +3,7 @@ import html
 import json
 from pathlib import Path
 
-from .protocol import write_json
+from .protocol import write_bytes, write_json
 from .replay_render import RENDERER_VERSION
 
 
@@ -99,7 +99,7 @@ document.querySelectorAll('#rows tr').forEach(r=>r.hidden=!r.textContent.toLower
     document = (document.replace("%(complete)d", str(complete)).replace("%(legacy)d", str(legacy)).replace("%(failed)d", str(failed))
                 .replace("%(rows)s", "\n".join(rows)))
     target = folder / "index.html"
-    temporary = folder / "index.html.tmp"
-    temporary.write_text(document, encoding="utf-8")
-    temporary.replace(target)
+    # Official process workers can refresh together; every publisher needs its
+    # own temporary file. The final scoring refresh produces the complete view.
+    write_bytes(target, document.encode("utf-8"))
     return str(target)

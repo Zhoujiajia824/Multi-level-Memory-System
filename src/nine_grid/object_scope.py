@@ -73,6 +73,35 @@ def adjacent_road_evidence(scene, current, lanes, side, tolerance=.3):
 def lane_role_geometry(scene, current_lane_id=None, front_m=40., rear_m=20.):
     """返回角色链、邻道权限、地图归属缓存；不读取任何对象隐藏路线。"""
     lanes = {lane.id: lane for lane in scene.lanes}
+    from .navigation_initialization import initialization_geometry
+    recovery = initialization_geometry(scene) if current_lane_id is None else None
+    if recovery is not None:
+        cache = {key:(lane,Polygon(lane.polygon),LineString(lane.center))
+                 for key,lane in lanes.items() if len(lane.polygon)>=3 and len(lane.center)>=2}
+        for key,(polygon,center) in recovery['native_geometry'].items():
+            cache[key] = lanes[key],polygon,center
+        reason = dict(known=False,exists=None,crossable=None,
+                      reason='initialization_recovery_no_current_shared_boundary_permission')
+        # This legacy field names the exact registered area, including an
+        # explicitly unverified reference; it does not certify vehicle motion.
+        trace = dict(points=scene.route, lane_ids=recovery['lane_ids'],shape=recovery['corridor'],
+            validated_corridor=recovery['corridor'],
+            ego_s=project(scene.route,scene.ego.position)[0], decisions=[],
+            current_lane_association=recovery['evidence'], navigation_connections=[dict(
+                from_lane_id=scene.ego.lane_id,to_lane_id=recovery['navigation_lane_id'],
+                shape=recovery['shape'],kind=('validated_initialization_recovery' if
+                    scene.diagnostics['navigation_initialization']['status']=='active' else 'reference_only_unverified_initialization'),
+                reference_quality=recovery['reference_quality']),*recovery['native_connections']],
+            native_forward_valid=recovery['native_forward_valid'],
+            verified_forward_until_m=recovery['verified_forward_until_m'],
+            forward_geometry_verified=recovery['native_forward_valid'],
+            native_connection_rejections=recovery['reference_quality']['native_connection_rejections'])
+        scene.diagnostics.setdefault('native_navigation_validation',{})['center']=dict(
+            forward_valid=recovery['native_forward_valid'],verified_forward_until_m=recovery['verified_forward_until_m'],
+            required_forward_m=max(40.,float(scene.diagnostics['route_association']['required_forward_reference_m'])),
+            rejected_connections=recovery['reference_quality']['native_connection_rejections'],
+            reference_quality=recovery['reference_quality'])
+        return dict(center=trace,left=None,right=None),dict(left=reason.copy(),right=reason.copy()),cache
     # 历史导航身份可保持坐标连续，但不能代替当前物理车道的观测证据。
     active = active_navigation_connection(scene) if current_lane_id is None else None
     identity = (active['connection']['from_lane_id'] if active is not None
@@ -94,6 +123,20 @@ def lane_role_geometry(scene, current_lane_id=None, front_m=40., rear_m=20.):
                                       center_role=side == 'center')
             if side == 'center' and active is not None and traces[side] is not None:
                 traces[side]['current_lane_association'] = active['evidence']
+            if scene.scenario=='navsim' and traces[side] is not None:
+                from .navigation_initialization import native_navigation_connections
+                links = native_navigation_connections(scene,traces[side],front_m=front_m,rear_m=rear_m,
+                                                       require_forward=side=='center')
+                traces[side]['navigation_connections'].extend(links)
+                scene.diagnostics.setdefault('native_navigation_validation',{})[side] = dict(
+                    forward_valid=traces[side]['native_forward_valid'],
+                    verified_forward_until_m=traces[side]['verified_forward_until_m'],
+                    required_forward_m=traces[side]['required_forward_connection_m'],
+                    rejected_connections=traces[side]['native_connection_rejections'],
+                    reference_quality=[link['reference_quality'] for link in links if 'reference_quality' in link])
+                # Current crossability/objects remain observed facts even when
+                # an adjacent lane's later continuation is not verified.
+                traces[side]['forward_geometry_verified'] = traces[side]['native_forward_valid']
     cache = {key: (lane, Polygon(lane.polygon), LineString(lane.center))
              for key, lane in lanes.items() if len(lane.polygon) >= 3 and len(lane.center) >= 2}
     return traces, roads, cache

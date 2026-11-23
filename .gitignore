@@ -27,35 +27,12 @@
 /config/navsim.local.json
 /config/models.yaml
 
-# 只发布环境检查、实验入口和记忆管理，不上传验收/临时脚本。
+# 只发布正式运行、环境检查和数据工具，不上传回归/临时脚本。
 /scripts/*
 !/scripts/check_environment.py
-!/scripts/check_frenet_apf.py
-!/scripts/check_planner_lane_potential.py
-!/scripts/check_potential_domain_frame.py
-!/scripts/check_dense_line_constraints.py
 !/scripts/plot_lane_potential.py
-!/scripts/check_highway_model_camera.py
-!/scripts/check_model_object_scope.py
-!/scripts/check_lane_object_scope.py
-!/scripts/check_lane_body_intrusion.py
-!/scripts/check_highway_truth_scope.py
-!/scripts/check_highway_navigation_connectors.py
-!/scripts/check_navigation_connection_domain.py
-!/scripts/check_roundabout_entry_regression.py
-!/scripts/check_grid_storage.py
-!/scripts/check_grid_memory_io.py
-!/scripts/check_grid_vector_retrieval.py
 !/scripts/run_highway.py
 !/scripts/run_navsim.py
-!/scripts/check_navsim_integration.py
-!/scripts/check_navsim_score_replay.py
-!/scripts/check_navsim_replay_render.py
-!/scripts/check_navsim_replay_official.py
-!/scripts/check_navsim_warmup_recovery.py
-!/scripts/check_navsim_resume_storage.py
-!/scripts/check_navsim_official_style.py
-!/scripts/check_navsim_navigation_preflight.py
 !/scripts/export_navsim_test_assets.py
 !/scripts/prepare_navsim_runtime.py
 !/scripts/sync_navsim_viewer.py
@@ -75,6 +52,8 @@
 !/tools/
 /tools/*
 !/tools/ep_agent_viewer/
+/tools/ep_agent_viewer/tests/
+/tools/ep_agent_viewer/.cache/
 
 # 仅发布运行需要的DINOv2 Base，权重由Git LFS管理。
 /models/*
@@ -87,7 +66,8 @@
 !/models/dinov2-base/NOTICE
 !/models/dinov2-base/provenance.json
 
-# 以下文件不删除，只在本地保存。
+# 测试脚本与冒烟产物统一保留在本地，不发布。
+/test/
 /tests/
 /docs/
 !/docs/
@@ -111,5 +91,3 @@ __pycache__/
 *.swp
 .DS_Store
 Thumbs.db
-
-!/scripts/regression_model_perception_scope.py

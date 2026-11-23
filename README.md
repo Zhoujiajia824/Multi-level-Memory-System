@@ -4,20 +4,28 @@
 
 NAVSIM 固定官方 **v2.2 / 359c7f72304bfa8273e754224a213d3751bd2340**，运行未经修改的 `run_metric_caching.py` 和 `run_pdm_score.py`。后者已经包含两阶段响应交通、成对帧舒适性和官方聚合，不能另用单帧均值代替。入口检查 SDK 源码指纹、完整样本及缓存覆盖，出现缺样本、失败轨迹或无效聚合时不输出合格 benchmark 结果。
 
+服务器模型同时接收八路当前相机和一张BEV，共九图；输出额度为4096 tokens。服务的上下文还需容纳图像和完整文本输入，不能把4096当作整个上下文大小。本次九图实测输入已超过16K；服务容量应在正式评分前以真实请求验证，`model_service`元数据必须与实际启动参数一致，不能靠删图或静默裁剪输入绕过容量不足。NAVSIM结构化服务使用greedy解码，说明字段最多192字符；vLLM专用服务启用`--structured-outputs-config '{"backend":"xgrammar","disable_any_whitespace":true}'`，限制JSON字段间空白，避免greedy空白退化耗尽输出额度（字符串正文不裁剪）；目标横向范围由同帧合法候选车道几何给出保守外包，不替模型选目标、不夹紧返回值。没有合法语义参考或纵向目标区间时，保存原因并跳过HTTP，继续原基础MPC；按锚点记录实际调用尝试次数，这类回退不能作为成功模型样本复用。
+
 **输入条件是 privileged baseline，不属于标准 sensor-only 输入条件。** 规划只访问当前及历史四帧（约1.5秒）的对象标注、自车状态、当前地图/roadblock 导航、当前红灯标记与八路当前图片；不访问未来自车轨迹、未来对象标注或评分缓存。模型与预测候选为当前/可跨越邻道沿线前40米、后20米内全部对象，与当前BEV视口内车辆、自行车、行人的并集；优化使用道路范围全部对象与最多3个关注对象，独立审计保留完整候选预测，八向代表主要用于检索。一般家具类 `generic_object` 排除，锥桶、施工标志和隔离障碍作为候选，仍需通过道路范围筛选。NAVSIM 提供相邻拓扑，未提供完整车道线跨越权限；本基线明确记录“同向相邻拓扑视为可跨越”的适配假设，不能把它写成真实标线真值。红灯布尔值的反值记为 `not_red`，不虚构绿/黄灯细分。
 
-每个官方评测锚点独立重置规划器和预测状态，不跨锚点延用计划。为满足官方输出，NAVSIM 单独使用4秒、0.1秒控制网格，输出未来0.5至4秒共8个**当前后轴坐标系**位姿；先将核心质心轨迹按 Pacifica 轴距和后轴偏移换回后轴，不能直接裁剪/补齐原3秒轨迹。内部质量分和预测执行审计与官方 EPDMS 分开保存。若启用模型，模型失败时基础规划回退及错误会留证；如果没有安全解，继续保留 `emergency_unverified`，不伪装为安全候选。
+每个官方评测锚点独立重置规划器和预测状态，不跨锚点延用计划。为满足官方输出，NAVSIM 单独使用4秒、0.1秒控制网格，输出未来0.5至4秒共8个**当前后轴坐标系**位姿；先将核心质心轨迹按 Pacifica 轴距和后轴偏移换回后轴，不能直接裁剪/补齐原3秒轨迹。内部质量分和预测执行审计与官方 EPDMS 分开保存。若启用模型，模型失败时基础规划回退及错误会留证。
+
+NAVSIM 的 `navsim_execution.postsolve_safety_policy=audit_only` 保留 MPC 的避障、道路、动力学约束及势场代价，但取消求解后因独立安全诊断不通过而再次替换制动轨迹。完整4秒诊断保留碰撞、离路、越线、限速和控制约束结果；诊断未通过但可执行的候选标为 `diagnostic_unverified`，不能称作安全解。控制种子和优化步必须先满足加速度、转角、非倒车、jerk、转角速率和质心横向加速度的可达限制，再重新积分轨迹；观测初态已不可行时保留受速率限制的恢复证据，不伪造瞬时合规。初态超速时，QP硬限速采用观测速度、加速度及jerk限幅推导的最早合法恢复包络，真实限速诊断和软罚不变。未收敛且约束残差过大的QP步不作为有效优化步。只有没有数值可执行候选时才使用最小风险制动，并如实记录 `emergency_unverified`。交通实体额外保留0.75米执行跟踪裕量，道路优化保留0.2米跟踪预留；真实道路几何及独立离路诊断不变，预留不足单列记录。这些预留不是已证明的误差上界。此策略仅适用于 NAVSIM，不改变 Highway/CARLA 的执行策略。
+
+首个QP步因数值残差不合格而被拒绝时，NAVSIM最多尝试一次已有种子的重新初始化：按同一MPC目标函数比较数值可执行的导航种子和制动导航种子，共享原有时间预算与迭代上限。选择不读取安全诊断结果，未收敛的种子不会冒称QP优化成功。
+
+路口重叠区域分别保留原始几何占道推断和可向前延续的公共导航锚点；参考、对象范围、模型目标坐标及APF使用同一初始化恢复走廊。恢复只使用当前状态、已观察历史及有向地图，不读取未来轨迹。硬输入核查覆盖有限坐标、地图、有向拓扑及端点身份；参考线的整车越界、转角可行性、前后覆盖不足和远期域分片另记为`reference_quality`，不能代替规划后的安全否决。优先使用可行恢复参考，否则明确标记`reference_only_unverified`，由原MPC优化，不冒称安全轨迹。普通导航接缝只在拓扑、中心和附件自洽时构造窄连接，并裁剪到官方道路内；不把整个路口授权为势场域。不明接缝保留缺口及原因，不授权跨越它的模型目标；邻道未来连接失败不删除当前位置的合法邻道对象。NuPlan矢量车道边界记为虚拟边界和未知标线，不能当作地图提供的不可跨越实线。
 
 首次准备两个独立环境：现有 EP-Driver Python3.12 数值环境，以及官方 SDK Python3.9 环境。按 [NAVSIM 官方安装说明](https://github.com/autonomousvision/navsim/blob/v2.2/docs/install.md)取得上述固定版本 NAVSIM 与 nuPlan v1.2；SDK 环境使用 `config/navsim/sdk-requirements.txt` 的推理/评分依赖，并将两份 devkit 以 `pip install --no-deps -e <路径>` 安装。Linux 为官方支持环境；本机 Windows 短测仅增加 Linux pickle 路径兼容和无下载的 `fcntl` 导入保护，评分源码/公式不变，不能据此声称完成 Linux 全量验证。缺少地图而需要 POSIX 文件锁时会明确失败。
 
 复制 `config/navsim.example.json` 为被忽略的 `config/navsim.local.json`，填写 SDK、两个 Python、数据与真实 DINO 权重目录；不得使用 LFS 指针代替权重。原始输入来自 `navsim_logs/test` 和 `sensor_blobs/test`，合成后续输入来自对应 `*_two_stage` 目录。入口将地图矢量文件校验后复制到本地 `outputs/navsim/maps_runtime`，官方临时文件不写入原数据目录。个人配置和运行产物不提交。
 
-在本分支根目录、数值环境中逐条运行：
+在本分支根目录、数值环境中逐条运行。`test/` 中的回归脚本仅保留在本地开发工作区，不随分支发布；服务器可跳过该行，正式运行入口保留在 `scripts/`：
 
 ```bash
-python scripts/check_navsim_integration.py
+python test/check_navsim_integration.py
 python scripts/run_navsim.py check
-python scripts/run_navsim.py smoke
+python scripts/run_navsim.py smoke --output-dir test/artifacts/navsim/smoke
 python scripts/run_navsim.py cache
 python scripts/run_navsim.py evaluate
 ```
@@ -44,6 +52,8 @@ python scripts/run_navsim.py gallery --output-dir outputs/navsim/warmup/A_base_b
 默认视频导出需要支持 `libx264` 的 FFmpeg，置于 PATH 或用 `EP_NAVSIM_FFMPEG` 指定可执行文件。服务器查看既有视频不需要 SDK；从其他电脑迁来的归档若需重绘，应在 `ep_driver_navsim.replay_render` 入口显式覆盖 SDK、Python、地图和数据路径，不能直接使用原电脑的绝对路径。
 
 当前数值规划实际使用40段0.1秒控制，主规划和独立参照均覆盖4秒。最终提交0.5、1.0、…、4.0秒的8个后轴位姿，拒绝短轨迹外推或补齐。`planning_evidence.json` 中的 `horizon_contract` 可核查主时域；4.9秒预测只用于4秒轨迹及后续0.9秒TTC诊断，不表示额外提交时长。
+
+`evaluation_workers` 控制官方评分的独立进程数（1–8，默认1；服务器配置建议4），保存在冻结配置中。Windows 保持串行；Linux 并发使用官方进程池及 `fork` 继承旁路可视化观察器，不能改为共享可变评分器的线程池。缓存生成仍串行，评分公式与聚合不变。少量并发验证只检查接入，不产生完整基准成绩。
 
 默认 `resume=true`。完成样本以最后原子写入的 `sample_complete.json` 为准，复用前核对数值源码、参数、模型版本和预处理、提示词、记忆快照、实际相机内容及必要资产哈希；只有 `trajectory.json` 不足以认定完成。模型组需提供明确 `model_revision`，未通过回答校验的基础规划降级样本不复用。不固定版本的API可显式设 `resume=false`。续跑仍会重新执行官方评分和可视化，不会把旧得分套给新输入。
 
@@ -504,4 +514,4 @@ CARLA围栏、护栏、墙、杆、灯牌不当作交通障碍物。`Static/Othe
 
 highway-env每个低频模型源帧保存无规划叠加的原生俯视图，输入顺序为原生俯视图、BEV；前者世界x向右/y向下，自车不固定朝上，后者自车朝上。CARLA保持同帧六RGB拼图、BEV。所有图像绑定同一冻结帧，采图不推进仿真。`model_inputs.jsonl`记录实际入模ID、车道范围ID、BEV动态ID及范围外补充ID；完整原始快照独立留存。
 
-本地离线检查：`python scripts/regression_model_perception_scope.py`、`python scripts/check_lane_object_scope.py`、`python scripts/check_model_object_scope.py`、`python scripts/check_highway_model_camera.py`。CARLA另有`python scripts/check_carla_object_categories.py`；离线通过不代替真实模型或服务器闭环实验。
+本地离线检查：`python test/regression_model_perception_scope.py`、`python test/check_lane_object_scope.py`、`python test/check_model_object_scope.py`、`python test/check_highway_model_camera.py`。回归脚本仅保留在本地 `test/`，不随分支发布；CARLA专属对象分类检查在对应开发工作区执行。离线通过不代替真实模型或服务器闭环实验。

@@ -419,6 +419,12 @@
   "planner": {
     "backend": "mpc"
   },
+  "navsim_execution": {
+    "postsolve_safety_policy": "audit_only",
+    "audit_horizon_s": 4.0,
+    "actor_tracking_margin_m": 0.75,
+    "road_tracking_margin_m": 0.2
+  },
   "diagnostics": {
     "enabled": true,
     "dino": true,

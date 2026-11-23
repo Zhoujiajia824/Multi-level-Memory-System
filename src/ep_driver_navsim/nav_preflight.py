@@ -5,6 +5,7 @@ failure remains a failure. A report passes only after every selected token has
 been checked against its current public input and the same source/map contract.
 """
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from collections import Counter
 import hashlib
 import importlib.metadata
 import json
@@ -20,9 +21,9 @@ import traceback
 from nine_grid.paths import filesystem_path
 from .protocol import digest, write_json
 
-SCHEMA = "ep-navsim-navigation-preflight-1"
+SCHEMA = "ep-navsim-navigation-preflight-4"
 MAP_VERSION = "nuplan-maps-v1.0"
-SCOPE = "all_current_poses_public_routes_and_local_maps;no_future_trajectory_or_metric_cache"
+SCOPE = "all_current_poses_causal_yaw_rates_motion_commands_public_routes_maps_and_initialization_corridors;no_future_trajectory_or_metric_cache"
 
 
 def worker_count(settings):
@@ -74,6 +75,9 @@ def cache_contract(settings, tokens):
     adapter = {name: hashlib.sha256((source / name).read_bytes().replace(b"\r\n", b"\n")).hexdigest()
                for name in ("nav_preflight.py", "sdk_runtime.py", "input_adapter.py",
                             "protocol.py", "sdk_bootstrap.py")}
+    for name in ('navigation_initialization.py','geometry.py','potential_domain.py'):
+        adapter['nine_grid/'+name] = hashlib.sha256(
+            (source.parent/'nine_grid'/name).read_bytes().replace(b'\r\n',b'\n')).hexdigest()
     required = ("official_commit", "official_source_sha256", "map_source_sha256",
                 "scene_filter_sha256", "mapping_sha256", "numerical_source_sha256")
     if any(not settings.get(key) for key in required):
@@ -86,12 +90,12 @@ def cache_contract(settings, tokens):
         desired_speed_mps=float(settings["desired_speed_mps"]),
         map_radius_m=float(settings["map_radius_m"]),
         runtime=verified_runtime(settings),
-        semantics="pinned_get_maps_api_and_adapter_map_packet_current_rear_axle_pose_public_roadblocks",
+        semantics="pinned_map_api_current_center_from_causal_rear_axle_motion_public_route_and_validated_initialization_corridor",
         scope=SCOPE, official_metric_cache=False)
 
 
 def extract_task(loader, token):
-    """Read only the current raw row; do not construct Scene or a parent map API.
+    """Read the current raw row and preceding yaw/time; never a future row.
 
     Synthetic files use the official trusted pickle format. Deserialization is
     unavoidable, but no future row/trajectory/annotation is inspected or sent.
@@ -107,13 +111,21 @@ def extract_task(loader, token):
         if str(metadata["initial_token"]) != str(now["token"]):
             raise ValueError("Scene metadata/current frame token mismatch")
         pose = now["ego_status"]["ego_pose"]
+        previous = value['frames'][2]
+        previous_yaw = float(previous['ego_status']['ego_pose'][2])
+        velocity = now["ego_status"]["ego_velocity"]
+        command = now["ego_status"]["driving_command"]
         map_name = metadata["map_name"]
     else:
         from pyquaternion import Quaternion
         now = loader.scene_frames_dicts[token][3]
         translation = now["ego2global_translation"]
+        velocity = now["ego_dynamic_state"][:2]
+        command = now["driving_command"]
         pose = [translation[0], translation[1],
                 Quaternion(*now["ego2global_rotation"]).yaw_pitch_roll[0]]
+        previous = loader.scene_frames_dicts[token][2]
+        previous_yaw = float(Quaternion(*previous['ego2global_rotation']).yaw_pitch_roll[0])
         map_name = now["map_location"]
     if str(now["token"]) != token:
         raise ValueError("Requested navigation token differs from the current frame")
@@ -122,10 +134,19 @@ def extract_task(loader, token):
         raise ValueError("Navigation current pose must contain three finite values")
     if not isinstance(map_name, str) or not map_name:
         raise ValueError("Navigation map name is missing")
+    from .input_adapter import navigation_command,navigation_ego
+    dt = (int(now['timestamp'])-int(previous['timestamp']))/1e6
+    if not math.isfinite(previous_yaw) or dt<=0:
+        raise ValueError('Navigation history yaw/time is invalid')
+    yaw_rate = ((pose[2]-previous_yaw+math.pi)%(2*math.pi)-math.pi)/dt
+    current_ego = navigation_ego(velocity,yaw_rate)
+    current_speed = math.hypot(*current_ego['velocity'])
     return dict(token=token, map_name=map_name, map_version=MAP_VERSION, origin=pose,
                 public_roadblock_ids=[str(value) for value in now["roadblock_ids"]],
                 source_anchor_token=str(now["token"]), timestamp_us=int(now["timestamp"]),
-                history_frames=4, input_scope="current_pose_public_route_map_only")
+                current_speed_mps=current_speed, driving_command=navigation_command(command)["one_hot"],
+                rear_axle_velocity_mps=[float(x) for x in velocity],yaw_rate_rps=yaw_rate,
+                history_frames=4, input_scope="current_pose_causal_motion_command_public_route_map_only")
 
 
 def check_map_task(task, contract):
@@ -134,13 +155,24 @@ def check_map_task(task, contract):
     platform_setup()
     import numpy as np
     from nuplan.common.maps.nuplan_map.map_factory import get_maps_api
-    from .input_adapter import _map_packet
+    from .input_adapter import _map_packet,navigation_ego,validate_navigation_initialization
 
     api = get_maps_api(contract["maps_root"], task["map_version"], task["map_name"])
+    ego = navigation_ego(task['rear_axle_velocity_mps'],task['yaw_rate_rps'])
+    current_speed = math.hypot(*ego['velocity'])
+    if not math.isclose(current_speed,task['current_speed_mps'],rel_tol=0.,abs_tol=1e-8):
+        raise ValueError('Navigation preflight current-state speed differs from packet helper')
     result = _map_packet(api, np.asarray(task["origin"], float), task["public_roadblock_ids"],
-                         contract["desired_speed_mps"], contract["map_radius_m"])
+                         contract["desired_speed_mps"], contract["map_radius_m"],
+                         current_speed_mps=current_speed, driving_command=task["driving_command"])
+    ego['lane_id'] = result[-1]['observed_current_lane_id']
+    route,recovery = validate_navigation_initialization(
+        ego,result[0],result[1],result[2],result[4],result[-1],task['yaw_rate_rps'],task['token'])
+    # Store a compact causal validation result, not another copy of route/map.
+    recovery = {key:value for key,value in recovery.items() if key not in ('points_world','headings_world')}
     return dict(route_evidence=result[-1], usable_lane_count=len(result[0]),
-                route_point_count=len(result[1]), skipped_lane_ids=result[-2])
+                route_point_count=len(route), skipped_lane_ids=result[-2],
+                initialization_recovery=dict(recovery,independently_validated=True))
 
 
 def _error(exc):
@@ -165,9 +197,17 @@ def _cached(path, token, task, contract_sha):
             return None
         if record["status"] == "passed":
             evidence = record["evidence"]
+            route = evidence["route_evidence"]
             if (record["error"] is not None or evidence["usable_lane_count"] < 1
                     or evidence["route_point_count"] < 2
-                    or type(evidence["route_evidence"]["topology_correction_changed"]) is not bool):
+                    or type(route["topology_correction_changed"]) is not bool
+                    or not math.isfinite(route["forward_reference_m"])
+                    or not math.isfinite(route["required_forward_reference_m"])
+                    or route["required_forward_reference_m"] <= 0
+                    or route["forward_reference_m"] < 0
+                    or evidence['initialization_recovery']['status'] not in ('active','disabled','reference_only_unverified')
+                    or evidence['initialization_recovery']['reference_feasibility_is_input_gate'] is not False
+                    or evidence['initialization_recovery']['independently_validated'] is not True):
                 return None
         elif record["status"] == "failed":
             if not record["error"]["type"] or not isinstance(record["error"]["message"], str):
@@ -215,10 +255,18 @@ def inspect_navigation(settings, loader, map_checker=None):
         corrected = [dict(token=token, **row["evidence"]["route_evidence"])
                      for token, row in sorted(results.items()) if row["status"] == "passed"
                      and row["evidence"]["route_evidence"]["topology_correction_changed"]]
+        degraded=[dict(token=token,reasons=row['evidence']['initialization_recovery'].get('reference_quality_reasons',[]),
+                       status=row['evidence']['initialization_recovery']['status'])
+                  for token,row in sorted(results.items()) if row['status']=='passed'
+                  and row['evidence']['initialization_recovery'].get('reference_quality_reasons')]
+        reason_counts=Counter(reason for row in degraded for reason in row['reasons'])
         report = dict(schema=SCHEMA, status=("failed" if failed else "passed") if complete else "in_progress",
             complete=complete, expected_tokens=len(tokens), checked_tokens=len(results),
             pending_tokens=len(tokens) - len(results), failed_token_count=len(failed),
             failed_tokens=failed, topology_corrected_tokens=corrected,
+            degraded_reference_count=len(degraded),degraded_references=degraded,
+            reference_quality_reason_counts=dict(sorted(reason_counts.items())),
+            reference_feasibility_is_input_gate=False,
             selected_tokens_sha256=digest(tokens), checked_tokens_sha256=digest(sorted(results)),
             task_manifest_sha256=digest([[token, row["task_sha256"]] for token, row in sorted(results.items())]),
             cache_contract=contract, cache_contract_sha256=contract_sha, cache_dir=str(cache_dir.resolve()),
@@ -299,6 +347,8 @@ def inspect_navigation(settings, loader, map_checker=None):
         raise RuntimeError("NAVSIM navigation preflight failed for %d/%d tokens; see navigation_preflight.json" %
                            (report["failed_token_count"], len(tokens)))
     return dict(checked_tokens=len(tokens), failed_tokens=0, complete=True,
+                degraded_reference_count=report['degraded_reference_count'],
+                reference_quality_reason_counts=report['reference_quality_reason_counts'],
                 topology_corrected_tokens=len(report["topology_corrected_tokens"]),
                 reused_tokens=reused, computed_tokens=computed,
                 cache_contract_sha256=contract_sha, workers=workers)

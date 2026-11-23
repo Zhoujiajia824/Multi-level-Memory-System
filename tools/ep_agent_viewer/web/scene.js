@@ -5,22 +5,22 @@ import {OrbitControls} from '/vendor/OrbitControls.js';
 import {GLTFLoader} from '/vendor/loaders/GLTFLoader.js';
 import {DRACOLoader} from '/vendor/loaders/DRACOLoader.js';
 import {RoomEnvironment} from '/vendor/environments/RoomEnvironment.js';
-import {COLORS,REGION_COLORS,REGION_NAMES,BOX_EDGES,BOX_FACES,clamp,validPoint,number,shortId,disposeGroup,WorldGeometry} from './scene-geometry.js';
+import {COLORS,REGION_COLORS,REGION_NAMES,BOX_EDGES,BOX_FACES,clamp,validPoint,number,disposeGroup,WorldGeometry} from './scene-geometry.js';
 
 export class SceneRenderer{
   constructor(canvas,tooltip){
-    this.canvas=canvas;this.tooltip=tooltip;this.frame=null;this.topdown=false;this.layers={roads:true,topology:false,regions:true,objects:true,grid_matches:true,sources:true,attention:true,trajectory:true,corridor:true,goal:true};
+    this.canvas=canvas;this.tooltip=tooltip;this.frame=null;this.topdown=false;this.layers={roads:true,sidewalk:true,junction:true,crosswalk:true,topology:false,regions:true,objects:true,grid_matches:true,sources:true,attention:true,trajectory:true,corridor:true,goal:true};
     this.origin=null;this.ground=0;this.userOrbit=false;this.disposed=false;this.modelState='loading';this.roadKey=null;this.hitTargets=[];
     canvas.dataset.egoModel='loading';canvas.dataset.renderer='three-webgl';
-    this.note=document.createElement('div');this.note.className='renderer-note';this.note.style.cssText='position:absolute;bottom:43px;left:16px;font:9px "Segoe UI","Microsoft YaHei",sans-serif;color:#91aaba;letter-spacing:.2px;pointer-events:none;padding:3px 7px;border-radius:4px;background:#102130b0;z-index:2';this.note.textContent='正在加载真实车辆模型…';canvas.parentElement?.append(this.note);
+    this.note=document.createElement('div');this.note.className='renderer-note';this.note.textContent='正在加载车辆模型…';canvas.parentElement?.append(this.note);
     try{this.renderer=new THREE.WebGLRenderer({canvas,antialias:true,alpha:false,preserveDrawingBuffer:true,powerPreference:'high-performance'});}
-    catch(error){this.failed=true;canvas.dataset.renderer='webgl-unavailable';this.note.style.cssText='position:absolute;inset:0;display:grid;place-items:center;padding:30px;text-align:center;font:13px "Microsoft YaHei",sans-serif;color:#aac0d3;background:#101b29';this.note.textContent='WebGL不可用。请在支持WebGL2的浏览器中启用硬件加速；其他归档面板仍可使用。';return;}
+    catch(error){this.failed=true;canvas.dataset.renderer='webgl-unavailable';this.note.classList.add('renderer-error');this.note.textContent='WebGL不可用，请启用浏览器硬件加速。其他归档面板仍可使用。';return;}
     this.renderer.setPixelRatio(Math.min(devicePixelRatio||1,2));this.renderer.outputColorSpace=THREE.SRGBColorSpace;this.renderer.toneMapping=THREE.ACESFilmicToneMapping;this.renderer.toneMappingExposure=.94;this.renderer.shadowMap.enabled=true;this.renderer.shadowMap.type=THREE.PCFSoftShadowMap;
-    this.scene=new THREE.Scene();this.scene.background=new THREE.Color(0x0f1a27);this.scene.fog=new THREE.FogExp2(0x0f1a27,.0045);
+    this.scene=new THREE.Scene();this.scene.background=new THREE.Color(0x0f1a27);this.scene.fog=new THREE.FogExp2(0x0f1a27,.0045);canvas.dataset.sceneTheme='dark';
     this.camera=new THREE.PerspectiveCamera(43,1,.12,900);this.camera.position.set(-16,13,-8);this.orthoCamera=new THREE.OrthographicCamera(-50,50,40,-40,.1,900);this.activeCamera=this.camera;
     this.controls=new OrbitControls(this.camera,canvas);this.controls.enableDamping=true;this.controls.dampingFactor=.09;this.controls.minDistance=7;this.controls.maxDistance=190;this.controls.maxPolarAngle=Math.PI/2-.035;this.controls.minPolarAngle=.08;this.controls.screenSpacePanning=true;this.controls.target.set(8,0,0);
     this.controls.mouseButtons={LEFT:THREE.MOUSE.ROTATE,MIDDLE:THREE.MOUSE.DOLLY,RIGHT:THREE.MOUSE.PAN};this.controls.addEventListener('start',()=>{this.userOrbit=true;if(tooltip)tooltip.hidden=true;});this.controls.addEventListener('change',()=>this.render());
-    this._setupLights();this._setupGround();this.groups={};for(const name of['roads','topology','regions','objects','grid_matches','corridor','trajectory','goal']){const group=new THREE.Group();group.name=name;this.groups[name]=group;this.scene.add(group);}this.geometry=new WorldGeometry(this);
+    this._setupLights();this._setupGround();this.groups={};for(const name of['roads','sidewalk','junction','crosswalk','topology','regions','objects','grid_matches','corridor','trajectory','goal']){const group=new THREE.Group();group.name=name;this.groups[name]=group;this.scene.add(group);}this.geometry=new WorldGeometry(this);
     this.egoPivot=new THREE.Group();this.egoPivot.name='recorded-ego-model';this.scene.add(this.egoPivot);
     const pmrem=new THREE.PMREMGenerator(this.renderer),room=new RoomEnvironment();this.environment=pmrem.fromScene(room,.04);this.scene.environment=this.environment.texture;this.scene.environmentIntensity=.65;room.dispose();pmrem.dispose();
     this.raycaster=new THREE.Raycaster();this.raycaster.params.Line.threshold=.3;this.pointer=new THREE.Vector2();this._move=e=>this._hover(e);this._leave=()=>{if(tooltip)tooltip.hidden=true;};canvas.addEventListener('pointermove',this._move);canvas.addEventListener('pointerleave',this._leave);
@@ -53,11 +53,14 @@ export class SceneRenderer{
   }
 
   _roads(){
-    const vis=this.frame.visualization||{},render=vis.render_geometry,polygons=render?.road_surface?.polygons||[],key=JSON.stringify([polygons,render?.markings||[]]);if(key===this.roadKey)return;this.roadKey=key;disposeGroup(this.groups.roads);const group=this.groups.roads;
+    const vis=this.frame.visualization||{},render=vis.render_geometry,polygons=render?.road_surface?.polygons||[],semantic=render?.semantic_surfaces||{},key=JSON.stringify([polygons,render?.markings||[],semantic]);if(key===this.roadKey)return;this.roadKey=key;for(const name of['roads','sidewalk','junction','crosswalk'])disposeGroup(this.groups[name]);const group=this.groups.roads;
     // Only the backend union preserves islands and holes. Never merge old
     // per-lane exteriors on the frontend or draw each section's transverse edge.
     for(const polygon of polygons){const material=new THREE.MeshStandardMaterial({color:COLORS.road,roughness:.91,metalness:.03,side:THREE.DoubleSide}),mesh=this.geometry.polygon(polygon,material,.006);if(mesh)group.add(mesh);for(const ring of[polygon.outer,...(polygon.holes||[])]){const line=this.geometry.line(ring,0x78909f,.34,.019);if(line)group.add(line);}}
     for(const marking of render?.markings||[]){if(marking.kind==='none')continue;const color=String(marking.color||'').toLowerCase().includes('yellow')?0xe1cc8c:COLORS.marking,stripe=this.geometry.stripe(marking.points,number(marking.width_m,.085),color,marking.kind==='broken');if(stripe)group.add(stripe);}
+    // Semantic surfaces come from the archive, independently of road base and
+    // lane paint. Missing map layers stay empty rather than being fabricated.
+    for(const[name,color,offset]of[['sidewalk',0x46515c,.018],['junction',0x344352,.012],['crosswalk',0xd5dde5,.034]]){const layer=semantic[name],surfaces=layer?.polygons||[];for(const polygon of surfaces){const material=new THREE.MeshStandardMaterial({color,roughness:.96,metalness:0,side:THREE.DoubleSide,polygonOffset:true,polygonOffsetFactor:-1,polygonOffsetUnits:-1}),mesh=this.geometry.polygon(polygon,material,offset);if(mesh)this.groups[name].add(mesh);}this.canvas.dataset[name+'Polygons']=String(surfaces.length);this.canvas.dataset[name+'Source']=layer?.source||'unavailable';}
     this.canvas.dataset.roadPolygons=String(polygons.length);this.canvas.dataset.roadHoles=String(polygons.reduce((n,p)=>n+(p.holes?.length||0),0));this.canvas.dataset.roadMarkings=String(render?.markings?.length||0);
   }
   _topology(){
@@ -67,7 +70,8 @@ export class SceneRenderer{
   }
 
   _regions(){
-    const group=this.groups.regions;disposeGroup(group);for(const region of this.frame.visualization?.regions||[]){const color=REGION_COLORS[region.name]||0x6aa8bd;for(const polygon of region.polygons||[]){const mesh=this.geometry.polygon(polygon,new THREE.MeshBasicMaterial({color,transparent:true,opacity:.065,depthWrite:false,side:THREE.DoubleSide}),.035);if(mesh){mesh.userData.region=region;group.add(mesh);this.hitTargets.push(mesh);}const outline=this.geometry.line([...polygon,polygon[0]],color,.36,.055,true);if(outline)group.add(outline);}if(validPoint(region.label_position)&&region.name.includes('side'))this.geometry.label(group,REGION_NAMES[region.name]||region.name,[...region.label_position.slice(0,2),this.ground+.12],'#94abbf',.43);}
+    const group=this.groups.regions;disposeGroup(group);let count=0;const regions=this.frame.visualization?.regions||[];for(const region of regions){const color=REGION_COLORS[region.name]||0x6aa8bd;for(const polygon of region.surfaces||region.polygons||[]){const mesh=this.geometry.polygon(polygon,new THREE.MeshBasicMaterial({color,transparent:true,opacity:.22,depthWrite:false,side:THREE.DoubleSide,toneMapped:false}),.045);if(mesh){count++;mesh.userData.region=region;mesh.renderOrder=2;group.add(mesh);this.hitTargets.push(mesh);}for(const ring of[polygon.outer||polygon,...(polygon.holes||[])]){const outline=this.geometry.line([...ring,ring[0]],color,.78,.062);if(outline){outline.renderOrder=3;group.add(outline);}}}}
+    this.canvas.dataset.regionCount=String(regions.filter(r=>(r.surfaces||r.polygons)?.length).length);this.canvas.dataset.regionPolygons=String(count);this.canvas.dataset.regionStyle='persistent_fill_solid_outline';
   }
 
   _objects(){
@@ -78,7 +82,6 @@ export class SceneRenderer{
       if(ordinary){const edges=[];for(const[a,b]of BOX_EDGES)edges.push(...vertices[a].toArray(),...vertices[b].toArray());const geometry=new THREE.BufferGeometry();geometry.setAttribute('position',new THREE.Float32BufferAttribute(edges,3));group.add(new THREE.LineSegments(geometry,new THREE.LineBasicMaterial({color,transparent:true,opacity:(source||attention)?.95:.37,toneMapped:false})));}
       if(matched){matchedCount++;const fill=new THREE.Mesh(faceGeometry.clone(),new THREE.MeshBasicMaterial({color:COLORS.match,transparent:true,opacity:.075,depthWrite:false,side:THREE.DoubleSide,toneMapped:false}));matches.add(fill);for(const[a,b]of BOX_EDGES){const curve=new THREE.LineCurve3(vertices[a],vertices[b]),edge=new THREE.Mesh(new THREE.TubeGeometry(curve,1,.027,4,false),new THREE.MeshBasicMaterial({color:COLORS.match,toneMapped:false}));matches.add(edge);}}
       if(attention){const accent=[];for(const[a,b]of BOX_EDGES){const start=vertices[a],end=vertices[b];accent.push(...start.toArray(),...start.clone().lerp(end,.25).toArray(),...end.toArray(),...end.clone().lerp(start,.25).toArray());}const geometry=new THREE.BufferGeometry();geometry.setAttribute('position',new THREE.Float32BufferAttribute(accent,3));group.add(new THREE.LineSegments(geometry,new THREE.LineBasicMaterial({color:COLORS.attention,transparent:true,opacity:1,depthTest:false,toneMapped:false})));}
-      if(source||attention||matched){const center=object.center;if(!validPoint(center))continue;const base=object.geometry_quality==='illustrative_2_5d'?this.ground+number(object.height,1.5):number(center[2],this.ground)+number(object.height,1.5)/2,roles=(object.grid_roles||[]).map(role=>REGION_NAMES[role]||role).join('/'),title=roles||(attention?'模型关注':source?'势场来源':'八向匹配'),label=this.geometry.label(matched?matches:group,`${title}\n${shortId(object.id)}`,[center[0],center[1],base+.55],attention?'#d6b4ff':matched?'#9bf4ff':'#a0f1bb',1,{pixelHeight:matched?43:37,priority:matched?100:attention?80:60});label.userData.object=object;label.userData.displayed=true;this.hitTargets.push(label);}
     }
     this.canvas.dataset.gridMatchedObjects=String(matchedCount);
   }
@@ -89,7 +92,8 @@ export class SceneRenderer{
     const segments=vis.trajectory_segments||(vis.trajectory?.length?[vis.trajectory]:[]);
     const main=this.geometry.plannedTrajectory(vis.trajectory||[],.055,.11);if(main)this.groups.trajectory.add(main);
     this.canvas.dataset.trajectoryColorOrder='original_sample_index_green_to_yellow';this.canvas.dataset.corridorStyle='yellow_fill_without_edges';this.canvas.dataset.trajectoryKind=provenance.kind||'archived_plan_or_unspecified';this.canvas.dataset.trajectorySegments=String(segments.length);this.canvas.dataset.corridorPolygons=String(ribbon?.polygons?.length||0);this.canvas.dataset.corridorSource=ribbon?.source||'unavailable';
-    if(vis.goal&&validPoint(vis.goal)){const marker=new THREE.Group(),ring=new THREE.Mesh(new THREE.TorusGeometry(.6,.055,8,48),new THREE.MeshBasicMaterial({color:COLORS.goal}));ring.rotation.x=Math.PI/2;marker.add(ring);const gem=new THREE.Mesh(new THREE.OctahedronGeometry(.28),new THREE.MeshStandardMaterial({color:COLORS.goal,emissive:0x544413,metalness:.28,roughness:.35}));gem.position.y=.75;marker.add(gem);marker.position.copy(this.geometry.point(vis.goal,.12));this.groups.goal.add(marker);this.geometry.label(this.groups.goal,'局部引导点',[vis.goal[0],vis.goal[1],number(vis.goal[2],this.ground)+1.85],'#f5db92',.63);}
+    if(vis.goal&&validPoint(vis.goal)){const marker=new THREE.Group(),material=new THREE.MeshBasicMaterial({color:COLORS.goal,side:THREE.DoubleSide,toneMapped:false,fog:false}),ring=new THREE.Mesh(new THREE.RingGeometry(.43,.51,48),material),dot=new THREE.Mesh(new THREE.CircleGeometry(.13,24),new THREE.MeshBasicMaterial({color:0xffffff,side:THREE.DoubleSide,toneMapped:false,fog:false}));ring.rotation.x=dot.rotation.x=-Math.PI/2;marker.add(ring,dot);const ticks=[];for(let angle=0;angle<Math.PI*2;angle+=Math.PI/2)ticks.push(Math.cos(angle)*.63,0,Math.sin(angle)*.63,Math.cos(angle)*.9,0,Math.sin(angle)*.9);const tickGeometry=new THREE.BufferGeometry();tickGeometry.setAttribute('position',new THREE.Float32BufferAttribute(ticks,3));marker.add(new THREE.LineSegments(tickGeometry,new THREE.LineBasicMaterial({color:COLORS.goal,toneMapped:false,fog:false})));marker.position.copy(this.geometry.point(vis.goal,.15));this.groups.goal.add(marker);}
+    this.canvas.dataset.goalMarkerStyle='flat_target';
   }
 
   _updateEgo(){
@@ -100,11 +104,11 @@ export class SceneRenderer{
 
   _clearGeometry(){
     for(const group of Object.values(this.groups))disposeGroup(group);this.egoPivot.visible=false;this.origin=null;this.roadKey=null;this.hitTargets=[];this.lastEgoPoint=null;if(this.tooltip)this.tooltip.hidden=true;
-    for(const key of['roadPolygons','roadHoles','roadMarkings','topologyEdges','gridMatchedObjects','corridorPolygons','trajectorySegments','labelVisible'])this.canvas.dataset[key]='0';this.canvas.dataset.frameGeometry='unavailable';this.canvas.dataset.trajectoryKind='unavailable';this.canvas.dataset.corridorSource='unavailable';this.canvas.dataset.trajectoryColorOrder='unavailable';this.canvas.dataset.corridorStyle='unavailable';
+    for(const key of['roadPolygons','roadHoles','roadMarkings','sidewalkPolygons','junctionPolygons','crosswalkPolygons','regionCount','regionPolygons','topologyEdges','gridMatchedObjects','corridorPolygons','trajectorySegments','labelVisible'])this.canvas.dataset[key]='0';this.canvas.dataset.frameGeometry='unavailable';this.canvas.dataset.trajectoryKind='unavailable';this.canvas.dataset.corridorSource='unavailable';this.canvas.dataset.trajectoryColorOrder='unavailable';this.canvas.dataset.corridorStyle='unavailable';
   }
 
   setFrame(frame){
-    if(this.failed){this.frame=frame;return;}const previous=this.frame,first=!this.origin||!validPoint(previous?.ego?.position||previous?.ego?.center);this.frame=frame;
+    if(this.failed){this.frame=frame;return;}const previous=this.frame,first=!this.origin||!validPoint(previous?.ego?.position||previous?.ego?.center);this.frame=frame;this.canvas.dataset.frameId=String(frame?.frame_id||'unavailable');
     const p=frame?.ego?.position||frame?.ego?.center;if(!validPoint(p)){this._clearGeometry();this.note.textContent=frame?'该帧自车位置无效；已清除上一帧场景':'等待归档场景';this.render();return false;}
     this.ground=number(frame.visualization?.ground_z_m,0);if(!this.origin)this.origin=[p[0],p[1],this.ground];this.hitTargets=[];this._roads();this._topology();this._regions();this._objects();this._trajectory();this._updateEgo();this._applyVisibility();this._updateNote();this.canvas.dataset.frameGeometry='available';const egoPoint=this.geometry.point([p[0],p[1],this.ground]);
     if(first)this.reset();else if(this.userOrbit&&this.lastEgoPoint){const delta=egoPoint.clone().sub(this.lastEgoPoint);this.camera.position.add(delta);this.controls.target.add(delta);}else if(!this.userOrbit)this._followCamera();this.lastEgoPoint=egoPoint;
@@ -120,7 +124,7 @@ export class SceneRenderer{
     this.orthoCamera.left=-height*aspect/2;this.orthoCamera.right=height*aspect/2;this.orthoCamera.top=height/2;this.orthoCamera.bottom=-height/2;this.orthoCamera.position.copy(target).add(new THREE.Vector3(0,180,0));this.orthoCamera.up.copy(forward);this.orthoCamera.lookAt(target);this.orthoCamera.updateProjectionMatrix();
   }
   setTopdown(enabled){if(this.failed)return;this.topdown=enabled;this.activeCamera=enabled?this.orthoCamera:this.camera;this.controls.enabled=!enabled;if(enabled)this._updateTopdown();else this.controls.update();this.render();}
-  _applyVisibility(){for(const name of['roads','topology','regions','grid_matches','corridor','trajectory','goal'])this.groups[name].visible=Boolean(this.layers[name]);}
+  _applyVisibility(){for(const name of['roads','sidewalk','junction','crosswalk','topology','regions','grid_matches','corridor','trajectory','goal'])this.groups[name].visible=Boolean(this.layers[name]);}
   setLayer(name,enabled){this.layers[name]=enabled;if(this.failed)return;if(['sources','attention','objects','grid_matches'].includes(name)&&this.frame?.ego&&this.origin){this.hitTargets=this.hitTargets.filter(o=>!o.userData.object);this._objects();}this._applyVisibility();this.render();}
   _hover(event){
     if(!this.tooltip||!this.origin||event.buttons||this.failed)return;const rect=this.canvas.getBoundingClientRect();this.pointer.set((event.clientX-rect.left)/rect.width*2-1,-(event.clientY-rect.top)/rect.height*2+1);this.raycaster.setFromCamera(this.pointer,this.activeCamera);const hits=this.raycaster.intersectObjects(this.hitTargets.filter(o=>o.parent?.visible!==false&&o.visible!==false),false),hit=hits.find(h=>(h.object.userData.object&&h.object.userData.displayed!==false)||h.object.userData.region||h.object.userData.topology)||hits.find(h=>h.object.userData.object);this.tooltip.hidden=!hit;

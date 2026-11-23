@@ -303,11 +303,12 @@ def _polygons(shape):
 
 
 def _surfaces(shape, z=0.):
-    """Polygon rings with holes retained (a ring exterior alone fills islands)."""
+    """Retain holes and archived vertex elevations; lift only genuinely XY data."""
     if shape is None or shape.is_empty:
         return []
     if shape.geom_type == "Polygon":
-        xyz = lambda ring: [[float(x), float(y), float(z)] for x, y in ring.coords]
+        xyz = lambda ring: [[float(p[0]), float(p[1]), float(p[2]) if len(p) > 2 else float(z)]
+                            for p in ring.coords]
         return [{"outer": xyz(shape.exterior), "holes": [xyz(ring) for ring in shape.interiors]}]
     return [part for child in getattr(shape, "geoms", []) for part in _surfaces(child, z)]
 
@@ -322,6 +323,72 @@ def _lines(shape, z=0.):
 
 def _map_lanes(frame):
     return (frame.get("scene") or {}).get("lanes") or (frame.get("map") or {}).get("lanes") or []
+
+
+def _semantic_surfaces(frame, z=0., viewport=None):
+    """Extract only archived semantic surfaces, preserving holes and elevations.
+
+    Keep individual polygons separate: XY union must not merge different decks.
+    Missing sidewalks or junction labels are not inferred by expanding road.
+    """
+    from shapely.geometry import Polygon
+    layers = {name: {"available": False, "polygons": [], "source": [],
+                     "elevation_source": [], "reason": "归档未保存该类别的有效路面几何"}
+              for name in ("sidewalk", "junction", "crosswalk")}
+    seen = set()
+
+    def add(name, value, source):
+        if value is None:
+            return
+        try:
+            if isinstance(value, dict) and "outer" in value:
+                shape = Polygon(value["outer"], holes=value.get("holes") or [])
+            elif isinstance(value, dict) and value.get("type") == "Feature":
+                shape = _shape(value.get("geometry"))
+            else:
+                shape = _shape(value)
+            if shape is None or shape.is_empty or not shape.is_valid or shape.geom_type not in ("Polygon", "MultiPolygon"):
+                return
+            shape = shape if viewport is None else shape.intersection(viewport)
+            identity = (name, shape.wkb)
+            if shape.is_empty or identity in seen:
+                return
+            seen.add(identity)
+            layer = layers[name]
+            layer["polygons"].extend(_surfaces(shape, z))
+            layer["source"].append(source)
+            layer["elevation_source"].append("recorded_xyz" if shape.has_z else "recorded_xy_local_flat_plane_approximation")
+            layer["available"], layer["reason"] = bool(layer["polygons"]), None
+        except (ValueError, TypeError, KeyError, ShapelyError):
+            return
+
+    for container_name in ("scene", "map", "rules"):
+        container = frame.get(container_name) or {}
+        if not isinstance(container, dict):
+            continue
+        for name in layers:
+            for index, value in enumerate(container.get(name + "s") or []):
+                add(name, value, f"{container_name}.{name}s[{index}]")
+            semantic = container.get("semantic_surfaces") or {}
+            layer = semantic.get(name) if isinstance(semantic, dict) else None
+            if isinstance(layer, dict):
+                for index, value in enumerate(layer.get("polygons") or []):
+                    add(name, value, f"{container_name}.semantic_surfaces.{name}[{index}]")
+
+    scene = frame.get("scene") or {}
+    metadata = (scene.get("diagnostics") or {}).get("lane_source_metadata") or {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    for lane in _map_lanes(frame):
+        if not isinstance(lane, dict):
+            continue
+        identity = str(lane.get("id", ""))
+        meta = metadata.get(identity) or {}
+        kind = str(meta.get("kind", lane.get("kind", lane.get("lane_type", "")))).lower().split(".")[-1]
+        name = ("junction" if lane.get("is_junction") is True or kind in ("connector", "lane_connector", "junction")
+                else "sidewalk" if kind == "sidewalk" else None)
+        if name:
+            add(name, lane.get("polygon_wkt", lane.get("polygon")), f"recorded_lane_class:{identity}:{kind}")
+    return layers
 
 
 def _road_render_geometry(frame, z):
@@ -435,7 +502,8 @@ def _road_render_geometry(frame, z):
                 "crossable": crossable, "color": entry["color"], "points": line,
                 "source_boundary_ids": entry["source_ids"], "source_lane_ids": sorted(entry["source_lane_ids"]),
                 "source": "deduplicated_recorded_boundary_geometry"})
-    return {"road_surface": {"polygons": _surfaces(rendered, z), "source": source,
+    return {"semantic_surfaces": _semantic_surfaces(frame, z),
+            "road_surface": {"polygons": _surfaces(rendered, z), "source": source,
                 "recorded_polygons": _surfaces(recorded, z), "recorded_area_m2": float(recorded.area),
                 "display_area_m2": float(rendered.area), "holes_preserved": True},
             "markings": markings, "connections": connections, "rejected_connections": rejected,
@@ -448,16 +516,59 @@ def _road_render_geometry(frame, z):
 def _region_geometry(frame, engine_root):
     """Use actual lane chains and permissions, rather than angular sectors."""
     import shapely
-    from shapely.geometry import LineString, Polygon
+    from shapely.geometry import LineString, Point, Polygon
     core = _engine(engine_root)
     scene = _scene(frame, core)
     diagnostics = scene.diagnostics.get("object_scope") or {}
-    settings = diagnostics.get("settings") or (frame.get("configuration") or {}).get("parameters", {}).get("planning_objects", {})
-    front, rear = float(settings.get("front_m", 40.)), float(settings.get("rear_m", 20.))
-    traces, roads, cache = core["object_scope"].lane_role_geometry(scene, front_m=front, rear_m=rear)
     selection = _plan(frame).get("diagnostics", {}).get("planning_object_selection", {})
+    if (selection.get("frame_id", scene.frame_id) != scene.frame_id or
+            not math.isclose(float(selection.get("time", scene.time)), scene.time, abs_tol=1e-6)):
+        selection = {}  # Never place an earlier frame's matching domain at today's ego.
+    configuration = (frame.get("configuration") or {}).get("parameters", {}).get("planning_objects", {})
+    options = ((diagnostics.get("settings"), "same_frame_object_scope"),
+               (selection.get("settings"), "same_frame_planning_object_selection"),
+               (configuration, "episode_configuration"))
+    settings, range_source = next(((value, source) for value, source in options
+                                  if isinstance(value, dict) and all(key in value for key in ("front_m", "rear_m"))), (None, None))
+    if settings is None:
+        raise ValueError("归档未保存八向匹配量程，不能用默认范围补造区域")
+    front, rear = float(settings["front_m"]), float(settings["rear_m"])
+    if not math.isfinite(front + rear) or front <= 0 or rear < 0:
+        raise ValueError("归档八向匹配量程无效")
+    traces, roads, cache = core["object_scope"].lane_role_geometry(scene, front_m=front, rear_m=rear)
+    # High-rate planning rows contain exact current state plus a static map,
+    # whereas the complete SceneSnapshot is archived at a lower capture rate.
+    # Recover only the same-frame planner's explicitly admitted lane candidates,
+    # and recheck their actual common boundary. Do not borrow a capture's old
+    # object_scope or claim that the entire static map is complete.
+    saved_road = selection.get("road") or {}
+    current_id = saved_road.get("source_lane_id")
+    current = cache.get(current_id, (None,))[0]
+    admitted = set(saved_road.get("candidate_corridor_lane_ids") or [])
+    if current is not None and current_id == scene.ego.lane_id:
+        for side in ("left", "right"):
+            identity = getattr(current, side)
+            if roads[side].get("known") or identity not in admitted or identity not in cache:
+                continue
+            target = cache[identity][0]
+            _, a, heading, _ = core["lane_roles"].project(current.center, scene.ego.position)
+            _, b, other_heading, _ = core["lane_roles"].project(target.center, a)
+            lateral = float(np.dot(b-a, [-math.sin(heading), math.cos(heading)]))
+            if math.cos(other_heading-heading) <= 0 or (lateral <= 0 if side == "left" else lateral >= 0):
+                continue
+            middle = Point((a+b)/2)
+            boundary_groups = [[edge for edge in lane.boundaries if len(edge.get("points", [])) >= 2
+                               and LineString(edge["points"]).distance(middle) <= .3]
+                              for lane in (current, target)]
+            if any(not edges for edges in boundary_groups) or any(
+                    edge.get("crossable") is not True for edges in boundary_groups for edge in edges):
+                continue
+            traces[side] = core["lane_roles"].trace_lane(scene, identity, front_m=front, back_m=rear, center_role=False)
+            roads[side] = {"known": True, "exists": True, "crossable": True,
+                           "reason": "same_frame_planning_corridor_and_recorded_shared_boundary"}
     matched = selection.get("region_objects") or {}
-    results = []
+    results, coverage = [], {}
+    z, _ = _ground_height(frame)
     for side in ("center", "left", "right"):
         trace = traces.get(side)
         if trace is None or trace.get("shape") is None:
@@ -467,6 +578,8 @@ def _region_geometry(frame, engine_root):
         if arc[-1] <= 0:
             continue
         ego_s = float(trace["ego_s"])
+        coverage[side] = {"front_m": min(front, float(arc[-1]) - ego_s), "rear_m": min(rear, ego_s),
+                          "requested_front_m": front, "requested_rear_m": rear}
         ego_corners = box_corners([*scene.ego.position, 0.], scene.ego.length, scene.ego.width,
                                  1., scene.ego.heading)[:4, :2]
         ego_interval = [core["lane_roles"].project(points, point)[0] for point in ego_corners]
@@ -491,18 +604,24 @@ def _region_geometry(frame, engine_root):
             normal = np.column_stack([-direction[:, 1], direction[:, 0]])
             band = Polygon(np.vstack([xy + normal * width, (xy - normal * width)[::-1]])).buffer(0)
             region_shape = shape.intersection(band)
+            if region_shape.is_empty:
+                continue
             polygons = _polygons(region_shape)
             scope_ids = [identity for identity, row in diagnostics.get("objects", {}).items()
                          if role in row.get("roles", [])]
             nearest = matched.get(role)
             identities = [] if nearest is None else ([str(nearest)] if not isinstance(nearest, list) else nearest)
-            results.append({"name": role, "polygons": polygons, "object_ids": identities,
+            results.append({"name": role, "polygons": polygons, "surfaces": _surfaces(region_shape, z),
+                "frame_id": scene.frame_id, "time": scene.time, "object_ids": identities,
                 "scope_object_ids": scope_ids, "lane_ids": trace["lane_ids"],
                 "arc_interval_m": [start - ego_s, end - ego_s],
                 "label_position": None if region_shape.is_empty else list(region_shape.representative_point().coords[0]),
                 "source": "recorded_map_and_core_lane_chain_reconstruction",
                 "note": "沿允许车道链弧长截取；当前帧几何重建，不是角度扇区"})
     return results, {"available": bool(results), "front_m": front, "rear_m": rear, "roads": roads,
+                     "frame_id": scene.frame_id, "time": scene.time, "range_source": range_source,
+                     "coverage": coverage, "independent_of_object_occupancy": True,
+                     "reason": None if results else "当前归档车道几何不足，不能构建八向区域",
                      "assignment_protocol": diagnostics.get("assignment_protocol"),
                      "source": "只读核心车道链重建"}
 
