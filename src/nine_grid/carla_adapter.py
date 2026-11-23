@@ -25,6 +25,7 @@ from .paths import filesystem_path
 from .carla_bridge import camera_storage_due
 from .carla_execution import duration_tick_limit
 from .carla_public_priority import PublicPriorityTracker
+from .carla_boundary_scope import scope_junction_boundaries
 from .geometry import (actor_shape, clean_polyline, polyline_lengths, project_polyline,
                        sample_polyline, checked_route_projection, wrap_angle)
 from .object_scope import scope_scene
@@ -499,7 +500,7 @@ class CarlaAdapter:
         try:
             raw = self.bridge.call('init', config=self.cfg, directory=str(self.output_dir), seed=int(self.seed))
             self._ingest_display_frames(raw)
-            mapping = raw.pop('map')
+            mapping = scope_junction_boundaries(raw.pop('map'))
             self.lanes = [Lane(**{**item, 'center': np.asarray(item['center'], float), 'polygon': np.asarray(item['polygon'], float),
                 'boundaries': [{**b, 'points': np.asarray(b['points'], float)} for b in item.get('boundaries', [])]}) for item in mapping['lanes']]
             if not self.lanes:

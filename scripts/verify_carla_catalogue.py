@@ -1,6 +1,5 @@
 """Catalogue regression checks; optional real 0.9.15 OpenDRIVE validation (no server)."""
 import argparse,copy,importlib.util,json,sys,tempfile
-from contextlib import nullcontext
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT/'src'))
 from nine_grid.carla_experiment_spec import resolve_spec,settings_from_manifest,COORDINATE_CONTRACT
@@ -20,8 +19,8 @@ def check_admission_contract(manifest):
         'family':'following','description':'Synthetic contract fixture; not CARLA validation',
         'map':'Town01','desired_speed_mps':5.,'duration_s':10.,'experiment':settings},1)
     settings=settings_from_manifest(manifest)
-    (ROOT/'outputs').mkdir(exist_ok=True)
-    with nullcontext(tempfile.mkdtemp(prefix='catalogue_contract_',dir=str(ROOT/'outputs'))) as temporary:
+    (ROOT/'test').mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='catalogue_contract_',dir=str(ROOT/'test')) as temporary:
         root=Path(temporary);dirs=[]
         for index in range(2):
             directory=root/str(index);directory.mkdir();dirs.append(directory)
@@ -30,13 +29,28 @@ def check_admission_contract(manifest):
                 'rgb_enabled':True,'rgb_initialization':{'status':'aligned'},
                 'actors_at_source':[{'id':'ego','carla_actor_id':'1','role':'ego','position':[0.,0.],'velocity':[5.,0.],'heading':0.}]}
             physics=[];video_rows=[];task=TaskCriteria(settings)
+            # Synthetic map-query payload with the same contract as the native
+            # recorder. Its geometry is the explicit straight fixture above;
+            # it is not evidence that a real CARLA map or drive was validated.
+            def waypoint(index):
+                point=settings['route']['points'][index]
+                return {'lane_id':'1|0|-1','position':[point['x_m'],-point['y_m']],
+                    'z':point['z_m'],'heading_rad':0.,'width_m':3.5,'lane_type':'Driving'}
+            map_evidence={'version':'carla-route-map-evidence-1.0',
+                'source':'native_public_waypoint_topology','physical_tick':0,
+                'route_widths_m':[3.5]*len(settings['route']['points']),
+                'boundary_gates':[{'index':gate['index'],'route_waypoint':waypoint(gate['index']),
+                    'distance_m':3.,'previous':[],'next':[]} for gate in task.checkpoints],
+                'corridors':{str(i):{'route_waypoint':waypoint(i),'neighbour_links':[]}
+                    for i in range(len(settings['route']['points']))}}
             views=('front_rgb','front_left_rgb','front_right_rgb','back_rgb','back_left_rgb','back_right_rgb')
             for tick in range(201):
                 ego={'id':'1','position':[tick*.1,0.],'heading':0.,'velocity':[5.,0.],
                     'lane_id':'1|0|-1','is_junction':False,'length':4.,'width':2.,'actor_origin_carla_xyz':[tick*.1,0.,0.]}
                 task.observe(tick,ego,[],{'ego':'1'})
                 physics.append({'instance_hash':manifest['instance_hash'],'physical_tick':tick,'frame':100+tick,
-                    'timestamp':10.+tick/50.,'sim_time_s':tick/50.,'ego':ego,'actors':[],'route_s_m':tick*.1})
+                    'timestamp':10.+tick/50.,'sim_time_s':tick/50.,'ego':ego,'actors':[],'route_s_m':tick*.1,
+                    'route_map_evidence':map_evidence if tick==0 else None})
                 if tick%5==0:
                     video_rows.append({'video_index':len(video_rows),'carla_frame':100+tick,'physical_tick':tick,'sim_time':tick/50.,
                         'source_cameras':[{'view':view,'frame':100+tick,'timestamp':10.+tick/50.} for view in views]})
@@ -44,7 +58,8 @@ def check_admission_contract(manifest):
                 'experiment_phase':'development','implementation_sha256':'a'*64,
                 'camera_width':640,'camera_height':360,'camera_fov':100,'camera_height_m':2.2,'camera_hz':10,
                 'camera_save_hz':1,'rgb_postprocess_effects':True,'map_resolution_m':2,'map_speed_cap_mps':30,
-                'same_level_tolerance_m':1.5,'arrival_margin_m':3}}},
+                'same_level_tolerance_m':1.5,'arrival_margin_m':3,
+                'longitudinal_control':copy.deepcopy(cli.load_yaml(ROOT/'config/carla.yaml')['carla']['longitudinal_control'])}}},
                 'summary.json':{'termination_reason':'collision'},'carla_initialization.json':initial,
                 'evaluation.json':{'version':'carla-physical-evaluation-2.0','physical_hz':50,
                     'physical_ticks':200,'first_frame':100,'scenario_valid':True,'evaluation_valid':True,

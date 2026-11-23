@@ -188,14 +188,19 @@ class Experiment:
         self._signals=SignalProgram(self.world,self.carla,self.settings.get('signals',{}))
         self.ego=self._spawn(self.settings['ego_blueprint'],self.forward_route[0],'ego')
         for source,plan in zip(self.settings['actors'],placements):
-            speed=source['speed_mps'] if source['type']=='vehicle' and source['behavior']!='parked' else 0.
+            speed=source['speed_mps'] if source['type']=='vehicle' and source['behavior'] not in ('parked','gated_follow') else 0.
             actor=self._spawn(source['blueprint'],plan['waypoint'],source['role'],speed,source['placement'].get('offset_m',0.))
             row={'source':source,'actor':actor,'plan':plan,'geometry':RouteGeometry(plan['route']) if plan['route'] else None,
                 'hint':None,'event':EventState(source),'stop_tick':None,'resume_tick':None,'wheelbase':None,
                 'target_speed':speed,'transition_count':0,'violation_ticks':0,'stop_signs':{},'initial_s':self.geometry.project(self._center(actor))[0],
                 'tracking':{},'last_speed':None,'maximum_speed_error_mps':0.}
+            if source['behavior']=='gated_follow':
+                if source['completion_route_s_m'] > row['geometry'].length-5.:
+                    raise ValueError('gated_follow completion exceeds its decoded continuing route')
+                row['initial_route_s']=row['geometry'].project(self._center(actor))[0]
             self._rows.append(row)
             if source['type']=='vehicle' and source['behavior']=='parked':actor.apply_control(self.carla.VehicleControl(brake=1.,hand_brake=True))
+            if source['behavior']=='gated_follow':actor.apply_control(self.carla.VehicleControl(brake=.5,hand_brake=False))
             if source['type']=='pedestrian':actor.apply_control(self.carla.WalkerControl(speed=0.))
         for light,_,_ in self._signals.saved:
             for wp in light.get_stop_waypoints():self._stops.append(('signal',light,wp))
@@ -381,6 +386,9 @@ class Experiment:
                     dx,dy=end.x-loc.x,end.y-loc.y;norm=max(1e-9,math.hypot(dx,dy))
                     speed=source['speed_mps'] if event.state=='active' else 0.
                     actor.apply_control(self.carla.WalkerControl(direction=self.carla.Vector3D(x=dx/norm,y=dy/norm,z=0.),speed=speed))
+                elif source['behavior']=='gated_follow' and event.state not in ('active','completed'):
+                    actor.apply_control(self.carla.VehicleControl(brake=.5,hand_brake=False))
+                    row['target_speed']=0.
                 elif source['type']=='vehicle' and source['behavior']!='parked':self._follow(row,tick,dt)
         except Exception as exc:
             self._errors.append(str(exc));self._cache_state();raise
@@ -458,6 +466,19 @@ class Experiment:
                         # Mark action completion after a real stop/hold. Following
                         # resumes next tick; arrival still requires the whole route.
                         event.transition('completed',tick,actual_stop_tick=row['stop_tick'])
+                elif kind=='gated_follow':
+                    geometry=row['geometry'];centre=self._center(actor)
+                    own_s,_,hint,error=geometry.project(centre,row['hint'])
+                    a=geometry.points[hint].transform.location;b=geometry.points[hint+1].transform.location
+                    heading_error=abs(wrap(math.radians(actor.get_transform().rotation.yaw)-math.atan2(b.y-a.y,b.x-a.x)))
+                    width=float(getattr(geometry.points[hint],'lane_width',3.5))
+                    maximum_error=max(.75,min(2.,width*.5))
+                    if (own_s>=source['completion_route_s_m'] and own_s>=row['initial_route_s']+.5
+                            and error<=maximum_error and heading_error<=math.pi/6):
+                        event.transition('completed',tick,observed_route_s_m=own_s,
+                            completion_route_s_m=source['completion_route_s_m'],
+                            route_error_m=error,heading_error_rad=heading_error,
+                            progress_reference='world_bounding_box_center_on_actor_route')
             self._flush_events(row)
         self._cache_state()
 

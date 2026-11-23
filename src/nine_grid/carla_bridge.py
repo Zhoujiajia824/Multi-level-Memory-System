@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import zlib
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 try:
@@ -77,6 +78,39 @@ def camera_storage_due(sim_time, camera_save_hz=1, physical_ticks=None, physics_
 
 def lane_key(waypoint):
     return '{}|{}|{}'.format(waypoint.road_id, waypoint.section_id, waypoint.lane_id)
+
+
+def native_lane_endpoints(road_map):
+    """Query real lane-section ends, which uniform samples/topology can omit."""
+    document = ET.fromstring(road_map.to_opendrive())
+    points = []
+    for road in document.findall('road'):
+        road_id = int(road.get('id'))
+        length = float(road.get('length'))
+        sections = road.findall('lanes/laneSection')
+        for index, section in enumerate(sections):
+            start = float(section.get('s'))
+            end = float(sections[index+1].get('s')) if index+1 < len(sections) else length
+            if end <= start:
+                continue
+            for lane in section.findall('left/lane') + section.findall('right/lane'):
+                if lane.get('type') != 'driving':
+                    continue
+                identity = int(lane.get('id'))
+                for value, direction in ((start, 1.), (end, -1.)):
+                    # Prefer the exact endpoint. At a section boundary CARLA may
+                    # resolve the other section, or reject s==road.length.
+                    candidates = [value] + [value + direction*min(epsilon, (end-start)/4.)
+                                             for epsilon in (1e-6, 1e-4, .001)]
+                    for candidate in candidates:
+                        wp = road_map.get_waypoint_xodr(road_id, identity, candidate)
+                        if (wp is not None and wp.section_id == index
+                                and str(wp.lane_type) == 'Driving'):
+                            points.append(wp)
+                            break
+                    else:
+                        raise ValueError('公开地图缺少真实车道端点：{}|{}|{}'.format(road_id,index,identity))
+    return points
 
 
 def boundary_semantics(marking_type, waypoint_permission, marking_permission, is_junction):
@@ -1146,6 +1180,8 @@ class CarlaSession:
         points.extend(self.route_wps)
         for start, end in self.map.get_topology():
             points.extend((start, end))
+        endpoints = native_lane_endpoints(self.map)
+        points.extend(endpoints)
         route_positions = [wp.transform.location for wp in self.route_wps]
         low_x, high_x = min(p.x for p in route_positions) - 120, max(p.x for p in route_positions) + 120
         low_y, high_y = min(p.y for p in route_positions) - 120, max(p.y for p in route_positions) + 120
@@ -1185,8 +1221,14 @@ class CarlaSession:
                     direction = int(self.carla.LaneChange.Left if side == 'left' else self.carla.LaneChange.Right)
                     semantics = boundary_semantics(mark.type, bool(int(permission) & direction),
                         bool(int(mark.lane_change) & direction), bool(waypoints[i].is_junction))
+                    start, end = waypoints[i], waypoints[i + 1]
+                    start_junction, end_junction = getattr(start, 'junction_id', None), getattr(end, 'junction_id', None)
+                    junction = (start_junction if start.is_junction and end.is_junction
+                                and type(start_junction) is int and start_junction >= 0
+                                and start_junction == end_junction else None)
                     boundaries.append({'id': '{}:{}:{}'.format(key, side, i), 'points': coordinates[i:i + 2],
-                        'line_type': str(mark.type), **semantics})
+                        'owner_lane_id': key, 'side': side, 'is_junction': junction is not None,
+                        'junction_id': junction, 'line_type': str(mark.type), **semantics})
             middle = waypoints[len(waypoints) // 2]
             adjacent = {}
             for side in ('left', 'right'):
@@ -1196,7 +1238,8 @@ class CarlaSession:
                     dyaw = math.radians(other.transform.rotation.yaw - middle.transform.rotation.yaw)
                     same = math.cos(dyaw) > 0.5
                 adjacent[side] = lane_key(other) if same and lane_key(other) in groups else None
-            successors = sorted(set(lane_key(w) for w in waypoints[-1].next(float(self.cfg.get('map_resolution_m', 2.0)) * 2)
+            # Direct topology, not a 4m leap that can skip short road sections.
+            successors = sorted(set(lane_key(w) for w in waypoints[-1].next(.01)
                                     if lane_key(w) != key and lane_key(w) in groups))
             lanes.append({'id': key, 'center': center, 'polygon': left + right[::-1],
                 'width': middle.lane_width, 'speed_limit': float(self.cfg.get('map_speed_cap_mps', 30)),
@@ -1213,6 +1256,9 @@ class CarlaSession:
         return {'lanes': lanes, 'route': [xy(p) for p in route_positions], 'route_lane_ids': route_ids,
                 'identity': map_identity(self.map),
                 'source': 'CARLA_public_waypoints_navigation_relative_elevation', 'priority_available': False,
+                'topology_sampling': {'native_lane_section_endpoint_count': len(endpoints),
+                    'direct_successor_query_m': .01,
+                    'geometry_policy': 'native_endpoint_positions_widths_and_yaws;no_polygon_padding'},
                 'elevation_filter': {'version':elevation.VERSION,'tolerance_m':tolerance,
                     'map_corridor_radius_m':elevation.radius_m,'rejected_waypoint_samples':rejected_height,
                     'rule':'nearest_xy_route_segment_interpolated_height;reject_multilevel_route_overlap',

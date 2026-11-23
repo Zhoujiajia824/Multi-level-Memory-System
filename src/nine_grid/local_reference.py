@@ -382,7 +382,8 @@ class LocalReferenceManager:
         lines = []
         for lane in scene.lanes:
             for boundary in lane.boundaries:
-                if boundary.get("crossable", False):
+                if (boundary.get("crossable", False)
+                        or boundary.get("kind") in ("virtual_connection", "virtual_lane_boundary")):
                     continue
                 points = np.asarray(boundary.get("points", []), float)
                 if len(points)<2 or np.any(np.max(points, axis=0)<lo) or np.any(np.min(points, axis=0)>hi):

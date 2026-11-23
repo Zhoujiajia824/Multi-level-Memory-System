@@ -386,7 +386,7 @@ python scripts/memory_admin.py --memory-dir outputs/memory_db/experiment_01 inva
 
 ## 9. CARLA 0.9.15：v2冻结实例与独立评价
 
-旧五模板和第二批 `scripted_traffic` 已由统一场景执行器替代。新目录包含21份独立候选YAML、12个Town及完整锁定OpenDRIVE路线。通过真实0.9.15 SDK离线拓扑/演员布置检查；**尚未完成服务器物理闭环验收，不能称为论文正式验证集。**
+旧五模板和第二批 `scripted_traffic` 已由统一场景执行器替代。新目录包含22份独立候选YAML、12个Town及完整锁定OpenDRIVE路线。通过真实0.9.15 SDK离线拓扑/演员布置检查；**尚未完成服务器物理闭环验收，不能称为论文正式验证集。**
 
 [完整场景目录、每个场景的独立录像命令、A/B/C配对、技术验收和新增场景说明](docs/carla_experiments.md)
 

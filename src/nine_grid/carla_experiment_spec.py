@@ -15,7 +15,7 @@ COORDINATE_CONTRACT = {
     'lateral_d': 'left_of_directed_route_positive_m',
     'world_axes': 'CARLA_world_xyz',
 }
-BEHAVIORS = ('follow', 'stop_resume', 'hard_brake', 'cut_in', 'cross', 'parked')
+BEHAVIORS = ('follow', 'gated_follow', 'stop_resume', 'hard_brake', 'cut_in', 'cross', 'parked')
 
 
 def digest(value):
@@ -92,7 +92,8 @@ def validate_settings(settings):
     roles = set()
     for row in rows:
         if not isinstance(row, dict) or set(row)-{'role','type','blueprint','placement','behavior','speed_mps',
-                'trigger','duration_ticks','hold_ticks','deceleration_mps2','required','completion_s_m'}:
+                'trigger','duration_ticks','hold_ticks','deceleration_mps2','required','completion_s_m',
+                'completion_route_s_m'}:
             raise ValueError('actor contains unsupported fields')
         role = row.get('role')
         if not isinstance(role, str) or not role or role == 'ego' or role in roles:
@@ -116,6 +117,22 @@ def validate_settings(settings):
             if place.get('lane') not in ('current','left','right','sidewalk_left','sidewalk_right'):
                 raise ValueError('unsupported relative placement lane')
         finite(place.get('offset_m', 0.), 'offset_m', -10., 10.)
+        if row['behavior'] == 'gated_follow':
+            if row['type'] != 'vehicle' or 'route' not in place:
+                raise ValueError('gated_follow requires a vehicle with its own locked route')
+            finite(row['speed_mps'], 'gated_follow.speed_mps', .1, 40.)
+            completion=finite(row.get('completion_route_s_m'), 'completion_route_s_m')
+            points=place['route']['points']
+            for point in points:
+                for key in ('x_m','y_m'):
+                    finite(point.get(key), 'gated_follow.route.'+key, -1e7, 1e7)
+            length=sum(math.hypot(b['x_m']-a['x_m'],b['y_m']-a['y_m']) for a,b in zip(points,points[1:]))
+            if completion > length-5.:
+                raise ValueError('gated_follow completion must leave at least 5m of continuing route')
+            if 'completion_s_m' in row:
+                raise ValueError('gated_follow completion uses its own route, not ego completion_s_m')
+        elif 'completion_route_s_m' in row:
+            raise ValueError('completion_route_s_m is only supported for gated_follow')
         _trigger(row.get('trigger', {}))
         for name in ('duration_ticks','hold_ticks'):
             integer(row.get(name, 200 if name == 'duration_ticks' else 150), name, 1)

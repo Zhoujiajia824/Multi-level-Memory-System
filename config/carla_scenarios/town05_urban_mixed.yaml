@@ -1,0 +1,115 @@
+schema_version: carla-experiment-2.0
+name: town05_urban_mixed
+family: multi_vehicle
+description: 174米短城市交互；双车道正常跟车及从左侧合法超越右车道慢车，宽弯左转进入单车道后让行两名正常步速行人，最后遵守STOP并左转汇入主路，继续约32米到达固定终点。
+map: Town05
+status: candidate
+split: development
+
+desired_speed_mps: 6
+duration_s: 60
+experiment:
+  ego_blueprint: vehicle.tesla.model3
+  initial_speed_mps: 3
+  weather: ClearNoon
+  route:
+    file: ../carla_routes/town05_urban_mixed.json
+  actors:
+  # 同车道前方约25米的正常交通车在第一个路口直行分流，没有急刹或停车脚本。
+  - role: slow_lead
+    type: vehicle
+    blueprint: vehicle.audi.a2
+    placement:
+      route:
+        file: ../carla_routes/town05_urban_mixed_slow_lead.json
+    behavior: follow
+    speed_mps: 5
+    required: false
+  # 右邻车道前方约10米的慢车；自车可在左车道合法超越，不要求为超车变道。
+  - role: adjacent_flow
+    type: vehicle
+    blueprint: vehicle.audi.a2
+    placement:
+      route:
+        file: ../carla_routes/town05_urban_mixed_adjacent_flow.json
+    behavior: follow
+    speed_mps: 3.8
+    required: false
+  # 在单车道路段按已观测的自车进度出发，与行人交互并行；仍遵守地图STOP和实体避让。
+  - role: mainline_vehicle
+    type: vehicle
+    blueprint: vehicle.audi.a2
+    placement:
+      route:
+        file: ../carla_routes/town05_urban_mixed_mainline.json
+    behavior: gated_follow
+    speed_mps: 3.8
+    trigger:
+      ego_s_m: [96, 109]
+      earliest_tick: 0
+    completion_route_s_m: 46
+    required: true
+  # 横穿起止均为真实人行道中心，约14.27米；按实测到达终点完成。
+  - role: walker_first
+    type: pedestrian
+    blueprint: walker.pedestrian.0001
+    placement:
+      s_m: 106
+      lane: sidewalk_right
+    behavior: cross
+    speed_mps: 1.35
+    trigger:
+      ego_s_m: [90, 98]
+      earliest_tick: 0
+    required: true
+  - role: walker_second
+    type: pedestrian
+    blueprint: walker.pedestrian.0001
+    placement:
+      s_m: 108
+      lane: sidewalk_right
+    behavior: cross
+    speed_mps: 1.35
+    trigger:
+      ego_s_m: [92, 100]
+      earliest_tick: 0
+    required: true
+  # 保留统一信号策略；新路线的两个路口在原始地图中均无动态灯控制。
+  signals:
+    green_ticks: 500
+    yellow_ticks: 150
+    all_red_ticks: 50
+    offset_ticks: 0
+  variations:
+  - path: actors.0.speed_mps
+    min: 4.8
+    max: 5.2
+  - path: actors.1.speed_mps
+    min: 3.6
+    max: 4.0
+  - path: actors.2.speed_mps
+    min: 3.6
+    max: 4.0
+  - path: actors.3.speed_mps
+    min: 1.3
+    max: 1.4
+  - path: actors.4.speed_mps
+    min: 1.3
+    max: 1.4
+  public_rules:
+  - id: town05_left_turn_yield_mainline
+    kind: yield
+    source: published_road_rule
+    controlled_lane_ids: [48|0|-1, 370|0|-1]
+    priority_lane_ids: [20|0|1, 368|0|1, 19|0|1]
+    stop_route_s_m: 116.21
+    conflict_route_s_m: [129, 144]
+    description: 公开路权：左转进入主路的车辆遵守STOP，并让行主路直行车辆；所有对比方法使用相同规则。
+  evaluation:
+    arrival_margin_m: 3
+    stall_seconds: 45
+    conflict_zones:
+    - id: pedestrian_crossing
+      route_s_m: [104, 113]
+      half_width_m: 2
+      pet_window_s: 10
