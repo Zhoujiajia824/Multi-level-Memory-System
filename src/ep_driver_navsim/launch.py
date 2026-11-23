@@ -1,5 +1,6 @@
 """Launch pinned, unmodified official scoring scripts with explicit provenance."""
 import argparse
+from collections import Counter
 import csv
 import hashlib
 import json
@@ -7,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -60,6 +62,7 @@ def split_contract(sdk_root, split):
     if mapped != required:
         raise ValueError("Official two-stage mapping/filter coverage differs; cannot define the evaluation set")
     return dict(evaluation_tokens=sorted(required), evaluation_logs=sorted(scene_filter["log_names"]),
+                original_tokens=sorted(originals), reactive_synthetic_tokens=sorted(synthetic),
                 original_count=len(originals), reactive_synthetic_count=len(synthetic),
                 scene_filter_sha256=hashlib.sha256(filter_path.read_bytes()).hexdigest(),
                 mapping_sha256=hashlib.sha256(mapping_path.read_bytes()).hexdigest())
@@ -123,6 +126,10 @@ def prepare_settings(config_path, split_override=None, output_override=None, bev
                     model_revision=None, model_service={}, structured_model_output=False,
                     evaluation_workers=1)
     settings = dict(defaults, **settings)
+    settings.setdefault("model_goal_retry_limit", 1 if settings["fast"] == "server" else 0)
+    if (type(settings["model_goal_retry_limit"]) is not int or settings["model_goal_retry_limit"] not in (0, 1)
+            or (settings["fast"] == "off" and settings["model_goal_retry_limit"] != 0)):
+        raise ValueError("model_goal_retry_limit must be 0 or 1 (0 when fast=off)")
     settings["evaluation_workers"] = evaluation_worker_count(settings["evaluation_workers"])
     if split_override:
         settings["split"] = split_override
@@ -220,10 +227,8 @@ def scoring_environment(settings):
     env["EP_NAVSIM_EVALUATION_WORKERS"] = str(evaluation_worker_count(settings.get("evaluation_workers", 1)))
     # This observer only exports the official scorer's already computed output.
     # It is installed before the unchanged official script imports pdm_score.
-    if settings["bev_video"]:
-        env["EP_NAVSIM_REPLAY_SETTINGS"] = settings["settings_path"]
-    else:
-        env.pop("EP_NAVSIM_REPLAY_SETTINGS", None)
+    # Minimal numerical records are independent of optional video rendering.
+    env["EP_NAVSIM_REPLAY_SETTINGS"] = settings["settings_path"]
     return env
 
 
@@ -330,40 +335,198 @@ def official_command(settings, cache=False):
 
 
 def verify_scores(settings, csv_path):
-    with Path(csv_path).open(encoding="utf-8", newline="") as stream:
-        rows = list(csv.DictReader(stream))
-    by_token = {row["token"]: row for row in rows}
+    from .evaluation_result import validate_csv, sample_state
+    from nine_grid.paths import filesystem_path
+    checked = validate_csv(settings, csv_path)
     expected = set(settings["evaluation_tokens"])
-    actual = {row["token"] for row in rows if not row["token"].startswith("extended_pdm_score_")}
-    if actual != expected or len(by_token) != len(rows):
-        raise RuntimeError("Official CSV is incomplete or has duplicate/unexpected tokens")
-    invalid = [token for token in expected if by_token[token]["valid"].lower() != "true"]
-    combined = by_token.get("extended_pdm_score_combined", {})
-    value = float(combined.get("score", "nan"))
-    if invalid or combined.get("valid", "").lower() != "true" or not math.isfinite(value):
-        raise RuntimeError("Official run is not a complete valid benchmark: failed=%d; aggregation_valid=%s" %
-                           (len(invalid), combined.get("valid")))
-    result = dict(status="complete", official_csv=str(csv_path), official_two_stage_epdms=value,
+    result = dict(status="complete", phase="complete", official_csv=str(csv_path),
+                official_two_stage_epdms=checked["scores"]["combined"],
+                official_stage_scores={stage: checked["scores"][stage] for stage in ("stage_one", "stage_two")},
+                official_metrics=checked["metrics"], official_stage_counts=checked["stage_counts"],
                 evaluated_tokens=len(expected), failed_tokens=0, input_condition=INPUT_CONDITION,
                 standard_sensor_only_comparable=False, official_commit=OFFICIAL_COMMIT,
                 split=settings["split"], settings_sha256=digest(settings))
     result["trajectory_sampling"] = dict(horizon_s=4.0, interval_s=0.5, poses=8,
                                          short_plan_padding_allowed=False)
-    if settings.get("fast") in ("api", "server"):
+    if settings.get("output_dir") is not None:
         audits = []
+        model_requested = settings.get("fast", "off") in ("api", "server")
         for token in sorted(expected):
-            path = Path(settings["output_dir"]) / "samples" / digest(token)[:24] / "trajectory.json"
-            audit = json.loads(path.read_text(encoding="utf-8")).get("condition_audit")
-            if not audit or audit.get("model_requested") is not True:
-                raise RuntimeError("Model-enabled benchmark lacks per-sample condition evidence: " + token)
+            path = filesystem_path(settings["output_dir"]) / "samples" / digest(token)[:24] / "trajectory.json"
+            state, state_error = sample_state(path.parent, token)
+            if state_error is not None:
+                raise RuntimeError("Official benchmark sample attempt is not complete: " + token)
+            try:
+                trajectory = json.loads(path.read_text(encoding="utf-8"))
+                audit = trajectory.get("condition_audit")
+                poses = trajectory["poses"]
+                valid_poses = (len(poses) == 8 and all(len(pose) == 3 and all(
+                    math.isfinite(float(value)) for value in pose) for pose in poses))
+            except (OSError, ValueError, TypeError, KeyError, OverflowError):
+                raise RuntimeError("Official benchmark lacks a valid submitted trajectory: " + token) from None
+            if (not valid_poses or trajectory.get("frame_id") != token
+                    or trajectory.get("sampling") != dict(horizon_s=4.0, interval_s=0.5)):
+                raise RuntimeError("Official benchmark trajectory token/horizon disagrees: " + token)
+            if state is not None and (trajectory.get("resume") or {}).get("identity_sha256") != state["identity_sha256"]:
+                raise RuntimeError("Official benchmark trajectory belongs to another sample attempt: " + token)
+            if (not audit or audit.get("model_requested") is not model_requested
+                    or audit.get("retrieval_enabled") is not settings.get("retrieve", False)):
+                raise RuntimeError("Official benchmark lacks consistent per-sample condition evidence: " + token)
             audits.append(audit)
-        valid = sum(audit.get("model_answer_valid") is True for audit in audits)
+        valid = sum(audit.get("model_semantics_applied", audit.get("model_answer_valid")) is True for audit in audits)
+        parsed = sum(audit.get("model_answer_parsed_valid", audit.get("model_answer_valid")) is True for audit in audits)
         hits = sum(bool(audit.get("retrieved_memory_ids")) for audit in audits)
-        result["condition_audit"] = dict(model_requested=len(audits), valid_model_answers=valid,
-            base_fallback_samples=len(audits)-valid, samples_with_retrieved_memories=hits,
-            all_samples_received_valid_model_answer=valid == len(audits),
-            memory_snapshot_id=settings["memory_snapshot_id"], memory_record_count=settings["memory_record_count"])
+        def attempts(audit, key):
+            value = audit.get(key)
+            return value if type(value) is int and value >= 0 else 0
+        validation_stages = Counter(str(audit.get("model_validation_stage") or
+            ("unarchived" if model_requested else "not_requested")) for audit in audits)
+        result["condition_audit"] = dict(model_requested=len(audits) if model_requested else 0, valid_model_answers=valid,
+            parsed_model_answers=parsed, model_semantics_applied=valid,
+            model_semantic_attempts=sum(attempts(audit, "model_semantic_attempts") for audit in audits),
+            model_call_attempts=sum(attempts(audit, "model_call_attempts") for audit in audits),
+            samples_with_goal_retry=sum(attempts(audit, "model_semantic_attempts") > 1 for audit in audits),
+            model_validation_stages=dict(validation_stages),
+            base_fallback_samples=len(audits)-valid if model_requested else 0, samples_with_retrieved_memories=hits,
+            all_samples_received_valid_model_answer=valid == len(audits) if model_requested else None,
+            memory_snapshot_id=settings.get("memory_snapshot_id"), memory_record_count=settings.get("memory_record_count", 0))
     return result
+
+
+def evaluate(settings):
+    from .run_lock import evaluation_lock
+    # Acquire before publishing any lifecycle state so a rejected second
+    # launcher cannot replace the running owner's benchmark_result.json.
+    with evaluation_lock(settings) as lease:
+        return _evaluate_locked(settings, lease)
+
+
+def _wait_owned_child(child, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return child.wait(timeout=max(0., deadline - time.monotonic()))
+        except KeyboardInterrupt:
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(child.args, timeout) from None
+
+
+def _stop_official_child(child):
+    """Stop only our explicitly created SDK child/session, with bounded waits."""
+    if os.name != "nt":
+        try:
+            if os.getpgid(child.pid) != child.pid or os.getsid(child.pid) != child.pid:
+                raise RuntimeError("Owned official child no longer has its own session; refusing group signal")
+        except ProcessLookupError:
+            # The group can outlive its leader; its ID remains reserved while
+            # those descendants exist. It is the session created by Popen.
+            pass
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    elif child.poll() is None:
+        child.terminate()
+    try:
+        _wait_owned_child(child, 10.)
+    except subprocess.TimeoutExpired:
+        if os.name != "nt":
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
+            child.kill()
+        _wait_owned_child(child, 5.)
+    if os.name != "nt":
+        # A multiprocessing worker may still be finishing after its main
+        # process exited. Do not let a log-sized batch continue model calls.
+        try:
+            os.killpg(child.pid, 0)
+        except ProcessLookupError:
+            return
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def run_official(settings, lease):
+    """Keep ownership until the official child exits, including interruption."""
+    child = subprocess.Popen(official_command(settings), env=scoring_environment(settings), cwd=ROOT,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                             start_new_session=os.name != "nt", **lease.child_options())
+    try:
+        code = child.wait()
+    except BaseException:
+        # No PID scan: only the child/session explicitly created immediately
+        # above is managed. External deployed model/viewer services are outside.
+        _stop_official_child(child)
+        raise
+    if code:
+        _stop_official_child(child)
+        raise subprocess.CalledProcessError(code, child.args)
+
+
+def _evaluate_locked(settings, lease):
+    """Run official evaluation, preserving truthful status even when it fails."""
+    from .evaluation_result import artifact_audit, run_state, utc_now
+    previous = Path(settings["output_dir"]) / "benchmark_result.json"
+    if previous.is_file() and json.loads(previous.read_text(encoding="utf-8")).get("status") == "complete":
+        raise ValueError("This output directory already contains a complete benchmark; choose a new output_dir")
+    started, phase, candidates = utc_now(), "cache_verification", []
+    run_state(settings, phase, started_utc=started)
+    try:
+        verify_cache_contract(settings)
+        normalize_cache_metadata(settings)
+        phase = "data_inspection"
+        run_state(settings, phase, started_utc=started)
+        run_sdk(settings, "inspect")
+        phase = "cache_verification"
+        run_state(settings, phase, started_utc=started)
+        run_sdk(settings, "check-cache")
+        output = Path(settings["output_dir"]) / "official_scores"
+        before = {path: (path.stat().st_size, path.stat().st_mtime_ns) for path in output.glob("*.csv")}
+        phase = "official_scoring"
+        run_state(settings, phase, started_utc=started)
+        run_official(settings, lease)
+        phase = "official_result_validation"
+        candidates = [path for path in output.glob("*.csv")
+                      if before.get(path) != (path.stat().st_size, path.stat().st_mtime_ns)]
+        run_state(settings, phase, started_utc=started)
+        if len(candidates) != 1:
+            raise RuntimeError("Expected one newly generated official result CSV")
+        result = verify_scores(settings, candidates[0])
+        audit = artifact_audit(settings)
+        if audit["missing_trajectory_tokens"] or audit["planning_failure_tokens"]:
+            raise RuntimeError("Official CSV and per-sample trajectory/failure evidence disagree")
+        result.update(started_utc=started, finished_utc=utc_now(), artifact_audit=audit)
+        write_json(Path(settings["output_dir"]) / "benchmark_result.json", result)
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        return result
+    except BaseException as exc:
+        # Never replace partial CSVs or sample artifacts with invented scores.
+        # A rerun/resume can inspect this record instead of mistaking missing
+        # benchmark_result.json for a still-running or successfully finished run.
+        try:
+            audit = artifact_audit(settings)
+        except Exception as audit_error:
+            audit = dict(planning_failure_tokens=[], audit_error=repr(audit_error))
+        if phase == "official_scoring":
+            candidates = list((Path(settings["output_dir"]) / "official_scores").glob("*.csv"))
+        run_state(settings, phase, status="failed", started_utc=started, error=exc,
+                  artifact_audit=audit, failed_tokens=len(audit["planning_failure_tokens"]),
+                  official_csv_candidates=[str(path) for path in candidates])
+        raise
+    finally:
+        if settings["bev_video"]:
+            try:
+                from .replay_gallery import update_gallery
+                print("Official scoring replay gallery:", update_gallery(settings["output_dir"]), flush=True)
+            except Exception as exc:
+                # Optional gallery output must not mask a numerical failure or
+                # invalidate an otherwise complete official benchmark result.
+                print("Official replay gallery refresh failed (scores unchanged): " + str(exc), file=sys.stderr, flush=True)
 
 
 def main():
@@ -410,22 +573,5 @@ def main():
         normalize_cache_metadata(settings)
         run_sdk(settings, "check-cache")
     else:
-        verify_cache_contract(settings)
-        normalize_cache_metadata(settings)
-        run_sdk(settings, "inspect")
-        run_sdk(settings, "check-cache")
-        output = Path(settings["output_dir"]) / "official_scores"
-        before = set(output.glob("*.csv"))
-        try:
-            subprocess.run(official_command(settings), check=True, env=scoring_environment(settings), cwd=ROOT)
-        finally:
-            if settings["bev_video"]:
-                from .replay_gallery import update_gallery
-                print("Official scoring replay gallery:", update_gallery(settings["output_dir"]), flush=True)
-        created = set(output.glob("*.csv")) - before
-        if len(created) != 1:
-            raise RuntimeError("Expected one newly generated official result CSV")
-        result = verify_scores(settings, created.pop())
-        write_json(Path(settings["output_dir"]) / "benchmark_result.json", result)
-        print(json.dumps(result, ensure_ascii=False), flush=True)
+        evaluate(settings)
     return 0

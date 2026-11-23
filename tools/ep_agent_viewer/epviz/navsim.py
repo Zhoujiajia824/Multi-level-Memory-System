@@ -10,6 +10,7 @@ import copy
 from collections import OrderedDict
 import csv
 import hashlib
+import json
 import math
 from pathlib import Path
 
@@ -68,11 +69,11 @@ class NavsimRun(_Episode):
         if settings.get("retrieve") is True:
             condition += "＋记忆检索"
         expected = settings.get("evaluation_tokens")
-        expected = len(expected) if isinstance(expected, list) else benchmark.get("evaluated_tokens")
+        expected = len(expected) if isinstance(expected, list) else benchmark.get("expected_tokens", benchmark.get("evaluated_tokens"))
         return dict(id=self.id, name=self.path.name, path=self.path.relative_to(self.authorized_root).as_posix(),
             label=condition + " · " + self.path.name, condition_label=condition,
             split=benchmark.get("split", settings.get("split")),
-            status=benchmark.get("status", "pending"), sample_count=self.sample_count,
+            status=benchmark.get("status", "pending"), run_phase=benchmark.get("phase"), sample_count=self.sample_count,
             completed_samples=self.completed_samples, expected_samples=expected,
             stages=dict(self.stages), model_backend=fast, retrieval_enabled=settings.get("retrieve"),
             standard_sensor_only_comparable=benchmark.get("standard_sensor_only_comparable"))
@@ -118,7 +119,10 @@ class NavsimRun(_Episode):
                    for key, field, label in _RUN_METRICS]
         warnings = []
         complete = result["status"] == "complete"
-        scores_status = "pending"
+        scores_status = "failed" if result["status"] == "failed" else "pending"
+        failure = self.benchmark().get("error")
+        if scores_status == "failed" and isinstance(failure, dict):
+            warnings.append(str(failure.get("type", "Error")) + ": " + str(failure.get("message", "")))
         if complete:
             valid = all(str(row.get("valid", "")).lower() == "true" for row in (first, second, combined))
             values = list(scores.values()) + [row[stage] for row in metrics for stage in ("stage_one", "stage_two")]
@@ -141,7 +145,9 @@ class NavsimRun(_Episode):
             metric_scale="0_to_1", warnings=warnings,
             score_semantics="SDK two-stage aggregation; not an arithmetic mean of available anchors",
             input_condition=self.benchmark().get("input_condition"),
-            failed_samples=self.benchmark().get("failed_tokens"))
+            failed_samples=self.benchmark().get("failed_tokens"),
+            error=failure if isinstance(failure, dict) else None,
+            condition_audit=self.benchmark().get("condition_audit"))
         return result
 
 
@@ -177,9 +183,37 @@ def _rows(value, columns=3):
 
 class NavsimEpisode(_Episode):
     @staticmethod
+    def current_attempt_complete(path):
+        """A new failed/running attempt cannot expose an older saved replay."""
+        state_path = path / "sample_state.json"
+        if _stat(state_path) is None:
+            return True  # Older archives did not have an attempt marker.
+        try:
+            if not _inside(state_path, path):
+                return False
+            with open(_disk(state_path), encoding="utf-8-sig") as stream:
+                state = json.load(stream)
+            if (state.get("schema") != "ep-navsim-sample-state-1" or state.get("status") != "complete"
+                    or not state.get("attempt_id") or not state.get("source_token")
+                    or not state.get("identity_sha256")):
+                return False
+            marker_path = path / "sample_complete.json"
+            if not _inside(marker_path, path):
+                return False
+            with open(_disk(marker_path), encoding="utf-8-sig") as stream:
+                marker = json.load(stream)
+            return (marker.get("schema") == "ep-navsim-completion-1" and marker.get("status") == "complete"
+                    and marker.get("attempt_id") == state["attempt_id"]
+                    and marker.get("source_token") == state.get("source_token")
+                    and marker.get("identity_sha256") == state.get("identity_sha256"))
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
+
+    @staticmethod
     def is_sample(path):
-        return any(_stat(path / name) is not None for name in ("input_packet.json", "input_packet.json.gz")) and any(
+        return (any(_stat(path / name) is not None for name in ("input_packet.json", "input_packet.json.gz")) and any(
             _stat(path / name) is not None for name in ("trajectory.json", "planning_evidence.json"))
+                and NavsimEpisode.current_attempt_complete(path))
 
     def __init__(self, path, identifier, authorized_root, run=None):
         super().__init__(path, identifier)
@@ -196,10 +230,27 @@ class NavsimEpisode(_Episode):
         return next((self.path / name for name in names if _inside(self.path / name, self.path)
                      and _stat(self.path / name) is not None), None)
 
+    def validate_asset(self, relative):
+        if not self.current_attempt_complete(self.path):
+            raise FileNotFoundError("Current NAVSIM attempt is incomplete or failed; old assets are excluded")
+        state = self.json(self.path / "sample_state.json") or {}
+        attempt = state.get("attempt_id")
+        if attempt and relative.replace("\\", "/").startswith("official_replay/"):
+            capture = self.json(self.path / "official_replay/capture_status.json") or {}
+            if (capture.get("status") != "complete" or capture.get("sample_attempt_id") != attempt
+                    or capture.get("token") != state.get("source_token")):
+                raise FileNotFoundError("Official replay belongs to a different sample attempt")
+            if relative.endswith((".mp4", ".png")):
+                render = self.json(self.path / "official_replay/render_status.json") or {}
+                if (render.get("status") != "complete" or render.get("sample_attempt_id") != attempt
+                        or render.get("token") != state.get("source_token")):
+                    raise FileNotFoundError("Official video belongs to a different sample attempt")
+
     def _source_signature(self):
         result = []
         for name in ("planning_evidence.json", "trajectory.json",
-                     "official_replay/trace.json.gz", "official_replay/trace.json"):
+                     "official_replay/trace.json.gz", "official_replay/trace.json",
+                     "sample_state.json", "sample_complete.json"):
             path = self.path / name
             stat = _stat(path) if _inside(path, self.path) else None
             result.append((stat.st_size, stat.st_mtime_ns) if stat else None)
@@ -224,6 +275,9 @@ class NavsimEpisode(_Episode):
         self.json_cache.clear()
 
     def refresh(self):
+        if not self.current_attempt_complete(self.path):
+            self.release_payload()
+            raise KeyError("Current NAVSIM sample attempt is incomplete or failed; old replay is excluded")
         signature = self._source_signature()
         self.warnings = []
         self.packet_path = self._file("input_packet.json.gz", "input_packet.json")
@@ -231,6 +285,10 @@ class NavsimEpisode(_Episode):
         self.submitted = self.json(self.path / "trajectory.json") or {}
         self.identity = self.planning.get("identity") or {}
         self.token = str(self.identity.get("token") or self.submitted.get("frame_id") or self.path.name)
+        sample_state = self.json(self.path / "sample_state.json") or {}
+        if sample_state and sample_state.get("source_token") != self.token:
+            self.release_payload()
+            raise KeyError("Current NAVSIM sample attempt has a different source token")
         self.plan = self.planning.get("plan") or {}
         if self.plan and str(self.plan.get("frame_id")) != self.token:
             self.warnings.append("Source plan token differs from anchor; plan excluded")
@@ -240,16 +298,18 @@ class NavsimEpisode(_Episode):
             self.submitted = {}
         self.trace_path = self._file("official_replay/trace.json.gz", "official_replay/trace.json")
         trace = self.json(self.trace_path) if self.trace_path else None
+        attempt = sample_state.get("attempt_id")
         self.trace = None
         if isinstance(trace, dict):
             states = (trace.get("ego") or {}).get("states")
             coords = (trace.get("provenance") or {}).get("coordinates", "")
             if (str(trace.get("token")) == self.token and _rows(states, 3)
                     and _finite(trace.get("dt_s")) is not None and float(trace["dt_s"]) > 0
-                    and "global_map_xy" in coords and "rear axle" in coords):
+                    and "global_map_xy" in coords and "rear axle" in coords
+                    and (not attempt or (trace.get("provenance") or {}).get("sample_attempt_id") == attempt)):
                 self.trace = trace
             else:
-                self.warnings.append("Official trace token, finite states, time grid or coordinate provenance invalid; replay excluded")
+                self.warnings.append("Official trace source, attempt, finite states, time grid or coordinates invalid; replay excluded")
         elif self.trace_path:
             self.warnings.append("Official trace is incomplete or unreadable; showing the source anchor only")
         count = len(self.trace["ego"]["states"]) if self.trace else 1
@@ -331,13 +391,16 @@ class NavsimEpisode(_Episode):
 
     def _video(self, store):
         render = self.json(self.path / "official_replay/render_status.json") or {}
+        attempt = (self.json(self.path / "sample_state.json") or {}).get("attempt_id")
+        same_attempt = not attempt or render.get("sample_attempt_id") == attempt
         path = store._relative(self, "official_replay/official_bev.mp4")
         available = bool(path and self.trace and str(render.get("token")) == self.token
-                         and render.get("status") == "complete")
+                         and render.get("status") == "complete" and same_attempt)
         official = bool(str(render.get("token")) == self.token and render.get("status") == "complete"
                         and render.get("renderer_version") == OFFICIAL_RENDERER_VERSION
-                        and render.get("official_visualization") is True)
-        preview = store._relative(self, "official_replay/official_bev_first.png") if str(render.get("token")) == self.token else None
+                        and render.get("official_visualization") is True and same_attempt and self.trace)
+        preview = store._relative(self, "official_replay/official_bev_first.png") if (
+            str(render.get("token")) == self.token and same_attempt and self.trace) else None
         video_stat = _stat(self.path / path) if path else None
         legacy = not render.get("renderer_version") or str(render.get("renderer_version")).startswith("legacy-custom-")
         label = "NAVSIM SDK官方绘图 · 评分执行视频" if official else (
@@ -371,12 +434,15 @@ class NavsimEpisode(_Episode):
     def _scores(self):
         benchmark = self.run.json(self.run.path / "benchmark_result.json") if self.run else {}
         benchmark = benchmark or {}
-        csv_row = self.run.csv_record(self.token) if self.run else None
+        summary = self.run.details() if self.run else {}
+        ready = summary.get("scores_status") == "complete"
+        csv_row = self.run.csv_record(self.token) if self.run and ready else None
         final = ((self.trace or {}).get("metrics") or {}).get("official_final")
         return dict(internal_quality=_compact(self.planning.get("internal_quality")),
             internal_quality_is_official_metric=False,
             official_anchor=_compact(final), official_csv_anchor=csv_row,
-            official_two_stage_aggregate=dict(score=benchmark.get("official_two_stage_epdms"),
+            official_two_stage_aggregate=dict(score=(summary.get("scores") or {}).get("combined") if ready else None,
+                status=summary.get("scores_status", "pending"),
                 evaluated_tokens=benchmark.get("evaluated_tokens"), failed_tokens=benchmark.get("failed_tokens"),
                 split=benchmark.get("split"), standard_sensor_only_comparable=benchmark.get("standard_sensor_only_comparable")),
             semantics="Internal quality, pre-aggregation official anchor metrics, CSV anchor row and official two-stage run aggregate are distinct; none are instantaneous replay metrics")

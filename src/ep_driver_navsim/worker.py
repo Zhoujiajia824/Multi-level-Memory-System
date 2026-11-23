@@ -20,11 +20,13 @@ import shapely
 
 from .protocol import (digest, trajectory_from_centers, validate_packet, write_json, horizon_contract,
                        relative_asset_path, HORIZON_S, PLANNING_STEP_S, PLANNING_STEPS)
-from .archive import write_input_packet, serialize_retrieval
+from .archive import write_input_packet, serialize_retrieval, write_json_gz
 from .resume import (build_run_identity, sample_identity, load_completed_sample,
-                     begin_sample, complete_sample)
+                     begin_sample, complete_sample, fail_sample)
 from .memory import check_memory_disjoint, load_memory_snapshot
-from .model import NoLegalGoalReference, StructuredServerVisionClient, structured_response_format
+from .model import (NoLegalGoalReference, AuditedVisionClient, StructuredServerVisionClient,
+                    structured_response_format, goal_retry_policy, rejection_stage,
+                    goal_retry_prompt, MODEL_ATTEMPT_PROTOCOL)
 from nine_grid.contracts import Actor, Lane, SceneSnapshot, RetrievalResult, plain
 from nine_grid.configuration import validate_config
 from nine_grid.models import (VisionClient, load_system_prompts, build_prompt, parse_answer,
@@ -138,11 +140,26 @@ class NumericalPipeline:
             raise ValueError("Retrieval requested but no compatible audited memory was loaded")
         self.run_identity = build_run_identity(settings, self.config, fast, prompts, self.memory_snapshot_id)
         self.resume_enabled = settings.get("resume", True)
-        self.fast = (StructuredServerVisionClient if structured else VisionClient)("fast", fast)
+        goal_retry_policy(settings)
+        self.fast = (StructuredServerVisionClient if structured else AuditedVisionClient)("fast", fast)
         self.extractor = DINOExtractor(self.config["dino"]["model"],
             device=self.config["dino"].get("device"), local_files_only=True)
 
     def compute(self, packet, output_dir):
+        attempt = {}
+        try:
+            return self._compute(packet, output_dir, attempt)
+        except Exception as exc:
+            source = packet.get("identity") if isinstance(packet, dict) else None
+            token = source.get("token") if isinstance(source, dict) else None
+            try:
+                fail_sample(output_dir, exc, attempt.get("state"), source_token=token)
+            except Exception as state_error:
+                logger = logging.getLogger(__name__)
+                logger.error("Failed to publish sample failure state: %s", type(state_error).__name__)
+            raise
+
+    def _compute(self, packet, output_dir, attempt):
         started = time.perf_counter()
         root = filesystem_path(output_dir)
         root.mkdir(parents=True, exist_ok=True)
@@ -152,7 +169,7 @@ class NumericalPipeline:
             cached = load_completed_sample(root, identity)
             if cached is not None:
                 return cached
-        begin_sample(root)
+        attempt["state"] = begin_sample(root, identity)
         scene = snapshot_from_packet(packet, self.config)
         packet_path = write_input_packet(root, packet)
         config_hash = digest(self.config)
@@ -167,6 +184,9 @@ class NumericalPipeline:
             timing["retrieval_s"] = time.perf_counter() - tick
         answer, model_error, model_error_detail, raw = None, None, None, None
         model_preparation_fallback = None
+        model_validation_stage = "not_requested"
+        model_attempts = []
+        retry_policy = goal_retry_policy(self.settings)
         model_call_attempts = 0
         model_request_sent = False
         response_format = None
@@ -177,7 +197,7 @@ class NumericalPipeline:
             structured = self.settings.get("structured_model_output", False)
             # Cache before build_prompt: prompt, request schema and strict parser
             # must use this exact original-frame reference and configured limits.
-            reference = _goal_reference(scoped_for_model, self.config) if structured else None
+            reference = _goal_reference(scoped_for_model, self.config)
             # Frame/source/image integrity remains a hard input error, even if a
             # valid numerical base plan could be produced without model semantics.
             images = model_image_paths(scene, reps)
@@ -193,6 +213,7 @@ class NumericalPipeline:
                 # Only an explicitly unavailable semantic reference/goal interval
                 # skips HTTP. It does not request braking or alter the base MPC.
                 model_error, model_error_detail = type(exc).__name__, str(exc)
+                model_validation_stage = "preparation_unavailable"
                 model_preparation_fallback = dict(reason=exc.reason_code,
                     detail=exc.detail, stage="structured_request_preparation", request_sent=False,
                     policy="same_base_mpc_without_model_semantics")
@@ -201,22 +222,54 @@ class NumericalPipeline:
             else:
                 if response_format is not None:
                     write_json(root / "model_response_format.json", response_format)
-                try:
-                    raw = (self.fast.call_structured(prompt, images, response_format) if structured
-                           else self.fast.call(prompt, images))
-                except Exception as exc:
-                    # Remote exception text may contain URLs or credentials.
-                    model_error = type(exc).__name__
-                else:
+                current_prompt = prompt
+                for semantic_index in range(retry_policy["limit"]+1):
+                    record = dict(attempt=semantic_index+1,
+                        prompt_sha256=hashlib.sha256(current_prompt.encode("utf-8")).hexdigest(),
+                        original_reference_id=reference["reference_id"],
+                        response_format_sha256=digest(response_format) if response_format else None)
+                    raw, model_error, model_error_detail = None, None, None
                     try:
-                        answer = parse_answer(raw, scoped_for_model, config=self.config, reference=reference)
-                    except ValueError as exc:
-                        model_error, model_error_detail = type(exc).__name__, str(exc)
+                        raw = (self.fast.call_structured(current_prompt, images, response_format) if structured
+                               else self.fast.call(current_prompt, images))
                     except Exception as exc:
+                        # Record only remote exception types, never credential-bearing text.
                         model_error = type(exc).__name__
+                        transport = copy.deepcopy(getattr(self.fast, "last_transport_attempts", []))
+                        choices = transport[-1].get("choices", []) if transport else []
+                        model_validation_stage = ("response_truncated" if choices and
+                            choices[0].get("finish_reason") == "length" else "transport_error")
+                        raw = choices[0].get("raw") if choices else None
+                    else:
+                        try:
+                            answer = parse_answer(raw, scoped_for_model, config=self.config, reference=reference)
+                        except ValueError as exc:
+                            model_error, model_error_detail = type(exc).__name__, str(exc)
+                            model_validation_stage = rejection_stage(raw, scoped_for_model, self.config, reference)
+                        except Exception as exc:
+                            model_error = type(exc).__name__
+                            model_validation_stage = "parser_error"
+                        else:
+                            model_validation_stage = "accepted"
+                    record.update(raw=raw, validation_stage=model_validation_stage,
+                        error=model_error, error_detail=model_error_detail,
+                        transport=copy.deepcopy(getattr(self.fast, "last_transport_attempts", [])))
+                    if semantic_index:
+                        record["feedback"] = dict(rejected_attempt=semantic_index,
+                            reason=model_attempts[-1]["error_detail"], stage="goal_geometry")
+                    model_attempts.append(record)
+                    if (model_validation_stage != "goal_geometry"
+                            or semantic_index == retry_policy["limit"]):
+                        break
+                    current_prompt = goal_retry_prompt(prompt, raw, model_error_detail, semantic_index+2)
             model_call_attempts = int(getattr(self.fast, "attempts", 0)) - attempts_before
             model_request_sent = model_call_attempts > 0
             timing["model_s"] = time.perf_counter() - tick
+            # Publish before planning so a subsequent numerical failure retains
+            # the original answer, each bounded correction and transport evidence.
+            write_json_gz(root / "model_attempts.json.gz", dict(schema=MODEL_ATTEMPT_PROTOCOL,
+                frame_id=scene.frame_id, policy=retry_policy, attempts=model_attempts,
+                final_stage=model_validation_stage))
         tick = time.perf_counter()
         scoped, predictions = prepare_planning_context(scene, self.config, answer=answer)
         timing["prediction_s"] = time.perf_counter() - tick
@@ -251,6 +304,9 @@ class NumericalPipeline:
             parameters_sha256=config_hash, parameters=self.config, timing_s=timing,
             model_answer=plain(answer), model_error=model_error, model_error_detail=model_error_detail, model_raw=raw,
             model_preparation_fallback=model_preparation_fallback,
+            model_validation_stage=model_validation_stage, model_goal_retry_policy=retry_policy,
+            model_semantic_attempts=len(model_attempts),
+            model_attempts_asset="model_attempts.json.gz" if self.fast.enabled else None,
             model_call_attempts=model_call_attempts, model_request_sent=model_request_sent,
             model_semantics_applied=model_semantics_applied, model_planning_fallback=plain(semantic_fallback),
             structured_model_output=self.settings.get("structured_model_output", False),
@@ -281,6 +337,8 @@ class NumericalPipeline:
             model_preparation_fallback=model_preparation_fallback,
             model_call_attempts=model_call_attempts, model_request_sent=model_request_sent,
             model_error=model_error, model_error_detail=model_error_detail,
+            model_validation_stage=model_validation_stage, model_goal_retry_policy=retry_policy,
+            model_semantic_attempts=len(model_attempts),
             structured_model_output=self.settings.get("structured_model_output", False),
             retrieval_enabled=self.settings["retrieve"],
             retrieved_memory_ids=[record["id"] for record in retrieved.records])
@@ -292,9 +350,10 @@ class NumericalPipeline:
                           *(Path(row["path"]) for row in packet["camera_images"])]
         if self.fast.enabled:
             artifact_paths.append(root / "model_prompt.txt")
+            artifact_paths.append(root / "model_attempts.json.gz")
         if response_format is not None:
             artifact_paths.append(root / "model_response_format.json")
-        complete_sample(root, identity, artifact_paths)
+        complete_sample(root, identity, artifact_paths, attempt_id=attempt["state"]["attempt_id"])
         return result
 
 

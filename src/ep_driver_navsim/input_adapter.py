@@ -94,6 +94,18 @@ def validate_navigation_initialization(ego, lanes, route, ids, road, association
     record['reference_quality_reasons']=sorted(set(reasons))
     record['input_contract']='causal_finite_current_state_directed_public_topology_and_coordinate_attachments'
     record['reference_feasibility_is_input_gate']=False
+    # Preflight used to validate lane chains without constructing their final
+    # lane/map intersection. Check the identical domain builder before images,
+    # DINO or model calls, so numeric overlay failures are not discovered late.
+    # This is the default 120m/20m base domain, not the speed-dependent extent
+    # the MPC may request later, and does not certify a vehicle trajectory.
+    from nine_grid.potential_domain import build_lane_potential_domain
+    domain,evidence = build_lane_potential_domain(snapshot)
+    record['potential_domain_validation'] = dict(valid=True,area_m2=float(domain.area),
+        domain_type=domain.geom_type,checked_front_m=evidence['map_extension_front_m'],
+        checked_rear_m=evidence['map_extension_rear_m'],numeric_overlay=evidence['numeric_overlay'],
+        scope='base_domain_geometry_only;MPC_revalidates_actual_speed_dependent_extent',
+        vehicle_safety_certificate=False)
     return route,record
 
 

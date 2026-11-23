@@ -15,6 +15,7 @@ import subprocess
 import time
 
 import numpy as np
+from nine_grid.paths import filesystem_path
 
 from .protocol import digest, write_json
 
@@ -128,7 +129,7 @@ def _token(cache, settings):
 
 def _destination(cache, settings):
     token = _token(cache, settings)
-    return token, Path(settings["output_dir"]) / "samples" / digest(token)[:24] / "official_replay"
+    return token, filesystem_path(settings["output_dir"]) / "samples" / digest(token)[:24] / "official_replay"
 
 
 def export_replay(arguments, result, capture, settings):
@@ -142,6 +143,8 @@ def export_replay(arguments, result, capture, settings):
         raise RuntimeError("Official score did not produce a complete replay capture")
     cache, sampling = arguments["metric_cache"], arguments["future_sampling"]
     token, destination = _destination(cache, settings)
+    from .score_record import current_attempt
+    attempt_id = current_attempt(arguments, settings)
     actual = np.asarray(result[1])
     if (actual.shape != capture["ego_states"].shape
             or not np.array_equal(actual, capture["ego_states"])):
@@ -174,6 +177,7 @@ def export_replay(arguments, result, capture, settings):
         actors=capture["actors"], red_lights=capture["red_lights"],
         metrics=dict(official_final=metric_values(result[0]), raw=capture["raw"]),
         events=capture["events"], provenance=dict(
+            sample_attempt_id=attempt_id,
             official_commit=settings.get("official_commit"),
             official_source_sha256=settings.get("official_source_sha256"),
             input_condition=settings.get("input_condition"),
@@ -194,6 +198,7 @@ def export_replay(arguments, result, capture, settings):
         json.dump(replay, stream, allow_nan=False, separators=(",", ":"))
     temp.replace(replay_path)
     write_json(destination / "capture_status.json", dict(status="complete", token=token,
+        sample_attempt_id=attempt_id,
         replay=str(replay_path), samples=count, dt_s=float(sampling.interval_length),
         physical_horizon_s=float(sampling.num_poses * sampling.interval_length), score_unchanged=True))
     started = time.perf_counter()
@@ -228,10 +233,9 @@ def _failure_status(cache, settings, exc):
 
 def wrap_score_function(original, settings):
     """Delegate the official score exactly once and return its exact result object."""
-    if not settings.get("bev_video", True):
-        return original
     if getattr(original, "_ep_official_replay_observer", False):
         return original
+    video = settings.get("bev_video", True)
     signature = inspect.signature(original)
     exported_count = 0
 
@@ -241,11 +245,24 @@ def wrap_score_function(original, settings):
         bound = signature.bind(*args, **kwargs)
         arguments = dict(bound.arguments)
         capture = dict(errors=[])
-        bound.arguments["traffic_agents_policy"] = _PolicyObserver(arguments["traffic_agents_policy"], capture)
-        bound.arguments["scorer"] = _ScorerObserver(arguments["scorer"], capture)
+        if video:
+            bound.arguments["traffic_agents_policy"] = _PolicyObserver(arguments["traffic_agents_policy"], capture)
+            bound.arguments["scorer"] = _ScorerObserver(arguments["scorer"], capture)
         # Exceptions from official scoring propagate exactly as before. Export
         # errors are separate and must never manufacture invalid score rows.
         result = original(*bound.args, **bound.kwargs)
+        try:
+            from .score_record import export_score_record
+            export_score_record(arguments, result, settings)
+        except Exception as exc:
+            try:
+                from .score_record import record_failure
+                record_failure(arguments, settings, exc)
+            except Exception:
+                LOG.warning("Unable to save official score evidence failure status")
+            LOG.warning("Official score evidence export failed; numerical result retained: %s", exc)
+        if not video:
+            return result
         try:
             export_replay(arguments, result, capture, settings)
         except Exception as exc:

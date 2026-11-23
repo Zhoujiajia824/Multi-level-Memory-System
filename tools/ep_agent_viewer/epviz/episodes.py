@@ -289,7 +289,7 @@ class EpisodeStore:
 
     def discover(self) -> list[dict]:
         with self._lock:
-            found = []
+            found, declared_run_ids = [], set()
             for directory, dirs, _files in os.walk(_disk(self.root), followlinks=False):
                 path = _path(directory)
                 dirs[:] = [name for name in dirs if name not in _PRUNE]
@@ -297,6 +297,15 @@ class EpisodeStore:
                     dirs[:] = []
                     continue
                 from .navsim import NavsimEpisode, NavsimRun
+                if "run_settings.json" in _files and "benchmark_result.json" in _files:
+                    key = str(path)
+                    candidate = self._navsim_runs.get(key) or NavsimRun(path, self.root)
+                    benchmark = candidate.benchmark()
+                    if (benchmark.get("input_condition") == "privileged_current_history_tracks_hd_map_route_traffic_lights"
+                            and benchmark.get("split") in ("warmup_two_stage", "navhard_two_stage")
+                            and benchmark.get("status") in ("running", "failed", "complete")):
+                        self._navsim_runs[key] = candidate
+                        declared_run_ids.add(candidate.id)
                 if NavsimEpisode.is_sample(path):
                     relative = path.relative_to(self.root).as_posix()
                     identifier = hashlib.sha256(relative.encode("utf-8")).hexdigest()[:16]
@@ -320,7 +329,7 @@ class EpisodeStore:
                     episode.refresh()
                     found.append(self._describe(episode))
                     dirs[:] = []
-            self._active_run_ids = {row["run_id"] for row in found if row.get("run_id")}
+            self._active_run_ids = declared_run_ids | {row["run_id"] for row in found if row.get("run_id")}
             for run in self._navsim_runs.values():
                 members = [row for row in found if row.get("run_id") == run.id]
                 run.sample_count = len(members)
@@ -436,7 +445,10 @@ class EpisodeStore:
 
     def resolve_asset(self, identifier: str, relative: str) -> Path:
         with self._lock:
-            path = self._resolve(self._episode(identifier), relative)
+            episode = self._episode(identifier)
+            path = self._resolve(episode, relative)
+            if hasattr(episode, "validate_asset"):
+                episode.validate_asset(relative)
             asset_stat = _stat(path)
             if asset_stat is None or not stat_mode.S_ISREG(asset_stat.st_mode):
                 raise FileNotFoundError("Asset is unavailable")

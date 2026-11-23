@@ -4,11 +4,13 @@ An absent, old, partial, corrupt or mismatched checkpoint is simply a cache miss
 The completion marker is published last. It is never inferred from trajectory.json.
 """
 import hashlib
+from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 import json
 from pathlib import Path
 import platform
 import sys
+import uuid
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
@@ -18,10 +20,12 @@ from nine_grid.paths import filesystem_path
 from . import INPUT_PROTOCOL
 from .archive import read_input_packet, read_json
 from .protocol import digest, horizon_contract, relative_asset_path, trajectory_from_centers, write_json
-from .model import STRUCTURED_OUTPUT_PROTOCOL
+from .model import STRUCTURED_OUTPUT_PROTOCOL, goal_retry_policy, goal_retry_prompt, MODEL_ATTEMPT_PROTOCOL
 
 SCHEMA = "ep-navsim-completion-1"
 COMPLETION_FILE = "sample_complete.json"
+SAMPLE_STATE_FILE = "sample_state.json"
+SAMPLE_STATE_SCHEMA = "ep-navsim-sample-state-1"
 
 
 def file_sha256(path):
@@ -76,6 +80,7 @@ def build_run_identity(settings, effective_config, model_settings, system_prompt
                                     for key in ("parameters", "prompts_config")},
                 model=model, model_service=settings.get("model_service", {}),
                 structured_model_output=settings.get("structured_model_output", False),
+                model_goal_retry_policy=goal_retry_policy(settings),
                 structured_output_protocol=(STRUCTURED_OUTPUT_PROTOCOL
                     if settings.get("structured_model_output", False) else None),
                 system_prompts_sha256={key: digest(value) for key, value in system_prompts.items()},
@@ -92,16 +97,51 @@ def sample_identity(packet, run_identity):
         cameras.append(dict(view=row["view"], frame_id=row["frame_id"], time=row["time"],
                             path=str(path.resolve()), size_bytes=path.stat().st_size,
                             sha256=file_sha256(path)))
-    return dict(schema=SCHEMA, run=run_identity, input_packet_sha256=digest(packet),
+    return dict(schema=SCHEMA, run=run_identity, source_token=packet["identity"]["token"],
+                input_packet_sha256=digest(packet),
                 camera_content=cameras)
 
 
-def begin_sample(root):
-    """Invalidate any old success before touching a sample's output assets."""
+def begin_sample(root, identity=None, source_token=None):
+    """Publish an active attempt before invalidating old success pointers.
+
+    Old trajectories and official evidence remain on disk. They cannot become
+    the current attempt merely because a retry fails before overwriting them.
+    """
     root = filesystem_path(root)
     root.mkdir(parents=True, exist_ok=True)
+    state = dict(schema=SAMPLE_STATE_SCHEMA, status="processing", attempt_id=uuid.uuid4().hex,
+                 source_token=identity.get("source_token") if identity is not None else source_token,
+                 identity_sha256=digest(identity) if identity is not None else None,
+                 started_utc=datetime.now(timezone.utc).isoformat())
+    write_json(root / SAMPLE_STATE_FILE, state)
     (root / COMPLETION_FILE).unlink(missing_ok=True)
     (root / "failure.json").unlink(missing_ok=True)
+    return state
+
+
+def fail_sample(root, error, attempt=None, source_token=None):
+    root = filesystem_path(root)
+    if attempt is None:
+        attempt = begin_sample(root, source_token=source_token)
+    state = read_json(root / SAMPLE_STATE_FILE)
+    if state.get("attempt_id") != attempt["attempt_id"]:
+        return False  # A superseded computation cannot mark another attempt failed.
+    state.update(status="failed", finished_utc=datetime.now(timezone.utc).isoformat(),
+                 error=dict(type=type(error).__name__, detail=str(error)))
+    write_json(root / SAMPLE_STATE_FILE, state)
+    return True
+
+
+def _current_state(root, identity, attempt_id=None):
+    state = read_json(root / SAMPLE_STATE_FILE)
+    if (state.get("schema") != SAMPLE_STATE_SCHEMA or state.get("status") not in ("processing", "complete")
+            or state.get("source_token") != identity.get("source_token")
+            or state.get("identity_sha256") != digest(identity)
+            or not isinstance(state.get("attempt_id"), str) or not state["attempt_id"]
+            or (attempt_id is not None and state["attempt_id"] != attempt_id)):
+        raise ValueError("Sample attempt or source identity changed")
+    return state
 
 
 def _local_asset(root, name):
@@ -163,6 +203,44 @@ def _validate_output(root, identity, assets):
         raise ValueError("Checkpoint packet/camera content differs")
     result = read_json(root / "trajectory.json")
     evidence = read_json(root / "planning_evidence.json")
+    policy = identity["run"].get("model_goal_retry_policy")
+    if policy is not None:
+        for record in (result.get("condition_audit", {}), evidence):
+            if record.get("model_goal_retry_policy") != policy:
+                raise ValueError("Checkpoint model correction policy differs")
+        if identity["run"]["model"]["backend"] != "off":
+            if "model_attempts.json.gz" not in assets or evidence.get("model_attempts_asset") != "model_attempts.json.gz":
+                raise ValueError("Checkpoint model attempt evidence is missing")
+            attempts = read_json(root / "model_attempts.json.gz")
+            rows = attempts.get("attempts", [])
+            if (attempts.get("schema") != MODEL_ATTEMPT_PROTOCOL or attempts.get("policy") != policy
+                    or attempts.get("frame_id") != packet["identity"]["token"]
+                    or type(rows) is not list or len(rows) > policy["limit"]+1
+                    or attempts.get("final_stage") != evidence.get("model_validation_stage")
+                    or len(rows) != evidence.get("model_semantic_attempts")
+                    or len(rows) != result.get("condition_audit", {}).get("model_semantic_attempts")):
+                raise ValueError("Checkpoint model attempt evidence differs")
+            if rows and (rows[-1].get("raw") != evidence.get("model_raw")
+                         or rows[-1].get("validation_stage") != evidence.get("model_validation_stage")):
+                raise ValueError("Checkpoint final model answer differs from its attempt")
+            base_prompt = (root / "model_prompt.txt").read_text(encoding="utf-8")
+            for index, row in enumerate(rows):
+                prompt = base_prompt
+                if index:
+                    previous = rows[index-1]
+                    if (previous.get("validation_stage") != "goal_geometry"
+                            or row.get("feedback") != dict(rejected_attempt=index,
+                                reason=previous.get("error_detail"), stage="goal_geometry")):
+                        raise ValueError("Checkpoint correction does not follow a geometric rejection")
+                    prompt = goal_retry_prompt(base_prompt, previous.get("raw"), previous.get("error_detail"), index+1)
+                if (row.get("attempt") != index+1
+                        or row.get("prompt_sha256") != hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+                        or row.get("original_reference_id") != rows[0].get("original_reference_id")
+                        or row.get("response_format_sha256") != evidence.get("model_response_format_sha256")):
+                    raise ValueError("Checkpoint correction source or prompt differs")
+            if ((not rows and evidence.get("model_validation_stage") != "preparation_unavailable")
+                    or (evidence.get("model_answer") is not None and evidence.get("model_validation_stage") != "accepted")):
+                raise ValueError("Checkpoint model acceptance stage differs")
     if identity["run"].get("structured_model_output"):
         unsent = _unsent_semantic_preparation(result, evidence)
         has_schema = "model_response_format.json" in assets
@@ -224,12 +302,13 @@ def _condition_success(result, evidence, identity):
         and bool(identity["run"]["model"].get("model_revision"))))
 
 
-def complete_sample(root, identity, artifact_paths):
+def complete_sample(root, identity, artifact_paths, attempt_id=None):
     """Validate complete outputs, hash assets, then atomically publish success.
 
     A scored fallback can be complete, but B/C fallback completion is never reusable.
     """
     root = filesystem_path(root)
+    state = _current_state(root, identity, attempt_id) if (root / SAMPLE_STATE_FILE).exists() else None
     assets = {}
     for value in artifact_paths:
         path = filesystem_path(value)
@@ -239,9 +318,16 @@ def complete_sample(root, identity, artifact_paths):
     requested = identity["run"]["model"]["backend"] != "off"
     if requested and "model_prompt.txt" not in assets:
         raise ValueError("Model participation evidence is incomplete")
+    if state is not None:
+        _current_state(root, identity, state["attempt_id"])
     write_json(root / COMPLETION_FILE, dict(schema=SCHEMA, status="complete",
         reusable=_condition_success(result, evidence, identity), identity=identity,
-        identity_sha256=digest(identity), assets=assets))
+        identity_sha256=digest(identity), assets=assets,
+        **(dict(attempt_id=state["attempt_id"], source_token=state["source_token"]) if state else {})))
+    if state is not None:
+        _current_state(root, identity, state["attempt_id"])
+        state.update(status="complete", finished_utc=datetime.now(timezone.utc).isoformat())
+        write_json(root / SAMPLE_STATE_FILE, state)
 
 
 def load_completed_sample(root, identity):
@@ -251,6 +337,11 @@ def load_completed_sample(root, identity):
         if (root / "failure.json").exists():
             return None
         marker = read_json(root / COMPLETION_FILE)
+        if (root / SAMPLE_STATE_FILE).exists():
+            state = _current_state(root, identity)
+            if (state["status"] != "complete" or marker.get("attempt_id") != state["attempt_id"]
+                    or marker.get("source_token") != state["source_token"]):
+                return None
         if (marker["schema"] != SCHEMA or marker["status"] != "complete"
                 or marker["reusable"] is not True or marker["identity"] != identity
                 or marker["identity_sha256"] != digest(identity)):

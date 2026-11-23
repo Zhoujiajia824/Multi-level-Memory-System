@@ -6,6 +6,9 @@ import shapely
 from .object_scope import lane_role_geometry
 
 
+OVERLAY_GRID_M = 1e-9
+
+
 def polygonal_area(geometry):
     """Keep the exact positive-area components of a geometric intersection.
 
@@ -27,6 +30,63 @@ def polygonal_area(geometry):
     if not polygons:
         raise ValueError('导航车道势场域没有有效面，不能以线或点替代车道')
     return shapely.union_all(polygons)
+
+
+def _clip_lane_domain(parts, drivable):
+    """Intersect valid inputs, retrying only a numerically broken GEOS overlay.
+
+    Coincident lane/map boundaries can produce nested shells or misplaced holes
+    even though both inputs are valid. A one-nanometre overlay grid resolves
+    that numeric topology; it is not a lane buffer or an invalid-map repair.
+    """
+    if not drivable.is_valid or drivable.is_empty:
+        raise ValueError('势场可行驶地图源几何无效或为空')
+    if any(not part.is_valid for part in parts):
+        raise ValueError('势场车道源几何无效')
+    corridor = shapely.union_all(parts)
+    if corridor.is_empty or not corridor.is_valid:
+        raise ValueError('势场导航车道源并集无效或为空')
+    reason = None
+    try:
+        domain = shapely.intersection(corridor, drivable)
+        if not domain.is_valid:
+            reason = shapely.is_valid_reason(domain)
+    except shapely.errors.GEOSException as exc:
+        reason = type(exc).__name__
+    repair = dict(applied=reason is not None, method='valid_input_fixed_precision_overlay',
+                  source_valid=dict(corridor=True, drivable=True),
+                  grid_size_m=OVERLAY_GRID_M if reason else None,
+                  geos_version=shapely.geos_version_string, original_overlay_error=reason)
+    if reason is not None:
+        domain = shapely.intersection(corridor, drivable, grid_size=OVERLAY_GRID_M)
+    if domain.is_empty or not domain.is_valid:
+        raise ValueError('导航车道势场域为空或几何无效')
+    intersection_type = domain.geom_type
+    domain = polygonal_area(domain)
+    if domain.is_empty or not domain.is_valid or domain.geom_type not in ('Polygon', 'MultiPolygon'):
+        raise ValueError('导航车道势场面域为空或几何无效')
+    if reason is not None:
+        # Vertex rounding displaces each input vertex by at most half a grid
+        # diagonal. The two-sided boundary-strip area bounds this numerical
+        # effect; the tolerance follows actual input perimeter, not road width.
+        tolerance = 2 * OVERLAY_GRID_M * (corridor.length + drivable.length) + 8 * OVERLAY_GRID_M**2
+        excess, verification = {}, {}
+        for name, source in (('corridor', corridor), ('drivable', drivable)):
+            try:
+                difference = shapely.difference(domain, source)
+                if not difference.is_valid:
+                    raise shapely.errors.GEOSException('Invalid difference overlay')
+                verification[name] = 'float64_difference'
+            except shapely.errors.GEOSException:
+                difference = shapely.difference(domain, source, grid_size=OVERLAY_GRID_M)
+                verification[name] = 'same_precision_grid_difference'
+            if not difference.is_valid or difference.area > tolerance:
+                raise ValueError('势场数值相交超出原车道或可行驶地图范围')
+            excess[name] = float(difference.area)
+        repair.update(subset_excess_area_m2=excess, subset_area_tolerance_m2=float(tolerance),
+                      subset_verification=verification,
+                      tolerance_basis='2*grid_m*(corridor_perimeter_m+drivable_perimeter_m)+8*grid_m^2')
+    return domain, intersection_type, repair
 
 
 def build_lane_potential_domain(scene, front_m=120., rear_m=20.):
@@ -66,13 +126,7 @@ def build_lane_potential_domain(scene, front_m=120., rear_m=20.):
                 connections.add(pair)
     if not parts:
         raise ValueError('势场缺少已确认的当前车道几何，不能使用整个可行驶地图代替')
-    domain = shapely.union_all(parts).intersection(scene.drivable)
-    if domain.is_empty or not domain.is_valid:
-        raise ValueError('导航车道势场域为空或几何无效')
-    intersection_type = domain.geom_type
-    domain = polygonal_area(domain)
-    if domain.is_empty or not domain.is_valid or domain.geom_type not in ('Polygon', 'MultiPolygon'):
-        raise ValueError('导航车道势场面域为空或几何无效')
+    domain, intersection_type, repair = _clip_lane_domain(parts, scene.drivable)
     return domain, {
         'version': 'lane-potential-domain-1.2',
         'lane_ids': sorted(selected),
@@ -89,6 +143,7 @@ def build_lane_potential_domain(scene, front_m=120., rear_m=20.):
         'navigation_connections': [{'from_lane_id': pair[0], 'to_lane_id': pair[1]} for pair in sorted(connections)],
         'geometry': 'union(actual_lane_polygon intersect centerline_half_width_band;confirmed_traversed_navigation_connection_band) intersect drivable',
         'intersection_type': intersection_type, 'domain_type': domain.geom_type,
+        'numeric_overlay': repair,
         'area_policy': 'exact_polygonal_components;zero_area_lines_and_points_excluded;no_buffer_or_expansion',
         'outside': 'undefined; rejected_by_domain_constraint',
         'map_extension_front_m': float(front_m), 'map_extension_rear_m': float(rear_m),

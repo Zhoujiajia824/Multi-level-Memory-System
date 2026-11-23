@@ -19,7 +19,7 @@ const potentialCache=new Map();
 
 function toast(message){$('toast').textContent=message;$('toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').hidden=true,4200);}
 function connection(message,status='good'){$('connection').className=`badge ${status}`;$('connection').replaceChildren(el('i'),document.createTextNode(message));}
-async function request(url,signal,options={}){const response=await fetch(url,{signal,cache:'no-store',...options});if(!response.ok){let detail;try{detail=(await response.json()).error;}catch{}throw new Error(detail||`HTTP ${response.status}`);}return response.json();}
+async function request(url,signal,options={}){const response=await fetch(url,{signal,cache:'no-store',...options});if(!response.ok){let detail;try{detail=(await response.json()).error;}catch{}const error=new Error(detail||`HTTP ${response.status}`);error.status=response.status;throw error;}return response.json();}
 function episodeName(item){return item.scenario||item.summary?.scenario||item.episode_id||item.id;}
 function modeName(mode){return ({pure_base:'纯基础规划',base:'纯基础规划',base_model:'基础规划 + 模型',model:'基础规划 + 模型',retrieval:'模型 + 经验记忆',full_pipeline:'模型辅助规划',fast:'基础规划 + 模型',emergency_unverified:'紧急制动'})[mode]||mode||'执行模式未归档';}
 function metricValue(value){if(value===true)return'是';if(value===false)return'否';if(value===undefined||value===null)return'未归档';if(typeof value==='number')return Number.isInteger(value)?String(value):fmt(value,3);return typeof value==='string'?value:json(value);}
@@ -38,8 +38,8 @@ function rememberSelection(){
 function visibleEpisodes(){return state.episodes.filter(item=>{const inRun=!state.runs.length||(state.run===otherRun?!item.run_id:item.run_id===state.run);return inRun&&(state.stage==='all'||item.stage===state.stage);});}
 function renderRunResults(){
   const run=selectedRun(),panel=$('run-results');panel.hidden=!run;if(!run)return;
-  const summary=state.runSummary,ready=summary?.scores_status==='complete',scores=ready?summary.scores||{}:{};
-  const status=$('run-results-status');status.className=`badge ${ready?'good':'subtle'}`;status.textContent=ready?'已完成':summary?.scores_status==='unavailable'?'汇总不可用':summary?'汇总未生成':'读取中';
+  const summary=state.runSummary,ready=summary?.scores_status==='complete',scores=ready?summary.scores||{}:{},failed=(summary||run).status==='failed';
+  const status=$('run-results-status');status.className=`badge ${ready?'good':failed?'bad':'subtle'}`;status.textContent=ready?'已完成':failed?'测评失败':summary?.scores_status==='unavailable'?'汇总不可用':summary?.status==='running'?'测评进行中':summary?'汇总未生成':'读取中';
   $('run-results-name').textContent=`${run.condition_label||run.label||run.name} · ${run.name||run.id}`;
   $('run-results-name').title=run.path||'';
   const detail=summary||run,split=detail.split||run.split||'';
@@ -54,7 +54,13 @@ function renderRunResults(){
     for(const [key]of scoreColumns){const value=ready?summary.metrics?.find(metric=>metric.key===key)?.[stage]:null;const cell=el('td',null,finite(value)?fmt(value*100):'—');cell.dataset.metric=key;row.append(cell);}
     const score=el('td','stage-score',finite(scores[stage])?fmt(scores[stage]*100):'—');score.dataset.metric='EPDMS';row.append(score);body.append(row);
   }
-  $('run-results-note').textContent=ready?'官方 CSV 汇总 · 0–100 分，越高越好':summary?.scores_status==='unavailable'?'官方评分汇总不可用，请检查本轮评分文件。':'官方汇总尚未生成；可继续查看已完成场景。';
+  const phases={data_inspection:'数据与导航预检',cache_verification:'评分缓存核验',official_scoring:'官方评分',official_result_validation:'官方结果核验'};
+  let note=ready?'官方 CSV 汇总 · 0–100 分，越高越好':failed?`${phases[detail.run_phase]||detail.run_phase||'测评'}失败；已有场景仍可查看。`:
+    summary?.scores_status==='unavailable'?'官方评分汇总不可用，请检查本轮评分文件。':'官方汇总尚未生成；可继续查看已完成场景。';
+  if(failed&&summary?.error?.message)note+=` ${String(summary.error.message).slice(0,300)}`;
+  const condition=summary?.condition_audit;
+  if(ready&&condition?.model_requested>0)note+=` · 模型实际应用 ${condition.model_semantics_applied??condition.valid_model_answers??0}/${condition.model_requested}，回退 ${condition.base_fallback_samples??0}`;
+  $('run-results-note').textContent=note;
   $('run-results-note').title=summary?.official_csv||summary?.warnings?.join('\n')||'';
 }
 async function loadRunResults(){
@@ -139,6 +145,11 @@ async function selectEpisode(id){
   }
   await loadManifest(true);
 }
+async function clearUnavailableEpisode(){
+  await selectEpisode(null);$('episode-select').value='';
+  $('episode-meta').textContent='当前样本未完成或失败，旧回放已清除；刷新后重新选择';
+  connection('当前样本不可用','warn');await loadRunResults();
+}
 async function loadManifest(initial=false){
   if(!state.episode)return;
   const episode=state.episode,epoch=state.manifestEpoch,requestId=++state.manifestRequest;
@@ -165,7 +176,7 @@ async function loadManifest(initial=false){
     connection(state.follow?'跟随产物 · 1Hz':'产物已连接');
     if(count){const next=state.follow?count-1:Math.min(state.index,count-1);if(initial||state.follow||next!==state.index||!state.frame||state.frame.pending)await loadFrame(next);}
     else{$('stage-empty').hidden=false;$('stage-empty').querySelector('strong').textContent='实验尚未写入规划帧';}
-  }catch(error){if(episode!==state.episode||epoch!==state.manifestEpoch||requestId!==state.manifestRequest)return;connection('读取失败','bad');if(initial)toast(error.message);}
+  }catch(error){if(episode!==state.episode||epoch!==state.manifestEpoch||requestId!==state.manifestRequest)return;if(error.status===404&&state.isNavsim){await clearUnavailableEpisode();return;}connection('读取失败','bad');if(initial)toast(error.message);}
 }
 async function loadFrame(index,{fromPlayback=false,fromVideoClock=false}={}){
   const count=state.manifest?.frames?.length||0;if(!count)return;
@@ -177,7 +188,7 @@ async function loadFrame(index,{fromPlayback=false,fromVideoClock=false}={}){
     if(epoch!==state.epoch||episode!==state.episode)return;
     state.frame=frame;state.index=index;if(!fromPlayback)state.playTime=finite(frame.time)?frame.time:0;
     renderFrame(frame,{exactVideoSeek:!fromPlayback,fromVideoClock});potentialLabel();if(!$('potential-panel').hidden)loadPotential(frame,{playback:fromPlayback});
-  }catch(error){if(error.name!=='AbortError'&&epoch===state.epoch){toast(`帧读取失败：${error.message}`);pause();}}
+  }catch(error){if(error.name!=='AbortError'&&epoch===state.epoch){if(error.status===404&&state.isNavsim){await clearUnavailableEpisode();return;}toast(`帧读取失败：${error.message}`);pause();}}
   finally{if(epoch===state.epoch){state.fetching=false;if(fromVideoClock)syncFromVideo();}}
 }
 function renderFrame(frame,{exactVideoSeek=false,fromVideoClock=false}={}){

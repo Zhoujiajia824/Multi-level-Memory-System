@@ -134,8 +134,7 @@ def smoke(settings, loader):
         candidate = MetricCacheLoader(Path(settings["metric_cache_path"]))
         if set(tokens).issubset(candidate.tokens):
             ready_cache = candidate
-    if settings.get("bev_video", True):
-        pdm_score = wrap_score_function(pdm_score, settings)
+    pdm_score = wrap_score_function(pdm_score, settings)
     rows = []
     try:
         agent.initialize()

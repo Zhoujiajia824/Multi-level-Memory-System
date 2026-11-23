@@ -412,6 +412,7 @@ def _render_captured(replay_path, destination, replay, canvas, size, metadata, *
         raise RuntimeError("Encoded official replay failed frame-count/fps validation")
     os.replace(temporary, video)
     status = dict(status="complete", token=replay["token"], replay_version=VERSION,
+                  sample_attempt_id=(replay.get("provenance") or {}).get("sample_attempt_id"),
                   stage=replay.get("stage"), replay_path=str(replay_path),
                   video=str(video), preview=str(destination / "official_bev_first.png"),
                   frames=count, decoded_frames=decoded, playback_verified=True, decode_verified=True,
@@ -485,6 +486,7 @@ def render_replay(replay_path, output_dir=None, *, size=900, settings=None,
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         from .protocol import write_json
         write_json(destination / "render_status.json", dict(status="failed", token=replay["token"],
+            sample_attempt_id=(replay.get("provenance") or {}).get("sample_attempt_id"),
             renderer_version=RENDERER_VERSION, official_visualization=False, error=str(exc),
             official_score_unchanged=True, failure_scope="visualization_only"))
         raise

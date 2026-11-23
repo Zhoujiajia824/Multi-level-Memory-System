@@ -1,7 +1,10 @@
 """NAVSIM-only server schema requests; core output validation stays authoritative."""
 import copy
+import json
 import logging
 import math
+import re
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -12,8 +15,101 @@ from nine_grid.geometry import polyline_lengths
 
 STRUCTURED_OUTPUT_PROTOCOL = "navsim-scoped-response-schema-1.1"
 STRUCTURED_DECODING = {"policy": "greedy", "temperature": 0.0}
+MODEL_ATTEMPT_PROTOCOL = "ep-navsim-model-attempts-1"
+GOAL_RETRY_PROTOCOL = "navsim-model-goal-retry-1"
 
 logger = logging.getLogger(__name__)
+
+
+def goal_retry_policy(settings):
+    limit = settings.get("model_goal_retry_limit", 1 if settings["fast"] == "server" else 0)
+    if type(limit) is not int or limit not in (0, 1) or (settings["fast"] == "off" and limit):
+        raise ValueError("model_goal_retry_limit must be 0 or 1; off requires 0")
+    return dict(protocol=GOAL_RETRY_PROTOCOL, limit=limit, trigger="goal_geometry_only",
+                reference="same_source_frame")
+
+
+def rejection_stage(raw, scene, config, reference):
+    """Locate a rejection without relaxing the core parser's acceptance rules."""
+    from nine_grid.decision_protocol import normalize_model_output
+    from nine_grid.models import _unique_answer_object
+    if not isinstance(raw, str) or len(raw) > 6000:
+        return "response_format"
+    serialized = raw.strip()
+    if serialized.startswith("```"):
+        match = re.fullmatch(r"```(?:json)?[ \t]*\r?\n((?:(?!```).)*?)\r?\n```",
+                             serialized, re.DOTALL | re.IGNORECASE)
+        if match is None:
+            return "response_format"
+        serialized = match[1]
+    try:
+        attention, _, _, _ = normalize_model_output(json.loads(serialized, object_pairs_hook=_unique_answer_object))
+    except (ValueError, TypeError):
+        return "response_format"
+    ids = attention_ids(scene, config)
+    selected = [item["id"] for item in attention]
+    if len(set(selected)) != len(selected) or any(value not in ids for value in selected):
+        return "attention_identity"
+    if (not isinstance(reference, dict) or reference.get("frame_id") != scene.frame_id
+            or reference.get("time") != scene.time or reference.get("semantic_reference_valid", True) is not True):
+        return "goal_reference"
+    return "goal_geometry"
+
+
+def goal_retry_prompt(prompt, raw, reason, attempt):
+    """Ask the model again; never clamp, snap or substitute its goal locally."""
+    feedback = dict(attempt=attempt, rejected_answer=raw, rejection=str(reason),
+                    coordinate_policy="原始输入帧及原规划参考不变；不得更换坐标原点或使用未来状态")
+    return (prompt + "\n局部目标几何校验未通过。请根据原始场景、同一规划参考和下面的拒绝原因，"
+            "重新给出完整四部分JSON回答。程序没有修改你的目标点；仍须由你重新选择可达目标。\n"
+            + json.dumps(feedback, ensure_ascii=False))
+
+
+class _AuditedTransport:
+    def __init__(self, transport, records):
+        self.transport, self.records = transport, records
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+    def create(self, **kwargs):
+        content = kwargs.get("messages", [{}, {}])[-1].get("content", [])
+        row = dict(max_tokens=kwargs.get("max_tokens"),
+                   image_count=sum(isinstance(item, dict) and item.get("type") == "image_url"
+                                   for item in content) if isinstance(content, list) else 0)
+        started = time.monotonic()
+        try:
+            result = self.transport.chat.completions.create(**kwargs)
+        except Exception as exc:
+            row["transport_error"] = type(exc).__name__
+            status = getattr(exc, "status_code", None)
+            row["http_status"] = status if type(status) is int else None
+            raise
+        else:
+            row["response_model"] = getattr(result, "model", None)
+            choices = getattr(result, "choices", [])
+            row["choices"] = [dict(finish_reason=getattr(choice, "finish_reason", None),
+                                   raw=getattr(getattr(choice, "message", None), "content", None))
+                              for choice in choices]
+            usage = getattr(result, "usage", None)
+            row["usage"] = {key: getattr(usage, key, None) for key in
+                            ("prompt_tokens", "completion_tokens", "total_tokens")} if usage else None
+            return result
+        finally:
+            row["wall_s"] = time.monotonic()-started
+            self.records.append(row)
+
+
+class AuditedVisionClient(VisionClient):
+    """Preserve response evidence even when the existing transport rejects length."""
+    def call(self, prompt, image_paths):
+        self.last_transport_attempts = []
+        original = self.client
+        if not self.enabled:
+            return None
+        self.client = _AuditedTransport(original, self.last_transport_attempts)
+        try:
+            return super().call(prompt, image_paths)
+        finally:
+            self.client = original
 
 
 class NoLegalGoalReference(ValueError):
@@ -183,7 +279,7 @@ class _SchemaTransport:
         return self.transport.chat.completions.create(**kwargs)
 
 
-class StructuredServerVisionClient(VisionClient):
+class StructuredServerVisionClient(AuditedVisionClient):
     """Keep the core image payload/retries while adding one mandatory server field."""
     def __init__(self, role, settings, **kwargs):
         if settings.get("backend") != "server":
