@@ -237,7 +237,15 @@ class ViewerHandler(BaseHTTPRequestHandler):
             if path == "/api/episodes":
                 with self.server.store_lock:
                     episodes = self.server.store.discover() if self.server.store else []
-                return self._json(dict(episodes=episodes, read_only=True), head=head)
+                    runs = self.server.store.list_runs() if self.server.store else []
+                return self._json(dict(episodes=episodes, runs=runs, read_only=True), head=head)
+            run_match = re.fullmatch(r"/api/runs/([0-9a-f]{16})", path)
+            if run_match:
+                if self.server.store is None:
+                    raise FileNotFoundError("未指定实验目录")
+                with self.server.store_lock:
+                    document = self.server.store.get_run(run_match[1])
+                return self._json(dict(**document, read_only=True), head=head)
             if path == "/api/asset":
                 episode, relative = query.get("episode", [""])[0], query.get("path", [""])[0]
                 with self.server.store_lock:

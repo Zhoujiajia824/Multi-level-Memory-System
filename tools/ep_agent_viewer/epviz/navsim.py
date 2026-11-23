@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 from collections import OrderedDict
 import csv
+import hashlib
 import math
 from pathlib import Path
 
@@ -17,6 +18,131 @@ from .episodes import _Episode, _Record, _disk, _finite, _inside, _stat
 
 _PACKETS = OrderedDict()
 OFFICIAL_RENDERER_VERSION = "navsim-sdk-plots-1.0"
+
+_RUN_METRICS = (
+    ("NC", "no_at_fault_collisions", "无责任碰撞"),
+    ("DAC", "drivable_area_compliance", "可行驶区域遵守"),
+    ("DDC", "driving_direction_compliance", "行驶方向遵守"),
+    ("TLC", "traffic_light_compliance", "交通灯遵守"),
+    ("EP", "ego_progress", "自车行驶进度"),
+    ("TTC", "time_to_collision_within_bound", "碰撞时间安全性"),
+    ("LK", "lane_keeping", "车道保持"),
+    ("HC", "history_comfort", "历史运动衔接舒适性"),
+    ("EC", "two_frame_extended_comfort", "相邻规划扩展舒适性"),
+)
+
+
+def _stage(value):
+    return {"original": "stage_one", "synthetic": "stage_two",
+            "stage_one": "stage_one", "stage_two": "stage_two"}.get(str(value).lower())
+
+
+class NavsimRun(_Episode):
+    """One shared cache per run, independent of which anchor is selected.
+
+    Aggregates are read only from the SDK's named CSV summary rows. In
+    particular, an average over the available anchors is never a run score.
+    """
+    def __init__(self, path, authorized_root):
+        relative = path.relative_to(authorized_root).as_posix()
+        identifier = hashlib.sha256(("navsim-run:" + relative).encode("utf-8")).hexdigest()[:16]
+        super().__init__(path, identifier)
+        self.authorized_root = authorized_root
+        self.sample_count = 0
+        self.completed_samples = 0
+        self.stages = dict(stage_one=0, stage_two=0, unknown=0)
+        self._csv_signature = None
+        self._csv_rows = {}
+        self._csv_error = None
+
+    def benchmark(self):
+        value = self.json(self.path / "benchmark_result.json")
+        return value if isinstance(value, dict) else {}
+
+    def metadata(self):
+        settings = self.json(self.path / "run_settings.json") or {}
+        settings = settings if isinstance(settings, dict) else {}
+        benchmark = self.benchmark()
+        fast = settings.get("fast")
+        condition = "基础规划" if fast == "off" else "基础规划＋模型" if fast in ("api", "server") else "输入条件未归档"
+        if settings.get("retrieve") is True:
+            condition += "＋记忆检索"
+        expected = settings.get("evaluation_tokens")
+        expected = len(expected) if isinstance(expected, list) else benchmark.get("evaluated_tokens")
+        return dict(id=self.id, name=self.path.name, path=self.path.relative_to(self.authorized_root).as_posix(),
+            label=condition + " · " + self.path.name, condition_label=condition,
+            split=benchmark.get("split", settings.get("split")),
+            status=benchmark.get("status", "pending"), sample_count=self.sample_count,
+            completed_samples=self.completed_samples, expected_samples=expected,
+            stages=dict(self.stages), model_backend=fast, retrieval_enabled=settings.get("retrieve"),
+            standard_sensor_only_comparable=benchmark.get("standard_sensor_only_comparable"))
+
+    def _official_rows(self):
+        # Stored absolute paths may come from another host. Resolve only the
+        # basename within this authorized run, never the original target.
+        basename = str(self.benchmark().get("official_csv", "")).replace("\\", "/").split("/")[-1]
+        path = self.path / "official_scores" / basename
+        stat = _stat(path) if basename and _inside(path, self.path) else None
+        signature = (str(path), stat.st_size, stat.st_mtime_ns) if stat else None
+        if signature != self._csv_signature:
+            self._csv_signature, self._csv_rows, self._csv_error = signature, {}, None
+            if stat:
+                try:
+                    with open(_disk(path), encoding="utf-8-sig", newline="") as stream:
+                        for row in csv.DictReader(stream):
+                            token = row.get("token")
+                            if not token:
+                                continue
+                            if token in self._csv_rows:
+                                raise ValueError("Duplicate token in official CSV")
+                            self._csv_rows[token] = row
+                except (OSError, ValueError, UnicodeError, csv.Error) as exc:
+                    self._csv_rows = {}
+                    self._csv_error = type(exc).__name__ + ": " + str(exc)
+        return (path.relative_to(self.path).as_posix() if stat else None), self._csv_rows
+
+    def csv_record(self, token):
+        return self._official_rows()[1].get(token)
+
+    def details(self):
+        result = self.metadata()
+        path, rows = self._official_rows()
+        first = rows.get("extended_pdm_score_stage_one", {})
+        second = rows.get("extended_pdm_score_stage_two", {})
+        combined = rows.get("extended_pdm_score_combined", {})
+        scores = dict(combined=_finite(combined.get("score")),
+                      stage_one=_finite(first.get("score")), stage_two=_finite(second.get("score")))
+        metrics = [dict(key=key, label=label,
+                        stage_one=_finite(first.get(field + "_stage_one")),
+                        stage_two=_finite(second.get(field + "_stage_two")))
+                   for key, field, label in _RUN_METRICS]
+        warnings = []
+        complete = result["status"] == "complete"
+        scores_status = "pending"
+        if complete:
+            valid = all(str(row.get("valid", "")).lower() == "true" for row in (first, second, combined))
+            values = list(scores.values()) + [row[stage] for row in metrics for stage in ("stage_one", "stage_two")]
+            scores_status = "complete" if valid and all(v is not None and 0 <= v <= 1 for v in values) else "unavailable"
+            expected = _finite(self.benchmark().get("official_two_stage_epdms"))
+            if expected is not None and scores["combined"] is not None and abs(expected - scores["combined"]) > 1e-9:
+                scores_status = "unavailable"
+                warnings.append("官方CSV综合分与benchmark_result不一致，未展示为有效汇总。")
+            if scores_status != "complete":
+                warnings.append("完整且有效的官方两阶段汇总行尚不可用。")
+        if self._csv_error:
+            warnings.append("官方CSV读取失败：" + self._csv_error)
+        if scores_status != "complete":
+            # A partial file or a finished anchor cannot stand in for the
+            # completed run's aggregation, even if some numbers are present.
+            scores = {key: None for key in scores}
+            metrics = [{**row, "stage_one": None, "stage_two": None} for row in metrics]
+        result.update(scores=scores, metrics=metrics, scores_status=scores_status,
+            official_csv=path, score_source="official_csv_named_summary_rows",
+            metric_scale="0_to_1", warnings=warnings,
+            score_semantics="SDK two-stage aggregation; not an arithmetic mean of available anchors",
+            input_condition=self.benchmark().get("input_condition"),
+            failed_samples=self.benchmark().get("failed_tokens"))
+        return result
 
 
 def _compact(value):
@@ -55,19 +181,50 @@ class NavsimEpisode(_Episode):
         return any(_stat(path / name) is not None for name in ("input_packet.json", "input_packet.json.gz")) and any(
             _stat(path / name) is not None for name in ("trajectory.json", "planning_evidence.json"))
 
-    def __init__(self, path, identifier, authorized_root):
+    def __init__(self, path, identifier, authorized_root, run=None):
         super().__init__(path, identifier)
         self.authorized_root = authorized_root
         candidate = path.parent.parent
-        self.run = _Episode(candidate, "run") if path.parent.name == "samples" and _inside(candidate, authorized_root) else None
+        self.run = (run or NavsimRun(candidate, authorized_root)) if (
+            path.parent.name == "samples" and _inside(candidate, authorized_root)) else None
         self.identity, self.trace, self.plan, self.submitted, self.planning = {}, None, {}, {}, {}
         self.trace_path, self.packet_path = None, None
+        self._listing_signature = None
+        self._listing_state = None
 
     def _file(self, *names):
         return next((self.path / name for name in names if _inside(self.path / name, self.path)
                      and _stat(self.path / name) is not None), None)
 
+    def _source_signature(self):
+        result = []
+        for name in ("planning_evidence.json", "trajectory.json",
+                     "official_replay/trace.json.gz", "official_replay/trace.json"):
+            path = self.path / name
+            stat = _stat(path) if _inside(path, self.path) else None
+            result.append((stat.st_size, stat.st_mtime_ns) if stat else None)
+        return tuple(result)
+
+    def listing(self):
+        """Cache small, validated listing facts, without retaining every replay.
+
+        A growing/changed sample is checked with the same refresh validation as
+        a selected sample. Unchanged samples need no JSON/gzip decoding on the
+        next directory refresh. Run metadata and CSV stage fallback stay live.
+        """
+        if self._listing_state is None or self._source_signature() != self._listing_signature:
+            self.refresh()
+            self.release_payload()
+        return self.describe()
+
+    def release_payload(self):
+        """Drop large replay/model objects; keep only the listing facts."""
+        self.identity, self.trace, self.plan, self.submitted, self.planning = {}, None, {}, {}, {}
+        self.timeline = []
+        self.json_cache.clear()
+
     def refresh(self):
+        signature = self._source_signature()
         self.warnings = []
         self.packet_path = self._file("input_packet.json.gz", "input_packet.json")
         self.planning = self.json(self.path / "planning_evidence.json") or {}
@@ -99,15 +256,45 @@ class NavsimEpisode(_Episode):
         step = float(self.trace["dt_s"]) if self.trace else 0
         self.timeline = [_Record(i, 0, self.token if i == 0 else f"{self.token}:replay:{i:03d}", round(i * step, 9))
                          for i in range(count)]
+        primary_stage = (None, None)
+        sources = [("official_trace.stage", (self.trace or {}).get("stage"))]
+        sources.extend(("identity." + key, self.identity.get(key)) for key in ("stage", "frame_type"))
+        for source, value in sources:
+            if stage := _stage(value):
+                primary_stage = stage, source
+                break
+        self._listing_state = dict(frame_count=count, duration=self.timeline[-1].time,
+                                   execution_mode=self.submitted.get("execution_mode"),
+                                   primary_stage=primary_stage)
+        self._listing_signature = signature
 
     def describe(self):
         benchmark = self.run.json(self.run.path / "benchmark_result.json") if self.run else None
+        stage, stage_source = self.stage()
+        run = self.run.metadata() if self.run else {}
+        listing = self._listing_state
         return dict(id=self.id, name=self.token, path=self.path.relative_to(self.authorized_root).as_posix(),
                     scenario="NAVSIM · " + self.token, platform="navsim", dataset="navsim", live=False,
-                    frame_count=len(self.timeline), duration=self.timeline[-1].time,
-                    execution_mode=self.submitted.get("execution_mode"),
-                    summary=dict(scenario="navsim", execution_mode=self.submitted.get("execution_mode"),
+                    frame_count=listing["frame_count"], duration=listing["duration"],
+                    execution_mode=listing["execution_mode"],
+                    run_id=run.get("id"), run_name=run.get("name"), condition_label=run.get("condition_label"),
+                    stage=stage, stage_source=stage_source,
+                    summary=dict(scenario="navsim", execution_mode=listing["execution_mode"],
                                  independent_anchor=True, benchmark=_compact(benchmark)))
+
+    def stage(self):
+        # The scorer explicitly records original/synthetic. Missing future GT
+        # or a suggestive directory name is not evidence of a stage.
+        primary = (self._listing_state or {}).get("primary_stage", (None, None))
+        if primary[0]:
+            return primary
+        row = self.run.csv_record(self.token) if self.run else None
+        if row:
+            first = any(isinstance(key, str) and key.endswith("_stage_one") and _finite(value) is not None for key, value in row.items())
+            second = any(isinstance(key, str) and key.endswith("_stage_two") and _finite(value) is not None for key, value in row.items())
+            if first != second:
+                return ("stage_one" if first else "stage_two"), "official_csv_stage_columns"
+        return "unknown", None
 
     def _packet(self):
         signature = _stat(self.packet_path) if self.packet_path else None
@@ -178,23 +365,13 @@ class NavsimEpisode(_Episode):
             video=self._video(store), warnings=self.warnings + warnings,
             alignment_policy="One independent anchor; source images only at t=0; official replay never becomes planner input",
             navsim=dict(independent_anchor=True, anchor_token=self.token, identity=self.identity,
-                        trace_available=self.trace is not None, source_frame_index=0))
+                        trace_available=self.trace is not None, source_frame_index=0,
+                        run_id=self.run.id if self.run else None, stage=self.stage()[0]))
 
     def _scores(self):
         benchmark = self.run.json(self.run.path / "benchmark_result.json") if self.run else {}
         benchmark = benchmark or {}
-        csv_row = None
-        if self.run:
-            # Only archive-contained files are permitted; never follow a stored
-            # absolute official_csv path to a different machine's filesystem.
-            relative = str(benchmark.get("official_csv", "")).replace("\\", "/").split("/")[-1]
-            path = self.run.path / "official_scores" / relative
-            if relative and _inside(path, self.run.path) and _stat(path):
-                try:
-                    with open(_disk(path), encoding="utf-8-sig", newline="") as stream:
-                        csv_row = next((r for r in csv.DictReader(stream) if r.get("token") == self.token), None)
-                except (OSError, ValueError, UnicodeError):
-                    pass
+        csv_row = self.run.csv_record(self.token) if self.run else None
         final = ((self.trace or {}).get("metrics") or {}).get("official_final")
         return dict(internal_quality=_compact(self.planning.get("internal_quality")),
             internal_quality_is_official_metric=False,

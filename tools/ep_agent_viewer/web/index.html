@@ -18,8 +18,19 @@
 </header>
 <div class="workspace">
   <aside class="sidebar">
-    <label class="field-label" for="episode-select">选择实验</label>
-    <div class="select-row"><select id="episode-select"><option>正在读取实验…</option></select><button id="refresh" class="icon-button" title="刷新实验列表" aria-label="刷新实验列表">↻</button></div>
+    <div id="run-filters" class="run-filters" hidden>
+      <label class="field-label" for="run-select">测评轮次</label>
+      <select id="run-select" aria-label="选择测评轮次"></select>
+      <label class="field-label" for="stage-select">测评阶段</label>
+      <select id="stage-select" aria-label="筛选测评阶段">
+        <option value="all">全部阶段</option>
+        <option value="stage_one">第一阶段 · 原始场景</option>
+        <option value="stage_two">第二阶段 · 合成场景</option>
+        <option value="unknown">阶段未归档</option>
+      </select>
+    </div>
+    <label class="field-label" for="episode-select">场景</label>
+    <div class="select-row"><select id="episode-select"><option>正在读取场景…</option></select><button id="refresh" class="icon-button" title="刷新轮次与场景" aria-label="刷新轮次与场景">↻</button></div>
     <div id="episode-meta" class="episode-meta">加载运行产物</div>
     <div class="mode-card"><div><span class="tiny-label">当前模式</span><strong id="run-mode">—</strong></div><span id="run-status" class="status-dot"></span></div>
     <details class="sidebar-group"><summary>显示图层</summary><div class="layer-list">
@@ -43,6 +54,14 @@
   </aside>
 
   <main class="main">
+    <section id="run-results" class="panel run-results" hidden aria-label="所选测评轮次的官方汇总">
+      <div class="run-results-header">
+        <div><h2>官方测评结果 <span id="run-results-status" class="badge subtle">读取中</span></h2><p id="run-results-name"></p><p id="run-results-progress"></p></div>
+        <div class="run-total"><span>综合 EPDMS</span><strong id="run-score-total">—</strong><span> / 100</span></div>
+      </div>
+      <div class="run-score-scroll"><table id="run-score-table" class="run-score-table"><caption class="visually-hidden">官方两阶段各项指标，0到100分，越高越好；不随场景筛选重新计算。</caption><thead><tr><th scope="col">阶段</th></tr></thead><tbody></tbody></table></div>
+      <p id="run-results-note" class="run-results-note">官方汇总 · 0–100 分</p>
+    </section>
     <div class="scene-header"><div><h1 id="scene-title">驾驶现场</h1></div><div class="scene-stats"><div><span>时间</span><strong id="sim-time">0.00<small>s</small></strong></div><div><span>速度</span><strong id="ego-speed">—<small>km/h</small></strong></div><div><span>规划对象</span><strong id="actor-count">—<small>个</small></strong></div></div></div>
     <section class="scene-panel panel">
       <div class="panel-toolbar"><div class="tab-group" id="view-tabs"><button data-view="scene" class="active">空间场景</button><button data-view="video">原始录像</button><button data-view="bev">BEV图</button></div><div class="scene-actions"><button id="potential-toggle" class="mini-button">车道势场</button><button id="topdown" class="mini-button" aria-pressed="false">俯视</button><button id="reset-view" class="icon-button" title="回到自车" aria-label="回到自车">⌖</button><button id="capture" class="icon-button" title="保存场景截图" aria-label="保存场景截图">▣</button></div></div>

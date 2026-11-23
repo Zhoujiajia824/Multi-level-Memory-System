@@ -7,7 +7,8 @@ const json=value=>typeof value==='string'?value:JSON.stringify(value,null,2);
 const finite=value=>typeof value==='number'&&Number.isFinite(value);
 const el=(tag,cls,text)=>{const node=document.createElement(tag);if(cls)node.className=cls;if(text!==undefined)node.textContent=text;return node;};
 const clock=t=>{if(!finite(t))return'—';return `${String(Math.floor(Math.max(0,t)/60)).padStart(2,'0')}:${(Math.max(0,t)%60).toFixed(2).padStart(5,'0')}`;};
-const state={episodes:[],episode:null,manifest:null,frame:null,index:0,requested:-1,playing:false,rate:1,follow:new URLSearchParams(location.search).get('follow')==='1',epoch:0,manifestEpoch:0,manifestRequest:0,frameController:null,potentialController:null,view:'scene',isNavsim:false,nonNavsimView:'scene',pendingVideoSeek:null,playTime:0,lastWall:0,fetching:false};
+const initialParams=new URLSearchParams(location.search);
+const state={episodes:[],runs:[],run:initialParams.get('run'),stage:['stage_one','stage_two','unknown'].includes(initialParams.get('stage'))?initialParams.get('stage'):'all',runSummary:null,runController:null,runRequest:0,listingRequest:0,episode:initialParams.get('episode'),manifest:null,frame:null,index:0,requested:-1,playing:false,rate:1,follow:initialParams.get('follow')==='1',epoch:0,manifestEpoch:0,manifestRequest:0,frameController:null,potentialController:null,view:'scene',isNavsim:false,nonNavsimView:'scene',pendingVideoSeek:null,playTime:0,lastWall:0,fetching:false};
 const sceneLayers={roads:true,sidewalk:true,junction:true,crosswalk:true,topology:false,regions:true,objects:true,grid_matches:true,sources:true,attention:true,trajectory:true,corridor:true,goal:true};
 let scene=null,scenePromise=null,plotlyPromise=null,navsimPlotLoading=false;
 const assetUrl=path=>!path?'':typeof path==='object'?(path.url||assetUrl(path.path)):path.startsWith('/api/')||path.startsWith('/assets/')?path:`/api/asset?episode=${encodeURIComponent(state.episode||'')}&path=${encodeURIComponent(path)}`;
@@ -25,6 +26,44 @@ function metricValue(value){if(value===true)return'是';if(value===false)return'
 function emptyPanel(container,title,message,icon='⌁'){container.replaceChildren();const block=el('div','empty-state small');block.append(el('span','empty-icon',icon),el('strong',null,title),el('p',null,message));container.append(block);}
 function metricList(container,title,values){container.append(el('div','metric-title',title));const dl=el('dl','metric-list');for(const [label,value]of values){const row=el('div');row.append(el('dt',null,label),el('dd',typeof value==='boolean'?(value?'good':'bad'):null,metricValue(value)));dl.append(row);}container.append(dl);}
 function rawDetails(container,title,value){if(value==null)return;const d=el('details');d.append(el('summary',null,title),el('pre',null,json(value)));container.append(d);}
+const stageName=stage=>({stage_one:'第一阶段',stage_two:'第二阶段',unknown:'阶段未归档'})[stage]||'阶段未归档';
+const scoreColumns=[['NC','无责任碰撞'],['DAC','可行驶区域遵守'],['DDC','行驶方向遵守'],['TLC','交通灯遵守'],['EP','自车行驶进度'],['TTC','碰撞时间安全指标'],['LK','车道保持'],['HC','历史衔接舒适性'],['EC','相邻规划扩展舒适性']];
+const otherRun='__other_experiments__';
+const selectedRun=()=>state.runs.find(run=>run.id===state.run);
+function rememberSelection(){
+  const url=new URL(location.href);
+  for(const [key,value]of [['run',state.run],['stage',state.stage==='all'?null:state.stage],['episode',state.episode]]){if(value)url.searchParams.set(key,value);else url.searchParams.delete(key);}
+  history.replaceState(null,'',url);
+}
+function visibleEpisodes(){return state.episodes.filter(item=>{const inRun=!state.runs.length||(state.run===otherRun?!item.run_id:item.run_id===state.run);return inRun&&(state.stage==='all'||item.stage===state.stage);});}
+function renderRunResults(){
+  const run=selectedRun(),panel=$('run-results');panel.hidden=!run;if(!run)return;
+  const summary=state.runSummary,ready=summary?.scores_status==='complete',scores=ready?summary.scores||{}:{};
+  const status=$('run-results-status');status.className=`badge ${ready?'good':'subtle'}`;status.textContent=ready?'已完成':summary?.scores_status==='unavailable'?'汇总不可用':summary?'汇总未生成':'读取中';
+  $('run-results-name').textContent=`${run.condition_label||run.label||run.name} · ${run.name||run.id}`;
+  $('run-results-name').title=run.path||'';
+  const detail=summary||run,split=detail.split||run.split||'';
+  $('run-results-progress').textContent=[split,`${detail.completed_samples??0}${detail.expected_samples!=null?' / '+detail.expected_samples:''} 个场景已评分`].filter(Boolean).join(' · ');
+  $('run-score-total').textContent=finite(scores.combined)?fmt(scores.combined*100):'—';
+  const table=$('run-score-table'),head=el('tr');head.append(el('th',null,'阶段'));head.firstChild.scope='col';
+  for(const [key,label]of [...scoreColumns,['EPDMS','阶段综合分']]){const th=el('th',null,key);th.scope='col';th.title=label;head.append(th);}
+  table.tHead.replaceChildren(head);const body=table.tBodies[0];body.replaceChildren();
+  for(const stage of ['stage_one','stage_two']){
+    const row=el('tr',state.stage===stage?'selected':'');row.dataset.stage=stage;
+    const label=el('th',null,stageName(stage));label.scope='row';row.append(label);
+    for(const [key]of scoreColumns){const value=ready?summary.metrics?.find(metric=>metric.key===key)?.[stage]:null;const cell=el('td',null,finite(value)?fmt(value*100):'—');cell.dataset.metric=key;row.append(cell);}
+    const score=el('td','stage-score',finite(scores[stage])?fmt(scores[stage]*100):'—');score.dataset.metric='EPDMS';row.append(score);body.append(row);
+  }
+  $('run-results-note').textContent=ready?'官方 CSV 汇总 · 0–100 分，越高越好':summary?.scores_status==='unavailable'?'官方评分汇总不可用，请检查本轮评分文件。':'官方汇总尚未生成；可继续查看已完成场景。';
+  $('run-results-note').title=summary?.official_csv||summary?.warnings?.join('\n')||'';
+}
+async function loadRunResults(){
+  const run=selectedRun(),requestId=++state.runRequest;state.runController?.abort();state.runController=new AbortController();state.runSummary=null;renderRunResults();if(!run)return;
+  try{
+    const summary=await request(`/api/runs/${encodeURIComponent(run.id)}`,state.runController.signal);
+    if(requestId!==state.runRequest||state.run!==run.id)return;state.runSummary=summary;renderRunResults();
+  }catch(error){if(error.name==='AbortError'||requestId!==state.runRequest)return;$('run-results-status').textContent='汇总读取失败';$('run-results-note').textContent=error.message;}
+}
 
 async function ensureScene(){
   if(!state.manifest||state.isNavsim&&state.view!=='scene')return null;
@@ -55,15 +94,34 @@ function ensurePlotly(){
 }
 
 async function loadEpisodes(){
+  const requestId=++state.listingRequest;
   try{
-    const data=await request('/api/episodes');state.episodes=Array.isArray(data)?data:data.episodes||[];
-    const selected=state.episode;const select=$('episode-select');select.replaceChildren();
-    if(!state.episodes.length){select.append(new Option('指定目录暂无实验',''));connection('目录已连接');emptyPanel($('dialogue-panel'),'暂无实验产物','运行程序后点击刷新，或开启跟随最新。');$('episode-meta').textContent='未发现有效运行目录';return;}
-    for(const item of state.episodes){const id=item.id||item.episode_id;select.append(new Option(`${episodeName(item)} · ${String(item.episode_id||id).slice(-29)}`,id));}
-    const desired=state.episodes.some(e=>(e.id||e.episode_id)===selected)?selected:state.episodes[0].id||state.episodes[0].episode_id;
-    select.value=desired;connection('产物已连接');
-    if(desired!==state.episode)await selectEpisode(desired);else await loadManifest(false);
-  }catch(error){connection('连接失败','bad');toast(error.message);$('episode-meta').textContent=error.message;}
+    const data=await request('/api/episodes');if(requestId!==state.listingRequest)return;
+    state.episodes=Array.isArray(data)?data:data.episodes||[];state.runs=Array.isArray(data.runs)?data.runs:[];
+    const runSelect=$('run-select');runSelect.replaceChildren();$('run-filters').hidden=!state.runs.length;
+    for(const run of state.runs){const option=new Option(`${run.condition_label||run.label||run.name} · ${run.name||run.id}`,run.id);option.title=run.path||'';runSelect.append(option);}
+    const hasOther=state.episodes.some(item=>!item.run_id);if(state.runs.length&&hasOther)runSelect.append(new Option('其他实验',otherRun));
+    if(!state.runs.length){state.run=null;state.stage='all';}
+    else if(!state.runs.some(run=>run.id===state.run)&&!(state.run===otherRun&&hasOther)){state.run=state.episodes.find(item=>(item.id||item.episode_id)===state.episode)?.run_id||state.runs[0].id;}
+    runSelect.value=state.run||'';configureStageFilter();
+    const summaryRequest=loadRunResults();await applyEpisodeFilters();await summaryRequest;
+  }catch(error){if(requestId!==state.listingRequest)return;connection('连接失败','bad');toast(error.message);$('episode-meta').textContent=error.message;}
+}
+function configureStageFilter(){
+  const select=$('stage-select'),run=selectedRun();if(!run)state.stage='all';
+  select.disabled=!run;select.value=state.stage;
+  select.querySelector('[value="unknown"]').hidden=!(run?.stages?.unknown>0)&&state.stage!=='unknown';
+}
+async function applyEpisodeFilters(){
+  const items=visibleEpisodes(),select=$('episode-select');select.replaceChildren();select.disabled=!items.length;
+  if(!items.length){
+    select.append(new Option('当前选择暂无场景',''));await selectEpisode(null);connection('目录已连接');
+    $('episode-meta').textContent='当前轮次和阶段暂无已归档场景';return;
+  }
+  for(const item of items){const id=item.id||item.episode_id,label=item.run_id?`${stageName(item.stage)} · ${episodeName(item)}`:`${episodeName(item)} · ${String(item.episode_id||id).slice(-29)}`;const option=new Option(label,id);option.title=item.path||'';select.append(option);}
+  const desired=items.some(item=>(item.id||item.episode_id)===state.episode)?state.episode:items[0].id||items[0].episode_id;
+  select.value=desired;connection('产物已连接');rememberSelection();
+  if(desired!==state.episode||!state.manifest)await selectEpisode(desired);else await loadManifest(false);
 }
 async function selectEpisode(id){
   pause();state.epoch++;state.manifestEpoch++;potentialGeneration++;potentialBusy=false;potentialSourceFrame=null;state.frameController?.abort();state.potentialController?.abort();state.episode=id;state.frame=null;state.manifest=null;state.index=0;state.requested=-1;state.pendingVideoSeek=null;state.playTime=0;state.fetching=false;potentialData=null;scene?.setFrame(null);
@@ -71,6 +129,14 @@ async function selectEpisode(id){
   $('navsim-panel').hidden=true;$('navsim-panel').open=false;navsimPlotToken=null;
   $('sim-time').textContent='—';$('ego-speed').textContent='—';$('actor-count').textContent='—';$('frame-id').textContent='等待新源帧';$('plan-safety').textContent='等待读取';$('plan-safety').className='badge subtle';$('warnings').hidden=true;$('camera-count').textContent='0 VIEWS';drawPotential();
   emptyPanel($('dialogue-panel'),'读取当前实验','正在关联源帧与归档内容…');
+  rememberSelection();
+  if(!id){
+    $('video').hidden=true;$('video-status').textContent='当前选择暂无场景';$('stage-empty').querySelector('strong').textContent='当前选择暂无场景';
+    $('stage-empty').querySelector('p').textContent='请选择其他测评轮次或阶段。';$('episode-meta').textContent='暂无场景';
+    $('run-mode').textContent=selectedRun()?.condition_label||'—';$('run-status').className='status-dot';
+    $('timeline').max=0;$('timeline').value=0;$('timeline-current').textContent='—';$('timeline-end').textContent='—';$('timeline-frame').textContent='FRAME — / —';$('timeline-events').replaceChildren();
+    emptyPanel($('dialogue-panel'),'暂无场景','请选择其他测评轮次或阶段。');emptyPanel($('metrics-panel'),'暂无场景','整轮官方汇总仍显示在上方。');emptyPanel($('memory-panel'),'暂无场景','');return;
+  }
   await loadManifest(true);
 }
 async function loadManifest(initial=false){
@@ -82,13 +148,14 @@ async function loadManifest(initial=false){
     if(!manifest.frames)manifest.frames=Array.from({length:count},(_,index)=>({index,time:manifest.times?.[index]}));
     if(!manifest.times)manifest.times=manifest.frames.map(f=>f.time);
     const summary=manifest.summary||{};
-    $('episode-meta').textContent=manifest.dataset==='navsim'?`独立样本 · ${count} 个采样`:`${count} 个规划帧 · ${manifest.platform||'实验回放'}`;
+    const item=state.episodes.find(item=>(item.id||item.episode_id)===episode),run=selectedRun();
+    $('episode-meta').textContent=manifest.dataset==='navsim'?`${stageName(item?.stage)} · ${count} 个采样`:`${count} 个规划帧 · ${manifest.platform||'实验回放'}`;
     $('episode-meta').title=manifest.dataset==='navsim'?`锚点 ${manifest.navsim.anchor_token}，独立4秒，不与其他样本串接`:manifest.episode_id||episode;
     const scenario=manifest.scenario||summary.scenario||'驾驶现场';
     $('scene-title').textContent=manifest.dataset==='navsim'?'NAVSIM 评测回放':({highway:'高速公路',roundabout:'环岛',intersection:'十字路口',merge:'汇入'})[scenario]||scenario;
     $('scene-title').title=scenario;
-    $('run-mode').textContent=modeName(summary.execution_mode||manifest.execution_mode||manifest.configuration?.execution_mode);
-    $('run-status').className=`status-dot ${summary.arrival?'good':''}`;
+    $('run-mode').textContent=run?.condition_label||item?.condition_label||modeName(summary.execution_mode||manifest.execution_mode||manifest.configuration?.execution_mode);
+    $('run-status').className=`status-dot ${run?.status==='complete'||summary.arrival?'good':''}`;
     $('data-root').textContent=manifest.path||manifest.source||manifest.relative_path||'由服务端指定的只读实验目录';
     $('timeline').max=Math.max(0,count-1);$('timeline-end').textContent=clock(manifest.times.at(-1));
     $('next-event').disabled=!(manifest.model_event_indices?.length);
@@ -369,6 +436,8 @@ function tick(wall){
 function nextSourceFrame(){const m=state.manifest;if(!m)return;let next=m.frames.find(f=>f.index>state.index&&f.camera_available);if(!next&&m.platform?.includes('highway'))next=m.frames.find(f=>f.index>state.index&&f.captured);if(next)manualFrame(next.index);else toast('后续没有归档相机帧');}
 function nextEvent(){const next=state.manifest?.model_event_indices?.find(i=>i>state.index);if(next!==undefined)manualFrame(next);else toast('后续没有真实模型调用事件');}
 
+$('run-select').addEventListener('change',async e=>{state.run=e.target.value;configureStageFilter();const summaryRequest=loadRunResults();await applyEpisodeFilters();await summaryRequest;});
+$('stage-select').addEventListener('change',async e=>{state.stage=e.target.value;renderRunResults();await applyEpisodeFilters();});
 $('episode-select').addEventListener('change',e=>selectEpisode(e.target.value));$('refresh').addEventListener('click',loadEpisodes);
 $('play').addEventListener('click',play);$('previous-frame').addEventListener('click',()=>manualFrame(state.index-1));$('next-frame').addEventListener('click',()=>manualFrame(state.index+1));
 $('timeline').addEventListener('input',e=>manualFrame(Number(e.target.value)));$('playback-rate').addEventListener('change',e=>state.rate=Number(e.target.value));

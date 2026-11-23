@@ -25,10 +25,14 @@ CARLA 使用相同启动方式，把 `--root` 指向 CARLA 运行结果，把 `-
 
 ```powershell
 conda activate mulmem_highway
-python "D:/code/AutoDriver_Agent_memory_system/Multi-level Memory System for Intelligent Driving/ep_agent_viewer/run_viewer.py" `
-  --root "D:/code/AutoDriver_Agent_memory_system/Multi-level Memory System for Intelligent Driving/.worktrees/EP-Driver-NAVSIM/outputs/navsim/warmup/A_base_adapter_fixed" `
-  --host 127.0.0.1 --port 8765 --open
+python "D:/code/AutoDriver_Agent_memory_system/Multi-level Memory System for Intelligent Driving/.worktrees/EP-Driver-NAVSIM/tools/ep_agent_viewer/run_viewer.py" `
+  --root "D:/code/AutoDriver_Agent_memory_system/Multi-level Memory System for Intelligent Driving/.worktrees/EP-Driver-NAVSIM/outputs/navsim/warmup" `
+  --host 127.0.0.1 --port 8766 --open
 ```
+
+左侧按“测评轮次 → 测评阶段 → 场景”选择；轮次名称同时注明基础规划、模型或检索条件，不把不同轮次混在同一场景列表。第一阶段为原始场景，第二阶段为合成场景，以官方归档的阶段字段为准，缺失时单列“阶段未归档”。刷新保留当前选择，浏览器地址也保存轮次、阶段及场景。
+
+上方“官方测评结果”展示整轮综合 EPDMS、第一/第二阶段总分，以及 NC、DAC、DDC、TLC、EP、TTC、LK、HC、EC，统一为0–100分。分数仅读取官方 CSV 的命名汇总行，筛选场景不会重新计算或取平均；未完成或汇总不完整时显示待生成，不冒用单锚点分数。修改查看器代码后须重启 Python 服务，单独刷新页面不会更新已驻留的后端。
 
 每个 sample 作为独立 episode，播放到自己的结尾就停止，绝不按 token 顺序串成连续驾驶。读取 `input_packet.json` / `input_packet.json.gz`、`planning_evidence.json`、`trajectory.json`、`official_replay/trace.json.gz`（亦兼容未压缩 trace）。缺少或损坏 trace 时仍可检查单个源锚点。
 
@@ -38,7 +42,7 @@ NAVSIM 默认主画面为 `official_replay/official_bev.mp4` 的归档执行视�
 
 相机和源 BEV 只在 t=0 展示，不生成或借用未来相机图；当前产物没有相机内外参，不做精确投影。未来状态来自已保存的官方评分执行，仅供离线回放，不作为新的规划、模型调用或记忆输入。NAVSIM 模式不会加载规划核心或重建势场。
 
-“执行证据”分开列出内部 quality、trace 的官方单锚点最终 PDM 指标、官方 CSV 本 token 行以及 `benchmark_result.json` 的整轮两阶段 EPDMS 聚合值。CSV 后处理和整轮聚合不冒充 trace 的单锚点分数；各分数不随回放时间变成瞬时指标。只授权单个 sample 目录时，不越界读取父目录整轮分数。
+右侧“评估”分开列出内部 quality、trace 的官方单锚点最终 PDM 指标、官方 CSV 本 token 行以及 `benchmark_result.json` 的整轮两阶段 EPDMS 聚合值。CSV 后处理和整轮聚合不冒充 trace 的单锚点分数；各分数不随回放时间变成瞬时指标。只授权单个 sample 目录时，不越界读取父目录整轮分数。
 
 模型面板展示已有 `model_prompt.txt`、原始 `model_raw`、解析 `model_answer` 和归档错误；检索面板保留真实经验文本、ID、分数及诊断摘要，省略内部地图、历史和特征数组。旧产物没有实际模型输入图片清单时，不推断所有导出相机图都曾发送给模型。`official_bev.mp4` 是评分 BEV 回放，不是未来真实相机录像；41 帧覆盖 4 秒物理时间，10fps 编码时长为 4.1 秒。
 

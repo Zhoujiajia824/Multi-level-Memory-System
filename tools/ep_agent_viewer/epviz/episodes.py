@@ -277,6 +277,9 @@ class EpisodeStore:
             raise ValueError(f"Experiment root is not a directory: {self.root}")
         self.engine_root = Path(engine_root).resolve() if engine_root else None
         self._episodes: dict[str, _Episode] = {}
+        self._navsim_runs = {}
+        self._navsim_active = OrderedDict()
+        self._active_run_ids = set()
         self._lock = threading.RLock()
 
     @staticmethod
@@ -293,13 +296,21 @@ class EpisodeStore:
                 if not _inside(path, self.root):
                     dirs[:] = []
                     continue
-                from .navsim import NavsimEpisode
+                from .navsim import NavsimEpisode, NavsimRun
                 if NavsimEpisode.is_sample(path):
                     relative = path.relative_to(self.root).as_posix()
                     identifier = hashlib.sha256(relative.encode("utf-8")).hexdigest()[:16]
-                    episode = self._episodes.setdefault(identifier, NavsimEpisode(path, identifier, self.root))
-                    episode.refresh()
-                    found.append(episode.describe())
+                    if identifier not in self._episodes:
+                        candidate = path.parent.parent
+                        run = None
+                        if path.parent.name == "samples" and _inside(candidate, self.root):
+                            key = str(candidate)
+                            if key not in self._navsim_runs:
+                                self._navsim_runs[key] = NavsimRun(candidate, self.root)
+                            run = self._navsim_runs[key]
+                        self._episodes[identifier] = NavsimEpisode(path, identifier, self.root, run=run)
+                    episode = self._episodes[identifier]
+                    found.append(episode.listing())
                     dirs[:] = []
                     continue
                 if self._is_episode(path):
@@ -309,7 +320,31 @@ class EpisodeStore:
                     episode.refresh()
                     found.append(self._describe(episode))
                     dirs[:] = []
+            self._active_run_ids = {row["run_id"] for row in found if row.get("run_id")}
+            for run in self._navsim_runs.values():
+                members = [row for row in found if row.get("run_id") == run.id]
+                run.sample_count = len(members)
+                run.completed_samples = sum(row["frame_count"] > 1 for row in members)
+                run.stages = {stage: sum(row.get("stage") == stage for row in members)
+                              for stage in ("stage_one", "stage_two", "unknown")}
             return sorted(found, key=lambda row: row["path"])
+
+    def list_runs(self) -> list[dict]:
+        """Metadata for the NAVSIM runs from the latest discovery snapshot."""
+        with self._lock:
+            return sorted((run.metadata() for run in self._navsim_runs.values()
+                           if run.id in self._active_run_ids), key=lambda row: row["path"])
+
+    def get_run(self, identifier: str) -> dict:
+        with self._lock:
+            run = next((run for run in self._navsim_runs.values() if run.id == identifier), None)
+            if run is None:
+                self.discover()
+                run = next((run for run in self._navsim_runs.values() if run.id == identifier), None)
+            run_stat = _stat(run.path) if run is not None and _inside(run.path, self.root) else None
+            if run_stat is None or not stat_mode.S_ISDIR(run_stat.st_mode):
+                raise KeyError("Unknown NAVSIM run")
+            return run.details()
 
     def _episode(self, identifier: str) -> _Episode:
         if identifier not in self._episodes:
@@ -340,8 +375,17 @@ class EpisodeStore:
     def refresh(self, identifier: str) -> dict:
         with self._lock:
             episode = self._episode(identifier)
-            episode.refresh()
+            self._refresh_episode(episode)
             return self._describe(episode)
+
+    def _refresh_episode(self, episode):
+        episode.refresh()
+        if hasattr(episode, "release_payload"):
+            self._navsim_active[episode.id] = episode
+            self._navsim_active.move_to_end(episode.id)
+            while len(self._navsim_active) > 4:
+                _, previous = self._navsim_active.popitem(last=False)
+                previous.release_payload()
 
     def _relative(self, episode: _Episode, value) -> str | None:
         """Map archived absolute paths after a move, never read their old target."""
@@ -401,7 +445,7 @@ class EpisodeStore:
     def get_manifest(self, identifier: str) -> dict:
         with self._lock:
             episode = self._episode(identifier)
-            episode.refresh()
+            self._refresh_episode(episode)
             if hasattr(episode, "manifest"):
                 return episode.manifest(self)
             result = self._describe(episode)
@@ -450,7 +494,7 @@ class EpisodeStore:
     def get_frame(self, identifier: str, index: int) -> dict:
         with self._lock:
             episode = self._episode(identifier)
-            episode.refresh()
+            self._refresh_episode(episode)
             if hasattr(episode, "frame"):
                 return episode.frame(self, index)
             if isinstance(index, bool) or not isinstance(index, int) or index < 0 or index >= len(episode.timeline):
