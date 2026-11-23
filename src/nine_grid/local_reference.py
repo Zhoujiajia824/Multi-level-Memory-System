@@ -35,6 +35,89 @@ class LocalReferenceResult:
     diagnostics: dict
 
 
+def rear_covered_reference(scene, reference, *, rear_m=20., anchor_s=None):
+    """Add chart support from the actual lane chain, leaving the task intact.
+
+    Dense navigation may start a few millimetres ahead of the registered ego.
+    A clipped endpoint is not a normal Frenet foot, even inside the lane.  Use
+    measured public lane geometry behind that endpoint instead of weakening
+    the projection's coverage test or extrapolating a tangent off the road.
+    The returned offset belongs only to this new chart, never task progress.
+    """
+    from .object_scope import lane_role_geometry
+    from .lane_roles import project as lane_project
+
+    original = clean_polyline(reference).copy()
+    evidence = {'version': 'topology-rear-reference-1.0', 'added_length_m': 0.,
+                'requested_rear_m': float(rear_m), 'status': 'unchanged',
+                'task_route_unchanged': True, 'forward_extension': False}
+    ego_s, _, _ = project_polyline(scene.ego.position, original,
+                                   previous_s=anchor_s, heading=scene.ego.heading)
+    if ego_s >= rear_m:
+        evidence['reason'] = 'existing_reference_has_rear_coverage'
+        return original, evidence
+    if scene.diagnostics.get('route_projection', {}).get('valid') is False:
+        evidence['reason'] = 'navigation_projection_invalid'
+        return original, evidence
+    traces, _, lanes = lane_role_geometry(scene, front_m=1., rear_m=rear_m)
+    trace = traces.get('center')
+    if trace is None:
+        evidence['reason'] = 'no_confirmed_current_lane_chain'
+        return original, evidence
+    points = np.asarray(trace['points'], float)
+    expected_s = float(trace['ego_s'])-ego_s
+    start_s, _, start_heading = project_polyline(original[0], points,
+        previous_s=expected_s, heading=np.arctan2(*(original[1]-original[0])[::-1]), window=2.)
+    foot = sample_polyline(points, start_s)
+    initial_heading = np.arctan2(*(original[1]-original[0])[::-1])
+    # A nearby parallel/return branch is not a replacement for this endpoint.
+    if (np.linalg.norm(foot-original[0]) > .05 or abs(start_s-expected_s) > 2.
+            or abs(float(wrap_angle(start_heading-initial_heading))) > .35):
+        evidence['reason'] = 'reference_start_not_same_local_lane_branch'
+        return original, evidence
+    ego_foot = sample_polyline(original, ego_s)
+    own = lanes.get(scene.ego.lane_id)
+    if (own is None or not own[1].covers(Point(scene.ego.position))
+            or np.linalg.norm(ego_foot-scene.ego.position) > float(own[0].width)/2):
+        evidence['reason'] = 'ego_outside_confirmed_reference_lane'
+        return original, evidence
+    lower = max(0., start_s-max(0., rear_m-ego_s))
+    # Behind an official route's first point there may be no route history to
+    # choose between merging predecessors. Retain only the unambiguous suffix.
+    ambiguous = []
+    for decision in trace['decisions']:
+        if decision['direction'] != 'backward' or decision['alternatives'] <= 1:
+            continue
+        source = lanes.get(decision['from'])
+        if source is not None:
+            boundary_s, _, _, error = lane_project(points, source[0].center[0])
+            if error <= .05:
+                lower = max(lower, boundary_s)
+                ambiguous.append(decision['from'])
+    available = start_s-lower
+    if available <= 1e-5:
+        evidence['reason'] = 'no_unambiguous_public_rear_geometry'
+        return original, evidence
+    count = max(2, int(np.ceil(available/.5))+1)
+    prefix = sample_polyline(points, np.linspace(lower, start_s, count)[:-1])
+    joined = clean_polyline(np.vstack((prefix, original)))
+    # The prefix is actual lane geometry; do not bridge an unmapped gap merely
+    # because the endpoints have compatible headings.
+    prefix_line = LineString(np.vstack((prefix, original[0])))
+    if (trace['shape'] is None or not trace['shape'].buffer(1e-7).covers(prefix_line)
+            or not scene.drivable.buffer(1e-7).covers(prefix_line)):
+        evidence['reason'] = 'rear_prefix_not_covered_by_public_lane_geometry'
+        return original, evidence
+    offset = float(polyline_lengths(joined)[len(prefix)])
+    evidence.update(status='extended', reason='public_lane_chain_before_navigation_start',
+        added_length_m=offset, candidate_lane_chain_ids=list(trace['lane_ids']),
+        current_lane_id=scene.ego.lane_id,
+        ambiguous_predecessors_clipped_at=ambiguous, original_point_count=len(original),
+        prefix_point_count=len(prefix), original_start=original[0].tolist(),
+        extended_start=joined[0].tolist(), ego_original_s_m=float(ego_s))
+    return joined, evidence
+
+
 class LocalReferenceManager:
     """一个几何候选进入同一个 MPC；车道变换过程跨模型帧保持。"""
 

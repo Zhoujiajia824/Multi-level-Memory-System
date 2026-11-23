@@ -45,11 +45,14 @@ class PublicTrafficRules:
         position=[center[0],-center[1]]
         controlled=[]
         for lane in self.route.lanes:
-            projection=project(position,lane['center'])
+            projection=project(position,lane['center'],elevations=self.route.lane_elevations[lane['id']],
+                               elevation=center[2])
             p=projection['position']
             if abs(p[0]-position[0])<extent[0] and abs(p[1]-position[1])<extent[1]:
-                if abs(self.route.height_at(p)-center[2])<=abs(float(box.extent.z))+1.5:
-                    controlled.append(dict(lane_id=lane['id'],position=list(p),heading_rad=projection['heading_rad']))
+                elevation=self.route.lane_height_at(lane['id'],p,center[2])
+                if abs(elevation-center[2])<=abs(float(box.extent.z))+1.5:
+                    controlled.append(dict(lane_id=lane['id'],position=list(p),elevation_m=elevation,
+                                           heading_rad=projection['heading_rad']))
         value=dict(id=actor.id,type_id=actor.type_id,position=position,z_m=center[2],
             extent_xy_m=extent,controlled=controlled,
             source='public_stop_trigger_volume_intersection_with_public_lane_center',
@@ -116,7 +119,8 @@ class PublicTrafficRules:
             for controlled in geometry['controlled']:
                 if controlled['lane_id'] not in self.route.lane_ids and controlled['lane_id']!=ego['lane_id']:
                     continue
-                stop=self.route.stop_projection(controlled['position'],controlled['lane_id'],ego['lane_id'])
+                stop=self.route.stop_projection(controlled['position'],controlled['lane_id'],ego['lane_id'],
+                                                controlled['elevation_m'])
                 if stop is not None:
                     possible.append((stop,controlled))
             affected=self._affected(geometry,waypoints,ego_transform,ego_snapshot)

@@ -8,7 +8,7 @@ from shapely.geometry import Polygon
 from shapely.geometry import LineString
 from .contracts import Actor, PlanResult
 from .planning_objects import planning_view, road_rule_observations
-from .local_reference import LocalReferenceManager, LocalReferenceResult
+from .local_reference import LocalReferenceManager, LocalReferenceResult, rear_covered_reference
 from .goals import GoalManager, goal_seed_path, first_arrival_residual
 from .lane_potential import LanePotentialGeometry
 from .potential_domain import build_lane_potential_domain
@@ -378,13 +378,18 @@ class Planner:
             goal_context=(goal_ref,goal_position,sqrt_weight)
         domain_world,domain_evidence=build_lane_potential_domain(scene,front_m=max(120.,reach),rear_m=20.)
         # 换道五次参考是跟踪目标；势场坐标始终沿导航车道，不随避让轨迹摆动。
-        potential_reference=goal_context[0] if goal_context is not None else clean_polyline(world_to_ego(scene.route,origin,angle))
+        potential_world=(np.asarray(active_goal['goal_reference']['points'],float)
+                         if active_goal is not None else scene.route)
+        potential_old_s=(active_goal['last_s'] if active_goal is not None else
+            project_polyline(origin,scene.route,scene.diagnostics.get('route_s'),angle)[0])
+        potential_world,potential_reference_evidence=rear_covered_reference(
+            scene,potential_world,rear_m=20.,anchor_s=potential_old_s)
+        potential_prefix_s=float(potential_reference_evidence['added_length_m'])
+        potential_reference=clean_polyline(world_to_ego(potential_world,origin,angle))
         # 有效面在刚体旋转后仍可能因接触边浮点退化而自交。保留世界域，
         # 仅转换查询点和法向，避免修补/扩张/简化授权车道几何。
         potential_geometry=LanePotentialGeometry(potential_reference,domain_world,domain_pose=(origin,angle))
-        potential_old_s=(active_goal['last_s'] if active_goal is not None else
-            project_polyline(origin,scene.route,scene.diagnostics.get('route_s'),angle)[0])
-        potential_s0=float(potential_geometry.chart_arc_from_polyline_s(potential_old_s))
+        potential_s0=float(potential_geometry.chart_arc_from_polyline_s(potential_old_s+potential_prefix_s))
         potential_geometry.anchor_s=potential_s0
         targets=[]
         for identity,trajectory in predictions.trajectories.items():
@@ -761,8 +766,9 @@ class Planner:
             goal_constant=0.
             if goal_context is not None:
                 goal_ref,goal_position,sqrt_weight=goal_context
-                goal_residual,goal_jacobian,goal_evidence=first_arrival_residual(states[:,:2],goal_ref,
-                    active_goal['s_goal_m'],goal_position,sqrt_weight,active_goal['last_s'],
+                goal_residual,goal_jacobian,goal_evidence=first_arrival_residual(states[:,:2],potential_reference,
+                    active_goal['s_goal_m']+potential_prefix_s,goal_position,sqrt_weight,
+                    active_goal['last_s']+potential_prefix_s,
                     frenet_geometry=potential_geometry)
                 goal_jac=lambda c:np.einsum('rni,nij->rj',goal_jacobian,c['all'][:,:2])
                 # 一次事件势能0.5*w*||D(F(p_hit)-F(g))||²-C，不随节点数稀释。
@@ -1140,6 +1146,7 @@ class Planner:
                 'line_treatment':'full_body_geometric_constraints; no_line_APF',
                 'domain':domain_evidence,'invalid_samples':accepted['potential_invalid_samples'],
                 'geometry':potential_geometry.diagnostics,'source_projection_uncovered_samples':source_coverage,
+                'reference_coverage':potential_reference_evidence,
                 'source_projection_policy':'outside_confirmed_reference_no_APF;physical_collision_constraints_retained',
                 'classes':risk_cfg['classes'],'attention_increment':increment,
                 'source_ids':sorted(actor.id for actor,_,_ in targets),

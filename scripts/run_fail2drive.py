@@ -5,6 +5,7 @@ import argparse
 from datetime import datetime
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -154,6 +155,37 @@ def adapter_source_hash():
         code.update(path.relative_to(ROOT).as_posix().encode())
         code.update(path.read_bytes())
     return code.hexdigest()
+
+
+def official_result(checkpoint, route_id):
+    """Read the upstream verdict; a finished process is not a completed route."""
+    try:
+        data = json.loads(checkpoint.read_text(encoding="utf-8"))
+        records = data["_checkpoint"]["records"]
+        if not isinstance(records, list) or len(records) != 1:
+            raise ValueError("expected one official record")
+        record = records[0]
+        if record["route_id"] != "RouteScenario_%d_rep0" % route_id:
+            raise ValueError("official route identity mismatch")
+        scores = record["scores"]
+        completion = scores["score_route"]
+        if type(completion) not in (int, float) or not math.isfinite(completion):
+            raise ValueError("invalid official completion score")
+        checkpoint_data = data["_checkpoint"]
+        global_record = checkpoint_data.get("global_record")
+        valid = (data.get("entry_status") == "Finished" and data.get("eligible") is True
+                 and checkpoint_data.get("progress") == [1, 1]
+                 and isinstance(global_record, dict)
+                 and global_record.get("status") in ("Perfect", "Completed", "Failed"))
+        record_completed = record["status"] in ("Perfect", "Completed") and completion >= 100.
+        completed = valid and record_completed and global_record["status"] in ("Perfect", "Completed")
+        return dict(route_id=route_id, official_status=record["status"],
+                    entry_status=data.get("entry_status"), route_completed=completed,
+                    official_result_valid=valid, record_completed=record_completed,
+                    official_scores=scores, checkpoint=str(checkpoint))
+    except (OSError, ValueError, KeyError, TypeError):
+        return dict(route_id=route_id, route_completed=False,
+                    official_status="result_missing_or_invalid", checkpoint=str(checkpoint))
 
 
 def fingerprint(config, args, routes):
@@ -344,6 +376,7 @@ def main():
         "custom_episode_limit": None, "simulator_started_by_launcher": False}, ensure_ascii=False, indent=2))
     if args.dry_run:
         return 0
+    failed_routes = 0
     for job_args,prepared in jobs:
         config,runtime_path,command,env,provenance,identity,inputs = prepared
         association = config["archive_association"]
@@ -381,7 +414,12 @@ def main():
                 result = subprocess.call(command, env=env, cwd=ROOT, stdout=stdout, stderr=stderr)
             if result:
                 return result
-    return 0
+            verdict = official_result(checkpoint, route_id)
+            print(json.dumps(dict(verdict, repetition_seed=job_args.seed), ensure_ascii=False), flush=True)
+            failed_routes += int(not verdict["route_completed"])
+    # Keep collecting a requested batch after route-level failures, but do not
+    # report shell success merely because upstream cleaned up normally.
+    return 2 if failed_routes else 0
 
 
 if __name__ == "__main__":

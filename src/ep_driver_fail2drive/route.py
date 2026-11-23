@@ -20,8 +20,14 @@ def xy(location):
     return [float(location.x), -float(location.y)]
 
 
-def project(point, points, previous_s=None, window=None, heading=None, minimum_s=None, maximum_s=None):
+def project(point, points, previous_s=None, window=None, heading=None, minimum_s=None, maximum_s=None,
+            segment_indices=None, elevations=None, elevation=None):
     """Return real Euclidean residual, not only signed lateral distance."""
+    if (elevations is None) != (elevation is None):
+        raise ValueError('Projection elevation requires both route heights and the public query height')
+    if elevations is not None and (len(elevations) != len(points)
+            or not all(math.isfinite(v) for v in elevations) or not math.isfinite(elevation)):
+        raise ValueError('Projection heights must be finite and match the route')
     arc, candidates = 0., []
     for index, (a, b) in enumerate(zip(points, points[1:])):
         dx, dy = b[0]-a[0], b[1]-a[1]
@@ -29,6 +35,9 @@ def project(point, points, previous_s=None, window=None, heading=None, minimum_s
         if length <= 1e-8:
             continue
         end = arc + length
+        if segment_indices is not None and index not in segment_indices:
+            arc = end
+            continue
         if previous_s is not None and window is not None and (end < previous_s-window or arc > previous_s+window):
             arc = end
             continue
@@ -47,17 +56,23 @@ def project(point, points, previous_s=None, window=None, heading=None, minimum_s
         tangent = math.atan2(dy, dx)
         distance = math.hypot(point[0]-foot[0], point[1]-foot[1])
         mismatch = abs(wrap(tangent-heading)) if heading is not None else 0.
+        height_error = (abs(elevation-(elevations[index]+fraction*(elevations[index+1]-elevations[index])))
+                        if elevations is not None else 0.)
         # Heading is a gate, not a weight that could conceal a distant foot.
         candidates.append((distance, mismatch, abs(arc+fraction*length-(previous_s or 0.)),
                            index, arc+fraction*length, foot, tangent,
-                           ((point[0]-foot[0])*(-dy)+(point[1]-foot[1])*dx)/length))
+                           ((point[0]-foot[0])*(-dy)+(point[1]-foot[1])*dx)/length,
+                           height_error, math.hypot(distance,height_error)))
         arc = end
     if not candidates:
         raise ValueError('Official route has no projectable segment in the current progress window')
     aligned = [row for row in candidates if row[1] <= math.pi/2.]
-    row = min(aligned or candidates, key=lambda item: (round(item[0], 8), item[2]))
-    return dict(s_m=row[4], position=row[5], heading_rad=row[6], lateral_m=row[7],
-                distance_m=row[0], heading_error_rad=row[1], segment_index=row[3])
+    row = min(aligned or candidates, key=lambda item: (round(item[9], 8), item[2]))
+    result = dict(s_m=row[4], position=row[5], heading_rad=row[6], lateral_m=row[7],
+                  distance_m=row[0], heading_error_rad=row[1], segment_index=row[3])
+    if elevations is not None:
+        result['elevation_error_m'] = row[8]
+    return result
 
 
 def point_in_polygon(point, polygon):
@@ -144,8 +159,11 @@ class RouteAdapter:
         self.previous_s, self.previous_position, self.previous_time = None, None, None
         self.previous_frame, self.last_projection = None, None
 
-    def height_at(self, point):
-        result = project(point, self.points)
+    def height_at(self, point, z_hint=None):
+        # XY alone cannot distinguish the same route's bridge/underpass visits.
+        # A public map/query height selects the branch; it never changes it.
+        result = project(point, self.points, elevations=self.elevations if z_hint is not None else None,
+                         elevation=z_hint)
         i = result['segment_index']
         length = math.dist(self.points[i], self.points[i+1])
         fraction = math.dist(self.points[i], result['position'])/length
@@ -169,10 +187,15 @@ class RouteAdapter:
             p = xy(location)
             if not (lowx <= p[0] <= highx and lowy <= p[1] <= highy):
                 continue
+            # Preserve the existing single-layer 2D driving domain. Retaining
+            # both overlapping heights would let the worker union different
+            # floors into one traversable surface; that needs a separate 3D
+            # map contract, not merely a less selective initialization filter.
             if abs(location.z-self.height_at(p)) > float(self.config.get('same_level_tolerance_m', 1.5)):
                 continue
             groups.setdefault(lane_key(wp), {})[round(wp.s, 6)] = wp
         lanes = []
+        self.lane_elevations = {}
         for key in sorted(groups):
             waypoints = sorted(groups[key].values(), key=lambda w:w.s, reverse=next(iter(groups[key].values())).lane_id > 0)
             if len(waypoints) < 2:
@@ -202,8 +225,18 @@ class RouteAdapter:
             lanes.append(dict(id=key,center=center,polygon=left+right[::-1],width=float(middle.lane_width),
                 speed_limit=float(self.config.get('map_speed_cap_mps',30.)),successors=successors,
                 left=adjacent['left'],right=adjacent['right'],priority=0,boundaries=boundaries))
+            self.lane_elevations[key] = [float(wp.transform.location.z) for wp in waypoints]
         missing = set(self.lane_ids)-{lane['id'] for lane in lanes}
         if missing:
+            layered = {lane_key(wp) for wp in self.waypoints if lane_key(wp) in missing and
+                       abs(wp.transform.location.z-self.height_at(xy(wp.transform.location))) >
+                       float(self.config.get('same_level_tolerance_m',1.5)) and
+                       abs(wp.transform.location.z-self.height_at(xy(wp.transform.location),wp.transform.location.z)) <=
+                       float(self.config.get('same_level_tolerance_m',1.5))}
+            if layered:
+                raise ValueError('unsupported_multilevel_2d_navigation: official route height is ambiguous near XY; '
+                                 'different floors must not be unioned into one driving domain: '+
+                                 ','.join(sorted(layered)))
             raise ValueError('Public map conversion is missing official route lanes: '+','.join(sorted(missing)))
         return lanes
 
@@ -250,12 +283,37 @@ class RouteAdapter:
         self.last_projection = dict(result)
         return result
 
-    def stop_projection(self, position, lane_id, current_lane_id):
+    def lane_height_at(self, lane_id, point, z_hint=None):
+        lane = next(item for item in self.lanes if item['id'] == lane_id)
+        heights = self.lane_elevations[lane_id]
+        result = project(point,lane['center'],elevations=heights if z_hint is not None else None,
+                         elevation=z_hint)
+        i = result['segment_index']
+        fraction = math.dist(lane['center'][i],result['position'])/math.dist(lane['center'][i],lane['center'][i+1])
+        return heights[i]+fraction*(heights[i+1]-heights[i])
+
+    def stop_projection(self, position, lane_id, current_lane_id, elevation_m=None):
         """Associate an upcoming public stop with its actual controlled lane."""
         if self.previous_s is None or (lane_id not in self.lane_ids and lane_id != current_lane_id):
             return None
-        candidates = project(position,self.points,self.previous_s,None,
-                             minimum_s=max(0.,self.previous_s-.1))
+        segments = None
+        if lane_id != current_lane_id:
+            # Membership anywhere in the route is insufficient: a parallel
+            # lane used only later must not impose its current stop on this
+            # lane. A dense transition may have one endpoint in either lane.
+            segments = {i for i in range(len(self.points)-1)
+                        if lane_id in (lane_key(self.waypoints[i]),lane_key(self.waypoints[i+1]))}
+            if not segments:
+                return None
+        try:
+            candidates = project(position,self.points,self.previous_s,None,
+                minimum_s=max(0.,self.previous_s-.1),segment_indices=segments,
+                elevations=self.elevations if elevation_m is not None else None,elevation=elevation_m)
+        except ValueError:
+            return None
+        if (elevation_m is not None and candidates['elevation_error_m'] >
+                float(self.config.get('same_level_tolerance_m',1.5))):
+            return None
         lane = next((item for item in self.lanes if item['id'] == lane_id),None)
         if lane is None:
             return None

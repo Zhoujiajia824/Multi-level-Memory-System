@@ -6,6 +6,8 @@
 
 这是 **MAP／范围内当前真值输入** 适配。使用当前对象状态、公开地图和官方导航，不读取场景未来事件或周车隐藏路线，不能称为纯视觉感知提交。模型输入是六路同帧 RGB、BEV 和筛选后的候选真值。BEV、OCC、八向张量、DINO、独立参照与内部质量评分保留；它们的评分不代替官方成绩。
 
+模型请求使用当前帧的 JSON Schema 约束行动枚举、必填理由、真实候选 ID 和合法前向目标区间，仍由原有道路几何与目标校验严格验收。通信重试、服务端结构化输出兼容和回答纠错共用最多两次请求预算；不通过修改目标、删除虚构 ID 或编造理由接纳回答。输入图像字节哈希、各次原文与错误分别归档；摘要区分模型调用与实际语义参与。
+
 ## Fail2Drive 环境与身份
 
 服务器专用安装位置：
@@ -26,6 +28,8 @@
 
 该分支配置明确使用 `speed_normalization_mps=1.0` 校准速度代价；未修改主分支默认参数或 MPC/APF 公式。模型目标连接采用连续插值参考与五次偏移，消除稀疏参考法向产生的伪折点，精确保留原始目标世界坐标，仍检查实际曲率、车体、道路和不可跨线。
 
+势场坐标的起端覆盖只从已确认的当前车道后向几何补充，歧义前驱不擅自接入；原任务路线、终点和模型冻结目标不变。停止线按实际受控车道对应的导航段及公共高程关联，不能仅凭该车道在后续路线出现就对当前路段生效。已识别的、会丢失必需导航车道的高程歧义会明确拒绝，不用合并不同楼层来补齐地图；多层道路尚未完整支持。
+
 ## Fail2Drive 单条与完整评测
 
 下面命令在本分支项目根目录执行。专用 CARLA 必须另行在可用 GPU 启动，RPC 为39000、streaming为39001、secondary为39002，Traffic Manager为39003；本入口不会启动模拟器，也不管理旧22000服务。
@@ -40,7 +44,7 @@ python scripts/run_fail2drive.py \
   --worker-python /home/zjj/miniconda3/envs/ep-driver-fail2drive/bin/python \
   --routes fail2drive_split/Base_Animals_0075.xml \
   --seed 1 --planner-hz 10 --video --record \
-  --output-dir outputs/fail2drive/B_model_smoke --dry-run
+  --output-dir output/fail2drive/B_model_smoke --dry-run
 ```
 
 单条真实评测使用同一命令去掉 `--dry-run`，不添加 `--duration`。`--video` 录制六路相机拼图，原视频和 H.264 结果同时保留，编码后核验解码帧数。另一个展示相机采用官方 `viz_path_agent.py` 示例相机参数，按官方示例的图片布局归档在 `viz/`；它不进入模型。项目视频编码与已有 `ep_agent_viewer` 不属于官方独立网页查看器。
@@ -51,12 +55,14 @@ python scripts/run_fail2drive.py \
 
 `--resume` 沿用官方检查点，要求已启动任务的代码、参数、路线及种子指纹一致；批量中未启动的任务正常新建。更换方法或配置请使用新的方法根目录，不能混写旧成绩。运行失败仍保留官方错误和内部执行证据，不伪造成功。
 
+每条结束后直接打印官方状态、完成率与分数；`entry_status=Finished` 仅表示收尾完成。单条失败或批量中存在失败路线，入口在完成所请求的批次后返回状态码 2；原始官方结果和评分不修改。
+
 完整成绩由原始官方脚本汇总：
 
 ```bash
 /home/zjj/miniconda3/envs/ep-fail2drive/bin/python \
   /data/zjj/code/EP-Driver/fail2drive-devkit/tools/f2d_result_parser.py \
-  outputs/fail2drive/B_model_formal --method EP-Driver-B --strict
+  output/fail2drive/B_model_formal --method EP-Driver-B --strict
 ```
 
 当前回归包含真实 CPU DINO、实际数值子进程、本地 HTTP 模型协议替身、执行映射、源帧绑定和公开规则适配；这些不等于部署模型与真实 CARLA 闭环验证。公开停牌和红黄灯已接入；Yield 路权明确标为尚未覆盖，不能声称完整道路规则已验证。
@@ -65,7 +71,7 @@ python scripts/run_fail2drive.py \
 
 `scripts/watch_fail2drive.py` 使用 Python 标准库，在已有 `ep-fail2drive` 环境运行即可。它只读评测 Agent 保存的官方展示相机 JPEG 与同名源帧清单，不连接 CARLA、不新增传感器，也不推进世界。清单在 JPEG 原子落盘后发布，包含实际帧号、仿真时间和图像哈希，转发端不从文件名猜测物理帧。
 
-服务器辅助目录为 `/data/zjj/code/fiil2drive_test/`，私有运行配置为 `fail2drive.server.json`、模型配置为 `models.yaml`、观看入口为 `watch_fail2drive.sh`，输出放在 `outputs/`。这里的 `fiil2drive_test` 沿用用户指定拼写。脚本本体随 Git 分支维护，辅助入口调用它，避免另存一份实现。
+服务器辅助目录为 `/data/zjj/code/fiil2drive_test/`，私有运行配置为 `fail2drive.server.json`、模型配置为 `models.yaml`、观看入口为 `watch_fail2drive.sh`。实验产物放在本分支 `/data/zjj/code/EP-Driver/EP-Driver-Fail2Drive/output/`；旧私有配置可用 `--output-dir` 明确覆盖。这里的 `fiil2drive_test` 沿用用户指定拼写。脚本本体随 Git 分支维护，辅助入口调用它，避免另存一份实现。
 
 服务器端观看服务：
 

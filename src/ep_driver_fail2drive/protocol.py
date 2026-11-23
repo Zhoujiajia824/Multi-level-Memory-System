@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from queue import Empty, Queue
@@ -25,6 +26,10 @@ class WorkerClient:
         self.timeout_s = float(timeout_s)
         self.sequence = 0
         self.messages = Queue()
+        self.outgoing = Queue()
+        self.closed = False
+        self.failed = False
+        self.request_lock = threading.Lock()
         self.log = Path(stderr_path).open("a", encoding="utf-8")
         source_root = str(Path(__file__).resolve().parents[1])
         env = dict(os.environ)
@@ -42,6 +47,22 @@ class WorkerClient:
         )
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
+        # Pipe writes can block while the child imports dependencies or hangs.
+        # The caller's watchdog must cover sending as well as waiting for JSON.
+        self.writer = threading.Thread(target=self._write, daemon=True)
+        self.writer.start()
+
+    def _write(self):
+        while True:
+            line = self.outgoing.get()
+            if line is None:
+                return
+            try:
+                self.process.stdin.write(line)
+                self.process.stdin.flush()
+            except (UnicodeError, OSError, ValueError) as exc:
+                self.messages.put({'_writer_error': type(exc).__name__})
+                return
 
     def _read(self):
         try:
@@ -53,14 +74,26 @@ class WorkerClient:
             self.messages.put(None)
 
     def plan(self, packet):
+        if not self.request_lock.acquire(blocking=False):
+            raise WorkerError("numeric worker permits only one in-flight frozen request")
+        try:
+            if self.closed or self.failed:
+                raise WorkerError("numeric worker transport is closed or failed")
+            return self._plan(packet)
+        except Exception:
+            self.failed = True
+            raise
+        finally:
+            self.request_lock.release()
+
+    def _plan(self, packet):
+        deadline = time.monotonic() + self.timeout_s
         self.sequence += 1
         request_id = self.sequence
         request = {"op": "plan", "request_id": request_id, "packet": packet}
         if self.process.poll() is not None:
             raise WorkerError("numeric worker exited with code %s" % self.process.returncode)
-        self.process.stdin.write(json.dumps(request, ensure_ascii=False, allow_nan=False) + "\n")
-        self.process.stdin.flush()
-        deadline = time.monotonic() + self.timeout_s
+        self.outgoing.put(json.dumps(request, ensure_ascii=False, allow_nan=False) + "\n")
         try:
             line = self.messages.get(timeout=max(0.0, deadline-time.monotonic()))
         except Empty as exc:
@@ -69,25 +102,32 @@ class WorkerClient:
             raise WorkerError("numeric worker closed protocol stream")
         if isinstance(line, dict) and "_reader_error" in line:
             raise WorkerError("numeric worker protocol reader failed: "+line["_reader_error"])
+        if isinstance(line, dict) and "_writer_error" in line:
+            raise WorkerError("numeric worker protocol writer failed: "+line["_writer_error"])
         try:
             response = json.loads(line)
         except (TypeError, json.JSONDecodeError) as exc:
             raise WorkerError("non-JSON output on numeric worker stdout") from exc
-        if response.get("request_id") != request_id:
+        if not isinstance(response, dict) or response.get("request_id") != request_id:
             raise WorkerError("numeric worker response request_id mismatch")
-        if not response.get("ok", False):
+        if response.get("ok") is not True:
             raise WorkerError("numeric worker failed: %s" % response.get("error", "unknown error"))
         plan = response.get("plan", response)
-        if (plan.get("frame_id") != packet["scene"]["frame_id"] or
-                abs(float(plan.get("time", -1))-float(packet["time"])) > 1e-7):
+        stamp = plan.get("time") if isinstance(plan, dict) else None
+        if (not isinstance(plan, dict) or plan.get("frame_id") != packet["scene"]["frame_id"] or
+                type(stamp) not in (int, float) or not math.isfinite(stamp) or
+                abs(stamp-float(packet["time"])) > 1e-7):
             raise WorkerError("plan source frame/time does not match its frozen request")
         return plan
 
     def close(self):
+        if self.closed:
+            return
+        self.closed = True
         if self.process.poll() is None:
+            # Never write to a potentially blocked stdin on the cleanup thread.
+            self.outgoing.put('{"op":"close"}\n')
             try:
-                self.process.stdin.write('{"op":"close"}\n')
-                self.process.stdin.flush()
                 self.process.wait(timeout=5)
             except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
                 self.process.terminate()
@@ -96,4 +136,7 @@ class WorkerClient:
                 except subprocess.TimeoutExpired:
                     self.process.kill()
                     self.process.wait(timeout=5)
+        self.outgoing.put(None)
+        self.writer.join(timeout=1)
+        self.reader.join(timeout=1)
         self.log.close()

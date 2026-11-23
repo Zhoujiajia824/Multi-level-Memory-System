@@ -6,7 +6,7 @@
   "parameters_path": "config/parameters.json",
   "models_path": "config/fail2drive.models.example.yaml",
   "prompts_path": "config/prompts.yaml",
-  "output_dir": "outputs/fail2drive",
+  "output_dir": "output/fail2drive",
   "planner_hz": 10,
   "model_hz": 1,
   "worker_timeout_s": 240,

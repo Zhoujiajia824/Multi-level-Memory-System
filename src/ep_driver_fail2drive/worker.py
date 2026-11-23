@@ -30,7 +30,7 @@ from .protocol import SCHEMA
 from nine_grid.configuration import validate_config
 from nine_grid.contracts import Actor, Lane, SceneSnapshot, RetrievalResult, plain
 from nine_grid.goals import build_goal_reference
-from nine_grid.models import (VisionClient, CommunicationFailure, build_prompt,
+from nine_grid.models import (build_prompt,
                               model_image_paths, parse_answer, load_system_prompts)
 from nine_grid.perception_scope import perception_scene
 from nine_grid.planner_factory import create_planner
@@ -39,6 +39,9 @@ from nine_grid.prediction import Predictor
 from nine_grid.quality import evaluate, execution_audit
 from nine_grid.representations import (DINOExtractor, NineGridBuilder,
                                        build_representations, render_goal_overlay)
+from .model_contract import (VERSION as MODEL_CONTRACT_VERSION, CAMERA_VIEWS,
+    ContractVisionClient, UnusableGoalReference, decision_schema, contract_prompt,
+    freeze_inputs, request_decision)
 
 ROOT = Path(__file__).resolve().parents[2]
 LOG = logging.getLogger(__name__)
@@ -129,6 +132,10 @@ def decode_scene(packet):
                             frame_id=raw['frame_id'], time=stamp))
     if len({camera['view'] for camera in cameras}) != len(cameras):
         raise ValueError('Duplicate camera views')
+    if cameras:
+        if {item['view'] for item in cameras} != set(CAMERA_VIEWS):
+            raise ValueError('Model source must contain all six Fail2Drive camera views')
+        cameras = sorted(cameras, key=lambda item: CAMERA_VIEWS.index(item['view']))
     assets['camera_images'] = cameras
     diagnostics = dict(raw.get('diagnostics', {}))
     diagnostics['observation_policy'] = 'range_limited_ground_truth_no_occlusion-1.0'
@@ -177,16 +184,17 @@ class PlanningWorker:
             raise ValueError('B_model requires backend=server; it cannot silently run base only')
         prompts_path = _path(runtime.get('prompts_path', 'config/prompts.yaml'))
         model_settings['system_prompt'] = load_system_prompts(prompts_path)['fast']
-        model_settings['max_total_attempts'] = int(runtime.get('model_attempts', 2))
+        self.model_attempts = runtime.get('model_attempts', 2)
+        model_settings['max_total_attempts'] = 1
         model_settings['timeout_s'] = float(runtime.get('model_timeout_s', 60))
         model_settings['max_tokens'] = 4096
-        attempts = model_settings['max_total_attempts']
-        if not 1 <= attempts <= 2 or not 0 < model_settings['timeout_s'] <= 90:
+        attempts = self.model_attempts
+        if type(attempts) is not int or not 1 <= attempts <= 2 or not 0 < model_settings['timeout_s'] <= 90:
             raise ValueError('Model attempts/timeout exceed the bounded official watchdog policy')
         budget = attempts*model_settings['timeout_s'] + sum(2**i for i in range(attempts-1))
         if budget+30 >= float(runtime.get('worker_timeout_s', 240)):
             raise ValueError('Model call budget must leave at least 30s for decoding/planning/archive')
-        self.client = client or VisionClient('fast', model_settings)
+        self.client = client or ContractVisionClient('fast', model_settings)
         self.planner = create_planner(config)
         self.reference_planner = create_planner(config)
         self.predictor = Predictor(config)
@@ -198,12 +206,22 @@ class PlanningWorker:
         self.directory = None
         self.next_source_time = None
         self.first_time = None
+        self.last_model_outcome = None
         self.counts = dict(plans=0, model_calls=0, valid_answers=0, invalid_answers=0,
-            communication_failures=0, emergency_plans=0, reference_evaluations=0)
+            communication_failures=0, emergency_plans=0, reference_evaluations=0,
+            model_source_frames=0, http_attempts=0, contract_rejections=0,
+            transport_errors=0, structured_fallbacks=0, model_skipped_reference=0,
+            guided_plans=0, answer_available_plans=0)
         self.configuration_evidence = dict(parameters=self.config, official_commit=OFFICIAL_COMMIT,
             runtime=_redacted(runtime), models=_redacted(model_settings), privileged_input=True,
             memory_retrieval=False, memory_write=False, reflection=False,
             source_hashes={'parameters':_sha(parameters), 'models':_sha(models_path), 'prompts':_sha(prompts_path)},
+            model_contract=dict(version=MODEL_CONTRACT_VERSION,
+                configured_transport='OpenAI_response_format_json_schema',
+                max_http_attempts_per_source=self.model_attempts, legacy_parser_unchanged=True,
+                fallback='only_explicit_400_or_422_schema_unsupported;then_strict_local_validation',
+                repairs='model_feedback_only;no_goal_clamping_no_ID_deletion_no_invented_reasons',
+                counter_definition='model_calls=count_of_source_frames_with_requests;http_attempts=total_requests'),
             internal_quality_is_official_score=False, whole_route_duration_limit=None)
 
     def _append(self, name, value):
@@ -259,7 +277,7 @@ class PlanningWorker:
                 ensure_ascii=False, allow_nan=False), encoding='utf-8')
             scene.assets['camera_manifest_json'] = str((camera_folder/'manifest.json').resolve())
             scene.diagnostics['goal_reference'] = build_goal_reference(planning_input, self.config,
-                                                    request_version=self.counts['model_calls']+1)
+                                                    request_version=self.counts['model_source_frames']+1)
             planning_input.diagnostics['goal_reference'] = scene.diagnostics['goal_reference']
             stamp = time.perf_counter()
             reps = build_representations(scene, capture, self.extractor, self.grids)
@@ -270,29 +288,58 @@ class PlanningWorker:
                         diagnostics={'reason':'B_model: retrieval disabled', 'candidates':[]})
             prompt = build_prompt(planning_input, reps, retrieval)
             image_paths = model_image_paths(planning_input, reps)
-            self._append('model_inputs', dict(frame_id=scene.frame_id, time=scene.time,
-                prompt=prompt, images=image_paths, object_ids=scope['selected_ids'],
-                goal_reference=scene.diagnostics['goal_reference'], memory_enabled=False))
+            input_evidence = freeze_inputs(planning_input, reps, prompt, image_paths, scope['selected_ids'])
             self.active_answer = None
-            self.counts['model_calls'] += 1
+            self.counts['model_source_frames'] += 1
             stamp = time.perf_counter()
-            raw, errors = None, []
+            schema = None
+            def archive_model_input():
+                self._append('model_inputs', dict(frame_id=scene.frame_id, time=scene.time,
+                    prompt=prompt, images=image_paths, object_ids=scope['selected_ids'],
+                    input_evidence=input_evidence, output_schema=schema,
+                    goal_reference=scene.diagnostics['goal_reference'], memory_enabled=False))
             try:
-                raw = self.client.call(prompt, image_paths)
-                self.active_answer = parse_answer(raw, scene, reference=scene.diagnostics['goal_reference'],
-                    config=self.config, max_characters=self.config['models']['answer_max_characters'])
-                self.counts['valid_answers'] += 1
-            except CommunicationFailure as exc:
-                errors.append(str(exc))
-                self.counts['communication_failures'] += 1
-                self.planner.clear_semantic_guidance()
-            except ValueError as exc:
-                errors.append(str(exc))
-                self.counts['invalid_answers'] += 1
+                schema = decision_schema(scene.diagnostics['goal_reference'], scope['selected_ids'])
+            except UnusableGoalReference as exc:
+                result = dict(answer=None, raw=None, errors=[str(exc)], attempts=[],
+                              accepted=False, status='skipped_invalid_reference', version=MODEL_CONTRACT_VERSION)
+                self.counts['model_skipped_reference'] += 1
+                archive_model_input()
+            else:
+                prompt += contract_prompt(schema)
+                archive_model_input()  # Preserve the frozen request before any HTTP/watchdog timeout.
+                def validate(raw):
+                    answer = parse_answer(raw, planning_input, reference=scene.diagnostics['goal_reference'],
+                        config=self.config, max_characters=self.config['models']['answer_max_characters'])
+                    if set(answer.model_output) != {'scene', 'decision', 'attention', 'local_goal'}:
+                        raise ValueError('Fail2Drive requires the complete modern four-part decision contract')
+                    return answer
+                result = request_decision(self.client, prompt, image_paths, schema=schema,
+                    input_evidence=input_evidence, validate=validate, max_attempts=self.model_attempts)
+                self.active_answer = result['answer']
+                self.counts['model_calls'] += 1
+                self.counts['http_attempts'] += len(result['attempts'])
+                self.counts['contract_rejections'] += sum(a['status']=='contract_rejected' for a in result['attempts'])
+                self.counts['transport_errors'] += sum(a['status']=='communication_error' for a in result['attempts'])
+                self.counts['structured_fallbacks'] += sum(a.get('schema_unsupported', False) for a in result['attempts'])
+                if self.active_answer is not None:
+                    self.counts['valid_answers'] += 1
+                    result['status'] = 'accepted'
+                elif any(a['status']=='contract_rejected' for a in result['attempts']):
+                    self.counts['invalid_answers'] += 1
+                    result['status'] = 'contract_rejected'
+                else:
+                    self.counts['communication_failures'] += 1
+                    result['status'] = 'communication_failure'
+            if self.active_answer is None:
                 self.planner.clear_semantic_guidance()
             timing['model_s'] = time.perf_counter()-stamp
             self._append('model_outputs', dict(frame_id=scene.frame_id, time=scene.time,
-                raw=raw, answer=self.active_answer, errors=errors, wall_seconds=timing['model_s']))
+                **result, wall_seconds=timing['model_s']))
+            self.last_model_outcome = dict(frame_id=scene.frame_id, status=result['status'],
+                errors=result['errors'], attempts=len(result['attempts']), version=MODEL_CONTRACT_VERSION,
+                last_request_mode=result['attempts'][-1]['request_mode'] if result['attempts'] else None,
+                structured_supported=getattr(self.client, 'structured_supported', None))
         stamp = time.perf_counter()
         if scene.rules.get('navigation_brake_required'):
             self.planner.clear_semantic_guidance()
@@ -314,6 +361,11 @@ class PlanningWorker:
         self._append('execution_audit', dict(frame_id=scene.frame_id, time=scene.time, **audit))
         self.counts['plans'] += 1
         self.counts['emergency_plans'] += int(plan.diagnostics.get('emergency', False))
+        self.counts['answer_available_plans'] += int(self.active_answer is not None)
+        self.counts['guided_plans'] += int(self.active_answer is not None and plan.diagnostics.get('semantic_enabled', False))
+        plan.diagnostics['model_contract'] = dict(last_source=self.last_model_outcome,
+            answer_available=self.active_answer is not None,
+            semantic_enabled=bool(plan.diagnostics.get('semantic_enabled', False)))
         if model_due:
             stamp = time.perf_counter()
             reference_input, reference_predictions = prepare_planning_context(scene, self.config, existing=predictions)
@@ -360,6 +412,9 @@ class PlanningWorker:
             (self.directory/'summary.json').write_text(json.dumps(dict(**self.counts,
                 official_score=False, route_id=self.route_id, scenario='fail2drive',
                 execution_mode='B_model', simulated_seconds=(self.last_time-self.first_time if self.last_time else 0.),
+                model_guidance_status=('used' if self.counts['guided_plans'] else
+                    'valid_answers_not_used' if self.counts['valid_answers'] else
+                    'no_valid_answers' if self.counts['model_calls'] else 'not_called'),
                 completion='see_parent_official_results_only'), indent=2), encoding='utf-8')
 
 

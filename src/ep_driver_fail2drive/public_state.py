@@ -71,7 +71,7 @@ class PublicStateExtractor:
         result,part = [],[]
         for location in self.map.get_crosswalks():
             point = xy(location)
-            if abs(location.z-self.route.height_at(point)) > float(self.config.get('same_level_tolerance_m',1.5)):
+            if abs(location.z-self.route.height_at(point,location.z)) > float(self.config.get('same_level_tolerance_m',1.5)):
                 part=[]
                 continue
             if part and math.dist(point,part[0]) < .05:
@@ -179,7 +179,8 @@ class PublicStateExtractor:
             if actor.id not in self._light_stops:
                 try:
                     self._light_stops[actor.id]=[
-                        dict(lane_id=lane_key(wp),position=xy(wp.transform.location))
+                        dict(lane_id=lane_key(wp),position=xy(wp.transform.location),
+                             elevation_m=float(wp.transform.location.z))
                         for wp in actor.get_stop_waypoints()]
                 except (AttributeError,RuntimeError) as exc:
                     self._light_stops[actor.id]=[]
@@ -197,8 +198,8 @@ class PublicStateExtractor:
                 if identity not in self.route.lane_ids and identity != ego['lane_id']:
                     continue
                 position = stop['position']
-                considered.append(dict(lane_id=identity,position=position))
-                s = self.route.stop_projection(position,identity,ego['lane_id'])
+                considered.append(dict(lane_id=identity,position=position,elevation_m=stop['elevation_m']))
+                s = self.route.stop_projection(position,identity,ego['lane_id'],stop['elevation_m'])
                 if s is not None:
                     relevant.append(s)
                 elif identity == ego['lane_id'] and state in ('red','yellow'):
