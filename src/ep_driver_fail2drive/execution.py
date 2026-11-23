@@ -3,6 +3,23 @@ Extracted from committed CARLA execution; official evaluator owns world ticks.
 """
 import math
 
+
+def planning_previous_control(previous_execution, initial_steering_rad=0.):
+    """MPC jerk applies to planned acceleration, never the actuator's feedback effort.
+
+    Steering uses the previously returned, rate-limited wheel angle. Both values
+    describe the last applied control segment rather than a new measured state.
+    """
+    if previous_execution is None:
+        acceleration, steering = 0., initial_steering_rad
+    else:
+        acceleration = previous_execution['planned_acceleration_mps2']
+        steering = previous_execution['steering_rad_left']
+    if any(type(v) not in (int, float) or not math.isfinite(v) for v in (acceleration, steering)):
+        raise ValueError('规划连续性锚点必须是有限的前次规划加速度与已返回转角')
+    return [float(acceleration), float(steering)]
+
+
 class ControlTimeline:
     """只执行已经规划的控制；耗尽后显式报告，不无限保持末项。"""
     def __init__(self, acceleration_min=-6., acceleration_max=3., steering_max=.6, physics_hz=None):
@@ -24,8 +41,12 @@ class ControlTimeline:
         self.physics_hz = physics_hz
         self.source_tick = None
         self.step_ticks = None
+        self.emergency_braking = False
 
-    def install(self, controls, source_time, step_s, source_speed_mps=None, source_tick=None):
+    def install(self, controls, source_time, step_s, source_speed_mps=None, source_tick=None,
+                emergency_braking=False):
+        if type(emergency_braking) is not bool:
+            raise ValueError('紧急制动序列标志必须为布尔值')
         if (isinstance(source_time, bool) or not isinstance(source_time, (int, float))
                 or not math.isfinite(source_time) or source_time < -1e-5):
             raise ValueError('控制序列需要有限非负源仿真时间')
@@ -41,6 +62,8 @@ class ControlTimeline:
                            or not math.isfinite(v) for v in control)):
                 raise ValueError('控制序列必须由有限的加速度和转角组成')
             acceleration, steering = map(float, control)
+            if emergency_braking and acceleration > 1e-8:
+                raise ValueError('紧急制动序列不能包含正加速度')
             if not self.minimum <= acceleration <= self.maximum or abs(steering) > self.steering_max + 1e-8:
                 raise ValueError('控制序列超出规划物理边界')
             checked.append([acceleration, steering])
@@ -75,6 +98,7 @@ class ControlTimeline:
         self.step_s = float(step_s)
         self.source_tick = source_tick
         self.step_ticks = step_ticks
+        self.emergency_braking = emergency_braking
         self.revision += 1
 
     def at(self, sim_time, physical_tick=None):
@@ -116,7 +140,7 @@ class SignedAccelerationController:
     throttle/brake是执行器归一化输入，前馈增益仍须真实CARLA闭环验收。
     不依赖Ackermann内部将速度误差两次积分后才改变踏板的响应。
     """
-    VERSION = 'signed-acceleration-feedforward-1.0'
+    VERSION = 'signed-acceleration-feedforward-1.1'
 
     def __init__(self, maximum_steering_rad, dt=.02, acceleration_min=-6.,
                  acceleration_max=3., steering_rate=.8, settings=None):
@@ -153,13 +177,18 @@ class SignedAccelerationController:
         self.steering = None
 
     def step(self, tick, acceleration, steering, target_speed, measured_speed,
-             measured_acceleration, actual_steering_rad=0.):
+             measured_acceleration, actual_steering_rad=0., emergency_braking=False):
         if type(tick) is not int or tick < 0:
             raise ValueError('执行反馈需要非负整数物理帧')
-        values = (acceleration, steering, target_speed, measured_speed,
-                  measured_acceleration, actual_steering_rad)
-        if any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
+        numeric = (acceleration, steering, target_speed, measured_speed,
+                   measured_acceleration, actual_steering_rad)
+        if any(type(v) not in (int, float) or not math.isfinite(v) for v in numeric):
             raise ValueError('执行反馈必须为有限物理量')
+        if type(emergency_braking) is not bool:
+            raise ValueError('紧急制动执行标志必须为布尔值')
+        if emergency_braking and acceleration > 1e-8:
+            raise ValueError('紧急制动计划包含正加速度，禁止将其作为制动执行')
+        values = numeric + (emergency_braking,)
         if self.last_tick is not None:
             if tick < self.last_tick:
                 raise ValueError('执行反馈物理帧倒退')
@@ -190,6 +219,11 @@ class SignedAccelerationController:
                 (unsaturated < self.minimum and acceleration_error < 0)):
             self.integral = proposed_integral
         requested_acceleration = max(self.minimum, min(self.maximum, without_integral+self.integral))
+        if emergency_braking:
+            # A zero/release segment of an emergency stop must not acquire
+            # throttle from velocity feedback or an earlier positive integral.
+            requested_acceleration = min(0., requested_acceleration)
+            self.integral = min(0., self.integral)
         if intent < 0:
             # 有明确制动意图时不能由滞后的正速度误差或积分生成油门。
             # 仍允许反馈减弱过强制动；下界只保留明确的制动方向，不能反向给油。
@@ -200,7 +234,7 @@ class SignedAccelerationController:
         brake = max(0., min(1., -requested_acceleration/cfg['brake_full_deceleration_mps2']))
         if hold:
             throttle, brake, self.integral = 0., max(brake, cfg['stop_hold_brake']), 0.
-        elif intent < 0:
+        elif intent < 0 or emergency_braking:
             throttle = 0.
         # 与CARLA Ackermann相同的最大轮转角归一化；保留原左正坐标约定。
         previous_steering = actual_steering_rad if self.steering is None else self.steering
@@ -213,6 +247,8 @@ class SignedAccelerationController:
             'measured_longitudinal_acceleration_mps2': measured_acceleration,
             'speed_error_mps': speed_error, 'acceleration_error_mps2': acceleration_error,
             'integral_mps2': self.integral, 'requested_acceleration_mps2': requested_acceleration,
+            'emergency_braking': emergency_braking,
+            'continuity_acceleration_source': 'planned_acceleration_mps2',
             'throttle': throttle, 'brake': brake, 'stop_hold': hold,
             'steer_normalized_right': -self.steering/self.maximum_steering,
             'steering_rad_left': self.steering, 'maximum_steering_rad': self.maximum_steering}

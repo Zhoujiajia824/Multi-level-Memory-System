@@ -199,8 +199,11 @@ class Fail2DriveArtifacts:
         return rows
 
     def video(self, original):
-        result = dict(original, visualization_label="CARLA 六相机实录", official_visualization=False,
-                      sync_available=False)
+        official_view = original.get("video_view") == "official_display" and original.get("camera_id") == "rgb"
+        result = dict(original,
+                      visualization_label="官方示例相机真实录像" if official_view else "CARLA六相机真实录像（旧版缩小拼图）",
+                      video_view="official_display" if official_view else "legacy_camera_mosaic",
+                      official_visualization=False, sync_available=False)
         rows = self._execution()
         count, fps = original.get("frames"), original.get("fps")
         if (not result.get("available") or original.get("status") != "complete"

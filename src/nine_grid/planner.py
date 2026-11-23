@@ -8,7 +8,8 @@ from shapely.geometry import Polygon
 from shapely.geometry import LineString
 from .contracts import Actor, PlanResult
 from .planning_objects import planning_view, road_rule_observations
-from .local_reference import LocalReferenceManager, LocalReferenceResult, rear_covered_reference
+from .local_reference import (LocalReferenceManager, LocalReferenceResult,
+                              rear_covered_reference, terminal_covered_reference)
 from .goals import GoalManager, goal_seed_path, first_arrival_residual
 from .lane_potential import LanePotentialGeometry
 from .potential_domain import build_lane_potential_domain
@@ -67,6 +68,22 @@ def _interpolate_with_slope(s,arc,values):
     slopes=np.diff(values)/np.diff(arc)
     derivative=np.where((s>arc[0])&(s<arc[-1]),slopes[indices],0.)
     return np.interp(s,arc,values),derivative
+
+
+def _reference_window(reference,start,end,anchors=()):
+    """Sample a window without shortcutting its original polyline vertices.
+
+    Returned stations retain their ordered branch identity, including an exact
+    task endpoint; nearest-XY projection is not used to relocate a loop's end.
+    """
+    reference=clean_polyline(reference);arc=polyline_lengths(reference)
+    start=float(np.clip(start,0.,arc[-1]));end=float(np.clip(end,start,arc[-1]))
+    fixed=np.unique(np.r_[start,end,arc[(arc>=start)&(arc<=end)],
+        [s for s in anchors if start<=s<=end]])
+    grid=np.linspace(start,end,max(2,int(np.ceil((end-start)/.5))+1))
+    grid=grid[np.min(np.abs(grid[:,None]-fixed[None,:]),axis=1)>1e-7]
+    stations=np.sort(np.r_[fixed,grid])
+    return sample_polyline(reference,stations),stations
 
 
 def _stop_speed_with_slope(s,stop_local,length,braking):
@@ -287,9 +304,19 @@ class Planner:
             build_seconds=self.dynamics.build_seconds
         ego_s=project_polyline(origin,scene.route,scene.diagnostics.get("route_s"),angle)[0]
         full_arc=polyline_lengths(scene.route)
-        start_arc=max(0.,ego_s-20);end_arc=min(full_arc[-1],ego_s+max(120,speed*4))
-        global_reference=clean_polyline(world_to_ego(sample_polyline(scene.route,np.linspace(start_arc,end_arc,max(2,int((end_arc-start_arc)/.5)+1))),origin,angle))
+        terminal_enabled=scene.scenario=='fail2drive'
+        support_front=max(20.,speed*4.)
+        navigation_support,terminal_support=terminal_covered_reference(scene,scene.route,forward_m=support_front)
+        support_arc=polyline_lengths(navigation_support)
+        start_arc=max(0.,ego_s-20);end_arc=min(support_arc[-1],ego_s+max(120,speed*4))
+        global_world,global_stations=_reference_window(navigation_support,start_arc,end_arc,
+                                                      anchors=(float(full_arc[-1]),))
+        global_reference=world_to_ego(global_world,origin,angle)
         global_arc=polyline_lengths(global_reference)
+        terminal_local=float(full_arc[-1]-start_arc) if terminal_enabled else None
+        terminal_indices=np.flatnonzero(global_stations==full_arc[-1])
+        if terminal_enabled and len(terminal_indices):
+            terminal_local=float(global_arc[int(terminal_indices[0])])
         reference_state_before=self.export_reference_state()
         goal_revision_before=self.goals.revision
         active_goal=self.goals.update(scene,answer)
@@ -324,11 +351,15 @@ class Planner:
             selection=self.references.select(scene,predictions)
             selection.revision+=self.goals.revision
             seed_world=selection.world_path
+        selection.world_path,control_support=terminal_covered_reference(
+            scene,selection.world_path,forward_m=support_front)
+        seed_world,seed_support=terminal_covered_reference(scene,seed_world,forward_m=support_front)
         local_arc=polyline_lengths(selection.world_path)
         selected_s=project_polyline(origin,selection.world_path,heading=angle)[0]
         local_begin=max(0.,selected_s-20.)
         local_end=min(local_arc[-1],selected_s+max(120.,speed*4))
-        reference=clean_polyline(world_to_ego(sample_polyline(selection.world_path,np.linspace(local_begin,local_end,max(2,int((local_end-local_begin)/.5)+1))),origin,angle))
+        reference_world,_=_reference_window(selection.world_path,local_begin,local_end)
+        reference=world_to_ego(reference_world,origin,angle)
         local_s0=project_polyline([0.,0.],reference)[0];reference_arc=polyline_lengths(reference)
         tangents=np.unwrap(np.arctan2(np.gradient(reference[:,1]),np.gradient(reference[:,0])))
         signed_curvature=np.gradient(tangents,np.maximum.accumulate(reference_arc+np.arange(len(reference_arc))*1e-9))
@@ -382,8 +413,11 @@ class Planner:
                          if active_goal is not None else scene.route)
         potential_old_s=(active_goal['last_s'] if active_goal is not None else
             project_polyline(origin,scene.route,scene.diagnostics.get('route_s'),angle)[0])
+        potential_world,potential_forward_support=terminal_covered_reference(
+            scene,potential_world,forward_m=support_front)
         potential_world,potential_reference_evidence=rear_covered_reference(
             scene,potential_world,rear_m=20.,anchor_s=potential_old_s)
+        potential_reference_evidence['forward_support']=potential_forward_support
         potential_prefix_s=float(potential_reference_evidence['added_length_m'])
         potential_reference=clean_polyline(world_to_ego(potential_world,origin,angle))
         # 有效面在刚体旋转后仍可能因接触边浮点退化而自交。保留世界域，
@@ -537,6 +571,9 @@ class Planner:
                 steer=feed+1.2*float(wrap_angle(heading-state[2]))-.3*np.arctan(d/max(state[3],2.))
                 navigation_s=s if active_goal is None else project_polyline(state[:2],reference)[0]
                 desired=min(max_speed,float(scene.rules.get('desired_speed',25.))*scale,np.sqrt(max_lat*2*rear/max(2*abs(np.sin(np.arctan(axle_ratio*np.tan(steer)))),.001))*.9,float(np.interp(navigation_s,reference_arc,speed_profile)))
+                if terminal_local is not None:
+                    terminal_s=project_polyline(state[:2],global_reference)[0]
+                    desired=min(desired,float(_stop_speed_with_slope(terminal_s,terminal_local,0.,braking)[0]))
                 follow_speed,_=following_speed(np.array([navigation_s]),np.array([step_index]))
                 desired=min(desired,float(follow_speed[0]))
                 if stop_local is not None:
@@ -627,11 +664,16 @@ class Planner:
             if stop_local is not None:
                 front_s=project_polyline(body_vertices(dense,scene.ego.length,scene.ego.width).reshape(-1,2),global_reference)[0]
                 stop_ok=bool(np.max(front_s)<=stop_local+tolerance)
-            return {'valid':bool(inside.all() and domain_inside.all() and line_ok.all() and actor_ok.all() and stop_ok),
+            terminal_overshoot=0.
+            if terminal_local is not None:
+                terminal_overshoot=max(0.,float(np.max(_path_projection(dense[:,:2],global_reference)[0])-terminal_local))
+            terminal_ok=terminal_overshoot<=tolerance
+            return {'valid':bool(inside.all() and domain_inside.all() and line_ok.all() and actor_ok.all() and stop_ok and terminal_ok),
                 'substep_s':sub_dt,'samples':len(dense),'actor_clearance_min_m':None if not np.isfinite(minimum) else minimum,
                 'offroad_samples':int((~inside).sum()),'line_violation_samples':int((~line_ok).sum()),
                 'line_clearance_min_m':None if not np.isfinite(line_clearance_minimum) else line_clearance_minimum,
                 'outside_potential_domain_samples':int((~domain_inside).sum()),
+                'task_terminal_passed':not terminal_ok,'task_terminal_max_overshoot_m':terminal_overshoot,
                 'stop_line_passed':not stop_ok,'predicted_contacts':contacts,
                 'limitation':'物理子步离散复核，不是连续时间碰撞证明；周车未来来自预测'}
 
@@ -738,6 +780,18 @@ class Planner:
                 stop_speed,stop_derivative=_stop_speed_with_slope(global_s,stop_local,scene.ego.length,braking)
                 stopped=stop_speed<target;target=np.minimum(target,stop_speed)
                 target_direction=np.where(stopped[:,None],stop_derivative[:,None]*global_tangent*global_interior[:,None],target_direction)
+            if terminal_local is not None:
+                # The task endpoint refers to the ego centre, not a red-light
+                # bumper stop. Geometry after it is support, never a new goal.
+                terminal_speed,terminal_derivative=_stop_speed_with_slope(
+                    navigation_s,terminal_local,0.,braking)
+                ending=terminal_speed<target;target=np.minimum(target,terminal_speed)
+                target_direction=np.where(ending[:,None],
+                    terminal_derivative[:,None]*navigation_tangent*navigation_interior[:,None],target_direction)
+                terminal_s_jac=lambda c:np.einsum('ni,nij->nj',
+                    navigation_tangent*navigation_interior[:,None],c['sens'][:,:2])
+                terminal_position_margin=terminal_local-navigation_s
+                penalty('route_terminal',terminal_position_margin,lambda c:-terminal_s_jac(c))
             # 线段内部等于原横向距离平方；折线端点保留完整位移，避免
             # 最近线段切换时仅取垂距造成目标跳变和错误的数值梯度。
             path_projectors=np.eye(2)[None,:,:]-tangent[:,:,None]*tangent[:,None,:]
@@ -862,6 +916,12 @@ class Planner:
                 minima.append(float(gap.min()))
             # 时域末端仍保留停车空间。车体前缘而非中心到障碍物的距离。
             terminal_margins=[]
+            if terminal_local is not None:
+                terminal_gap=float(terminal_local-navigation_s[-1]-current[-1,3]**2/(2*braking))
+                penalty('route_terminal_stopping',np.array([terminal_gap]),
+                    lambda c:(-terminal_s_jac(c)[-1]-current[-1,3]/braking*c['sens'][-1,3])[None,:])
+                metrics_terminal_position=float(terminal_position_margin.min())
+                metrics_terminal_stopping=terminal_gap
             if np.isfinite(lead_rear[-1]):
                 gap_end=lead_rear[-1]-s[-1]-scene.ego.length/2-follow_gap
                 stopping_difference=max(0.,(current[-1,3]**2-lead_speed[-1]**2)/(2*terminal_braking))
@@ -885,6 +945,9 @@ class Planner:
             for key in ('actor_risk','line_risk','goal_attraction','contour','heading'):components.setdefault(key,0.)
             metrics={name:value for name,value in zip(labels,minima)}
             metrics['tracking_corridor']=float(tracking_margin.min())
+            if terminal_local is not None:
+                metrics['route_terminal']=metrics_terminal_position
+                metrics['route_terminal_stopping']=metrics_terminal_stopping
             metrics['potential_domain']=float(domain_margin.min())
             if terminal_margins:metrics['terminal_stopping']=float(min(terminal_margins))
             control_margin=float(min(np.min(controls[:,0]-min_a),np.min(max_a-controls[:,0]),
@@ -1067,12 +1130,13 @@ class Planner:
             if own is not None:
                 # 交叉口几何最近标签可能是直行连接段。制动仍沿已知导航
                 # 相容中心延伸，不能突然跟随错误分支，也不继承VLM目标。
-                brake_reference=clean_polyline(world_to_ego(
-                    self.references._continuation(scene,own,lane_table),origin,angle))
+                brake_world,_=terminal_covered_reference(scene,
+                    self.references._continuation(scene,own,lane_table),forward_m=support_front)
+                brake_reference=clean_polyline(world_to_ego(brake_world,origin,angle))
             brake_arc=polyline_lengths(brake_reference)
             brake_tangents=np.unwrap(np.arctan2(np.gradient(brake_reference[:,1]),np.gradient(brake_reference[:,0])))
             brake_curvature=np.gradient(brake_tangents,brake_arc+np.arange(len(brake_arc))*1e-9)
-            def brake_controls(deceleration,follow_lane):
+            def brake_controls(deceleration,follow_lane,relax_initial_jerk=False):
                 trajectory=[];state=initial.copy();last=previous_control.copy();release_conflicts=[]
                 for step_index in range(n):
                     s,offset,_=project_polyline(state[:2],brake_reference,heading=state[2])
@@ -1086,6 +1150,11 @@ class Planner:
                     release_limit=brake_acceleration_limit(max(0.,state[3]),dt,max_jerk)
                     lower=max(min_a,last[0]-max_jerk*dt,-release_limit)
                     upper=min(max_a,last[0]+max_jerk*dt)
+                    if relax_initial_jerk and step_index==0:
+                        # Emergency-only exception to longitudinal comfort.
+                        # All following steps keep the original release/jerk
+                        # envelope, and steering continuity is never relaxed.
+                        lower=max(min_a,-release_limit);upper=max_a
                     conflict=lower>upper+1e-10
                     # 从可行初态提前释放制动，不等到v/dt末步截断才破坏jerk。
                     # 已无共同可行区间时优先非倒退和控制箱，明确记录初态冲突。
@@ -1103,13 +1172,32 @@ class Planner:
                     command=np.clip(command,[min_a,-max_delta],[max_a,max_delta])
                     trajectory.append(command);state=propagate(state,command,scene.ego.length,dt,self.substeps,wheelbase,rear);last=command
                 return np.asarray(trajectory),release_conflicts
-            for label,deceleration,follow_lane in [('lane_service_brake',min(braking,-min_a),True),
-                    ('lane_maximum_brake',-min_a,True),('heading_maximum_brake',-min_a,False)]:
-                braking_controls,release_conflicts=brake_controls(deceleration,follow_lane)
+            brake_specs=[('lane_service_brake',min(braking,-min_a),True),
+                         ('lane_maximum_brake',-min_a,True),('heading_maximum_brake',-min_a,False)]
+            for label,deceleration,follow_lane,relaxed in [(*spec,False) for spec in brake_specs]+[
+                    (spec[0]+'_initial_jerk_relaxed',spec[1],spec[2],True) for spec in brake_specs]:
+                if relaxed and any(value['safety_feasible'] and value['emergency_braking_eligible']
+                                   for _,value in emergency_candidates):
+                    continue
+                braking_controls,release_conflicts=brake_controls(deceleration,follow_lane,relaxed)
                 value=terms(braking_controls,is_brake=True)
                 value['braking_release_conflicts']=release_conflicts
                 if release_conflicts:value['safety_feasible']=False
                 if not value['valid']:continue
+                value['emergency_braking_eligible']=bool(np.all(braking_controls[:,0]<=1e-8))
+                transition=float(abs(braking_controls[0,0]-previous_control[0]))
+                value['emergency_jerk_relaxation']={
+                    'active':bool(relaxed and transition>max_jerk*dt+1e-10),
+                    'scope':'first_longitudinal_control_transition_only',
+                    'previous_acceleration_mps2':float(previous_control[0]),
+                    'first_acceleration_mps2':float(braking_controls[0,0]),
+                    'normal_delta_limit_mps2':float(max_jerk*dt),
+                    'actual_delta_mps2':transition,
+                    'later_longitudinal_and_all_steering_limits_retained':True}
+                # Even when every physical check passes, a relaxed comfort
+                # transition must never become a certified normal solution.
+                if value['emergency_jerk_relaxation']['active']:
+                    value['safety_feasible']=False
                 value['initialization_source']=label;value['candidate_source']='current_state_braking'
                 evidence=value['dense_validation'];contacts=evidence['predicted_contacts']
                 _,lateral,route_heading=project_polyline(value['states'][:,:2],brake_reference)
@@ -1133,7 +1221,10 @@ class Planner:
                 emergency_candidates.append((risk_order,value))
             if not emergency_candidates:
                 raise RuntimeError('当前状态不能形成有限有界制动控制，拒绝伪造有效轨迹')
-            accepted=min(emergency_candidates,key=lambda item:item[0])[1]
+            eligible=[item for item in emergency_candidates if item[1]['emergency_braking_eligible']]
+            if not eligible:
+                raise RuntimeError('Emergency braking candidates contain positive acceleration; refusing hidden throttle')
+            accepted=min(eligible,key=lambda item:item[0])[1]
             termination='validated_brake' if accepted['safety_feasible'] else 'emergency_braking_no_certified_solution'
         execution_mode=('safe_brake' if accepted.get('is_brake') else 'normal') if accepted['safety_feasible'] else 'emergency_unverified'
         elapsed=time.perf_counter()-started
@@ -1157,6 +1248,13 @@ class Planner:
                 'goal_event':'legacy_frozen_polyline_first_crossing; energy_on_same_smooth_Frenet_projection'},
             'emergency':execution_mode=='emergency_unverified',
             'braking_release_conflicts':accepted.get('braking_release_conflicts',[]),
+            'emergency_jerk_relaxation':accepted.get('emergency_jerk_relaxation',{'active':False}),
+            'task_terminal':dict(enabled=terminal_enabled,reference_point='ego_center',
+                task_endpoint=scene.route[-1].tolist(),remaining_m=float(full_arc[-1]-ego_s),
+                navigation_window_start_s_m=float(start_arc),terminal_chart_s_m=terminal_local,
+                terminal_anchor_in_window=bool(len(terminal_indices)),
+                braking_mps2=braking,official_arrival_unchanged=True,
+                navigation_support=terminal_support,control_support=control_support,seed_support=seed_support),
             'braking_risk_metrics':accepted.get('braking_risk_metrics'),
             'braking_risk_order_fields':['not_safety_feasible','predicted_contact','maximum_contact_closing_speed_mps',
                 'negative_first_contact_time_s','offroad_plus_line_violation_samples','stop_line_passed',
@@ -1178,6 +1276,8 @@ class Planner:
             'emergency_candidates':[{'source':value['initialization_source'],'safety_feasible':value['safety_feasible'],
                 'risk_order':list(order),'dense_validation':value['dense_validation'],
                 'braking_risk_metrics':value.get('braking_risk_metrics'),
+                'emergency_braking_eligible':value.get('emergency_braking_eligible'),
+                'emergency_jerk_relaxation':value.get('emergency_jerk_relaxation'),
                 'braking_release_conflicts':value.get('braking_release_conflicts',[])} for order,value in emergency_candidates],
             'vehicle_dynamics':{'reference_point':'geometric_center','wheelbase_m':wheelbase,
                 'rear_axle_to_center_m':rear,'geometry_source':'platform' if scene.ego.wheelbase_m is not None else 'highway_legacy'},
@@ -1218,7 +1318,8 @@ class Planner:
             safety_feasible=accepted['safety_feasible'],initial_safety_checks=initial_safety,
             speed_numerical_tolerance_mps=speed_tolerance,
             hard_constraint_groups=['dynamics','acceleration','steering','nonnegative_speed','jerk','steering_rate',
-                'road','potential_domain','noncrossable_line','actor_clearance','speed_limit','lateral_acceleration','stop_line','terminal_stopping','tracking_corridor'],
+                'road','potential_domain','noncrossable_line','actor_clearance','speed_limit','lateral_acceleration','stop_line','terminal_stopping','tracking_corridor']+
+                (['route_terminal','route_terminal_stopping'] if terminal_enabled else []),
             soft_constraint_violations={key:max(0.,-value) for key,value in accepted['minima'].items()
                                         if key not in ('nonnegative_speed','control_box')},
             geometry_progress='closest_point_eliminated_free_progress')

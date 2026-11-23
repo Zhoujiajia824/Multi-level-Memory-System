@@ -7,5 +7,10 @@ fast:
   api_key_env: FAST_VLM_API_KEY
   timeout_s: 60
   max_tokens: 4096
+  # 对齐当前8000服务max_model_len；不改变服务配置，输出可在窗口内按需调整。
+  context_window_tokens: 16384
+  temperature: 0.2
+  # 仅必要结构；退化输出的第二次请求显式加反馈并放松为json_object/text。
+  response_format: json_schema
 reflection:
   backend: off

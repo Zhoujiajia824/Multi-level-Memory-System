@@ -290,7 +290,7 @@ def _scene(frame, core):
         actors=[actor(row) for row in frame.get("actors", original.get("actors", []))],
         lanes=records, route=route[:, :2],
         route_lane_ids=original.get("route_lane_ids", map_data.get("route_lane_ids", [])),
-        drivable=drivable, scenario=original.get("scenario", "recorded"),
+        drivable=drivable, scenario=original.get("scenario", "fail2drive" if frame.get("fail2drive") else "recorded"),
         rules=frame.get("rules", original.get("rules", {})) or {}, diagnostics=diagnostics)
 
 
@@ -1012,6 +1012,25 @@ def build_potential(frame: dict, engine_root=None, resolution=None) -> dict:
         if coverage is not None:
             if coverage.get("version") != "topology-rear-reference-1.0":
                 raise ValueError("不支持的势场参考后向覆盖版本，不能猜测坐标参考")
+            forward = coverage.get("forward_support")
+            if forward is not None:
+                if not isinstance(forward, dict) or forward.get("version") != "public-terminal-support-1.0":
+                    raise ValueError("不支持的官方终点坐标支持版本")
+                module = importlib.import_module(core["contracts"].__package__ + ".local_reference")
+                if not hasattr(module, 'terminal_covered_reference'):
+                    raise ValueError("所选源码不支持归档的终点参考覆盖")
+                reference, rebuilt_forward = module.terminal_covered_reference(scene, reference,
+                    forward_m=float(forward["requested_forward_m"]))
+                for key in ("version", "status", "reason", "lane_ids", "task_route_unchanged",
+                            "model_goal_interval_unchanged", "support_is_task_extension"):
+                    if rebuilt_forward.get(key) != forward.get(key):
+                        raise ValueError("重建终点支持与归档不一致：" + key)
+                if not math.isclose(float(rebuilt_forward['added_length_m']),
+                                    float(forward['added_length_m']), abs_tol=1e-5, rel_tol=1e-7):
+                    raise ValueError("重建终点支持弧长与归档不一致")
+                for key in ("task_endpoint", "support_end"):
+                    if key in forward and not np.allclose(rebuilt_forward.get(key), forward[key], atol=1e-6, rtol=0):
+                        raise ValueError("重建终点支持端点与归档不一致：" + key)
             # 仅重建归档中已存在的坐标覆盖；不修改路线或执行规划。
             module = importlib.import_module(core["contracts"].__package__ + ".local_reference")
             reference, rebuilt_coverage = module.rear_covered_reference(scene, reference,

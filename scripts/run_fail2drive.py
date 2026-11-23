@@ -198,7 +198,7 @@ def fingerprint(config, args, routes):
               "traffic_manager_seed": config["archive_association"]["traffic_manager_seed"],
               "track": "MAP", "physics_hz": 20, "config": config,
               "input_config_sha256": {key: hashlib.sha256(Path(config[key]).read_bytes()).hexdigest()
-                  for key in ("parameters_path", "models_path", "prompts_path")}}
+                  for key in ("parameters_path", "models_path", "prompts_path") if config.get(key)}}
     return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest(), inputs
 
 
@@ -213,7 +213,14 @@ def prepare(args, preflight=None):
     config = json.loads(absolute(args.config).read_text(encoding="utf-8"))
     if config.get("official_commit") != OFFICIAL_COMMIT:
         raise ValueError("runtime config official_commit does not match adapter lock")
-    for key in ("parameters_path", "models_path", "prompts_path"):
+    mode = getattr(args, 'execution_mode', None) or config.get('execution_mode', 'B_model')
+    if mode not in ('A_base', 'B_model'):
+        raise ValueError('execution_mode must be A_base or B_model')
+    config['execution_mode'] = mode
+    required = ('parameters_path', 'models_path', 'prompts_path') if mode == 'B_model' else ('parameters_path',)
+    if mode == 'A_base':
+        config['models_path'] = config['prompts_path'] = None
+    for key in required:
         config[key] = str(absolute(getattr(args, key) or config[key]))
         if not Path(config[key]).is_file():
             raise ValueError("missing "+key+": "+config[key])
@@ -292,6 +299,8 @@ def main():
     parser.add_argument("--routes-subset", default="")
     parser.add_argument("--route-ids", nargs="+", type=int, help="Select IDs from the official route directory")
     parser.add_argument("--config", default="config/fail2drive.example.json")
+    parser.add_argument("--execution-mode", choices=('A_base', 'B_model'),
+                        help="A_base无模型；B_model使用服务器模型；两者均保留表示与参照评分")
     parser.add_argument("--parameters-path")
     parser.add_argument("--models-path")
     parser.add_argument("--prompts-path")
@@ -371,7 +380,7 @@ def main():
                 "traffic_manager_seed": job[1][0]["archive_association"]["traffic_manager_seed"],
                 "checkpoint": job[1][0]["archive_association"]["official_checkpoint"]} for job in jobs[:8]]
     print(json.dumps({"command": jobs[0][1][2] if len(jobs)==1 else None, "official": provenance,
-        "method_results_root": args.output_dir, "execution_mode": "B_model", "dry_run": args.dry_run,
+        "method_results_root": args.output_dir, "execution_mode": jobs[0][1][0]['execution_mode'], "dry_run": args.dry_run,
         "jobs": len(jobs), "repetition_seeds": seeds, "preview": preview,
         "custom_episode_limit": None, "simulator_started_by_launcher": False}, ensure_ascii=False, indent=2))
     if args.dry_run:

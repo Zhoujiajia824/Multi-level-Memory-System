@@ -20,7 +20,7 @@ function toast(message){$('toast').textContent=message;$('toast').hidden=false;c
 function connection(message,status='good'){$('connection').className=`badge ${status}`;$('connection').replaceChildren(el('i'),document.createTextNode(message));}
 async function request(url,signal,options={}){const response=await fetch(url,{signal,cache:'no-store',...options});if(!response.ok){let detail;try{detail=(await response.json()).error;}catch{}throw new Error(detail||`HTTP ${response.status}`);}return response.json();}
 function episodeName(item){return item.dataset==='fail2drive'?item.name:item.scenario||item.summary?.scenario||item.episode_id||item.id;}
-function modeName(mode){return ({pure_base:'纯基础规划',base:'纯基础规划',base_model:'基础规划 + 模型',B_model:'基础规划 + 服务器模型',model:'基础规划 + 模型',retrieval:'模型 + 经验记忆',full_pipeline:'模型辅助规划',fast:'基础规划 + 模型',emergency_unverified:'紧急制动'})[mode]||mode||'执行模式未归档';}
+function modeName(mode){return ({A_base:'纯基础规划',pure_base:'纯基础规划',base:'纯基础规划',base_model:'基础规划 + 模型',B_model:'基础规划 + 服务器模型',model:'基础规划 + 模型',retrieval:'模型 + 经验记忆',full_pipeline:'模型辅助规划',fast:'基础规划 + 模型',emergency_unverified:'紧急制动'})[mode]||mode||'执行模式未归档';}
 function metricValue(value){if(value===true)return'是';if(value===false)return'否';if(value===undefined||value===null)return'未归档';if(typeof value==='number')return Number.isInteger(value)?String(value):fmt(value,3);return typeof value==='string'?value:json(value);}
 function emptyPanel(container,title,message,icon='⌁'){container.replaceChildren();const block=el('div','empty-state small');block.append(el('span','empty-icon',icon),el('strong',null,title),el('p',null,message));container.append(block);}
 function metricList(container,title,values){container.append(el('div','metric-title',title));const dl=el('dl','metric-list');for(const [label,value]of values){const row=el('div');row.append(el('dt',null,label),el('dd',typeof value==='boolean'?(value?'good':'bad'):null,metricValue(value)));dl.append(row);}container.append(dl);}
@@ -182,7 +182,7 @@ function configureDatasetView(manifest,initial){
   if(benchmark&&!wasBenchmark)state.nonNavsimView=state.view;
   state.isNavsim=navsim;state.isFail2Drive=fail2drive;
   $('view-tabs').querySelector('[data-view="scene"]').textContent=benchmark?'三维诊断（非官方）':'空间场景';
-  $('view-tabs').querySelector('[data-view="video"]').textContent=fail2drive?'CARLA实录 · 六相机':navsim?(manifest.video?.official_visualization?'官方执行视频':'归档执行视频'):'原始录像';
+  $('view-tabs').querySelector('[data-view="video"]').textContent=fail2drive?(manifest.video?.video_view==='official_display'?'官方示例相机 · 原始录像':'CARLA实录 · 六相机'):navsim?(manifest.video?.official_visualization?'官方执行视频':'归档执行视频'):'原始录像';
   $('view-tabs').querySelector('[data-view="display"]').hidden=!fail2drive;
   $('fail2drive-results').hidden=!fail2drive;
   $('view-tabs').querySelector('[data-view="bev"]').textContent=navsim?'源规划BEV（诊断）':'BEV图';
@@ -195,13 +195,15 @@ function renderFail2Drive(frame){
   const latest=state.manifest?.fail2drive||f;
   const official=latest.official||{},scores=official.scores||{},summary=latest.worker_summary||{},association=latest.association||{};
   panel.replaceChildren();const heading=el('div','benchmark-heading');heading.append(el('strong',null,`官方路线 ${association.official_route_id??'—'} · seed ${association.repetition_seed??'—'}`),el('span',`badge ${official.route_completed?'good':official.official_result_valid?'warn':'subtle'}`,official.official_status||'官方结果未就绪'));panel.append(heading);
-  const stats=el('div','benchmark-stats');for(const [label,value]of [['完成率 RC',finite(scores.score_route)?fmt(scores.score_route,1)+'%':'—'],['驾驶得分 DS',fmt(scores.score_composed,2)],['违规系数',fmt(scores.score_penalty,3)],['模型有效回答',`${summary.valid_answers??'—'} / ${summary.model_calls??'—'}`],['模型参与规划',`${summary.guided_plans??'—'} / ${summary.plans??'—'}`]]){const box=el('div');box.append(el('span',null,label),el('strong',null,value));stats.append(box);}panel.append(stats);
+  const semanticControl=summary.semantic_control_plans;
+  const stats=el('div','benchmark-stats');for(const [label,value]of [['完成率 RC',finite(scores.score_route)?fmt(scores.score_route,1)+'%':'—'],['驾驶得分 DS',fmt(scores.score_composed,2)],['违规系数',fmt(scores.score_penalty,3)],['协议接纳回答',`${summary.valid_answers??'—'} / ${summary.model_calls??'—'}`],[finite(semanticControl)?'安全行驶语义启用':'语义上下文（旧统计）',`${semanticControl??summary.guided_plans??'—'} / ${summary.plans??'—'}`]]){const box=el('div');box.append(el('span',null,label),el('strong',null,value));stats.append(box);}panel.append(stats);
   panel.append(el('p','context-caption',official.official_result_valid?'官方最终路线评分，不随回放时间改变。输入条件：MAP／范围内当前真值；内部quality与官方分数分别展示。':official.reason||official.unavailable_reason||'官方结果尚未归档或关联证据不足，不能以正常收尾认定成功。'));
+  panel.append(el('p','context-caption',finite(semanticControl)?'协议接纳不证明场景理解正确；语义启用次数只计通过安全验收的正常行驶，不代表因果收益。':'旧语义上下文计数可能包含紧急规划；协议接纳不证明解释质量或模型引导成功。'));
   const display=f.display||{},image=$('display-image'),sample=display.selected;
   image.hidden=!sample?.path;if(sample?.path){const url=assetUrl(sample.path);if(image.getAttribute('src')!==url)image.src=url;}else image.removeAttribute('src');
   $('display-status').textContent=sample?`官方示例相机归档 · 实际CARLA帧 ${sample.carla_frame} · ${fmt(sample.time,3)}s · 与规划源帧相差 ${fmt(frame.time-sample.time,3)}s · 2Hz归档，不冒充当前同帧RGB`:display.reason||'此规划时刻没有已验证的官方示例相机归档。单独授权planning目录时不读取外部画面。';
   if(state.view==='display')$('scene-description').textContent='沿用官方示例相机配置的真实CARLA画面 · 项目只读回放界面';
-  else if(state.view==='video')$('scene-description').textContent='实际六路CARLA相机录像 · 非重新仿真或自定义三维渲染';
+  else if(state.view==='video')$('scene-description').textContent=state.manifest?.video?.video_view==='official_display'?'官方示例相机每物理帧原尺寸实录 · 项目只读回放界面':'实际六路CARLA相机录像 · 旧版缩小拼图，单路320×180';
   else if(state.view==='scene')$('scene-description').textContent='自定义三维诊断（非官方） · 仅依据本轮归档状态与地图';
 }
 function modelMode(frame){const summary=state.manifest?.summary||{};return summary.execution_mode||frame.configuration?.execution_mode||state.manifest?.execution_mode;}
@@ -220,17 +222,54 @@ function chat(container,role,label,time,content,{collapsed=false}={}){
   }else if(text.length>1800){body.append(document.createTextNode(text.slice(0,900)+'…'));rawDetails(body,'展开完整归档内容',content);}else body.textContent=text;
   bubble.append(body);event.append(bubble);container.append(event);return body;
 }
+function fail2DriveModelStatus(panel,output,frame){
+  const accepted=output.accepted===true&&!!output.answer;
+  const attempts=output.attempts||[],truncated=attempts.some(item=>item.wire?.finish_reason==='length'||item.output_failure==='output_truncated');
+  const kinds={whitespace_loop:'模型持续生成空白',output_truncated:'模型输出达到长度上限',context_limit:'上下文预算被服务拒绝',empty_response:'模型返回为空',unfinished_response:'模型回答未完整结束'};
+  const labels={accepted:'回答已通过校验',contract_rejected:'回答未通过校验',communication_failure:'HTTP通信失败，未获得有效回答',output_rejected:'模型输出异常，未采纳',skipped_invalid_reference:'参考范围无效，未请求模型'};
+  const lastFailure=[...attempts].reverse().find(item=>item.output_failure)?.output_failure;
+  const title=!accepted&&lastFailure?(kinds[lastFailure]||lastFailure)+' · 本次未采纳':truncated&&!accepted?'输出达到长度上限 · 本次未采纳':labels[output.status]||output.status||'调用状态未归档';
+  const box=el('div',`model-result-status ${accepted?'accepted':'rejected'}`);box.append(el('strong',null,title));
+  if(!accepted){const reasons=output.errors||[];box.append(el('p',null,truncated?'原始回答未完成，不能作为有效驾驶建议。':reasons.length?reasons.join('；'):'未保存通过校验的回答；具体原因见请求证据。'));if(output.status==='communication_failure'&&truncated)box.append(el('p','context-caption','旧归档将输出截断记为通信失败；本条返回证据是length，不据此认定断网。'));}
+  const contract=frame.plan?.diagnostics?.model_contract||{};
+  box.append(el('p','context-caption',`当前规划模型引导：${contract.semantic_enabled?'已启用':'未启用'}${frame.model_source_frame_id?' · 绑定源帧 '+frame.model_source_frame_id:''}`));
+  panel.append(box);
+}
+function fail2DriveModelAnswer(panel,output){
+  const answer=output.answer,modern=answer?.model_output;
+  if(answer&&modern?.scene&&modern?.decision&&modern?.local_goal){
+    const body=chat(panel,'agent','驾驶建议',output.time,'');body.classList.add('answer-content');
+    const part=(title,text)=>{const block=el('div','answer-section');block.append(el('strong',null,title),el('p',null,text??'未归档'));body.append(block);};
+    part('场景概括',modern.scene.description);part('判断依据',modern.scene.reason);
+    for(const [label,key]of [['横向决策','lateral'],['纵向决策','longitudinal']]){const value=modern.decision[key]||{};part(label,`${value.action||'未归档'}${value.reason?' · '+value.reason:''}`);}
+    if(modern.attention?.length)for(const [i,item]of modern.attention.entries())part(`关注对象 ${i+1} · ${item.id}`,item.reason);
+    else part('关注对象','本次没有重点关注对象');
+    const goal=modern.local_goal;part('局部引导点',`沿参考前进 ${fmt(goal.delta_s_m,2)} m，横向偏移 ${fmt(goal.d_m,2)} m（左正右负）${goal.reason?'；'+goal.reason:''}`);
+    const texts=[modern.scene.description,modern.scene.reason,modern.decision.lateral?.reason,modern.decision.longitudinal?.reason,...(modern.attention||[]).map(v=>v.reason),goal.reason].filter(v=>typeof v==='string');
+    if(texts.length&&texts.every(v=>[...v.trim()].length<=1))body.prepend(el('p','model-text-warning','此旧归档的解释文本只有单字，存在退化；协议通过不代表解释内容有效。原文保留，不补写理由。'));
+  }else if(answer){chat(panel,'agent','驾驶建议',output.time,answer.explanation||answer);}
+  const evidence=el('details','model-evidence');evidence.append(el('summary',null,'查看原始返回与逐次请求证据'));
+  if(output.raw!==null&&output.raw!==undefined)rawDetails(evidence,'模型原始返回（未改写）',output.raw);
+  for(const attempt of output.attempts||[]){const wire=attempt.wire||{},reason=wire.finish_reason,usage=wire.usage||{};
+    const request=el('details');request.append(el('summary',null,`请求 ${attempt.attempt} · ${attempt.output_failure||reason==='length'&&'输出达到长度上限'||attempt.status||'未归档'} · ${attempt.request_mode||'模式未归档'}`));
+    metricList(request,'服务返回的实际token用量',[['输入tokens',usage.prompt_tokens],['输出tokens',usage.completion_tokens],['总tokens',usage.total_tokens],['结束原因',reason],['本次输出额度',wire.request_max_tokens],['上下文窗口（配置值）',wire.configured_context_window_tokens]]);
+    if(!wire.usage)request.append(el('p','context-caption','此旧归档没有服务usage，不从字符数估算或补造token数量。'));
+    rawDetails(request,'原始请求证据（未改写）',attempt);evidence.append(request);
+  }
+  rawDetails(evidence,'归档校验错误',output.errors);panel.append(evidence);
+}
 function renderDialogue(frame){
   const panel=$('dialogue-panel');panel.replaceChildren();
   const current=!!(frame.model_input||frame.model_output),active=!current&&!!(frame.active_model_input||frame.active_model_output);
   const input=current?frame.model_input:frame.active_model_input,output=current?frame.model_output:frame.active_model_output;
-  const mode=modelMode(frame),pure=mode==='pure_base';
+  const mode=modelMode(frame),pure=mode==='pure_base'||mode==='A_base';
   $('agent-mode-badge').textContent=pure?'基础':input||output?'模型':'空档';
   $('agent-subtitle').textContent=pure?'基础规划':active?'上次决策生效':'决策记录';
   if(!input&&!output){emptyPanel(panel,pure?'本轮未调用模型':'此帧没有模型记录',pure?'本轮使用基础规划。':'点击“模型事件”查看其他调用。','✧');return;}
   const source=input?.frame_id||output?.frame_id||frame.model_source_frame_id;
   const info=el('details','call-details');info.append(el('summary',null,'调用信息'),el('p',null,`${active?'绑定决策来源':'实际模型调用源帧'} · ${source||'未归档'}${active?' · 此帧未重新调用':''}`));
   if(frame.navsim)info.append(el('p',null,'t=0独立锚点的归档记录；评分回放期间无新调用。缺少实际输入图片清单时，不推断发送过哪些图。'));panel.append(info);
+  if(frame.fail2drive&&output)fail2DriveModelStatus(panel,output,frame);
   if(input){const body=chat(panel,'user','场景输入',input.time,input.prompt||input.messages||input.input||input,{collapsed:true});
     const images=input.images||input.image_paths||[],urls=input.image_urls||[];
     if(urls.length){
@@ -242,8 +281,8 @@ function renderDialogue(frame){
     }
     if(images.length)body.parentElement.append(el('p','context-caption',`${images.length} 张输入图${urls.length<images.length?` · ${images.length-urls.length} 张资产未找到`:''}`));
   }else panel.append(el('div','chat-empty','模型输入没有归档，无法还原输入内容。'));
-  if(output){const content=output.answer?.model_output||output.answer||output.raw||output.response||output.output||output;const body=chat(panel,'agent','规划建议',output.time,content);
-    if(frame.fail2drive){const contract=frame.plan?.diagnostics?.model_contract||{};metricList(panel,'调用结果与当前规划',[['归档请求状态',output.status],['回答已通过校验',output.accepted],['当前规划使用模型引导',contract.semantic_enabled],['实际绑定源帧',frame.model_source_frame_id]]);for(const attempt of output.attempts||[]){const reason=attempt.wire?.finish_reason;rawDetails(panel,`请求 ${attempt.attempt} · ${reason==='length'?'输出达到长度上限':attempt.status||'未归档'} · ${attempt.request_mode||'模式未归档'}`,attempt);}}
+  if(output&&frame.fail2drive){fail2DriveModelAnswer(panel,output);}
+  else if(output){const content=output.answer?.model_output||output.answer||output.raw||output.response||output.output||output;const body=chat(panel,'agent','规划建议',output.time,content);
     if((frame.navsim||frame.fail2drive)&&output.raw!==null&&output.raw!==undefined)rawDetails(panel,'模型原始返回（未改写）',output.raw);
     const attention=output.answer?.attention||output.attention||[];if(attention.length){const chips=el('div','attention-chips');for(const obj of attention)chips.append(el('span','attention-chip',String(obj.id||obj.object_id||obj)));body.append(chips);}
     if(output.errors?.length)panel.append(el('div','chat-empty','归档模型解析问题：'+json(output.errors)));
@@ -255,7 +294,7 @@ function renderDialogue(frame){
 }
 function renderMemory(frame){
   const panel=$('memory-panel');panel.replaceChildren();const retrieval=frame.retrieval||frame.active_retrieval;
-  if(frame.fail2drive){emptyPanel(panel,'本轮不检索记忆','Fail2Drive使用B模型模式，不检索、不写入记忆。','◈');$('memory-count').textContent='0';return;}
+  if(frame.fail2drive){emptyPanel(panel,'本轮不检索记忆',modelMode(frame)==='A_base'?'Fail2Drive使用纯基础规划模式，不调用模型、不检索、不写入记忆。':'Fail2Drive使用B模型模式，不检索、不写入记忆。','◈');$('memory-count').textContent='0';return;}
   let records=Array.isArray(retrieval)?retrieval:retrieval?.records||retrieval?.results||retrieval?.matches||[];
   if(!Array.isArray(records))records=[];$('memory-count').textContent=records.length;
   if(!records.length){emptyPanel(panel,'没有检索记忆',modelMode(frame)==='pure_base'?'纯基础规划模式未使用检索记忆。':'当前模型决策没有归档检索结果。','◈');if(frame.navsim&&retrieval)rawDetails(panel,'源锚点归档检索摘要',retrieval);return;}
@@ -280,7 +319,9 @@ function renderMetrics(frame){
     metricList(panel,'OFFICIAL · 最终路线结果',[['官方结果关联有效',o.official_result_valid],['官方路线状态',o.official_status],['路线已完成',o.route_completed],['路线完成率 RC',s.score_route],['驾驶得分 DS',s.score_composed],['违规系数',s.score_penalty],['路线长度 / m',m.route_length],['仿真时长 / s',m.duration_game],['实际耗时 / s',m.duration_system]]);
     panel.append(el('p','context-caption','官方结果为整条路线的最终值；下方内部quality、安全验收和执行审核属于项目诊断。'));
     rawDetails(panel,'官方违规原文',o.infractions);if(o.reason||o.unavailable_reason)panel.append(el('p','context-caption',o.reason||o.unavailable_reason));
-    metricList(panel,'MODEL · 整轮调用与实际参与',[['调用周期',w.model_calls],['HTTP请求尝试',w.http_attempts],['有效回答',w.valid_answers],['最终无效回答',w.invalid_answers],['失败周期（归档分类）',w.communication_failures],['实际启用语义的规划',w.guided_plans],['紧急规划',w.emergency_plans]]);rawDetails(panel,'官方结果关联证据',f.evidence);
+    metricList(panel,'MODEL · 整轮调用与实际参与',[['调用周期',w.model_calls],['HTTP请求尝试',w.http_attempts],['协议接纳回答',w.valid_answers],['最终无效回答',w.invalid_answers],[w.output_failures===undefined?'失败周期（旧归档分类）':'HTTP通信失败周期',w.communication_failures],['输出异常请求',w.output_failures],['空白循环请求',w.whitespace_loops],['输出截断请求',w.output_truncations],['上下文拒绝请求',w.context_limit_failures],['持有语义上下文的规划（含紧急）',w.semantic_context_plans??w.guided_plans],['安全正常行驶语义启用',w.semantic_control_plans],['安全制动语义上下文',w.semantic_safe_braking_plans],['紧急规划',w.emergency_plans]]);
+    if(w.output_failures===undefined)panel.append(el('p','context-caption','旧摘要未单独统计输出异常；失败周期不等同于网络断连。缺失计数显示未归档，不补零。'));
+    rawDetails(panel,'官方结果关联证据',f.evidence);
   }
   if(frame.navsim){
     const n=frame.navsim,s=n.scores||{},q=s.internal_quality||{},a=s.official_anchor||{},run=s.official_two_stage_aggregate||{},meta=n.source_plan_metadata||{};
@@ -312,7 +353,7 @@ function setupVideo(video){
   preview.hidden=true;
   if(!video?.available||!video.path&&!video.url){player.pause();player.removeAttribute('src');player.load();player.hidden=true;if(poster){preview.src=poster;preview.hidden=false;preview.alt=video.visualization_label+'首帧';}$('video-status').textContent=navsim?`${poster?video.visualization_label+'首帧 · ':''}此锚点尚无完整执行视频；不会切换成自定义三维主展示。`:'此轮尚无可读取录像。运行中的 MP4 可能需等待编码结束。';return;}
   player.hidden=false;const url=state.compatVideo||video.url||assetUrl(video.path);if(player.getAttribute('src')!==url){player.src=url;player.load();}
-  $('video-status').textContent=navsim?`${video.visualization_label} · 独立4秒`:state.isFail2Drive||state.manifest?.dataset==='fail2drive'?`CARLA六相机真实录像 · ${video.sync_available?'按物理帧证据与时间轴同步':'缺少可信时间映射，独立播放'}`:video.sync_available?'录像与时间轴同步':'独立录像 · 无时间映射';
+  $('video-status').textContent=navsim?`${video.visualization_label} · 独立4秒`:state.isFail2Drive||state.manifest?.dataset==='fail2drive'?`${video.visualization_label||'CARLA真实录像'} · ${video.size?.join('×')||'尺寸未归档'} · ${video.fps||'—'}fps · ${video.sync_available?'按物理帧证据与时间轴同步':'缺少可信时间映射，独立播放'}`:video.sync_available?'录像与时间轴同步':'独立录像 · 无时间映射';
   $('video-status').title=navsim?`${video.renderer_version||'绘图版本未归档'} · ${video.visualization_note||'每个视频覆盖本锚点4秒评分执行。'}`:video.sync_available?'使用归档时间映射':'无逐帧仿真时间映射，不强行同步';
 }
 function videoTime(simTime){const v=state.manifest?.video;if(!v?.sync_available)return null;const mapping=v.time_map||v.timestamps;if(Array.isArray(mapping)&&mapping.length){const point=mapping.reduce((a,b)=>Math.abs((b.sim_time??b.time)-simTime)<Math.abs((a.sim_time??a.time)-simTime)?b:a);return point.video_time??point.media_time??null;}if(finite(v.simulation_start_time)&&finite(v.media_start_time))return simTime-v.simulation_start_time+v.media_start_time;return null;}

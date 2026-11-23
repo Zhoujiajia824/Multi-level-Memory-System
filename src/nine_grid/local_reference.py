@@ -118,6 +118,92 @@ def rear_covered_reference(scene, reference, *, rear_m=20., anchor_s=None):
     return joined, evidence
 
 
+def terminal_covered_reference(scene, reference, *, forward_m=30.):
+    """Use public lane geometry beyond the fixed task end for braking support.
+
+    This never extends the task or the model's frozen goal interval. A finite
+    route can end in the middle of a real lane; a braking rollout still needs
+    coordinates there. Unknown exits, parallel lanes and repeated loop branches
+    are not replaced with a tangent or a nearest-road guess.
+    """
+    original = clean_polyline(reference).copy()
+    evidence = dict(version='public-terminal-support-1.0', status='unchanged',
+        added_length_m=0., requested_forward_m=float(forward_m),
+        task_route_unchanged=True, model_goal_interval_unchanged=True,
+        support_is_task_extension=False, lane_ids=[])
+    def unchanged(reason):
+        evidence['reason'] = reason
+        return original, evidence
+    if scene.scenario != 'fail2drive':
+        return unchanged('not_a_finite_official_task')
+    if scene.diagnostics.get('route_projection', {}).get('valid') is False:
+        return unchanged('navigation_projection_invalid')
+    task = clean_polyline(scene.route)
+    if np.linalg.norm(original[-1]-task[-1]) > .05:
+        return unchanged('reference_does_not_end_at_fixed_task_endpoint')
+    lanes = {lane.id: lane for lane in scene.lanes}
+    lane = lanes.get(scene.route_lane_ids[-1]) if scene.route_lane_ids else None
+    if lane is None:
+        return unchanged('task_terminal_lane_unavailable')
+    points = clean_polyline(lane.center)
+    delta = np.diff(points, axis=0)
+    lengths = np.linalg.norm(delta, axis=1)
+    units = delta/lengths[:, None]
+    fractions = np.clip(np.sum((task[-1]-points[:-1])*delta, axis=1)/lengths**2, 0., 1.)
+    feet = points[:-1]+fractions[:, None]*delta
+    heading = (task[-1]-task[-2])/np.linalg.norm(task[-1]-task[-2])
+    matches = (np.linalg.norm(feet-task[-1], axis=1) <= .05) & (units@heading >= np.cos(.35))
+    if not np.any(matches):
+        return unchanged('endpoint_not_on_confirmed_terminal_lane_center')
+    arc = polyline_lengths(points)
+    locations = arc[:-1]+fractions*lengths
+    # Adjacent samples share one foot; another lap with the same XY does not.
+    if float(np.ptp(locations[matches])) > .2:
+        return unchanged('ambiguous_terminal_lane_occurrence')
+    start = float(locations[np.flatnonzero(matches)[np.argmin(np.linalg.norm(feet[matches]-task[-1], axis=1))]])
+    if not Polygon(lane.polygon).covers(Point(task[-1])):
+        return unchanged('terminal_endpoint_outside_its_public_lane')
+    suffix = sample_polyline(points, np.linspace(start, arc[-1],
+        max(2, int(np.ceil((arc[-1]-start)/.5))+1)))
+    used, shapes = [lane.id], [Polygon(lane.polygon)]
+    reason = 'terminal_lane_geometry'
+    remaining = max(0., float(forward_m))
+    while polyline_lengths(suffix)[-1] < remaining-1e-6:
+        candidates = []
+        for key in lane.successors:
+            other = lanes.get(key)
+            if other is None or key in used:
+                continue
+            center = clean_polyline(other.center)
+            a = suffix[-1]-suffix[-2]; b = center[1]-center[0]
+            if np.linalg.norm(a) < 1e-8:
+                a = np.asarray(lane.center[-1])-lane.center[-2]
+            if (np.linalg.norm(suffix[-1]-center[0]) <= .05
+                    and float(a@b)/(np.linalg.norm(a)*np.linalg.norm(b)) >= np.cos(.35)):
+                candidates.append((other, center))
+        if len(candidates) != 1:
+            reason = 'ambiguous_or_unavailable_public_successor'
+            break
+        lane, center = candidates[0]
+        suffix = clean_polyline(np.vstack((suffix, center[1:])))
+        used.append(lane.id); shapes.append(Polygon(lane.polygon))
+    available = min(remaining, float(polyline_lengths(suffix)[-1]))
+    if available <= 1e-5:
+        return unchanged('no_verified_forward_support')
+    suffix = sample_polyline(suffix, np.linspace(0., available, max(2, int(np.ceil(available/.5))+1)))
+    suffix[0] = original[-1]
+    line = LineString(suffix)
+    if (not unary_union(shapes).buffer(1e-7).covers(line)
+            or not scene.drivable.buffer(1e-7).covers(line)):
+        return unchanged('forward_support_outside_public_lane_or_drivable')
+    joined = clean_polyline(np.vstack((original, suffix[1:])))
+    evidence.update(status='extended', reason=reason,
+        added_length_m=float(polyline_lengths(joined)[-1]-polyline_lengths(original)[-1]),
+        lane_ids=used, task_endpoint=task[-1].tolist(),
+        support_end=joined[-1].tolist(), full_body_checks_retained=True)
+    return joined, evidence
+
+
 class LocalReferenceManager:
     """一个几何候选进入同一个 MPC；车道变换过程跨模型帧保持。"""
 

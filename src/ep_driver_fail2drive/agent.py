@@ -17,7 +17,8 @@ from leaderboard.autoagents.autonomous_agent import AutonomousAgent, Track
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 
 from ep_driver_fail2drive.archive import RouteArchive
-from ep_driver_fail2drive.execution import ControlTimeline, SignedAccelerationController
+from ep_driver_fail2drive.execution import (ControlTimeline, SignedAccelerationController,
+                                          planning_previous_control)
 from ep_driver_fail2drive.protocol import SCHEMA, WorkerClient
 from ep_driver_fail2drive.public_state import PublicStateExtractor
 from ep_driver_fail2drive.sensor_pose import SensorPoseTap
@@ -59,13 +60,15 @@ class EPDriverFail2DriveAgent(AutonomousAgent):
     def setup(self, path_to_conf_file):
         self.config = json.loads(Path(path_to_conf_file).read_text(encoding="utf-8"))
         self.track = Track.MAP
-        self.planner_hz = int(self.config.get("planner_hz", 10))
-        if self.planner_hz not in (1, 2, 10):
+        self.planner_hz = self.config.get("planner_hz", 10)
+        if type(self.planner_hz) is not int or self.planner_hz not in (1, 2, 10):
             raise ValueError("planner_hz must be 1, 2 or 10")
-        if float(self.config.get("model_hz", 1)) != 1:
+        model_hz = self.config.get("model_hz", 1)
+        if type(model_hz) not in (int, float) or model_hz != 1:
             raise ValueError("this adapter uses 1Hz model source snapshots")
-        if self.config.get("execution_mode", "B_model") != "B_model":
-            raise ValueError("Fail2Drive adapter only enables B_model without memory retrieval/writes")
+        self.execution_mode = self.config.get("execution_mode", "B_model")
+        if self.execution_mode not in ("A_base", "B_model"):
+            raise ValueError("Fail2Drive execution_mode must be A_base or B_model, without memory retrieval/writes")
         self.config_path = str(Path(path_to_conf_file).resolve())
         # Install before AgentWrapper creates sensors. Preserve the official
         # image parser/queue while retaining raw same-frame transform metadata.
@@ -83,7 +86,9 @@ class EPDriverFail2DriveAgent(AutonomousAgent):
             raise
 
     def sensors(self):
-        width, height = int(self.config.get("camera_width", 800)), int(self.config.get("camera_height", 450))
+        width, height = self.config.get("camera_width", 800), self.config.get("camera_height", 450)
+        if any(type(v) is not int or not 1 <= v <= 4096 for v in (width, height)):
+            raise ValueError("model camera width/height must be integer pixels between 1 and 4096")
         sensors = [{"type": "sensor.camera.rgb", "x": 0.0, "y": 0.0, "z": 1.8,
                  "roll": 0.0, "pitch": 0.0, "yaw": yaw, "width": width, "height": height,
                  "fov": 100, "id": name} for name, yaw in CAMERA_POSES]
@@ -196,6 +201,7 @@ class EPDriverFail2DriveAgent(AutonomousAgent):
                         [name for name, _ in CAMERA_POSES], save=model_due)
             if "rgb" not in input_data or int(input_data["rgb"][0]) != frame:
                 raise ValueError("official visualization RGB/state source frame mismatch")
+            self.archive.capture_display(input_data["rgb"], frame, source_time)
             if relative_tick % 10 == 0:
                 import cv2
                 destination = self.viz_path/("%05d.jpg" % relative_tick)
@@ -221,17 +227,15 @@ class EPDriverFail2DriveAgent(AutonomousAgent):
             plan_wall_s = None
             if plan_due:
                 scene = self.extractor.capture(frame, camera_images=images, world_snapshot=snapshot)
-                if self.previous_execution is None:
-                    prior_control = [0., -self.ego.get_control().steer*self.controller.maximum_steering]
-                    prior_frame = None
-                else:
-                    prior_control = [self.previous_execution["requested_acceleration_mps2"],
-                                     self.previous_execution["steering_rad_left"]]
-                    prior_frame = self.last_frame
+                prior_control = planning_previous_control(self.previous_execution,
+                    -self.ego.get_control().steer*self.controller.maximum_steering)
+                prior_frame = self.last_frame if self.previous_execution is not None else None
                 scene.setdefault("diagnostics", {}).update(previous_control=prior_control,
-                    previous_control_source={"kind": "previous_returned_controller_intent", "frame": prior_frame,
+                    previous_control_source={"kind": "previous_planned_acceleration_and_returned_steering", "frame": prior_frame,
                         "initialization": prior_frame is None,
-                        "note": "bounded actuator acceleration intent, not measured acceleration or original MPC u0"})
+                        "note": "jerk uses the last selected planned acceleration; inner-loop feedback effort is separate",
+                        "actuator_requested_acceleration_mps2": (self.previous_execution.get("requested_acceleration_mps2")
+                            if self.previous_execution is not None else None)})
                 packet = {"schema": SCHEMA, "route_id": self.route_id, "frame": frame,
                           "time": source_time, "scene": scene, "images": images,
                           "output_dir": str(self.archive.directory.resolve())}
@@ -240,8 +244,12 @@ class EPDriverFail2DriveAgent(AutonomousAgent):
                 plan_wall_s = time.monotonic()-begin_plan
                 if not plan.get("executable", False):
                     raise RuntimeError("numeric worker returned a non-executable control sequence")
+                diagnostics = plan.get("diagnostics", {})
+                emergency = (diagnostics.get("emergency") is True or
+                    str(diagnostics.get("execution_mode", "")).startswith("emergency"))
                 self.timeline.install(plan["controls"], source_time, float(plan["control_dt"]),
-                                      source_speed_mps=math.hypot(*scene["ego"]["velocity"]), source_tick=frame)
+                                      source_speed_mps=math.hypot(*scene["ego"]["velocity"]), source_tick=frame,
+                                      emergency_braking=emergency)
                 self.archive.append("agent_plans", plan)
                 self.archive.append("agent_sources", {"frame": frame, "time": source_time, "scene": scene})
             selected = self.timeline.at(source_time, physical_tick=frame)
@@ -255,7 +263,8 @@ class EPDriverFail2DriveAgent(AutonomousAgent):
             actual = self.ego.get_control()
             command = self.controller.step(frame, selected["control"][0], selected["control"][1],
                 selected["target_speed_mps"], measured_speed, measured_acceleration,
-                actual_steering_rad=-actual.steer*self.controller.maximum_steering)
+                actual_steering_rad=-actual.steer*self.controller.maximum_steering,
+                emergency_braking=self.timeline.emergency_braking)
             control = carla.VehicleControl(throttle=command["throttle"], brake=command["brake"],
                         steer=command["steer_normalized_right"], hand_brake=False,
                         reverse=False, manual_gear_shift=False)
