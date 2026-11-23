@@ -8,6 +8,7 @@ import math
 
 from .route import RouteAdapter, lane_key, point_in_polygon, polygons_intersect, project, xy
 from .traffic_rules import PublicTrafficRules
+from .vehicle_geometry import SCHEMA as GEOMETRY_SCHEMA
 
 
 SCHEMA = 'ep-driver-fail2drive-scene-1.0'
@@ -50,7 +51,7 @@ def _state_name(state):
 
 class PublicStateExtractor:
     """Read current-frame actors and a frozen official route; never tick/spawn."""
-    def __init__(self, world, ego, global_plan_world_coord, config=None, route_id='route'):
+    def __init__(self, world, ego, global_plan_world_coord, config=None, route_id='route', ego_geometry=None):
         self.world,self.ego,self.config = world,ego,dict(config or {})
         self.route_id = str(route_id)
         self.map = world.get_map()
@@ -59,7 +60,7 @@ class PublicStateExtractor:
         self.angular_history,self.history,self.kinematic_history = {},{},{}
         self.next_history = None
         self.last_frame = None
-        self.ego_geometry = None
+        self.ego_geometry = ego_geometry
         self._lane_bounds=[(lane,min(p[0] for p in lane['polygon']),max(p[0] for p in lane['polygon']),
                            min(p[1] for p in lane['polygon']),max(p[1] for p in lane['polygon']))
                           for lane in self.route.lanes]
@@ -126,21 +127,14 @@ class PublicStateExtractor:
         if attributes.get('mesh_path'):
             evidence['mesh_path']=attributes['mesh_path']
         if is_ego:
-            if self.ego_geometry is None:
-                inverse = transform.get_inverse_matrix()
-                wheels = actor.get_physics_control().wheels
-                if len(wheels) != 4:
-                    raise ValueError('The ego execution model requires four measured wheels')
-                local = []
-                for wheel in wheels:
-                    p=wheel.position
-                    local.append(sum(inverse[0][j]*[p.x/100.,p.y/100.,p.z/100.,1.][j] for j in range(4)))
-                front,rear = sum(local[:2])/2.,sum(local[2:])/2.
-                wheelbase,rear_distance = front-rear,box.location.x-rear
-                if not 0. < rear_distance < wheelbase:
-                    raise ValueError('Invalid public wheel geometry; cannot substitute vehicle length')
-                self.ego_geometry = wheelbase,rear_distance
-            row['wheelbase_m'],row['rear_axle_to_center_m'] = self.ego_geometry
+            geometry = self.ego_geometry
+            if not geometry or geometry.get('schema') != GEOMETRY_SCHEMA or geometry.get('status') != 'valid':
+                raise ValueError('Verified same-frame wheel geometry must be supplied before ego extraction')
+            row['wheelbase_m'] = geometry['wheelbase_m']
+            row['rear_axle_to_center_m'] = geometry['rear_axle_to_center_m']
+            evidence['geometry'] = dict(schema=geometry['schema'], measured_frame=geometry['frame'],
+                source=geometry['source'], wheelbase_m=row['wheelbase_m'],
+                rear_axle_to_center_m=row['rear_axle_to_center_m'])
         return row,evidence
 
     def _category(self, actor, row, evidence):

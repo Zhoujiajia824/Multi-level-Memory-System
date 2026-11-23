@@ -20,6 +20,8 @@ from ep_driver_fail2drive.archive import RouteArchive
 from ep_driver_fail2drive.execution import ControlTimeline, SignedAccelerationController
 from ep_driver_fail2drive.protocol import SCHEMA, WorkerClient
 from ep_driver_fail2drive.public_state import PublicStateExtractor
+from ep_driver_fail2drive.sensor_pose import SensorPoseTap
+from ep_driver_fail2drive.vehicle_geometry import measure_vehicle_geometry, json_safe, WheelGeometryError
 
 PHYSICS_HZ = 20
 CAMERA_POSES = (("front_rgb", 0), ("front_left_rgb", -60), ("front_right_rgb", 60),
@@ -45,6 +47,7 @@ class EPDriverFail2DriveAgent(AutonomousAgent):
         self.first_frame = None
         self.route_id = None
         self.previous_execution = None
+        self._pose_tap = None
 
     def set_global_plan(self, global_plan_gps, global_plan_world_coord):
         # Keep the supplied dense public navigation; base implementation downsamples at 200m.
@@ -64,6 +67,20 @@ class EPDriverFail2DriveAgent(AutonomousAgent):
         if self.config.get("execution_mode", "B_model") != "B_model":
             raise ValueError("Fail2Drive adapter only enables B_model without memory retrieval/writes")
         self.config_path = str(Path(path_to_conf_file).resolve())
+        # Install before AgentWrapper creates sensors. Preserve the official
+        # image parser/queue while retaining raw same-frame transform metadata.
+        spec = next(sensor for sensor in self.sensors() if sensor['id'] == 'front_rgb')
+        mount = carla.Transform(carla.Location(x=spec['x'], y=spec['y'], z=spec['z']),
+            carla.Rotation(pitch=spec['pitch'], yaw=spec['yaw'], roll=spec['roll']))
+        if self._pose_tap is not None:
+            self._pose_tap.close()
+        self._pose_tap = SensorPoseTap(self.sensor_interface, camera_id='front_rgb',
+                                     camera_mount_matrix_m=mount.get_matrix())
+        try:
+            self._pose_tap.install()
+        except Exception:
+            self._pose_tap.close()
+            raise
 
     def sensors(self):
         width, height = int(self.config.get("camera_width", 800)), int(self.config.get("camera_height", 450))
@@ -117,13 +134,38 @@ class EPDriverFail2DriveAgent(AutonomousAgent):
             "Fail2Drive/team_code/viz_path_agent.py and team_code/config.py at "+self.config["official_commit"],
             "layout": "VIZ_PATH/<route_run>/<step:05>.jpg", "save_interval_ticks": 10,
             "model_input": False, "independent_official_viewer": False})
+        self.archive.json("sensor_metadata_tap.json", dict(self._pose_tap.describe(),
+                          official_commit=self.config["official_commit"]))
+        try:
+            source_time = float(snapshot.timestamp.elapsed_seconds)
+            frozen_ego = snapshot.find(self.ego.id)
+            if frozen_ego is None:
+                raise ValueError("ego is absent from the source world snapshot")
+            pose = self._pose_tap.for_frame(snapshot.frame, source_time)
+            physics = self.ego.get_physics_control()
+            box = self.ego.bounding_box
+            geometry = measure_vehicle_geometry(
+                actor_transform_matrix_m=frozen_ego.get_transform().get_matrix(), wheels=physics.wheels,
+                bbox_center_m=[box.location.x, box.location.y, box.location.z],
+                bbox_extent_m=[box.extent.x, box.extent.y, box.extent.z], sensor_pose=pose,
+                frame=snapshot.frame, timestamp=source_time,
+                bbox_heading_deg=box.rotation.yaw)
+            if int(self.world.get_snapshot().frame) != int(snapshot.frame):
+                raise WheelGeometryError("world advanced while measuring source-frame wheel geometry", geometry)
+        except Exception as exc:
+            failure = dict(getattr(exc, "evidence", {}))
+            failure.update(status="invalid", source_frame=int(snapshot.frame), type=type(exc).__name__)
+            failure.setdefault("error", str(exc))
+            self.archive.json("ego_geometry.json", json_safe(failure))
+            raise
+        self.archive.json("ego_geometry.json", geometry)
         self.extractor = PublicStateExtractor(self.world, self.ego, self._global_plan_world_coord,
-                                            config=self.config.get("public_state", {}), route_id=self.route_id)
+            config=self.config.get("public_state", {}), route_id=self.route_id, ego_geometry=geometry)
         execution = dict(self.config.get("execution", {}))
         minimum = float(execution.get("acceleration_min", -6.0))
         maximum = float(execution.get("acceleration_max", 3.0))
         steering = float(execution.get("steering_max", .6))
-        wheel_angles = [wheel.max_steer_angle for wheel in self.ego.get_physics_control().wheels
+        wheel_angles = [wheel.max_steer_angle for wheel in physics.wheels
                         if wheel.max_steer_angle > 0]
         if not wheel_angles:
             raise RuntimeError("ego physics has no steering wheels")
@@ -229,10 +271,14 @@ class EPDriverFail2DriveAgent(AutonomousAgent):
         except Exception as exc:
             if self.archive is not None:
                 self.archive.append("agent_errors", {"frame": frame, "time": source_time,
-                                    "type": type(exc).__name__, "error": str(exc)})
+                    "type": type(exc).__name__, "error": str(exc),
+                    "evidence": json_safe(getattr(exc, "evidence", None))})
             raise  # Official evaluator must record Agent failure rather than a hidden successful fallback.
 
     def destroy(self):
+        if self._pose_tap is not None:
+            self._pose_tap.close()
+            self._pose_tap = None
         worker, archive = self.worker, self.archive
         self.worker, self.archive = None, None
         try:
