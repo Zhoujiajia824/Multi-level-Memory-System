@@ -10,7 +10,7 @@ import math
 from pathlib import Path
 
 
-VERSION = 'carla-physical-evaluation-2.1'
+VERSION = 'carla-physical-evaluation-2.2'
 DEFAULTS = {
     'arrival_margin_m': 3., 'arrival_lateral_m': 2.5,
     'speed_tolerance_mps': .5, 'overspeed_grace_s': .5,
@@ -158,6 +158,8 @@ class EpisodeEvaluator:
         self.seconds = {'offroad': 0., 'wrong_way': 0., 'speeding': 0., 'stopped': 0., 'expected_wait': 0.}
         self.max_values = {'speed_mps': 0., 'acceleration_mps2': 0., 'jerk_mps3': 0., 'lateral_acceleration_mps2': 0.}
         self._comfort_squared = {'acceleration_mps2': 0., 'jerk_mps3': 0., 'lateral_acceleration_mps2': 0.}
+        self._comfort_samples = {key: 0 for key in self._comfort_squared}
+        self._invalid_acceleration_samples = 0
         self.min_gap = self.min_headway = self.min_ttc = None
         self.stall_origin_s = self.stall_origin_tick = None
         self._event_keys, self._pending, self.events = set(), [], []
@@ -339,6 +341,13 @@ class EpisodeEvaluator:
                     list(ego.get('acceleration', [0., 0.]))+[ego['heading'], ego['length'], ego['width']])
                 or min(ego['length'], ego['width']) <= 0):
             raise ValueError('evaluation ego contains nonfinite state')
+        acceleration_valid = ego.get('acceleration_sample_valid', True)
+        if type(acceleration_valid) is not bool:
+            raise ValueError('acceleration sample validity must be boolean')
+        if not acceleration_valid:
+            if not isinstance(ego.get('acceleration_sample_reason'), str) or not ego['acceleration_sample_reason']:
+                raise ValueError('invalid acceleration sample must retain its reason')
+            self._invalid_acceleration_samples += 1
         self.tick, self.frame = tick, frame
         self.timestamp = timestamp
         if self.first_frame is None:
@@ -359,15 +368,23 @@ class EpisodeEvaluator:
         speed = _norm(ego.get('velocity', [0., 0.]))
         acceleration = list(ego.get('acceleration', [0., 0.]))
         self.max_values['speed_mps'] = max(self.max_values['speed_mps'], speed)
-        self.max_values['acceleration_mps2'] = max(self.max_values['acceleration_mps2'], _norm(acceleration))
         lateral_acceleration = abs(-math.sin(ego['heading'])*acceleration[0]+math.cos(ego['heading'])*acceleration[1])
-        self.max_values['lateral_acceleration_mps2'] = max(self.max_values['lateral_acceleration_mps2'], lateral_acceleration)
-        if self.previous is not None:
+        if acceleration_valid:
+            self.max_values['acceleration_mps2'] = max(self.max_values['acceleration_mps2'], _norm(acceleration))
+            self.max_values['lateral_acceleration_mps2'] = max(self.max_values['lateral_acceleration_mps2'], lateral_acceleration)
+        if self.previous is not None and acceleration_valid:
+            self._comfort_squared['acceleration_mps2'] += _norm(acceleration)**2
+            self._comfort_squared['lateral_acceleration_mps2'] += lateral_acceleration**2
+            self._comfort_samples['acceleration_mps2'] += 1
+            self._comfort_samples['lateral_acceleration_mps2'] += 1
+        # The activation frame contains set_target_velocity's initialization jump.
+        # Preserve it in the raw ego record, but do not differentiate through it.
+        if (self.previous is not None and acceleration_valid and
+                self.previous.get('acceleration_sample_valid', True)):
             jerk = _norm(_sub(acceleration, self.previous.get('acceleration', [0., 0.])))/self.dt
             self.max_values['jerk_mps3'] = max(self.max_values['jerk_mps3'], jerk)
-            self._comfort_squared['acceleration_mps2'] += _norm(acceleration)**2
             self._comfort_squared['jerk_mps3'] += jerk**2
-            self._comfort_squared['lateral_acceleration_mps2'] += lateral_acceleration**2
+            self._comfort_samples['jerk_mps3'] += 1
         for key in ('body_on_road', 'wrong_way'):
             if type(road.get(key)) is not bool:
                 self.coverage[key] = False
@@ -507,7 +524,11 @@ class EpisodeEvaluator:
             'collision_contact_episodes_per_km': contacts*1000/self.actual_distance_m if self.actual_distance_m > 0 else None,
             'contact_episode_rule': 'same_other_actor_callbacks_separated_by_more_than_0.5s_are_new_contacts',
             'violation_seconds': dict(self.seconds), 'maximum': dict(self.max_values),
-            'rms': {key: math.sqrt(total/self.tick) if self.tick else None for key, total in self._comfort_squared.items()},
+            'rms': {key: math.sqrt(total/self._comfort_samples[key]) if self._comfort_samples[key] else None
+                    for key, total in self._comfort_squared.items()},
+            'comfort_samples': dict(self._comfort_samples),
+            'invalid_acceleration_samples': self._invalid_acceleration_samples,
+            'comfort_sampling_policy': 'valid_control_interval_acceleration;jerk_requires_two_valid_samples;raw_measurements_retained',
             'minimum_net_gap_m': self.min_gap, 'minimum_time_headway_s': self.min_headway,
             'minimum_same_direction_ttc_s': self.min_ttc,
             'following_scope': 'current_heading_overlapping_body_corridor; crossing TTC not claimed',
@@ -944,11 +965,14 @@ class CarlaEvaluationProbe:
                     self.evaluator._write('conflict_zone_events.jsonl', row)
             self._zone_presence[identity] = present
 
-    def observe(self, snapshot, tick, events=(), scenario_events=None, control_execution=None):
+    def observe(self, snapshot, tick, events=(), scenario_events=None, control_execution=None,
+                acceleration_sample_valid=True, acceleration_sample_reason=None):
         ego = self._state(self.ego, snapshot)
         if ego is None:
             self.evaluator.infrastructure_error('ego_missing_from_world_snapshot')
             raise RuntimeError('physical evaluator cannot find ego in snapshot')
+        ego['acceleration_sample_valid'] = acceleration_sample_valid
+        ego['acceleration_sample_reason'] = acceleration_sample_reason
         actors = []
         for actor in self.world.get_actors():
             if actor.id != self.ego.id and actor.type_id.startswith(('vehicle.', 'walker.pedestrian.', 'static.prop.')):

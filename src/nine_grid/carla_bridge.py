@@ -63,7 +63,7 @@ def validate_camera_source_clock(clock):
 
 
 def camera_storage_due(sim_time, camera_save_hz=1, physical_ticks=None, physics_hz=50):
-    """从真实10Hz采集帧中选择1Hz原始图片归档，不影响显示/录像时钟。"""
+    """50Hz捕获、10Hz输出中选择1Hz原始图片归档，不影响显示/录像时钟。"""
     if isinstance(camera_save_hz, bool) or camera_save_hz != 1:
         raise ValueError('camera_save_hz当前必须为1，与快模型原帧采样对齐')
     if isinstance(sim_time, bool) or not isinstance(sim_time, (int, float)) or not math.isfinite(sim_time) or sim_time < -1e-5:
@@ -481,6 +481,7 @@ class CarlaSession:
         self._visualization = None
         self._camera_payload_cache = None
         self._camera_audit_lock = threading.Lock()
+        self._camera_ready = threading.Event()
         self._camera_audit = {}
         self.camera_sync_failure = None
         self.world_reset = None
@@ -514,7 +515,9 @@ class CarlaSession:
             raise ValueError('rgb_enabled必须为布尔值')
         self.rgb_enabled = config.get('rgb_enabled', False)
         if isinstance(config.get('camera_hz', 10), bool) or config.get('camera_hz', 10) != 10:
-            raise ValueError('RGB真实采样频率camera_hz当前必须为10，原始图片归档独立为1Hz')
+            raise ValueError('RGB消费/录像频率camera_hz当前必须为10，原始图片归档独立为1Hz')
+        if type(config.get('camera_capture_hz', 50)) not in (int, float) or config.get('camera_capture_hz', 50) != 50:
+            raise ValueError('RGB真实采集频率camera_capture_hz必须为50，与物理帧一致')
         self._display_enabled = bool(set(config.get('consumers', [])) & {'video', 'live'})
         self.display_capacity = config.get('display_queue_frames', 50)
         if type(self.display_capacity) is not int or self.display_capacity < 10:
@@ -636,12 +639,8 @@ class CarlaSession:
             raise ValueError('相机尺寸或视场配置非法')
         self._create_sensors()
         if self.rgb_enabled:
-            # 首张RGB是启动采样，实测第一间隔为6帧、此后才为5帧。
-            # 校准期间演员保持制动，未调用场景脚本、发布观测或开始实验计时。
+            # 固定初始化制动保持，每帧等待完整六路RGB再推进；不寻帧、不追图。
             self._align_initial_camera_phase()
-            # 下一稳态相机帧之前的四帧仍保持，最后一帧才激活初速。
-            for _ in range(self.physics_hz // 10 - 1):
-                self._initialization_tick('camera_phase_hold')
         self._initial_speed_audit = release_initial_motion(self.experiment, carla)
         snap = self._initialization_tick('initial_motion_activation')
         self._collect(self.frame)
@@ -651,7 +650,8 @@ class CarlaSession:
         self.evaluation_probe = CarlaEvaluationProbe(self.world, carla, self.ego, self.route_wps,
             settings=experiment, directory=self.root, physics_hz=self.physics_hz)
         self._evaluation = self.evaluation_probe.observe(snap, 0, events=list(self.events),
-            scenario_events=self.experiment.evaluation_state())
+            scenario_events=self.experiment.evaluation_state(), acceleration_sample_valid=False,
+            acceleration_sample_reason='initial_motion_activation_set_target_velocity')
         if self._rgb_initialization is not None:
             self._rgb_initialization.update(source_frame=self.frame, source_timestamp=self.t0,
                 activation_frame_gap=self.frame-self._rgb_initialization['stable_frame'])
@@ -663,7 +663,7 @@ class CarlaSession:
         self._publish(result)
         result = self._latest_result()
         result['map'] = self._map_payload()
-        result['bridge_version'] = 'carla-0.9.15-range-runtime-3.2'
+        result['bridge_version'] = 'carla-0.9.15-range-runtime-3.3'
         result['sdk_version'] = client_version
         result['server_version'] = server_version
         result['world_reset'] = copy.deepcopy(self.world_reset)
@@ -681,7 +681,9 @@ class CarlaSession:
             'world_reset': result['world_reset'], 'initialization_warmup': result['initialization_warmup'],
             'initial_speed_audit': result['initial_speed_audit'], 'source_frame': self.frame, 't0': self.t0,
             'physics_hz': self.physics_hz, 'planner_hz': self.planner_hz,
-            'rgb_enabled': self.rgb_enabled, 'camera_hz': 10., 'sensor_tick_s': .1,
+            'rgb_enabled': self.rgb_enabled, 'camera_hz': 10.,
+            'camera_capture_hz': float(self.physics_hz) if self.rgb_enabled else 0.,
+            'sensor_tick_s': 0., 'camera_barrier': 'six_views_before_next_physical_tick',
             'rgb_initialization': copy.deepcopy(self._rgb_initialization),
             'initialization_ticks': copy.deepcopy(self._initialization_ticks),
             'initial_motion': copy.deepcopy(self.experiment.initial_motion_audit),
@@ -693,7 +695,9 @@ class CarlaSession:
                           actor.get_transform().location.z, actor.get_transform().rotation.yaw],
                  'elapsed_s': float(actor.get_elapsed_time())}
                 for actor in self.world.get_actors().filter('traffic.traffic_light*')],
-            'note': '先制动预热确认六路RGB稳态五帧相位，再激活初速并建立t0；'
+            'note': (('先固定制动预热0.5秒，每物理帧收齐六路RGB，再激活初速并建立t0；'
+                      '50Hz采集、10Hz输出和录像、1Hz原图归档；') if self.rgb_enabled else
+                     '无图像消费者，不创建RGB相机或执行相机预热；注册后激活初速并建立t0；')+
                     '初始化推进与事件单列，灯态由冻结实例的整数帧程序控制。'}
         (self.root/'carla_initialization.json').write_text(json.dumps(initialization, ensure_ascii=False,
             allow_nan=False, indent=2), encoding='utf-8')
@@ -777,55 +781,34 @@ class CarlaSession:
                 '原因={}，阻塞演员数={}；详细身份见{}'.format(','.join(reasons), len(existing), path))
 
     def _align_initial_camera_phase(self):
-        """测量启动相位，不假设创建后的首张图就是稳态10Hz时钟原点。"""
-        period = self.physics_hz // 10
-        audit = {'version': 'carla-rgb-startup-phase-1.0', 'status': 'calibrating',
-            'expected_period_frames': period, 'required_stable_intervals': 2,
+        """固定制动预热；每物理帧收齐六路，绝不越过缺图帧寻图。
+
+        保留约0.5秒初始化保持以免缩短原有落地/制动时间；这不是通用
+        接地证明，布局漂移和碰撞检查仍由初始化运动审计负责。
+        """
+        count = max(3, self.physics_hz // 2)
+        audit = {'version': 'carla-rgb-startup-every-tick-2.0', 'status': 'calibrating',
+            'expected_period_frames': 1, 'warmup_frame_count': count,
+            'capture_hz': self.physics_hz, 'output_hz': 10., 'sensor_tick_s': 0.,
+            'warmup_simulated_seconds': count/float(self.physics_hz),
+            'barrier': 'six_views_before_next_physical_tick',
             'sample_frames': [], 'intervals_frames': [], 'initialization_only': True}
         self._rgb_initialization = audit
         self._rgb_initialization_deadline = time.monotonic()+self.timeout
         try:
-            self._initialization_tick('camera_bootstrap')
-            self._collect(self.frame)
-            audit['sample_frames'].append(self.frame)
-            previous, stable = self.frame, 0
-            # 最多0.6s初始化物理推进；每帧留出回调时间，不在缺图帧冻结30s。
-            # 仅用于启动相位探测；运行期仍严格等待指定当前帧，不继续推进找图。
-            front_key = next(iter(self.queues))
-            for _ in range(6*period):
-                probe = self._initialization_tick('camera_phase_probe')
-                deadline = min(time.monotonic()+.2, self._rgb_initialization_deadline)
-                image = None
-                while time.monotonic() < deadline:
-                    try:
-                        item = self.queues[front_key].get(timeout=max(0., deadline-time.monotonic()))
-                    except queue.Empty:
-                        break
-                    try:
-                        matched = camera_matches_snapshot(front_key, item, self.frame,
-                            float(probe.timestamp.elapsed_seconds))
-                    except CameraMetadataError:
-                        self._record_camera_event(front_key, 'rejected_metadata', item)
-                        raise
-                    if not matched:
-                        self._record_camera_event(front_key, 'discarded_startup_delayed', item)
-                        continue
-                    image = item
-                    break
-                if image is None:
-                    continue
-                self._collect(self.frame, prefetched={front_key: image})
-                gap = self.frame-previous
+            previous = None
+            for index in range(count):
+                probe = self._initialization_tick('camera_bootstrap' if index == 0 else 'camera_phase_probe')
+                self._collect(self.frame)
+                if previous is not None:
+                    gap = self.frame-previous
+                    audit['intervals_frames'].append(gap)
+                    if gap != 1:
+                        raise RuntimeError('逐物理帧RGB初始化出现非连续帧')
                 audit['sample_frames'].append(self.frame)
-                audit['intervals_frames'].append(gap)
-                stable = stable+1 if gap == period else 0
                 previous = self.frame
-                if stable >= 2:
-                    audit.update(status='aligned', stable_frame=self.frame,
-                        stable_timestamp=float(image.timestamp))
-                    return
-            raise RuntimeError('RGB初始化未形成六相机共同的10Hz五帧节拍；实际间隔{}'.format(
-                audit['intervals_frames']))
+            audit.update(status='aligned', stable_frame=self.frame,
+                stable_timestamp=float(probe.timestamp.elapsed_seconds))
         except Exception as exc:
             audit.update(status='failed', error=type(exc).__name__+': '+str(exc))
             # _collect可能已经保存部分成功相机；不能被外层异常覆盖为空。
@@ -876,7 +859,7 @@ class CarlaSession:
         for view, yaw in views if self.rgb_enabled else []:
             bp = self.world.get_blueprint_library().find('sensor.camera.rgb')
             for key, value in (('image_size_x', self.width), ('image_size_y', self.height),
-                               ('fov', self.fov), ('sensor_tick', .1)):
+                               ('fov', self.fov), ('sensor_tick', 0.)):
                 bp.set_attribute(key, str(value))
             if bp.has_attribute('enable_postprocess_effects'):
                 enabled = self.cfg.get('rgb_postprocess_effects', True)
@@ -942,6 +925,10 @@ class CarlaSession:
                 target.put_nowait(image)
             except queue.Full:
                 self._record_camera_event(key, 'queue_dropped', image)
+        finally:
+            # Any camera can release a shared collector wait. Waiting on the
+            # first missing camera must not hide a conflicting peer header.
+            self._camera_ready.set()
 
     def _save_camera_sync_failure(self, frame, error, selected):
         """记录失败现场的真实计数，不能用上一已发布场景的缓存运行状态代替。"""
@@ -962,14 +949,17 @@ class CarlaSession:
                     if selected is None and previous.get('requested_frame') == frame else
                     {key: {'frame': image.frame, 'timestamp': image.timestamp}
                      for key, image in (selected or {}).items()})
-        report = {'version': 'carla-rgb-sync-diagnostic-1.1',
+        report = {'version': 'carla-rgb-sync-diagnostic-1.2',
             'error': type(error).__name__+': '+str(error), 'requested_frame': frame,
             'error_kind': 'rgb_metadata_conflict' if isinstance(error, CameraMetadataError) else 'rgb_sync_failure',
             'metadata_conflict': copy.deepcopy(getattr(error, 'details', None)),
             'bridge_frame': self.frame, 'sim_time': self._sim_time,
             't0': self.t0, 'runtime_metrics': copy.deepcopy(self._runtime_metrics),
-            'requested_camera_hz': 10., 'sensor_tick_s': .1,
+            'requested_camera_hz': float(getattr(self, 'physics_hz', 50)), 'camera_output_hz': 10.,
+            'sensor_tick_s': 0., 'camera_barrier': 'six_views_before_next_physical_tick',
             'accepted_for_request': accepted,
+            'pending_camera_keys': sorted(set(self.queues)-set(accepted)),
+            'collection_policy': 'all_camera_queues_polled_under_one_shared_deadline',
             'cameras': cameras, 'world_reset': copy.deepcopy(self.world_reset),
             'initialization_warmup': copy.deepcopy(self._initialization_warmup),
             'initial_speed_audit': copy.deepcopy(self._initial_speed_audit),
@@ -1023,27 +1013,37 @@ class CarlaSession:
             deadline = time.monotonic() + self.timeout
             if self.t0 is None and self._rgb_initialization_deadline is not None:
                 deadline = min(deadline, self._rgb_initialization_deadline)
-            for key, q in self.queues.items():
-                while True:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError('10Hz RGB同步超时：{}，目标帧{}'.format(key, frame))
-                    try:
-                        if self._stop.is_set() and threading.current_thread() is self._ticker:
-                            raise RuntimeError('RGB等待被运行暂停中断')
-                        item = prefetched.pop(key) if key in prefetched else q.get(timeout=min(remaining, .1))
-                    except queue.Empty:
+            while len(result) != len(self.queues):
+                if self._stop.is_set() and threading.current_thread() is self._ticker:
+                    raise RuntimeError('RGB等待被运行暂停中断')
+                # Clear before inspecting queues: a callback racing with this
+                # scan leaves either its image queued or the event set.
+                self._camera_ready.clear()
+                for key, q in self.queues.items():
+                    if key in result:
                         continue
-                    try:
-                        matched = camera_matches_snapshot(key, item, frame, target_time)
-                    except CameraMetadataError:
-                        self._record_camera_event(key, 'rejected_metadata', item)
-                        raise
-                    if matched:
-                        result[key] = item
-                        self._record_camera_event(key, 'selected', item)
-                        break
-                    self._record_camera_event(key, 'discarded_stale', item)
+                    while True:
+                        try:
+                            item = prefetched.pop(key) if key in prefetched else q.get_nowait()
+                        except queue.Empty:
+                            break
+                        try:
+                            matched = camera_matches_snapshot(key, item, frame, target_time)
+                        except CameraMetadataError:
+                            self._record_camera_event(key, 'rejected_metadata', item)
+                            raise
+                        if matched:
+                            result[key] = item
+                            self._record_camera_event(key, 'selected', item)
+                            break
+                        self._record_camera_event(key, 'discarded_stale', item)
+                if len(result) == len(self.queues):
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    pending = ','.join(key for key in self.queues if key not in result)
+                    raise TimeoutError('逐物理帧RGB同步超时：{}，目标帧{}'.format(pending, frame))
+                self._camera_ready.wait(min(remaining, .1))
             timestamps = [item.timestamp for item in result.values()]
             if max(timestamps) - min(timestamps) > 1e-6:
                 raise RuntimeError('同帧RGB时间戳不一致')
@@ -1052,6 +1052,10 @@ class CarlaSession:
                 raise RuntimeError('RGB与目标世界帧时间戳不一致；拒绝旧图配新状态')
             self.frames = result
             self._camera_payload_cache = None
+            self._runtime_metrics['rgb_synchronized_frames'] = self._runtime_metrics.get('rgb_synchronized_frames', 0)+1
+            if self.t0 is not None:
+                self._runtime_metrics['rgb_runtime_synchronized_frames'] = self._runtime_metrics.get('rgb_runtime_synchronized_frames', 0)+1
+            self._runtime_metrics['last_rgb_synchronized_frame'] = frame
         except Exception as exc:
             self._save_camera_sync_failure(frame, exc, result)
             raise
@@ -1331,6 +1335,8 @@ class CarlaSession:
             world_driver='application_wall_paced_sync_ticks' if self.runtime_mode == 'async' else 'synchronous_plan_then_tick',
             carla_native_synchronous=True, physics_hz=self.physics_hz, planner_hz=self.planner_hz,
             control_step_s=self.control_step_s, camera_hz=10. if self.rgb_enabled else 0.,
+            camera_capture_hz=float(self.physics_hz) if self.rgb_enabled else 0.,
+            sensor_tick_s=0., camera_barrier='six_views_before_next_physical_tick',
             rgb_enabled=self.rgb_enabled, depth_sensor_count=0,
             duration_s=self.duration_s,
             duration_target_ticks=duration_tick_limit(self.duration_s, self.physics_hz),
@@ -1568,9 +1574,15 @@ class CarlaSession:
             if self._execution_controller is None:
                 raise RuntimeError('车辆执行控制器尚未按真实轮转角初始化')
             actual = self.ego.get_control()
+            # tick 0观测紧随初始化set_target_velocity，其加速度含人工速度跳变；
+            # tick 1起反馈来自正常物理控制响应，不过滤或钳制真实制动/加速测量。
+            feedback_valid = tick != 0 or self._initial_speed_audit is None
             requested = self._execution_controller.step(tick, acceleration, steering, desired,
                 speed, measured_acceleration,
-                -float(actual.steer)*self._execution_controller.maximum_steering)
+                -float(actual.steer)*self._execution_controller.maximum_steering,
+                acceleration_feedback_valid=feedback_valid,
+                acceleration_feedback_reason=('physical_step_response' if feedback_valid else
+                    'initial_motion_activation_set_target_velocity'))
             command = self.carla.VehicleControl(throttle=requested['throttle'], brake=requested['brake'],
                 steer=requested['steer_normalized_right'], hand_brake=False, reverse=False,
                 manual_gear_shift=False)
@@ -1654,8 +1666,11 @@ class CarlaSession:
                 self._terminal_reason = 'arrival'
             elif self._evaluation.get('stalled'):
                 self._terminal_reason = 'stall'
-        if self.rgb_enabled and self._at_frequency(10.):
+        if self.rgb_enabled:
+            # 包含非输出帧和终止帧：收到全部当前图像前绝不发下一tick，
+            # 避免CARLA0.9.15异步读回期间世界状态继续推进。
             self._collect(self.frame)
+        if self.rgb_enabled and self._at_frequency(10.):
             # 录像/观看独立消费10Hz；模型及归档仍只消费整秒原帧。
             if self._display_enabled or self._at_frequency(1.):
                 self._queue_display_frame(self._camera_payload())

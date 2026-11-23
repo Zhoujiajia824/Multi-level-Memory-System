@@ -398,7 +398,7 @@ python scripts/run_carla.py --scenario-config config/carla_scenarios/town01_foll
 
 继续使用 `ep-driver-carla` 主程序和 `--carla-python .../carla37/bin/python` SDK桥接。场景由 `--scenario-config 路径` 单独选择，冻结实例由 `--instance-config 路径`复用。地图/路线/演员/灯控与实例哈希随输出保存；正式阶段禁止在线写记忆、地图替换和污染RGB的世界debug线。
 
-世界50Hz、六路RGB10Hz、图片归档及模型源帧1Hz；规划可选1/2/10Hz。整数物理帧覆盖控制段、事件和历史调度；原始CARLA帧号/时间戳另存。GPU相机创建后先制动预热确认稳态共同帧，再激活初速建立t0。图像不与其他时刻状态拼接；旁观脚本不能tick。
+世界50Hz、六路RGB每物理帧采集50Hz，消费和录像10Hz，图片归档及模型源帧1Hz；规划可选1/2/10Hz。每物理帧收齐六路RGB后才推进下一帧，每五帧选择一次对外输出；不改写原始CARLA帧号/时间戳。GPU相机创建后固定制动预热0.5秒并逐帧校验，再激活初速建立t0。图像不与其他时刻状态拼接；旁观脚本不能tick。异步模式也保留图像屏障，GPU跟不上时如实记录墙钟滞后。
 
 `--video --no-world-plan`保存展示副本录像，原始模型图像保持干净。视频有解码检查和帧时间清单；采集缺失与驾驶失败分别记录。
 

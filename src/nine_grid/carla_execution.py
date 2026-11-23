@@ -179,7 +179,7 @@ class SignedAccelerationController:
     throttle/brake是执行器归一化输入，前馈增益仍须真实CARLA闭环验收。
     不依赖Ackermann内部将速度误差两次积分后才改变踏板的响应。
     """
-    VERSION = 'signed-acceleration-feedforward-1.0'
+    VERSION = 'signed-acceleration-feedforward-1.1'
 
     def __init__(self, maximum_steering_rad, dt=.02, acceleration_min=-6.,
                  acceleration_max=3., steering_rate=.8, settings=None):
@@ -216,13 +216,20 @@ class SignedAccelerationController:
         self.steering = None
 
     def step(self, tick, acceleration, steering, target_speed, measured_speed,
-             measured_acceleration, actual_steering_rad=0.):
+             measured_acceleration, actual_steering_rad=0.,
+             acceleration_feedback_valid=True, acceleration_feedback_reason=None):
         if type(tick) is not int or tick < 0:
             raise ValueError('执行反馈需要非负整数物理帧')
         values = (acceleration, steering, target_speed, measured_speed,
                   measured_acceleration, actual_steering_rad)
         if any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
             raise ValueError('执行反馈必须为有限物理量')
+        if type(acceleration_feedback_valid) is not bool:
+            raise ValueError('加速度反馈有效标记必须为布尔值')
+        if (not acceleration_feedback_valid and
+                (not isinstance(acceleration_feedback_reason, str) or not acceleration_feedback_reason)):
+            raise ValueError('无效加速度反馈必须记录来源原因')
+        values += (acceleration_feedback_valid, acceleration_feedback_reason)
         if self.last_tick is not None:
             if tick < self.last_tick:
                 raise ValueError('执行反馈物理帧倒退')
@@ -239,18 +246,21 @@ class SignedAccelerationController:
         acceleration = max(self.minimum, min(self.maximum, acceleration))
         speed_error = max(0., target_speed)-max(0., measured_speed)
         acceleration_error = acceleration-measured_acceleration
+        # set_target_velocity激活帧的加速度包含初始化速度跳变，不能解释成踏板响应。
+        # 只排除明确标记的该帧反馈；实测速、规划前馈和原始加速度审计均保留。
+        feedback_error = acceleration_error if acceleration_feedback_valid else 0.
         deadband = cfg['intent_deadband_mps2']
         intent = 1 if acceleration > deadband else -1 if acceleration < -deadband else 0
         # 制动/起步切换不继承相反方向的积分，不限制真实物理减速响应。
         if intent and intent != self.previous_intent:
             self.integral = 0.
         proposed_integral = max(-cfg['integral_limit_mps2'], min(cfg['integral_limit_mps2'],
-            self.integral+cfg['acceleration_ki']*acceleration_error*self.dt))
-        without_integral = acceleration+cfg['speed_kp']*speed_error+cfg['acceleration_kp']*acceleration_error
+            self.integral+cfg['acceleration_ki']*feedback_error*self.dt))
+        without_integral = acceleration+cfg['speed_kp']*speed_error+cfg['acceleration_kp']*feedback_error
         unsaturated = without_integral+proposed_integral
         # 到达加速度限幅时，只允许能解除饱和的积分变化。
-        if not ((unsaturated > self.maximum and acceleration_error > 0) or
-                (unsaturated < self.minimum and acceleration_error < 0)):
+        if not ((unsaturated > self.maximum and feedback_error > 0) or
+                (unsaturated < self.minimum and feedback_error < 0)):
             self.integral = proposed_integral
         requested_acceleration = max(self.minimum, min(self.maximum, without_integral+self.integral))
         if intent < 0:
@@ -275,6 +285,9 @@ class SignedAccelerationController:
             'target_speed_mps': max(0., target_speed), 'measured_speed_mps': measured_speed,
             'measured_longitudinal_acceleration_mps2': measured_acceleration,
             'speed_error_mps': speed_error, 'acceleration_error_mps2': acceleration_error,
+            'acceleration_feedback_valid': acceleration_feedback_valid,
+            'acceleration_feedback_reason': acceleration_feedback_reason,
+            'acceleration_feedback_error_mps2': acceleration_error if acceleration_feedback_valid else None,
             'integral_mps2': self.integral, 'requested_acceleration_mps2': requested_acceleration,
             'throttle': throttle, 'brake': brake, 'stop_hold': hold,
             'steer_normalized_right': -self.steering/self.maximum_steering,

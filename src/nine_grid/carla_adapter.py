@@ -220,8 +220,8 @@ class CameraVideoRecorder:
             if opened:
                 self.writer, self.path, self.codec, self.size = candidate, path, codec, size
                 self.status = 'recording'
-                logging.getLogger(__name__).info('CARLA录像开始：%s，编码=%s，%s，%.1f帧/秒',
-                    self.path, codec, size, self.adapter.camera_hz)
+                logging.getLogger(__name__).info('CARLA录像开始：%s，编码=%s，%s，输出%.1f帧/秒，RGB采集%.1fHz',
+                    self.path, codec, size, self.adapter.camera_hz, self.adapter.camera_capture_hz)
                 self._save_status()
                 return
             candidate.release()
@@ -311,7 +311,7 @@ class CameraVideoRecorder:
                     raise RuntimeError('CARLA录像文件无法打开，未通过可播放检查')
                 fps = float(capture.get(cv2.CAP_PROP_FPS))
                 if not math.isfinite(fps) or abs(fps-self.adapter.camera_hz) > .01:
-                    raise RuntimeError('CARLA录像帧率与RGB采集频率不一致')
+                    raise RuntimeError('CARLA录像帧率与RGB输出频率不一致')
                 while True:
                     okay, image = capture.read()
                     if not okay:
@@ -339,11 +339,15 @@ class CameraVideoRecorder:
                 'first_carla_frame': self.first_frame, 'last_carla_frame': self.last_frame,
                 'encoder_attempts': self.encoder_attempts, 'status_path': str(self.status_path),
                 'frame_manifest_path': str(self.frame_manifest_path),
-                'source': 'CARLA_same_frame_six_rgb_10hz',
+                'source': 'CARLA_same_frame_six_rgb_50hz_capture_10hz_output',
+                'capture_hz': self.adapter.camera_capture_hz,
+                'output_hz': self.adapter.camera_hz, 'video_fps': self.adapter.camera_hz,
+                'sensor_tick_s': 0.,
+                'sampling_policy': 'capture_every_physical_tick;emit_every_five_ticks;strict_same_frame',
                 'encoded_duration_s': self.frames / self.adapter.camera_hz,
                 'plan_overlay': self.frames_with_plan > 0, 'frames_with_plan': self.frames_with_plan,
                 'display_frames_dropped': self.adapter._display_frames_dropped,
-                'note': '实际10Hz六相机RGB；规划1/2/10Hz均消费独立图像队列；不补帧。丢帧单列，编码时长不代替仿真时长；原始图片1Hz归档'}
+                'note': '六相机每物理帧采集50Hz；每5物理帧选择同帧RGB供10Hz使用与录像；规划1/2/10Hz独立，不补帧。丢帧单列，编码时长不代替仿真时长；模型与原始图片1Hz取用归档'}
 
 
 class CarlaAdapter:
@@ -365,6 +369,12 @@ class CarlaAdapter:
             raise ValueError('CARLA运行模式必须为sync或async')
         self.dt = 1. / self.planner_hz
         self.cfg.update(physics_hz=int(config.get('clock', {}).get('physics_hz', 50)), planner_hz=int(self.planner_hz))
+        capture_hz = self.cfg.get('camera_capture_hz', self.cfg['physics_hz'])
+        if (type(capture_hz) not in (int, float) or not math.isfinite(capture_hz)
+                or capture_hz != self.cfg['physics_hz']):
+            raise ValueError('camera_capture_hz必须等于物理频率；六路RGB每物理帧采集')
+        self.camera_capture_hz = float(capture_hz)
+        self.cfg['camera_capture_hz'] = self.camera_capture_hz
         for key in ('acceleration_min_mps2', 'acceleration_max_mps2', 'steering_abs_max_rad', 'steering_rate_abs_max_radps'):
             if key in config.get('mpc', {}):
                 self.cfg[key] = config['mpc'][key]
@@ -428,6 +438,12 @@ class CarlaAdapter:
             raise RuntimeError('必须在CARLA初始化前确定相机消费者')
         if not isinstance(policy,dict) or policy.get('depth_enabled') is not False:
             raise ValueError('传感器策略必须明确禁用深度')
+        if (type(policy.get('rgb_hz')) not in (int, float) or policy['rgb_hz'] != 10
+                or type(policy.get('rgb_capture_hz')) not in (int, float)
+                or policy['rgb_capture_hz'] != self.camera_capture_hz
+                or type(policy.get('sensor_tick_s')) not in (int, float)
+                or policy['sensor_tick_s'] != 0.):
+            raise ValueError('相机消费者策略必须声明逐物理帧采集及10Hz输出')
         self._sensor_policy=copy.deepcopy(policy)
         self.cfg.update(self._sensor_policy)
         self.camera_hz=float(policy['rgb_hz'])

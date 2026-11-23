@@ -15,19 +15,22 @@ REQUIRED_CHECKS = ('route', 'actors', 'events', 'source_alignment', 'repeatabili
 CAMERAS = {'front_rgb', 'front_left_rgb', 'front_right_rgb', 'back_rgb', 'back_left_rgb', 'back_right_rgb'}
 MEASUREMENTS = ('body_on_road', 'wrong_way', 'speed_limit', 'collision_events', 'lane_markings',
                 'traffic_lights', 'stop_signs', 'public_priority', 'complete_physical_ticks')
-INFRASTRUCTURE_KEYS = ('camera_width', 'camera_height', 'camera_fov', 'camera_height_m', 'camera_hz',
+INFRASTRUCTURE_KEYS = ('camera_width', 'camera_height', 'camera_fov', 'camera_height_m', 'camera_hz', 'camera_capture_hz',
     'camera_save_hz', 'rgb_postprocess_effects', 'map_resolution_m', 'map_speed_cap_mps',
     'same_level_tolerance_m', 'arrival_margin_m', 'longitudinal_control')
 
 
 def infrastructure_contract(config):
-    missing = [key for key in INFRASTRUCTURE_KEYS if key not in config]
+    # Legacy archived configurations did not split capture and output clocks.
+    # New runner configurations always include camera_capture_hz; never invent
+    # a 50Hz capture claim when reading older evidence.
+    missing = [key for key in INFRASTRUCTURE_KEYS if key not in config and key != 'camera_capture_hz']
     if missing:
         raise ValueError('missing sensor/map contract: '+','.join(missing))
     from .carla_execution import SignedAccelerationController
     settings=config['longitudinal_control']
     if not isinstance(settings,dict):raise ValueError('longitudinal_control must be a mapping')
-    result={key:config[key] for key in INFRASTRUCTURE_KEYS}
+    result={key:config[key] for key in INFRASTRUCTURE_KEYS if key in config}
     result['longitudinal_control']=dict(SignedAccelerationController(.6,settings=settings).settings)
     result['longitudinal_controller_version']=SignedAccelerationController.VERSION
     return result
@@ -311,8 +314,15 @@ def _event_coverage(directory, settings, evaluation, clock, errors, evidence):
 
 
 def _video(directory, video, clock, errors, evidence):
+    source = video.get('source')
+    if source == 'CARLA_same_frame_six_rgb_50hz_capture_10hz_output':
+        if (video.get('capture_hz') != 50 or video.get('output_hz') != 10
+                or video.get('video_fps') != 10 or video.get('fps') != 10
+                or video.get('sensor_tick_s') != 0):
+            errors['video'].append('video_capture_output_clock_invalid')
     if (video.get('status') != 'complete' or not video.get('playback_verified') or video.get('frames', 0) < 2
-            or video.get('display_frames_dropped', 0) > 0 or video.get('source') != 'CARLA_same_frame_six_rgb_10hz'):
+            or video.get('display_frames_dropped', 0) > 0 or source not in (
+                'CARLA_same_frame_six_rgb_10hz', 'CARLA_same_frame_six_rgb_50hz_capture_10hz_output')):
         errors['video'].append('video_recording_incomplete')
     # Absolute paths in server metadata may be stale after the evidence tree is moved.
     # Only a movie in this episode directory is admitted, and its bytes are hashed.
@@ -437,7 +447,15 @@ def validate_runs(directories, coverage_directories=()):
                 errors['source_alignment'].append('camera_initial_alignment')
             if initial.get('physics_hz') != 50 or initial.get('camera_hz') != 10:
                 errors['source_alignment'].append('actual_physics_or_camera_frequency')
-            if ev.get('version') != 'carla-physical-evaluation-2.0' or ev.get('physical_hz') != 50:
+            if ('camera_capture_hz' in cfg or 'camera_capture_hz' in initial
+                    or video.get('source') == 'CARLA_same_frame_six_rgb_50hz_capture_10hz_output'):
+                if (cfg.get('camera_capture_hz') != 50 or initial.get('camera_capture_hz') != 50
+                        or initial.get('sensor_tick_s') != 0
+                        or initial.get('camera_barrier') != 'six_views_before_next_physical_tick'
+                        or video.get('source') != 'CARLA_same_frame_six_rgb_50hz_capture_10hz_output'):
+                    errors['source_alignment'].append('actual_rgb_capture_contract')
+            if ev.get('version') not in ('carla-physical-evaluation-2.0', 'carla-physical-evaluation-2.1',
+                                         'carla-physical-evaluation-2.2') or ev.get('physical_hz') != 50:
                 errors['source_alignment'].append('evaluation_version')
             if not ev.get('evaluation_valid') or not ev.get('scenario_valid'):
                 errors['events'].append('invalid_evaluation_or_scenario')

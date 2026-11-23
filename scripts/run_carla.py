@@ -167,7 +167,7 @@ def platform_configuration(data,args,scene_path):
         raise ValueError('平台YAML必须且仅包含carla对象；实验参数请放到独立场景YAML')
     allowed={'python','host','port','timeout_s','allow_world_reset','camera_width','camera_height',
         'camera_fov','camera_height_m','arrival_margin_m','map_resolution_m',
-        'map_speed_cap_mps','same_level_tolerance_m','runtime_mode','planner_hz','camera_hz',
+        'map_speed_cap_mps','same_level_tolerance_m','runtime_mode','planner_hz','camera_hz','camera_capture_hz',
         'world_plan_debug','display_plan_overlay','camera_save_hz','rgb_postprocess_effects','display_queue_frames',
         'longitudinal_control'}
     if set(data['carla'])-allowed:
@@ -189,10 +189,13 @@ def platform_configuration(data,args,scene_path):
         raise ValueError('carla.runtime_mode必须为sync或async')
     cfg.setdefault('planner_hz',10)
     cfg.setdefault('camera_hz',10)
+    cfg.setdefault('camera_capture_hz',50)
     if type(cfg['planner_hz']) is not int or cfg['planner_hz'] not in (1,2,10):
         raise ValueError('carla.planner_hz必须为1、2或10Hz整数')
     if type(cfg['camera_hz']) not in (int,float) or cfg['camera_hz']!=10:
-        raise ValueError('carla.camera_hz必须为10Hz；原始图片按camera_save_hz=1归档')
+        raise ValueError('carla.camera_hz消费与录像频率必须为10Hz；原始图片按camera_save_hz=1归档')
+    if type(cfg['camera_capture_hz']) not in (int,float) or cfg['camera_capture_hz']!=50:
+        raise ValueError('carla.camera_capture_hz必须为50Hz，与物理帧一致')
     for key,default in (('world_plan_debug',False),('display_plan_overlay',True),
                         ('rgb_postprocess_effects',True)):
         cfg.setdefault(key,default)

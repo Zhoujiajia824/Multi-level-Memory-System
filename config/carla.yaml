@@ -28,10 +28,12 @@ carla:
   camera_height: 360
   camera_fov: 100
   camera_height_m: 2.2
-  # 六路RGB真实采集/录像10Hz，原始图片与模型源帧1Hz归档；无深度。
+  # 六路RGB每物理帧采集50Hz（sensor_tick=0），每5物理帧选择同帧图像供10Hz使用和录像。
+  # camera_capture_hz必须与clock.physics_hz一致；原始图片与模型源帧仍为1Hz；无深度。
+  camera_capture_hz: 50
   camera_hz: 10
-  # 创建后首张图不作为稳态时钟原点：制动预热至连续两次六路共同5帧间隔，
-  # 然后激活初速并取下一共同帧作为t0。预热推进与布局漂移单独审计。
+  # 制动预热期间逐物理帧核验六路RGB，激活初速后以同帧图像建立t0。
+  # 预热推进与布局漂移单独审计；10Hz输出按整数物理帧选择，不依赖浮点相机节拍。
   display_queue_frames: 50  # 10Hz录像传输有界缓冲；溢出单列，不补造重复帧
   camera_save_hz: 1
   # RGB使用CARLA默认光照/色调处理；不创建深度相机。
