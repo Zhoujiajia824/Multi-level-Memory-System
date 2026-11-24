@@ -202,6 +202,33 @@ def fingerprint(config, args, routes):
     return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest(), inputs
 
 
+def reflection_memory_identity(directory):
+    """Bind an explicitly selected bank to resume provenance, without writing it.
+
+    Existing memory metadata binds feature assets by checksum; the reader still
+    checks those assets when taking its episode snapshot.
+    """
+    if not isinstance(directory, (str, Path)):
+        raise ValueError('reflection memory directory must be an explicit path')
+    root = absolute(directory)
+    if not root.is_dir():
+        raise ValueError('reflection memory directory does not exist: '+str(root))
+    names = [root/name for name in ('manifest.json', 'freeze.json', 'invalidations.jsonl')
+             if (root/name).is_file()]
+    records = root/'records'
+    if records.is_dir():
+        names.extend(sorted(records.glob('*/record.json')))
+    if not names:
+        raise ValueError('reflection memory directory has no published manifest or record metadata')
+    metadata = {}
+    for path in names:
+        if not path.resolve().is_relative_to(root):
+            raise ValueError('reflection memory metadata escapes the selected directory')
+        metadata[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return dict(root=str(root), metadata_sha256=metadata,
+                validation='metadata_identity_only;episode_reader_verifies_feature_assets')
+
+
 def prepare(args, preflight=None):
     source = absolute(args.fail2drive_root)
     if preflight is None:
@@ -217,6 +244,23 @@ def prepare(args, preflight=None):
     if mode not in ('A_base', 'B_model'):
         raise ValueError('execution_mode must be A_base or B_model')
     config['execution_mode'] = mode
+    reflection = getattr(args, 'reflection', None)
+    if reflection is not None:
+        config['reflection_enabled'] = reflection == 'on'
+    # A is genuinely model-free; legacy private configuration must not enable
+    # either model role when selecting the baseline at the command line.
+    enabled = config.get('reflection_enabled', True)
+    if mode == 'B_model' and type(enabled) is not bool:
+        raise ValueError('reflection_enabled must be a boolean')
+    config['reflection_enabled'] = mode == 'B_model' and enabled
+    memory_dir = getattr(args, 'reflection_memory_dir', None) or config.get('reflection_memory_dir')
+    if config['reflection_enabled'] and memory_dir:
+        memory_identity = reflection_memory_identity(memory_dir)
+        config['reflection_memory_dir'] = memory_identity['root']
+        config['reflection_memory_identity'] = memory_identity
+    else:
+        config['reflection_memory_dir'] = None
+        config.pop('reflection_memory_identity', None)
     required = ('parameters_path', 'models_path', 'prompts_path') if mode == 'B_model' else ('parameters_path',)
     if mode == 'A_base':
         config['models_path'] = config['prompts_path'] = None
@@ -301,6 +345,10 @@ def main():
     parser.add_argument("--config", default="config/fail2drive.example.json")
     parser.add_argument("--execution-mode", choices=('A_base', 'B_model'),
                         help="A_base无模型；B_model使用服务器模型；两者均保留表示与参照评分")
+    parser.add_argument("--reflection", choices=('on', 'off'),
+                        help="B_model规划验收失败时进行同帧反思；A_base始终关闭")
+    parser.add_argument("--reflection-memory-dir",
+                        help="仅反思读取的显式独立记忆库；不配置时不读库，不回落旧库")
     parser.add_argument("--parameters-path")
     parser.add_argument("--models-path")
     parser.add_argument("--prompts-path")

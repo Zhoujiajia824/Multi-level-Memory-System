@@ -1,0 +1,514 @@
+"""Explicitly invoked offline demonstration collector, not a benchmark Agent.
+
+No module-level CARLA import, connection, tick, model call or memory write.
+The caller owns a dedicated idle simulator. Only owned actors are destroyed.
+"""
+import hashlib
+import json
+import logging
+import math
+from pathlib import Path
+import queue
+import time
+import traceback
+
+from .archive import RouteArchive, _png
+from .demo_events import DemoEvents
+from .demo_routes import select_route, teaching_path
+from .demo_teacher import DemoTeacher, SCHEMA as TEACHER_SCHEMA
+from .execution import SignedAccelerationController
+from .public_state import PublicStateExtractor
+from .route import xy, point_in_polygon, project
+from .vehicle_geometry import measure_vehicle_geometry
+from nine_grid.paths import filesystem_path
+
+HZ = 20
+LOG = logging.getLogger(__name__)
+VIEWS = (('front_rgb', 0), ('front_left_rgb', -60), ('front_right_rgb', 60),
+         ('back_rgb', 180), ('back_left_rgb', -120), ('back_right_rgb', 120))
+
+
+def atomic_json(path, value):
+    target = Path(path)
+    temporary = target.with_suffix(target.suffix+'.tmp')
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
+    temporary.replace(target)
+
+
+class FrameBarrier:
+    """Exact frames only, including per-image timestamp and raw transform."""
+    def __init__(self, names):
+        if not names or len(set(names)) != len(names) or any(not isinstance(n, str) or not n for n in names):
+            raise ValueError('Camera barrier requires distinct nonempty camera names')
+        self.queues = {name: queue.Queue(maxsize=4) for name in names}
+        self.errors = []
+        self.last_frame, self.last_stamp = None, None
+
+    def callback(self, name):
+        if name not in self.queues:
+            raise ValueError('Unregistered camera: '+str(name))
+        def receive(image):
+            try:
+                self.queues[name].put_nowait(image)
+            except queue.Full:
+                self.errors.append('Camera queue overflow: '+name)
+        return receive
+
+    def get(self, frame, stamp, timeout=30.):
+        number = lambda value: type(value) in (int, float) and math.isfinite(value)
+        if (type(frame) is not int or frame < 0 or not number(stamp)
+                or not number(timeout) or timeout <= 0):
+            raise ValueError('Requested camera frame, time and timeout must be finite and valid')
+        if self.last_frame is not None and (frame != self.last_frame+1 or stamp <= self.last_stamp):
+            raise ValueError('Camera barrier requests must use consecutive increasing source frames')
+        deadline, result = time.monotonic()+timeout, {}
+        for name, rows in self.queues.items():
+            if self.errors:
+                raise RuntimeError(self.errors[0])
+            try:
+                image = rows.get(timeout=max(.001, deadline-time.monotonic()))
+            except queue.Empty as exc:
+                raise TimeoutError('Missing exact camera frame: '+name+' '+str(frame)) from exc
+            if (type(image.frame) is not int or image.frame != frame or not number(image.timestamp)
+                    or abs(image.timestamp-stamp) > 1e-6):
+                raise ValueError('Camera/world frame or timestamp mismatch: '+name)
+            try:
+                matrix = image.transform.get_matrix()
+                valid = (len(matrix) == 4 and all(len(row) == 4 and all(number(x) for x in row) for row in matrix))
+            except (AttributeError, TypeError):
+                valid = False
+            if not valid:
+                raise ValueError('Camera lacks a finite raw image transform: '+name)
+            result[name] = image
+        if self.errors:
+            raise RuntimeError(self.errors[0])
+        self.last_frame, self.last_stamp = frame, stamp
+        return result
+
+
+def _control(control):
+    return {key: getattr(control, key) for key in
+            ('throttle', 'brake', 'steer', 'hand_brake', 'reverse', 'manual_gear_shift', 'gear')}
+
+
+def _body_audit(scene, previous, collisions, line_events):
+    """Independent current-state audit; unknown evidence cannot certify success.
+
+    Body coverage uses a <=0.25m grid, not a continuous-geometry proof. Sensor
+    events retain their true source frames even when their callbacks arrive late.
+    """
+    number = lambda value: type(value) in (int, float) and math.isfinite(value)
+    errors, reasons, rule_evidence = [], [], []
+    try:
+        ego, rules, diagnostics = scene['ego'], scene['rules'], scene['diagnostics']
+        frame = diagnostics['carla_frame']
+        if type(frame) is not int or frame < 0:
+            raise ValueError('invalid physical source frame')
+        def body(row):
+            values = [*row['position'], row['heading'], row['length'], row['width']]
+            if len(row['position']) != 2 or not all(number(v) for v in values) or min(row['length'],row['width']) <= 0:
+                raise ValueError('invalid measured body')
+            c, s = math.cos(row['heading']), math.sin(row['heading'])
+            def at(u, v):
+                return [row['position'][0]+u*c-v*s,row['position'][1]+u*s+v*c]
+            return at
+        at = body(ego)
+        nx, ny = max(2,math.ceil(ego['length']/.25)), max(2,math.ceil(ego['width']/.25))
+        samples = [at(ego['length']*(i/nx-.5), ego['width']*(j/ny-.5))
+                   for i in range(nx+1) for j in range(ny+1)]
+        samples.append(list(ego['position']))
+        polygons = scene['drivable_polygons']
+        if not polygons:
+            raise ValueError('missing drivable polygons')
+        offroad = not all(any(point_in_polygon(p, poly) for poly in polygons) for p in samples)
+        current_events = []
+        for event in [*collisions,*line_events]:
+            if type(event.get('frame')) is not int or event['frame'] > frame or event['frame'] < 0:
+                errors.append('sensor event has invalid or future source frame')
+            else:
+                current_events.append(event)
+        collision_frames = sorted({row['frame'] for row in collisions if row in current_events})
+        reasons.extend(row['kind'] for row in line_events if row in current_events)
+        if rules.get('navigation_input_valid') is False or rules.get('unmapped_current_red'):
+            errors.append('current public rule or navigation association unresolved')
+        if rules.get('public_road_rules',{}).get('unmapped_current_stops'):
+            errors.append('current stop-sign association unresolved')
+        if number(rules.get('speed_limit')):
+            velocity = ego.get('velocity')
+            if not isinstance(velocity,(tuple,list)) or len(velocity)!=2 or not all(number(v) for v in velocity):
+                errors.append('missing finite observed velocity for speed audit')
+            elif math.hypot(*velocity) > rules['speed_limit']+.2:
+                reasons.append('speed_limit_exceeded')
+        else:
+            errors.append('missing finite public speed limit')
+        if previous is not None:
+            old = previous['ego']
+            if previous['diagnostics']['carla_frame'] != frame-1:
+                errors.append('physical audit sources are not consecutive')
+            old_at = body(old)
+            def front_station(row, transform):
+                trusted = (scene if row is ego else previous)['diagnostics']['route_projection'].get('trusted_progress_m')
+                return max(project(transform(row['length']/2,v), scene['route'],
+                    previous_s=trusted, window=row['length']+6 if trusted is not None else None,
+                    heading=row['heading'])['s_m'] for v in (-row['width']/2,row['width']/2))
+            before, now = front_station(old,old_at),front_station(ego,at)
+            lanes = {row['id']:row for row in scene.get('lanes',[])}
+            permitted_lanes = {ego.get('lane_id')}
+            old_lane = old.get('lane_id')
+            if ego.get('lane_id') in lanes.get(old_lane,{}).get('successors',[]):
+                permitted_lanes.add(old_lane)
+            current_lights = {row['id']:row for row in rules.get('traffic_lights',[])}
+            prior_lights = {row['id']:row for row in previous['rules'].get('traffic_lights',[])}
+            for identity in current_lights.keys() | prior_lights.keys():
+                light = current_lights.get(identity)
+                old_light = prior_lights.get(identity,{})
+                stops = (light or {}).get('stops',[]) + old_light.get('stops',[])
+                checked = set()
+                for stop in stops:
+                    if stop.get('lane_id') not in permitted_lanes:
+                        continue
+                    station = stop.get('task_stop_s')
+                    if not number(station) and isinstance(stop.get('position'),(list,tuple)):
+                        station = project(stop['position'],scene['route'],heading=stop.get('heading_rad'))['s_m']
+                    if not number(station):
+                        errors.append('controlled traffic-light stop lacks finite public geometry')
+                        continue
+                    key = (stop.get('lane_id'),round(station,5))
+                    if key in checked:
+                        continue
+                    checked.add(key)
+                    if not before <= station < now:
+                        continue
+                    state = light.get('state') if light else None
+                    source = light.get('source_frame') if light else None
+                    rule_evidence.append(dict(kind='traffic_light_crossing',id=identity,
+                        lane_id=stop.get('lane_id'),stop_s=station,current_state=state,source_frame=source))
+                    if source != frame or state not in ('red','yellow','green','off'):
+                        errors.append('crossed light lacks resolved current-frame state')
+                    elif state in ('red','yellow'):
+                        reasons.append('active_traffic_light_crossing')
+            current_stops = {row['id']:row for row in rules.get('stop_sign_obligations',[])}
+            prior_stops = {row['id']:row for row in previous['rules'].get('stop_sign_obligations',[])}
+            for identity in current_stops.keys() | prior_stops.keys():
+                obligation = current_stops.get(identity)
+                reference = obligation or prior_stops[identity]
+                if reference.get('lane_id') not in permitted_lanes:
+                    continue
+                station = reference.get('stop_s')
+                if not number(station):
+                    errors.append('stop-sign obligation lacks finite stop geometry')
+                    continue
+                if reference.get('status') == 'passed_without_observed_stop':
+                    reasons.append('stop_sign_passed_without_observed_stop')
+                if not before <= station < now:
+                    continue
+                if obligation is None or obligation.get('source_frame') != frame:
+                    errors.append('crossed stop sign lacks current-frame obligation evidence')
+                elif obligation.get('must_stop') is True:
+                    reasons.append('unfulfilled_stop_sign_crossing')
+                elif obligation.get('status') != 'fulfilled':
+                    errors.append('crossed stop sign has unknown fulfilment status')
+            # Aggregate stop_s alone is not enough to infer a light identity or
+            # to replay yesterday's red state after the current signal is green.
+            if not current_lights and not current_stops and rules.get('stop_s') is not None:
+                errors.append('active aggregate stop has no auditable rule identity')
+        return dict(collision=bool(collision_frames),collision_source_frames=collision_frames,
+            late_sensor_event_frames=sorted({row['frame'] for row in current_events if row['frame']<frame}),
+            offroad=offroad,rule_violation=bool(reasons),rule_reasons=sorted(set(reasons)),
+            rule_evidence=rule_evidence,body_sample_count=len(samples),body_sample_spacing_max_m=.25,
+            audit_input_valid=not errors,audit_errors=errors,
+            projection_valid=bool(diagnostics['route_projection']['valid']) and not errors)
+    except (ValueError,TypeError,KeyError,OverflowError) as exc:
+        return dict(collision=bool(collisions),offroad=False,rule_violation=False,rule_reasons=[],
+            projection_valid=False,audit_input_valid=False,audit_errors=['invalid physical audit input: '+str(exc)])
+
+
+def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=False, video=True):
+    import carla
+    import numpy as np
+    output = filesystem_path(output_dir)
+    archive = RouteArchive(output, video=video, fps=HZ)
+    (output/'native').mkdir()
+    run = dict(protocol='ep-driver-f2d-demo-capture-1.0', id=output.name,
+        demo_suite='fail2drive-targeted-demonstrations-1.0', scenario_family=spec['family'],
+        scenario=spec['id'], source='carla', source_version=None, split='independent_development',
+        reference_driver=TEACHER_SCHEMA, seed=spec['seed'], test_only=False,
+        complete=False, official_evaluation=False, record_hz=1, physics_hz=HZ,
+        frames_path='frames.jsonl', model_calls=0, retrieval_enabled=False,
+        read_future_during_current_representation=False, parameters=spec,
+        weather_preset='ClearNoon',seed_purpose='independent_site_order;not_an_engine_determinism_claim')
+    run['implementation_sha256'] = {name:hashlib.sha256((Path(__file__).parent/name).read_bytes()).hexdigest()
+        for name in ('demo_capture.py','demo_catalog.py','demo_events.py','demo_routes.py','demo_teacher.py',
+                     'public_state.py','traffic_rules.py','execution.py','vehicle_geometry.py')}
+    archive.json('run.json', run)
+    owned, sensors, world, saved, saved_weather, events = [], [], None, None, None, None
+    restored, complete, reached = False, False, False
+    collisions, line_events, errors = [], [], []
+    audit_rows, recovery_complete, geometry = [], False, None
+    try:
+        client = carla.Client(host, int(port))
+        client.set_timeout(30.)
+        if client.get_client_version() != client.get_server_version():
+            raise RuntimeError('CARLA client and server versions differ')
+        run['source_version'] = client.get_server_version()
+        world = client.get_world()
+        busy = [actor for actor in world.get_actors() if actor.type_id.startswith(('vehicle.', 'walker.', 'sensor.'))]
+        if world.get_settings().synchronous_mode or busy:
+            raise RuntimeError('Demonstration collection requires an idle dedicated world, no existing experiment actors')
+        if world.get_map().name.split('/')[-1] != spec['map']:
+            if not allow_map_load:
+                raise RuntimeError('Required map '+spec['map']+'; explicitly allow an idle-world map load')
+            world = client.load_world(spec['map'])
+        saved = world.get_settings()
+        saved_weather = world.get_weather()
+        settings = world.get_settings()
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = 1/HZ
+        settings.no_rendering_mode = False
+        settings.substepping = True
+        settings.max_substep_delta_time = .01
+        settings.max_substeps = 5
+        world.apply_settings(settings)
+        world.set_weather(carla.WeatherParameters.ClearNoon)
+        waypoints = select_route(world, spec)
+        authored = teaching_path(waypoints, spec)
+        route = [xy(wp.transform.location) for wp in waypoints]
+        archive.json('demonstration_design.json', dict(spec=spec, route_xy=route, teaching_path_xy=authored,
+            source='independent_public_map_topology', official_route_used=False,
+            formal_evaluation_control=False, runtime_success_not_yet_verified=True))
+        bp = world.get_blueprint_library().find('vehicle.tesla.model3')
+        bp.set_attribute('role_name', 'offline_demonstration_ego')
+        start = waypoints[0].transform
+        pose = carla.Transform(carla.Location(x=start.location.x,y=start.location.y,z=start.location.z+.4),
+                               carla.Rotation(pitch=start.rotation.pitch,yaw=start.rotation.yaw,roll=start.rotation.roll))
+        ego = world.try_spawn_actor(bp, pose)
+        if ego is None:
+            raise RuntimeError('Development ego spawn failed')
+        owned.append(ego)
+        ego.apply_control(carla.VehicleControl(brake=1.))
+        events = DemoEvents(world, waypoints, spec, carla)
+        archive.json('demonstration_actors.json', events.spawn())
+        barrier = FrameBarrier([name for name, _ in VIEWS]+['rgb'])
+        mounts = {}
+        for name, yaw in (*VIEWS, ('rgb', 0)):
+            camera = world.get_blueprint_library().find('sensor.camera.rgb')
+            camera.set_attribute('image_size_x', '1920' if name == 'rgb' else '800')
+            camera.set_attribute('image_size_y', '1080' if name == 'rgb' else '450')
+            camera.set_attribute('fov', '110' if name == 'rgb' else '100')
+            camera.set_attribute('sensor_tick', '0.0')
+            mount = (carla.Transform(carla.Location(x=-5.5, z=3.5), carla.Rotation(pitch=-8))
+                     if name == 'rgb' else carla.Transform(carla.Location(z=1.8), carla.Rotation(yaw=yaw)))
+            sensor = world.spawn_actor(camera, mount, attach_to=ego)
+            owned.append(sensor); sensors.append(sensor); mounts[name] = mount
+            sensor.listen(barrier.callback(name))
+        for kind, sink in (('sensor.other.collision', collisions), ('sensor.other.lane_invasion', line_events)):
+            sensor = world.spawn_actor(world.get_blueprint_library().find(kind), carla.Transform(), attach_to=ego)
+            owned.append(sensor); sensors.append(sensor)
+            def receive(event, target=sink, sensor_kind=kind):
+                if sensor_kind.endswith('collision'):
+                    row = dict(frame=int(event.frame), time=float(event.timestamp), kind='collision', other_actor=event.other_actor.id)
+                else:
+                    names = [str(mark.type).split('.')[-1].lower() for mark in event.crossed_lane_markings]
+                    if not any('solid' in name or name in ('curb', 'grass') for name in names):
+                        return
+                    row = dict(frame=int(event.frame), time=float(event.timestamp), kind='noncrossable_line', markings=names)
+                target.append(row)
+            sensor.listen(receive)
+        last_frame = int(world.get_snapshot().frame)
+        first_time, previous, extractor, teacher, controller = None, None, None, None, None
+        arrived_time, recovery_start = None, None
+        while True:
+            frame = int(world.tick(30.))
+            snapshot = world.get_snapshot()
+            if frame != last_frame+1 or snapshot.frame != frame:
+                raise RuntimeError('Another client advanced the demonstration world')
+            last_frame = frame
+            stamp = float(snapshot.timestamp.elapsed_seconds)
+            raw_images = barrier.get(frame, stamp)
+            first_time = stamp if first_time is None else first_time
+            elapsed = stamp-first_time
+            # Integer physical-frame schedule; never infer camera identity from time.
+            first_frame = frame if previous is None else first_frame
+            saved_source = (frame-first_frame) % HZ == 0
+            arrays = {name: (frame, np.frombuffer(image.raw_data, dtype=np.uint8).reshape(image.height, image.width, 4))
+                      for name, image in raw_images.items()}
+            images = archive.capture_images(arrays, frame, stamp, [name for name, _ in VIEWS], save=saved_source)
+            archive.capture_display(arrays['rgb'], frame, stamp)
+            if extractor is None:
+                box, physics = ego.bounding_box, ego.get_physics_control()
+                frozen = snapshot.find(ego.id)
+                geometry = measure_vehicle_geometry(actor_transform_matrix_m=frozen.get_transform().get_matrix(),
+                    wheels=physics.wheels, bbox_center_m=[box.location.x,box.location.y,box.location.z],
+                    bbox_extent_m=[box.extent.x,box.extent.y,box.extent.z], bbox_heading_deg=box.rotation.yaw,
+                    sensor_pose=dict(frame=frame, timestamp=stamp,
+                        camera_world_matrix_m=raw_images['front_rgb'].transform.get_matrix(),
+                        camera_mount_matrix_m=mounts['front_rgb'].get_matrix()), frame=frame, timestamp=stamp)
+                archive.json('ego_geometry.json', geometry)
+                extractor = PublicStateExtractor(world, ego, [wp.transform for wp in waypoints],
+                    config=dict(desired_speed_mps=spec['cruise_speed_mps']), route_id=output.name, ego_geometry=geometry)
+                if spec['interaction_kind'] == 'stop_sign':
+                    # A real public trigger is still required. This stricter
+                    # teaching dwell applies only to this independent collector.
+                    extractor.traffic_rules.hold_s = max(.1,float(spec['wait_s']))
+                    archive.json('demonstration_stop_policy.json',dict(real_stop_sign_required=True,
+                        observed_hold_s=extractor.traffic_rules.hold_s,formal_rules_modified=False))
+                body_evidence = events.validate_bodies(authored, 2*box.extent.y, ego_length=2*box.extent.x)
+                archive.json('development_site_geometry.json', body_evidence)
+                teacher_settings = dict(cruise_speed_mps=spec['cruise_speed_mps'],corridor_margin_m=.2)
+                if spec['interaction_kind'] == 'stop_sign':
+                    # The public stop trigger requires an observed stop within
+                    # 4m. A 2.5m front margin plus half a car would stop outside
+                    # that trigger forever. Keep the body behind the real line
+                    # while allowing the measured public obligation to complete.
+                    teacher_settings['stop_margin_m'] = .5
+                teacher = DemoTeacher(route, geometry['wheelbase_m'],settings=teacher_settings,bypass_reference=authored)
+                archive.json('demonstration_teacher.json',dict(schema=TEACHER_SCHEMA,settings=teacher.settings,
+                    formal_evaluation_control=False,safety_certified=False))
+                steering = math.radians(max(w.max_steer_angle for w in physics.wheels))
+                controller = SignedAccelerationController(steering, dt=1/HZ,
+                    acceleration_min=-5., acceleration_max=2., steering_rate=.7)
+                archive.append('event_evidence', dict(frame=frame,time=stamp,phase='approach',event='collection_started',completed=True))
+            scene = extractor.capture(frame, camera_images=images, world_snapshot=snapshot)
+            audit = _body_audit(scene, previous, collisions, line_events)
+            actual = ego.get_control()
+            command = teacher.step(scene, 1/HZ)
+            speed = math.hypot(*scene['ego']['velocity'])
+            heading = scene['ego']['heading']
+            acceleration = sum(v*d for v,d in zip(scene['ego']['acceleration'], (math.cos(heading),math.sin(heading))))
+            control = controller.step(frame, command['acceleration_mps2'], command['steering_rad_left'],
+                command['target_speed_mps'], speed, acceleration,
+                actual_steering_rad=-actual.steer*steering)
+            returned = carla.VehicleControl(throttle=control['throttle'],brake=control['brake'],
+                                           steer=control['steer_normalized_right'],hand_brake=False)
+            archive.append('execution', dict(frame=frame,time=stamp,applied_control=_control(actual),
+                returned_control=_control(returned), observed_ego=scene['ego'],
+                teacher=command,controller=control,audit=audit))
+            audit_rows.append(audit)
+            for event in events.update(scene,1/HZ):
+                archive.append('event_evidence', dict(frame=frame,time=stamp,**event))
+            progress = scene['diagnostics']['route_projection'].get('trusted_progress_m')
+            if events.completed and progress is not None:
+                completion_s = events.completion_progress_m
+                if completion_s is None:
+                    raise RuntimeError('Completed event lacks actual completion progress')
+                if recovery_start is None:
+                    recovery_start = stamp
+                    archive.append('event_evidence', dict(frame=frame,time=stamp,phase='recovery',event='recovery_started',completed=False))
+                if not recovery_complete and progress >= completion_s+float(spec['recovery_m']):
+                    recovery_complete = True
+                    archive.append('event_evidence', dict(frame=frame,time=stamp,phase='recovery',event='recovery_completed',completed=True))
+            arrival = math.dist(scene['ego']['position'], route[-1]) < 1.5 and speed < .2
+            correct_lane = scene['ego']['lane_id'] == '{}|{}|{}'.format(waypoints[-1].road_id,waypoints[-1].section_id,waypoints[-1].lane_id)
+            if arrival and correct_lane and events.completed and recovery_complete:
+                reached = True
+                arrived_time = stamp if arrived_time is None else arrived_time
+            else:
+                reached, arrived_time = False, None
+            if saved_source:
+                views = dict((name, arrays[name][1][:,:,2::-1]) for name,_ in VIEWS)
+                mosaic = np.concatenate((np.concatenate([views[n] for n in ('front_left_rgb','front_rgb','front_right_rgb')],axis=1),
+                    np.concatenate([views[n] for n in ('back_left_rgb','back_rgb','back_right_rgb')],axis=1)),axis=0)
+                native = 'native/%010d.png'%frame
+                _png(output/native, mosaic)
+                manifest_path = 'native/%010d.cameras.json'%frame
+                cameras = [dict(view=image['id'],rgb_path=Path(image['path']).relative_to(output).as_posix(),
+                    frame=frame,timestamp=stamp, camera_world_matrix_m=raw_images[image['id']].transform.get_matrix(),
+                    world_to_camera_ue=raw_images[image['id']].transform.get_inverse_matrix(),
+                    camera_mount_matrix_m=mounts[image['id']].get_matrix(),width=image['width'],height=image['height'],fov_deg=100.)
+                    for image in images]
+                atomic_json(output/manifest_path,dict(frame_id=scene['frame_id'],time=stamp,carla_frame=frame,
+                    carla_timestamp=stamp,cameras=cameras))
+                archive.append('raw_frames',dict(frame=frame,time=stamp,route_id=output.name,scene=scene,images=images,
+                    native_image=native,camera_manifest=manifest_path,audit=audit))
+                LOG.info('%s: sim=%.1fs frame=%d progress=%.2fm speed=%.2fm/s phase=%s interaction_complete=%s',
+                    spec['id'],elapsed,frame,progress or 0.,speed,command['phase'],events.completed)
+            if any(audit[k] for k in ('collision','offroad','rule_violation')) or not audit['projection_valid']:
+                raise RuntimeError('Demonstration failed actual physical audit: '+json.dumps(audit,ensure_ascii=False))
+            if reached and stamp-arrived_time >= 4.:
+                complete = True
+                break
+            if elapsed >= spec['max_duration_s']:
+                complete = True
+                break
+            if world.get_snapshot().frame != frame:
+                raise RuntimeError('World advanced during source capture/control calculation')
+            ego.apply_control(returned)
+            previous = scene
+    except BaseException as exc:
+        errors.append(type(exc).__name__+': '+str(exc))
+        try:
+            archive.json('capture_failure.json',dict(error=errors[-1],traceback=traceback.format_exc(),
+                frame=locals().get('frame'),time=locals().get('stamp'),successful_memory_created=False))
+        except Exception as write_error:
+            errors.append('failure evidence write: '+str(write_error))
+        raise
+    finally:
+        if events is not None and events.geometry_audit is not None:
+            try:
+                archive.json('development_site_geometry.json',events.geometry_audit)
+            except Exception as exc:
+                errors.append('geometry evidence: '+str(exc))
+        # Drain no synthetic physics steps. Sensor callbacks are finalized before
+        # their evidence is summarized; close/restore failures invalidate a run.
+        for sensor in reversed(sensors):
+            try:
+                sensor.stop()
+            except Exception as exc:
+                errors.append('sensor stop: '+str(exc))
+        try:
+            if events is not None:
+                events.close()
+        except Exception as exc:
+            errors.append(str(exc))
+        for actor in reversed(owned):
+            try:
+                if actor.is_alive and not actor.destroy():
+                    errors.append('destroy returned false: '+str(actor.id))
+            except Exception as exc:
+                errors.append('destroy: '+str(exc))
+        if saved is not None:
+            if saved_weather is not None:
+                try:
+                    world.set_weather(saved_weather)
+                except Exception as exc:
+                    errors.append('restore weather: '+str(exc))
+            try:
+                world.apply_settings(saved)
+                restored = True
+            except Exception as exc:
+                errors.append('restore settings: '+str(exc))
+        archive.json('physical_events.json',dict(collisions=collisions,line_events=line_events))
+        try:
+            archive.close()
+            if video:
+                status = json.loads((output/'planning'/'video_recording.json').read_text(encoding='utf-8'))
+                if (status.get('status') != 'complete' or status.get('playback_verified') is not True
+                        or status.get('frames') != len(audit_rows)
+                        or status.get('decoded_frames') != len(audit_rows)):
+                    errors.append('Recorded video did not pass full physical-frame decode verification')
+        except Exception as exc:
+            errors.append('archive close: '+str(exc))
+        # Video errors, teardown errors and unknown audits cannot certify data.
+        evaluation = dict(protocol='ep-driver-f2d-demo-evaluation-1.0',
+            reached=reached, interaction_complete=bool(events and events.completed),
+            recovery_complete=recovery_complete, collision_count=len(collisions),
+            offroad_count=sum(a['offroad'] for a in audit_rows),
+            rule_violation_count=max(len(line_events),sum(a['rule_violation'] for a in audit_rows)),
+            projection_valid=bool(audit_rows) and all(a['projection_valid'] for a in audit_rows),
+            world_settings_restored=restored,errors=errors,official_score=False,
+            evidence='actual_20hz_execution_and_sensors_not_designed_reference',
+            visual_proxy=spec['proxy'])
+        evaluation['passed'] = bool(complete and not errors and reached and evaluation['interaction_complete']
+            and recovery_complete and not evaluation['collision_count'] and not evaluation['offroad_count']
+            and not evaluation['rule_violation_count'] and evaluation['projection_valid'] and restored)
+        atomic_json(output/'demo_evaluation.json',evaluation)
+        run['demonstration_verification'] = dict(passed=evaluation['passed'],
+            evaluation_sha256=hashlib.sha256((output/'demo_evaluation.json').read_bytes()).hexdigest(),
+            physical_events_sha256=hashlib.sha256((output/'physical_events.json').read_bytes()).hexdigest(),
+            evidence_protocol=evaluation['protocol'], actual_physics_hz=HZ,
+            official_evaluation=False)
+        run.update(complete=complete and not errors, raw_frame_count=sum(1 for _ in (output/'raw_frames.jsonl').open(encoding='utf-8'))
+                   if (output/'raw_frames.jsonl').is_file() else 0, errors=errors,
+                   normalization_protocol='observable-driving-recording-1.0')
+        atomic_json(output/'run.json',run)
+    return evaluation

@@ -223,16 +223,16 @@ function chat(container,role,label,time,content,{collapsed=false}={}){
   bubble.append(body);event.append(bubble);container.append(event);return body;
 }
 function fail2DriveModelStatus(panel,output,frame){
-  const accepted=output.accepted===true&&!!output.answer;
+  const accepted=output.accepted===true&&!!output.answer&&output.trajectory_accepted!==false;
   const attempts=output.attempts||[],truncated=attempts.some(item=>item.wire?.finish_reason==='length'||item.output_failure==='output_truncated');
   const kinds={whitespace_loop:'模型持续生成空白',output_truncated:'模型输出达到长度上限',context_limit:'上下文预算被服务拒绝',empty_response:'模型返回为空',unfinished_response:'模型回答未完整结束'};
-  const labels={accepted:'回答已通过校验',contract_rejected:'回答未通过校验',communication_failure:'HTTP通信失败，未获得有效回答',output_rejected:'模型输出异常，未采纳',skipped_invalid_reference:'参考范围无效，未请求模型'};
+  const labels={accepted:'回答已通过校验',trajectory_accepted:'反思轨迹已通过规划验收',trajectory_rejected:'反思轨迹未通过验收，未采纳',replanned_selected:'反思重规划已采用 · 未做额外安全准入',unusable_planner_result:'反思规划结果不可执行或源帧不符，未采用',output_or_transport_rejected:'反思输出或通信失败，未采纳',contract_rejected:'回答未通过校验',communication_failure:'HTTP通信失败，未获得有效回答',output_rejected:'模型输出异常，未采纳',skipped_invalid_reference:'参考范围无效，未请求模型'};
   const lastFailure=[...attempts].reverse().find(item=>item.output_failure)?.output_failure;
   const title=!accepted&&lastFailure?(kinds[lastFailure]||lastFailure)+' · 本次未采纳':truncated&&!accepted?'输出达到长度上限 · 本次未采纳':labels[output.status]||output.status||'调用状态未归档';
   const box=el('div',`model-result-status ${accepted?'accepted':'rejected'}`);box.append(el('strong',null,title));
   if(!accepted){const reasons=output.errors||[];box.append(el('p',null,truncated?'原始回答未完成，不能作为有效驾驶建议。':reasons.length?reasons.join('；'):'未保存通过校验的回答；具体原因见请求证据。'));if(output.status==='communication_failure'&&truncated)box.append(el('p','context-caption','旧归档将输出截断记为通信失败；本条返回证据是length，不据此认定断网。'));}
   const contract=frame.plan?.diagnostics?.model_contract||{};
-  box.append(el('p','context-caption',`当前规划模型引导：${contract.semantic_enabled?'已启用':'未启用'}${frame.model_source_frame_id?' · 绑定源帧 '+frame.model_source_frame_id:''}`));
+  box.append(el('p','context-caption',`当前规划模型引导：${contract.semantic_enabled?'已启用':'未启用'}${frame.model_source_role==='reflection'?' · 采用反思重规划':''}${frame.model_source_frame_id?' · 绑定源帧 '+frame.model_source_frame_id:''}`));
   panel.append(box);
 }
 function fail2DriveModelAnswer(panel,output){
@@ -263,7 +263,7 @@ function renderDialogue(frame){
   const current=!!(frame.model_input||frame.model_output),active=!current&&!!(frame.active_model_input||frame.active_model_output);
   const input=current?frame.model_input:frame.active_model_input,output=current?frame.model_output:frame.active_model_output;
   const mode=modelMode(frame),pure=mode==='pure_base'||mode==='A_base';
-  $('agent-mode-badge').textContent=pure?'基础':input||output?'模型':'空档';
+  $('agent-mode-badge').textContent=pure?'基础':frame.model_source_role==='reflection'?'反思':input||output?'模型':'空档';
   $('agent-subtitle').textContent=pure?'基础规划':active?'上次决策生效':'决策记录';
   if(!input&&!output){emptyPanel(panel,pure?'本轮未调用模型':'此帧没有模型记录',pure?'本轮使用基础规划。':'点击“模型事件”查看其他调用。','✧');return;}
   const source=input?.frame_id||output?.frame_id||frame.model_source_frame_id;
@@ -287,17 +287,25 @@ function renderDialogue(frame){
     const attention=output.answer?.attention||output.attention||[];if(attention.length){const chips=el('div','attention-chips');for(const obj of attention)chips.append(el('span','attention-chip',String(obj.id||obj.object_id||obj)));body.append(chips);}
     if(output.errors?.length)panel.append(el('div','chat-empty','归档模型解析问题：'+json(output.errors)));
   }else panel.append(el('div','chat-empty','本次调用尚无归档返回。'));
+  if(frame.reflection_output){
+    const accepted=frame.reflection_output.trajectory_accepted===true;
+    const selected=frame.reflection_output.selected===true;
+    rawDetails(panel,selected&&frame.reflection_output.extra_safety_admission===false?'本帧已采用反思重规划 · 无额外安全准入':accepted?'本帧反思轨迹已通过验收':'本帧反思尝试及未采纳原因',frame.reflection_output);
+    if(frame.model_source_role==='reflection'&&frame.fast_model_output)rawDetails(panel,'原快模型答案及记录',frame.fast_model_output);
+  }
   if(current&&(frame.active_model_input||frame.active_model_output)){
     const previous=el('div','chat-empty');previous.append(el('p',null,`当前控制另绑定旧决策源帧 ${frame.model_source_frame_id||frame.active_model_input?.frame_id||'未归档'}。不与本次新请求配对。`));
     rawDetails(previous,'查看仍在生效的已绑定输入',frame.active_model_input);rawDetails(previous,'查看仍在生效的已绑定输出',frame.active_model_output);panel.append(previous);
   }
 }
 function renderMemory(frame){
-  const panel=$('memory-panel');panel.replaceChildren();const retrieval=frame.retrieval||frame.active_retrieval;
-  if(frame.fail2drive){emptyPanel(panel,'本轮不检索记忆',modelMode(frame)==='A_base'?'Fail2Drive使用纯基础规划模式，不调用模型、不检索、不写入记忆。':'Fail2Drive使用B模型模式，不检索、不写入记忆。','◈');$('memory-count').textContent='0';return;}
+  const panel=$('memory-panel');panel.replaceChildren();
+  const retrieval=frame.fail2drive?(frame.reflection_retrieval||frame.active_reflection_retrieval):(frame.retrieval||frame.active_retrieval);
+  if(frame.fail2drive&&(modelMode(frame)==='A_base'||!retrieval)){emptyPanel(panel,modelMode(frame)==='A_base'?'本轮不检索记忆':'本帧未记录反思检索',modelMode(frame)==='A_base'?'纯基础规划不调用模型、不检索、不写入记忆。':'快模型不检索；仅反思触发且配置了独立新库时检索，不读取默认旧库。','◈');$('memory-count').textContent='0';return;}
+  if(frame.fail2drive)panel.append(el('p','context-caption','仅反思使用的独立库检索 · 快模型未使用这些记忆'));
   let records=Array.isArray(retrieval)?retrieval:retrieval?.records||retrieval?.results||retrieval?.matches||[];
   if(!Array.isArray(records))records=[];$('memory-count').textContent=records.length;
-  if(!records.length){emptyPanel(panel,'没有检索记忆',modelMode(frame)==='pure_base'?'纯基础规划模式未使用检索记忆。':'当前模型决策没有归档检索结果。','◈');if(frame.navsim&&retrieval)rawDetails(panel,'源锚点归档检索摘要',retrieval);return;}
+  if(!records.length){emptyPanel(panel,frame.fail2drive?'没有合格检索记忆':'没有检索记忆',modelMode(frame)==='pure_base'?'纯基础规划模式未使用检索记忆。':frame.fail2drive?'本次检索没有可提供的合格经验，未补齐或借用其他库。':'当前模型决策没有归档检索结果。','◈');if((frame.navsim||frame.fail2drive)&&retrieval)rawDetails(panel,'源帧归档检索摘要',retrieval);return;}
   panel.append(el('p','context-caption',`真实检索来源 · ${retrieval.frame_id||frame.model_source_frame_id||frame.frame_id}`));
   const scoreList=retrieval.scores||[];
   records.forEach((record,i)=>{
@@ -307,11 +315,11 @@ function renderMemory(frame){
     const entries=typeof score==='number'?[['总分',score]]:Object.entries(score).filter(([k,v])=>typeof v==='number'&&/bev|occ|grid|score|similarity|fusion|total/i.test(k)).slice(0,6);
     for(const [name,value]of entries){const row=el('div','score-row');row.title=`${name}：${value}（归档原值）`;row.append(el('span',null,name.toUpperCase().slice(0,8)));const track=el('span','score-track'),bar=el('i');bar.style.width=`${Math.min(100,Math.max(0,value*100))}%`;track.append(bar);row.append(track,el('span',null,fmt(value,3)));card.append(row);}
     if(!entries.length)card.append(el('p','context-caption','相似度分数未归档'));
-    const content=record.experience||record.text||record.description||record.content||record.reasoning||record.answer?.explanation||record.answer;
+    const content=record.offline_text||record.experience||record.text||record.description||record.content||record.reasoning||record.answer?.explanation||record.answer;
     if(content)card.append(el('p',null,typeof content==='string'?content:json(content)));else card.append(el('p','context-caption','经验正文未归档 · 可查看实际索引信息'));
     rawDetails(card,'归档检索详情',record);panel.append(card);
   });
-  if(frame.navsim&&retrieval?.diagnostics)rawDetails(panel,'源锚点检索诊断摘要',retrieval.diagnostics);
+  if((frame.navsim||frame.fail2drive)&&retrieval?.diagnostics)rawDetails(panel,'源帧检索诊断摘要',retrieval.diagnostics);
 }
 function renderMetrics(frame){
   const panel=$('metrics-panel');panel.replaceChildren();const plan=frame.plan||{},d=plan.diagnostics||{},timing=frame.timing||{},audit=frame.execution_audit||{};

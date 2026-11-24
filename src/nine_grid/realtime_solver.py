@@ -79,12 +79,34 @@ class QuadraticSolver:
         # 空的物理控制箱与信赖域交集没有可解QP，不能交给CasADi抛异常，
         # 更不能交换上下界或裁剪边界来掩盖不可行。调用方仍只可执行已验收候选。
         self.last_diagnostics={'valid':False,'scaled_stationarity_inf':None,'scaled_primal_violation':None}
+        hessian=np.asarray(hessian,float);gradient=np.asarray(gradient,float)
+        matrix=np.asarray(matrix,float);lower=np.asarray(lower,float);upper=np.asarray(upper,float)
+        step_lower=np.asarray(step_lower,float);step_upper=np.asarray(step_upper,float)
+        if (hessian.shape!=(self.n,self.n) or gradient.shape!=(self.n,)
+                or matrix.ndim!=2 or matrix.shape[1]!=self.n
+                or lower.shape!=(len(matrix),) or upper.shape!=(len(matrix),)
+                or step_lower.shape!=(self.n,) or step_upper.shape!=(self.n,)
+                or not all(np.isfinite(value).all() for value in
+                           (hessian,gradient,matrix,step_lower,step_upper))
+                or np.isnan(lower).any() or np.isnan(upper).any() or (lower>upper).any()):
+            self.last_diagnostics['rejection_reason']='invalid_qp_input'
+            return np.zeros(self.n),False,'invalid_qp_input',time.perf_counter()-begin
         invalid_box=np.flatnonzero(np.asarray(step_lower)>np.asarray(step_upper))
         if len(invalid_box):
             self.last_diagnostics['invalid_step_bound_indices']=invalid_box.tolist()
             return np.zeros(self.n),False,'invalid_step_bounds',time.perf_counter()-begin
         scale=np.maximum(np.maximum(np.abs(step_lower),np.abs(step_upper)),1e-4)
         scaled=matrix*scale[None,:]
+        # 零敏感度行不能由本次控制增量修复。明确报告线性化不可行，
+        # 不把 0*x>=正数 除以1e-8后伪装成可优化的巨大残差。
+        constant=np.all(scaled==0.,axis=1)
+        inconsistent=np.flatnonzero(constant&((lower>1e-10)|(upper<-1e-10)))
+        if len(inconsistent):
+            self.last_diagnostics.update(rejection_reason='infeasible_constant_constraints',
+                infeasible_constant_row_indices=inconsistent.tolist(),
+                infeasible_constant_lower=[float(v) if np.isfinite(v) else None for v in lower[inconsistent]],
+                infeasible_constant_upper=[float(v) if np.isfinite(v) else None for v in upper[inconsistent]])
+            return np.zeros(self.n),False,'infeasible_constant_constraints',time.perf_counter()-begin
         low_box=step_lower/scale;high_box=step_upper/scale
         least=np.sum(np.where(scaled>=0,scaled*low_box,scaled*high_box),axis=1)
         greatest=np.sum(np.where(scaled>=0,scaled*high_box,scaled*low_box),axis=1)
@@ -137,7 +159,21 @@ class QuadraticSolver:
         # 固定迭代RTI允许检查已优化但未达到QP终止精度的迭代点；
         # 只有后续原动力学、实体、道路与全部控制边界验收合格才能执行。
         eligible=bool(stats.get('success',False)) or status in ('maximum iterations reached','solved inaccurate')
-        return step,eligible,status,time.perf_counter()-begin
+        finite=bool(np.isfinite(step).all() and self.last_diagnostics['valid'])
+        box_violation=float(max(0.,np.max(low_box-z),np.max(z-high_box))) if finite else None
+        self.last_diagnostics.update(scaled_step_bound_violation=box_violation,
+            step_bound_violation=(float(max(0.,np.max(step_lower-step),np.max(step-step_upper)))
+                                  if finite else None),solver_status=status)
+        # 迭代上限不是任意数值增量的通行证。明显越出控制箱/信赖域的
+        # 返回点必须拒绝；仅吸收同一QP容差内的浮点越界，后续仍做原非线性验收。
+        if not finite or box_violation>max(1e-8,float(self.tolerance)):
+            reason='nonfinite_qp_result' if not finite else 'step_bounds_violated'
+            self.last_diagnostics.update(proposal_eligible=False,rejection_reason=reason)
+            return np.zeros(self.n),False,reason+':'+status,time.perf_counter()-begin
+        bounded=np.clip(z,low_box,high_box)*scale
+        self.last_diagnostics.update(proposal_eligible=bool(eligible),
+            step_roundoff_projection_inf=float(np.max(np.abs(bounded-step))))
+        return bounded,eligible,status,time.perf_counter()-begin
 
 
 def rectangle_gap(states,other,length,width,other_length,other_width):

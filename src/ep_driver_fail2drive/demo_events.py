@@ -1,0 +1,503 @@
+"""Owned actors and causal, auditable events for independent demonstrations.
+
+The environment may schedule its own events. The teacher never receives this
+object, role labels, event timers, actor plans or release decisions. Completion
+here describes the observed interaction, not successful/official driving.
+"""
+import math
+
+from .demo_routes import station_waypoint, chain, _stop_controls_route
+from .route import xy, project, point_in_polygon, wrap
+
+
+def _hull(points):
+    """CARLA boxes return eight 3D vertices, not an ordered 2D polygon."""
+    values = sorted(set((float(p[0]), float(p[1])) for p in points))
+    if len(values) < 3 or any(not math.isfinite(v) for p in values for v in p):
+        raise ValueError('Actor has no finite planar physical body')
+    def cross(a, b, c):
+        return (b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0])
+    sides = []
+    for ordered in (values, list(reversed(values))):
+        side = []
+        for point in ordered:
+            while len(side) > 1 and cross(side[-2], side[-1], point) <= 0.:
+                side.pop()
+            side.append(point)
+        sides.extend(side[:-1])
+    if len(sides) < 3:
+        raise ValueError('Actor footprint is degenerate')
+    return sides
+
+
+def _body(actor):
+    return _hull([xy(v) for v in actor.bounding_box.get_world_vertices(actor.get_transform())])
+
+
+def _point_segment(point, a, b):
+    dx, dy = b[0]-a[0], b[1]-a[1]
+    norm = dx*dx+dy*dy
+    t = max(0., min(1., ((point[0]-a[0])*dx+(point[1]-a[1])*dy)/norm)) if norm else 0.
+    return math.hypot(point[0]-a[0]-t*dx, point[1]-a[1]-t*dy)
+
+
+def _intersection(a, b, c, d):
+    dx, dy, ex, ey = b[0]-a[0], b[1]-a[1], d[0]-c[0], d[1]-c[1]
+    determinant = dx*ey-dy*ex
+    if abs(determinant) < 1e-10:
+        return None
+    px, py = c[0]-a[0], c[1]-a[1]
+    t, u = (px*ey-py*ex)/determinant, (px*dy-py*dx)/determinant
+    return (a[0]+t*dx, a[1]+t*dy) if -1e-8 <= t <= 1.+1e-8 and -1e-8 <= u <= 1.+1e-8 else None
+
+
+def _segment_distance(a, b, c, d):
+    if _intersection(a, b, c, d) is not None:
+        return 0.
+    return min(_point_segment(p, x, y) for p, x, y in ((a,c,d),(b,c,d),(c,a,b),(d,a,b)))
+
+
+def _polygon_distance(a, b):
+    if point_in_polygon(a[0], b) or point_in_polygon(b[0], a):
+        return 0.
+    return min(_segment_distance(p,q,r,s) for p,q in zip(a,a[1:]+a[:1]) for r,s in zip(b,b[1:]+b[:1]))
+
+
+def _path_body_distance(path, polygon):
+    if any(point_in_polygon(p, polygon) for p in path):
+        return 0.
+    return min(_segment_distance(a,b,c,d) for a,b in zip(path,path[1:])
+               for c,d in zip(polygon,polygon[1:]+polygon[:1]))
+
+
+def _at(path, station):
+    arc = 0.
+    for a, b in zip(path, path[1:]):
+        length = math.dist(a, b)
+        if arc+length >= station:
+            t = max(0., min(1., (station-arc)/length))
+            return [a[0]+t*(b[0]-a[0]), a[1]+t*(b[1]-a[1])], math.atan2(b[1]-a[1], b[0]-a[0])
+        arc += length
+    return list(path[-1]), math.atan2(path[-1][1]-path[-2][1], path[-1][0]-path[-2][0])
+
+
+def _slice_interval(polygon, center, heading):
+    """Actual body intersection with one common road-normal cross-section."""
+    c, s = math.cos(heading), math.sin(heading)
+    local = [((p[0]-center[0])*c+(p[1]-center[1])*s,
+              -(p[0]-center[0])*s+(p[1]-center[1])*c) for p in polygon]
+    values = []
+    for a, b in zip(local, local[1:]+local[:1]):
+        if abs(a[0]) <= 1e-7:
+            values.append(a[1])
+        if a[0]*b[0] < 0.:
+            t = -a[0]/(b[0]-a[0])
+            values.append(a[1]+t*(b[1]-a[1]))
+    return (min(values), max(values)) if values else None
+
+
+class DemoEvents:
+    def __init__(self, world, waypoints, spec, carla):
+        self.world, self.waypoints, self.spec, self.carla = world, waypoints, spec, carla
+        self.route = [xy(wp.transform.location) for wp in waypoints]
+        self.teaching_path = self.route
+        self.ego_width = 2.
+        self.actors, self.rows = [], []
+        self.activated_at = self.completion_progress_m = None
+        self.completed, self.active = False, False
+        self.stationary_s = 0.
+        self.stop_observed, self.stop_rule_seen = False, False
+        self.stop_stationary_s = self.stop_max_stationary_s = 0.
+        self.stop_encounters = {}
+        self.last_time = None
+        self.geometry_audit = None
+
+    def _cross_branch(self, desired_station):
+        choices, seen = [], set()
+        for wp in self.waypoints:
+            if not wp.is_junction:
+                continue
+            junction = wp.get_junction()
+            if junction is None or junction.id in seen:
+                continue
+            seen.add(junction.id)
+            for entry, _ in junction.get_waypoints(self.carla.LaneType.Driving):
+                ahead = chain(entry, 35.)
+                if not ahead:
+                    continue
+                prefix, cursor = [], entry
+                for _ in range(10):
+                    options = list(cursor.previous(1.))
+                    if not options:
+                        break
+                    cursor = min(options, key=lambda item: abs(wrap(math.radians(
+                        item.transform.rotation.yaw-cursor.transform.rotation.yaw))))
+                    prefix.append(cursor)
+                path = list(reversed(prefix))+ahead
+                points = [xy(item.transform.location) for item in path]
+                arc = 0.
+                for a, b, left, right in zip(points, points[1:], path, path[1:]):
+                    direction = math.atan2(b[1]-a[1], b[0]-a[0])
+                    for c, d, route_wp in zip(self.route, self.route[1:], self.waypoints):
+                        cross = _intersection(a,b,c,d)
+                        route_heading = math.atan2(d[1]-c[1],d[0]-c[0])
+                        same_level = abs(left.transform.location.z-route_wp.transform.location.z) <= 1.5
+                        if cross is None or not same_level or abs(math.cos(wrap(direction-route_heading))) > .5:
+                            continue
+                        station = project(cross,self.route)['s_m']
+                        branch_station = arc+math.dist(a,cross)
+                        before = branch_station
+                        after = sum(math.dist(x,y) for x,y in zip(points,points[1:]))-branch_station
+                        if before >= 6. and after >= 10.:
+                            choices.append((abs(station-desired_station),station,branch_station,path))
+                    arc += math.dist(a,b)
+        if not choices:
+            raise RuntimeError('No same-level driving branch with a real perpendicular route crossing and exit clearance')
+        _, station, branch_station, path = min(choices,key=lambda value:value[:3])
+        return path, station, branch_station
+
+    def _crossing_left_limit(self, waypoint):
+        origin, yaw = waypoint.transform.location, math.radians(waypoint.transform.rotation.yaw)
+        limit = waypoint.lane_width/2.
+        seen, cursor = set(), waypoint
+        for _ in range(12):
+            cursor = cursor.get_left_lane()
+            if cursor is None or (cursor.road_id,cursor.section_id,cursor.lane_id) in seen:
+                break
+            seen.add((cursor.road_id,cursor.section_id,cursor.lane_id))
+            if str(cursor.lane_type).split('.')[-1] != 'Driving':
+                break
+            p = cursor.transform.location
+            left = (p.x-origin.x)*math.sin(yaw)-(p.y-origin.y)*math.cos(yaw)
+            limit = max(limit,left+cursor.lane_width/2.)
+        return limit+1.5
+
+    def spawn(self):
+        library = self.world.get_blueprint_library()
+        for config in self.spec['actor_specs']:
+            blueprint = None
+            for name in config['blueprint_candidates']:
+                values = sorted(library.filter(name), key=lambda item:item.id)
+                if values:
+                    blueprint = values[0]
+                    break
+            if blueprint is None:
+                raise RuntimeError('Missing required standard asset for '+config['id'])
+            if blueprint.has_attribute('is_invincible'):
+                blueprint.set_attribute('is_invincible','false')
+            wp = original = station_waypoint(self.waypoints,config['s_offset_m'])
+            for _ in range(abs(config['lane_offset'])):
+                wp = wp.get_left_lane() if config['lane_offset'] > 0 else wp.get_right_lane()
+                if wp is None or str(wp.lane_type).split('.')[-1] != 'Driving':
+                    raise RuntimeError('Required physical actor driving lane does not exist: '+config['id'])
+            pose, lateral, role = wp.transform,float(config['lateral_offset_m']),config['role']
+            cross_path, branch_station, interaction_station = None,None,float(config['s_offset_m'])
+            stop_sign_id = None
+            if role == 'roadside_crowd':
+                sidewalk, visited = original.get_right_lane(),set()
+                while sidewalk and str(sidewalk.lane_type).split('.')[-1] != 'Sidewalk':
+                    identity = (sidewalk.road_id,sidewalk.section_id,sidewalk.lane_id)
+                    if identity in visited:
+                        sidewalk = None
+                        break
+                    visited.add(identity)
+                    sidewalk = sidewalk.get_right_lane()
+                if sidewalk is None:
+                    raise RuntimeError('Crowd requires a real right sidewalk')
+                pose,lateral = sidewalk.transform,0.
+            if role == 'stop_sign_visual_occluder':
+                signs = [sign for sign in self.world.get_actors().filter('traffic.stop')
+                         if _stop_controls_route(sign,self.waypoints,target_station=config['s_offset_m'])]
+                if not signs:
+                    raise RuntimeError('No real stop controlling this development route')
+                sign = min(signs,key=lambda actor:min(actor.get_location().distance(w.transform.location) for w in self.waypoints))
+                stop_sign_id = sign.id
+                sign_pose = sign.get_transform()
+                nearest = min(self.waypoints,key=lambda item:item.transform.location.distance(sign_pose.location))
+                lane = nearest.transform.location
+                dx,dy = lane.x-sign_pose.location.x,lane.y-sign_pose.location.y
+                norm = math.hypot(dx,dy)
+                if norm < 2.:
+                    raise RuntimeError('No safe roadside placement for the stop-sign occluder')
+                pose = self.carla.Transform(self.carla.Location(x=sign_pose.location.x+.7*dx/norm,
+                    y=sign_pose.location.y+.7*dy/norm,z=sign_pose.location.z),
+                    self.carla.Rotation(yaw=sign_pose.rotation.yaw,pitch=sign_pose.rotation.pitch,roll=sign_pose.rotation.roll))
+                lateral = 0.
+                interaction_station = project(xy(nearest.transform.location),self.route)['s_m']
+            if role == 'cross_traffic_vehicle':
+                cross_path,interaction_station,branch_station = self._cross_branch(config['s_offset_m'])
+                pose,lateral = cross_path[0].transform,0.
+            yaw = math.radians(pose.rotation.yaw)
+            location = self.carla.Location(x=pose.location.x+lateral*math.sin(yaw),
+                y=pose.location.y-lateral*math.cos(yaw),z=pose.location.z+.35)
+            # A public cross branch supplies the actual actor heading. Applying
+            # the catalog's generic +90 offset again would point it off-road.
+            rotation = self.carla.Rotation(yaw=pose.rotation.yaw+(0. if cross_path else config['yaw_offset_deg']))
+            actor = self.world.try_spawn_actor(blueprint,self.carla.Transform(location,rotation))
+            if actor is None:
+                raise RuntimeError('Required actor spawn failed: '+config['id'])
+            self.actors.append(actor)
+            if config['actor_type'] in ('obstacle','visual_proxy'):
+                actor.set_simulate_physics(False)
+            # Make full-wall props' physical long axis road-normal. This is
+            # initialization-only, audited below, never an online teleport.
+            if role == 'full_blocker' and config['actor_type'] == 'obstacle':
+                body = _body(actor)
+                _,heading = _at(self.route,interaction_station)
+                tangent = [p[0]*math.cos(heading)+p[1]*math.sin(heading) for p in body]
+                normal = [-p[0]*math.sin(heading)+p[1]*math.cos(heading) for p in body]
+                if max(tangent)-min(tangent) > max(normal)-min(normal):
+                    rotated = self.carla.Rotation(yaw=rotation.yaw+90.)
+                    actor.set_transform(self.carla.Transform(location,rotated))
+            row = dict(config=config,actor=actor,original_waypoint=original,cross_path=cross_path,
+                       start=actor.get_location(),interaction_station_m=interaction_station,
+                       branch_crossing_s_m=branch_station,finished=False,actions=set(),
+                       stop_sign_id=stop_sign_id,
+                       crossing_left_limit_m=self._crossing_left_limit(original) if role == 'crossing_actor' else None,
+                       prior_motion_observed=False,brake_observed=False,brake_stopped_at=None,resume_origin=None)
+            self.rows.append(row)
+            if config['actor_type'] == 'vehicle':
+                if role == 'braking_lead':
+                    self._drive_vehicle(row,self.waypoints,float(config['speed_mps']))
+                else:
+                    actor.apply_control(self.carla.VehicleControl(brake=1.))
+        return [dict(id=row['config']['id'],actor_id=row['actor'].id,type_id=row['actor'].type_id,
+                     config=row['config'],actual_position_xy=xy(row['actor'].get_location()),
+                     actual_yaw_deg=row['actor'].get_transform().rotation.yaw,
+                     interaction_station_m=row['interaction_station_m'],
+                     branch_crossing_s_m=row['branch_crossing_s_m'],
+                     stop_sign_id=row['stop_sign_id'],
+                     crossing_left_limit_m=row['crossing_left_limit_m']) for row in self.rows]
+
+    def validate_bodies(self, teaching_path, ego_width, ego_length=5.):
+        """Return measured-footprint prechecks, never a physical safety proof."""
+        if not all(math.isfinite(v) and v > 0. for v in (ego_width,ego_length)):
+            raise ValueError('Measured ego dimensions must be positive')
+        if (len(teaching_path) < 2 or any(len(p)!=2 or not all(math.isfinite(v) for v in p) for p in teaching_path)
+                or any(math.dist(a,b)<1e-5 for a,b in zip(teaching_path,teaching_path[1:]))):
+            raise ValueError('Teaching path requires distinct consecutive finite XY points')
+        self.teaching_path,self.ego_width = teaching_path,float(ego_width)
+        audit = dict(schema='independent-demo-body-precheck-1.0',actors=[],full_lane_blockage=None,
+                     passing_clearance=None,ego_width_m=ego_width,ego_length_m=ego_length,
+                     limitation='Planar initialization precheck only; actual physical contact and compliance remain independently audited')
+        self.geometry_audit = audit
+        for row in self.rows:
+            audit['actors'].append(dict(id=row['config']['id'],actor_id=row['actor'].id,footprint_xy=_body(row['actor'])))
+        if 'full_lane_blockage' in self.spec['required_capabilities']:
+            rows = [r for r in self.rows if r['config']['role'] == 'full_blocker']
+            if not rows:
+                raise RuntimeError('Full-blockage design has no owned full blockers')
+            station = sum(r['interaction_station_m'] for r in rows)/len(rows)
+            center,heading = _at(self.route,station)
+            intervals = [_slice_interval(_body(r['actor']),center,heading) for r in rows]
+            intervals = [value for value in intervals if value is not None]
+            width,cursor = rows[0]['original_waypoint'].lane_width,-rows[0]['original_waypoint'].lane_width/2.
+            for left,right in sorted(intervals):
+                if left > cursor+.05:
+                    raise RuntimeError('Measured full blockage leaves a lateral gap in the common road cross-section')
+                cursor = max(cursor,right)
+            if cursor < width/2.-.05:
+                raise RuntimeError('Measured actors do not cover the full current lane at a common station')
+            audit['full_lane_blockage'] = dict(station_m=station,intervals_d_m=intervals,lane_width_m=width,covered=True)
+        fixed_roles = {'blocking_vehicle','blocking_obstacle','passable_edge_obstacle','roadside_occluder',
+                       'adjacent_construction','roadside_visual_distractor','stop_sign_visual_occluder','roadside_crowd'}
+        measured = []
+        for row in self.rows:
+            if row['config']['role'] not in fixed_roles:
+                continue
+            polygon,minimum = _body(row['actor']),float('inf')
+            for a,b in zip(teaching_path,teaching_path[1:]):
+                length = math.dist(a,b)
+                count = max(1,int(math.ceil(length/.5)))
+                heading = math.atan2(b[1]-a[1],b[0]-a[0])
+                c,s = math.cos(heading),math.sin(heading)
+                for i in range(count+1):
+                    t = i/count
+                    center = [a[0]+t*(b[0]-a[0]),a[1]+t*(b[1]-a[1])]
+                    # The half-sample extension guards the gap between body
+                    # samples; width remains the measured physical ego width.
+                    footprint = [(center[0]+u*c-v*s,center[1]+u*s+v*c)
+                        for u,v in ((ego_length/2.+.25,ego_width/2.),(ego_length/2.+.25,-ego_width/2.),
+                                    (-ego_length/2.-.25,-ego_width/2.),(-ego_length/2.-.25,ego_width/2.))]
+                    minimum = min(minimum,_polygon_distance(footprint,polygon))
+            measured.append(dict(id=row['config']['id'],minimum_body_clearance_m=minimum,required_m=.2))
+            if minimum < .2-1e-6:
+                raise RuntimeError('Authored teaching path lacks measured body clearance: '+row['config']['id'])
+        audit['passing_clearance'] = measured
+        self.geometry_audit = audit
+        return audit
+
+    def _observed(self, row, scene):
+        identity = 'carla_'+str(row['actor'].id)
+        return next((a for a in scene.get('actors',[]) if a.get('id') == identity),None)
+
+    def _drive_vehicle(self, row, path, speed):
+        actor = row['actor']
+        point = xy(actor.get_location())
+        points = [xy(wp.transform.location) for wp in path]
+        progress = project(point,points)['s_m']
+        target,_ = _at(points,progress+max(4.,1.2*speed))
+        current_yaw = -math.radians(actor.get_transform().rotation.yaw)
+        dx,dy = target[0]-point[0],target[1]-point[1]
+        left = -dx*math.sin(current_yaw)+dy*math.cos(current_yaw)
+        # NPC actuator approximation is explicit; actual response is observed.
+        wheel = math.atan2(2.*2.7*left,max(.1,dx*dx+dy*dy))
+        steer = max(-1.,min(1.,-wheel/math.radians(35.)))
+        actor.apply_control(self.carla.VehicleControl(steer=steer))
+        target_wp = min(path,key=lambda wp:math.dist(point,xy(wp.transform.location)))
+        forward = target_wp.transform.get_forward_vector()
+        actor.set_target_velocity(self.carla.Vector3D(x=speed*forward.x,y=speed*forward.y,z=speed*forward.z))
+
+    def update(self, scene, dt):
+        stamp,projection = float(scene['time']),scene['diagnostics']['route_projection']
+        if not math.isfinite(dt) or dt <= 0. or not math.isfinite(stamp):
+            raise ValueError('Event observation time must be finite and dt positive')
+        if self.last_time is not None and stamp <= self.last_time:
+            raise ValueError('Event observations must move forward in time')
+        if self.last_time is not None and abs(stamp-self.last_time-dt) > max(1e-5,dt*.01):
+            raise ValueError('Event dt must match contiguous observed simulation time')
+        if projection.get('valid') is False:
+            raise RuntimeError('Cannot advance demonstration events from an invalid route projection')
+        progress = projection.get('s_m',scene['diagnostics'].get('route_s'))
+        if progress is None or not math.isfinite(progress):
+            raise ValueError('Event trigger requires a finite current observed route station')
+        self.last_time = stamp
+        ego_speed = math.hypot(*scene['ego']['velocity'])
+        distance = next((event['distance_m'] for event in self.spec['trigger_specs'] if 'distance_m' in event),20.)
+        first_station = min(row['interaction_station_m'] for row in self.rows)
+        kind,events = self.spec['interaction_kind'],[]
+        obligations = scene.get('rules',{}).get('stop_sign_obligations',[])
+        if kind == 'stop_sign':
+            targets = {row.get('stop_sign_id') for row in self.rows if row.get('stop_sign_id') is not None}
+            if targets:
+                obligations = [row for row in obligations if row.get('id') in targets]
+        if kind == 'hard_brake':
+            lead = next(row for row in self.rows if row['config']['role'] == 'braking_lead')
+            observed = self._observed(lead,scene)
+            current_station = project(observed['position'] if observed else xy(lead['actor'].get_location()),self.route)['s_m']
+            trigger = 0. <= current_station-progress <= distance
+        else:
+            trigger = bool(obligations) if kind == 'stop_sign' else progress >= first_station-distance
+        if not self.active and trigger:
+            self.active,self.activated_at = True,stamp
+            events.append(dict(phase='interact',event='activated',completed=False,observed_progress_m=progress,
+                               trigger_station_m=first_station,trigger_source='current_observation'))
+        for row in self.rows:
+            if row['config']['role'] == 'braking_lead' and not self.active:
+                observed = self._observed(row,scene)
+                row['prior_motion_observed'] |= observed is not None and math.hypot(*observed['velocity']) > 1.
+                self._drive_vehicle(row,self.waypoints,float(row['config']['speed_mps']))
+        if not self.active:
+            return events
+        elapsed = stamp-self.activated_at
+        if ego_speed < .1:
+            self.stationary_s += dt
+        if obligations:
+            self.stop_rule_seen = True
+        if ego_speed < .1 and any(row.get('affected_now') for row in obligations):
+            self.stop_stationary_s += dt
+            self.stop_max_stationary_s = max(self.stop_max_stationary_s,self.stop_stationary_s)
+        else:
+            self.stop_stationary_s = 0.
+        for obligation in obligations:
+            identity = str(obligation['id'])
+            self.stop_encounters[identity] = dict(obligation)
+            if obligation.get('status') == 'fulfilled' and obligation.get('completed_frame') is not None:
+                self.stop_observed = True
+        moving_complete = []
+        for row in self.rows:
+            a,config = row['actor'],row['config']
+            if not a.is_alive:
+                if kind in ('blocked_wait','slow_lead'):
+                    continue
+                raise RuntimeError('Required demonstration actor disappeared before completion: '+config['id'])
+            role,speed = config['role'],float(config['speed_mps'])
+            yaw = math.radians(row['original_waypoint'].transform.rotation.yaw)
+            observed = self._observed(row,scene)
+            if kind == 'blocked_wait' and elapsed >= self.spec['wait_s']:
+                if not a.destroy():
+                    raise RuntimeError('Failed to remove owned blockage actor')
+                events.append(dict(phase='interact',event='owned_blockage_removed',actor_id=a.id,completed=False))
+            elif role == 'slow_lead':
+                a.apply_control(self.carla.WalkerControl(direction=self.carla.Vector3D(x=math.cos(yaw),y=math.sin(yaw)),speed=speed))
+                if elapsed >= self.spec['wait_s']:
+                    if not a.destroy():
+                        raise RuntimeError('Failed to remove owned slow-walking actor')
+                    events.append(dict(phase='interact',event='owned_slow_actor_removed',actor_id=a.id,completed=False))
+            elif role == 'crossing_actor':
+                origin = row['original_waypoint'].transform.location
+                location = a.get_location()
+                lateral = (location.x-origin.x)*math.sin(yaw)-(location.y-origin.y)*math.cos(yaw)
+                clearance = min(_path_body_distance(path,_body(a)) for path in (self.route,self.teaching_path))
+                complete = lateral >= row['crossing_left_limit_m'] and clearance > self.ego_width/2.+.2
+                a.apply_control(self.carla.WalkerControl(direction=self.carla.Vector3D(x=math.sin(yaw),y=-math.cos(yaw)),speed=0. if complete else speed))
+                moving_complete.append(complete)
+                if complete and not row['finished']:
+                    row['finished'] = True
+                    events.append(dict(phase='interact',event='crossing_body_observed_clear',actor_id=a.id,
+                                       lateral_m=lateral,path_body_clearance_m=clearance,completed=False))
+            elif role == 'braking_lead':
+                observed_speed = math.hypot(*observed['velocity']) if observed is not None else math.hypot(a.get_velocity().x,a.get_velocity().y)
+                row['prior_motion_observed'] |= not row['brake_observed'] and observed_speed > 1.
+                if row['brake_observed'] and observed_speed >= .1 and row['resume_origin'] is None:
+                    row['brake_stopped_at'] = None
+                if row['prior_motion_observed'] and observed_speed < .1 and row['brake_stopped_at'] is None:
+                    row['brake_stopped_at'] = stamp
+                    row['brake_observed'] = True
+                    events.append(dict(phase='interact',event='lead_stop_observed',actor_id=a.id,
+                                       observed_speed_mps=observed_speed,completed=False))
+                hold_complete = (row['brake_stopped_at'] is not None and
+                                 stamp-row['brake_stopped_at']+1e-8 >= self.spec['wait_s'])
+                if not hold_complete:
+                    a.apply_control(self.carla.VehicleControl(brake=1.))
+                    if 'brake' not in row['actions']:
+                        events.append(dict(phase='interact',event='lead_brake_commanded',actor_id=a.id,observed_speed_mps=observed_speed,completed=False))
+                        row['actions'].add('brake')
+                else:
+                    if row['resume_origin'] is None:
+                        row['resume_origin'] = xy(a.get_location())
+                        events.append(dict(phase='interact',event='lead_resume_commanded',actor_id=a.id,completed=False))
+                    self._drive_vehicle(row,self.waypoints,speed)
+                    moved = math.dist(xy(a.get_location()),row['resume_origin'])
+                    moving_complete.append(row['brake_observed'] and observed_speed > 1. and moved > 2.)
+            elif role == 'cross_traffic_vehicle':
+                path = row['cross_path']
+                branch = project(xy(a.get_location()),[xy(wp.transform.location) for wp in path])
+                clearance = min(_path_body_distance(p,_body(a)) for p in (self.route,self.teaching_path))
+                complete = branch['s_m'] >= row['branch_crossing_s_m']+8. and clearance > self.ego_width/2.+.5
+                if complete:
+                    a.apply_control(self.carla.VehicleControl(brake=1.))
+                else:
+                    self._drive_vehicle(row,path,speed)
+                moving_complete.append(complete)
+        if kind in ('blocked_wait','slow_lead'):
+            ready = elapsed >= self.spec['wait_s'] and all(not row['actor'].is_alive for row in self.rows)
+        elif kind == 'stop_sign':
+            fulfilled = [value for value in self.stop_encounters.values() if value.get('status') == 'fulfilled']
+            ready = bool(fulfilled) and self.stop_observed and all(
+                value.get('cleared') or progress > value['stop_s']+4. for value in fulfilled)
+            if ready and self.stop_max_stationary_s+1e-7 < self.spec['wait_s']:
+                raise RuntimeError('Real stop was released without the configured observed stationary hold')
+        elif kind in ('crossing','construction_crossing','cross_traffic','hard_brake'):
+            ready = bool(moving_complete) and all(moving_complete)
+        else:
+            ready = progress >= max(row['interaction_station_m'] for row in self.rows)+5.
+        if ready and not self.completed:
+            if kind == 'blocked_wait' and self.stationary_s < 3.:
+                raise RuntimeError('Blockage disappeared without a genuinely observed wait')
+            self.completed,self.completion_progress_m = True,progress
+            events.append(dict(phase='interact',event='interaction_completed',completed=True,
+                               observed_progress_m=progress,observed_stationary_s=self.stationary_s,
+                               official_success=False))
+        return events
+
+    def close(self):
+        errors = []
+        for actor in reversed(self.actors):
+            try:
+                if actor.is_alive and not actor.destroy():
+                    errors.append('destroy returned false: '+str(actor.id))
+            except Exception as exc:
+                errors.append(str(exc))
+        if errors:
+            raise RuntimeError('Demonstration actor cleanup failed: '+str(errors))

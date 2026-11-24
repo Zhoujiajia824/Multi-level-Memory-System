@@ -13,4 +13,14 @@ fast:
   # 仅必要结构；退化输出的第二次请求显式加反馈并放松为json_object/text。
   response_format: json_schema
 reflection:
-  backend: off
+  # 与fast复用部署服务，但使用config/prompts.yaml的reflection提示词。
+  # 旧个人配置未提供reflection或仍为off时，B组同样复用fast服务并明确归档。
+  backend: server
+  base_url: http://127.0.0.1:8000/v1
+  model: Qwen2.5-VL-3B-Instruct
+  api_key_env: FAST_VLM_API_KEY
+  timeout_s: 60
+  max_tokens: 4096
+  context_window_tokens: 16384
+  temperature: 0.2
+  response_format: json_schema

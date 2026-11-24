@@ -1,0 +1,1345 @@
+{
+  "schema_version": "fail2drive-demonstrations-1.0",
+  "catalog_id": "independent_standard_asset_demonstrations_v1",
+  "taxonomy_source": {
+    "repository": "autonomousvision/fail2drive",
+    "commit": "bceb18afb7d62e06e990739e013e750d92ad7a88",
+    "file": "tools/f2d_result_parser.py",
+    "use": "category_names_only"
+  },
+  "independent_design": true,
+  "official_evaluation": false,
+  "publication_policy": "executed_verified_and_reviewed_only",
+  "coordinate_contract": "s_offset_m is route arc length from independent start; lane_offset +1 left, -1 right; lateral_offset_m left-positive",
+  "demonstrations": [
+    {
+      "id": "demo_wall",
+      "family": "Wall",
+      "map": "Town05",
+      "seed": 731001,
+      "interaction_kind": "blocked_wait",
+      "design_status": "pending_execution",
+      "route_policy": "independent_topology_selection",
+      "approach_m": 25.0,
+      "interaction_m": 35.0,
+      "recovery_m": 20.0,
+      "cruise_speed_mps": 4.0,
+      "wait_s": 60.0,
+      "max_duration_s": 150.0,
+      "required_capabilities": [
+        "straight_route",
+        "full_lane_blockage"
+      ],
+      "supported_visual_proxy": false,
+      "proxy": {
+        "description": "标准路障构成车道完全封闭，等待当前通路重新可行后继续。",
+        "limitations": "墙体材质和官方异常视觉外观未复现；覆盖等待及清障恢复。独立地图位置、全新种子及标准CARLA资产；不复制正式路线、事件参数或长尾测试资产，真实闭环通过后方可入库。",
+        "official_visual_shift_reproduced": false
+      },
+      "actor_specs": [
+        {
+          "id": "barrier_left",
+          "role": "full_blocker",
+          "actor_type": "obstacle",
+          "blueprint_candidates": [
+            "static.prop.streetbarrier"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 37,
+          "lateral_offset_m": 1.1,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        },
+        {
+          "id": "barrier_center",
+          "role": "full_blocker",
+          "actor_type": "obstacle",
+          "blueprint_candidates": [
+            "static.prop.streetbarrier"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 37,
+          "lateral_offset_m": 0,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        },
+        {
+          "id": "barrier_right",
+          "role": "full_blocker",
+          "actor_type": "obstacle",
+          "blueprint_candidates": [
+            "static.prop.streetbarrier"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 37,
+          "lateral_offset_m": -1.1,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        }
+      ],
+      "trigger_specs": [
+        {
+          "event": "activate_blockage",
+          "source": "current_observation",
+          "distance_m": 28
+        },
+        {
+          "event": "release_blockage_after_activation",
+          "source": "current_observation",
+          "duration_s": 60
+        }
+      ],
+      "teacher_policy": {
+        "kind": "blocked_wait",
+        "observation_only": true,
+        "allow_opposite_lane": false,
+        "stop_for_occupied_corridor": true,
+        "resume_only_when_current_corridor_clear": true
+      },
+      "success_requirements": [
+        "actual_execution",
+        "same_frame_capture",
+        "collision_free",
+        "on_road",
+        "traffic_rules",
+        "interaction_completed",
+        "recovery_completed",
+        "arrival"
+      ]
+    },
+    {
+      "id": "demo_fully_blocked",
+      "family": "FullyBlocked",
+      "map": "Town05",
+      "seed": 731002,
+      "interaction_kind": "blocked_wait",
+      "design_status": "pending_execution",
+      "route_policy": "independent_topology_selection",
+      "approach_m": 25.0,
+      "interaction_m": 35.0,
+      "recovery_m": 20.0,
+      "cruise_speed_mps": 4.0,
+      "wait_s": 60.0,
+      "max_duration_s": 150.0,
+      "required_capabilities": [
+        "straight_route",
+        "full_lane_blockage"
+      ],
+      "supported_visual_proxy": false,
+      "proxy": {
+        "description": "标准货车横置全封闭当前通路，保留60秒阻塞与恢复阶段。",
+        "limitations": "不重现官方横置资产配置；实际车体覆盖须在场景预检中测量。独立地图位置、全新种子及标准CARLA资产；不复制正式路线、事件参数或长尾测试资产，真实闭环通过后方可入库。",
+        "official_visual_shift_reproduced": false
+      },
+      "actor_specs": [
+        {
+          "id": "blocking_truck",
+          "role": "full_blocker",
+          "actor_type": "vehicle",
+          "blueprint_candidates": [
+            "vehicle.carlamotors.carlacola"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 37,
+          "lateral_offset_m": 0,
+          "yaw_offset_deg": 90,
+          "speed_mps": 0,
+          "required": true
+        }
+      ],
+      "trigger_specs": [
+        {
+          "event": "activate_blockage",
+          "source": "current_observation",
+          "distance_m": 28
+        },
+        {
+          "event": "release_blockage_after_activation",
+          "source": "current_observation",
+          "duration_s": 60
+        }
+      ],
+      "teacher_policy": {
+        "kind": "blocked_wait",
+        "observation_only": true,
+        "allow_opposite_lane": false,
+        "stop_for_occupied_corridor": true,
+        "resume_only_when_current_corridor_clear": true
+      },
+      "success_requirements": [
+        "actual_execution",
+        "same_frame_capture",
+        "collision_free",
+        "on_road",
+        "traffic_rules",
+        "interaction_completed",
+        "recovery_completed",
+        "arrival"
+      ]
+    },
+    {
+      "id": "demo_pedestrians_on_road",
+      "family": "PedestriansOnRoad",
+      "map": "Town05",
+      "seed": 731003,
+      "interaction_kind": "slow_lead",
+      "design_status": "pending_execution",
+      "route_policy": "independent_topology_selection",
+      "approach_m": 25.0,
+      "interaction_m": 55.0,
+      "recovery_m": 20.0,
+      "cruise_speed_mps": 4.0,
+      "wait_s": 20.0,
+      "max_duration_s": 120.0,
+      "required_capabilities": [
+        "straight_route"
+      ],
+      "supported_visual_proxy": false,
+      "proxy": {
+        "description": "三名行人在车道上缓慢同向行走，完整演示跟随、观察及恢复。",
+        "limitations": "标准行人沿路慢行；不使用官方行人型号和精确布局。独立地图位置、全新种子及标准CARLA资产；不复制正式路线、事件参数或长尾测试资产，真实闭环通过后方可入库。",
+        "official_visual_shift_reproduced": false
+      },
+      "actor_specs": [
+        {
+          "id": "walker_one",
+          "role": "slow_lead",
+          "actor_type": "walker",
+          "blueprint_candidates": [
+            "walker.pedestrian.0001"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 37,
+          "lateral_offset_m": -0.6,
+          "yaw_offset_deg": 0,
+          "speed_mps": 1.5,
+          "required": true
+        },
+        {
+          "id": "walker_two",
+          "role": "slow_lead",
+          "actor_type": "walker",
+          "blueprint_candidates": [
+            "walker.pedestrian.0002"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 38.5,
+          "lateral_offset_m": 0,
+          "yaw_offset_deg": 0,
+          "speed_mps": 1.5,
+          "required": true
+        },
+        {
+          "id": "walker_three",
+          "role": "slow_lead",
+          "actor_type": "walker",
+          "blueprint_candidates": [
+            "walker.pedestrian.0003"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 40,
+          "lateral_offset_m": 0.6,
+          "yaw_offset_deg": 0,
+          "speed_mps": 1.5,
+          "required": true
+        }
+      ],
+      "trigger_specs": [
+        {
+          "event": "start_slow_walk",
+          "source": "current_observation",
+          "distance_m": 25
+        },
+        {
+          "event": "end_slow_walk_after_activation",
+          "source": "current_observation",
+          "duration_s": 20
+        }
+      ],
+      "teacher_policy": {
+        "kind": "slow_lead",
+        "observation_only": true,
+        "allow_opposite_lane": false,
+        "prefer_following": true
+      },
+      "success_requirements": [
+        "actual_execution",
+        "same_frame_capture",
+        "collision_free",
+        "on_road",
+        "traffic_rules",
+        "interaction_completed",
+        "recovery_completed",
+        "arrival"
+      ]
+    },
+    {
+      "id": "demo_construction_pedestrian",
+      "family": "ConstructionPedestrian",
+      "map": "Town05",
+      "seed": 731004,
+      "interaction_kind": "construction_crossing",
+      "design_status": "pending_execution",
+      "route_policy": "independent_topology_selection",
+      "approach_m": 25.0,
+      "interaction_m": 35.0,
+      "recovery_m": 20.0,
+      "cruise_speed_mps": 4.0,
+      "wait_s": 0.0,
+      "max_duration_s": 90.0,
+      "required_capabilities": [
+        "straight_route",
+        "same_direction_left_lane",
+        "crossable_left_boundary"
+      ],
+      "supported_visual_proxy": false,
+      "proxy": {
+        "description": "当前车道施工绕行时有工人进入绕行走廊，应先让行再绕过施工。",
+        "limitations": "迁移工人与施工复合冲突，不读取工人未来运动。独立地图位置、全新种子及标准CARLA资产；不复制正式路线、事件参数或长尾测试资产，真实闭环通过后方可入库。",
+        "official_visual_shift_reproduced": false
+      },
+      "actor_specs": [
+        {
+          "id": "construction_cone",
+          "role": "blocking_obstacle",
+          "actor_type": "obstacle",
+          "blueprint_candidates": [
+            "static.prop.trafficcone01"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 37,
+          "lateral_offset_m": 0,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        },
+        {
+          "id": "construction_barrier",
+          "role": "blocking_obstacle",
+          "actor_type": "obstacle",
+          "blueprint_candidates": [
+            "static.prop.streetbarrier"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 40,
+          "lateral_offset_m": 0,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        },
+        {
+          "id": "worker",
+          "role": "crossing_actor",
+          "actor_type": "walker",
+          "blueprint_candidates": [
+            "walker.pedestrian.0004"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 43,
+          "lateral_offset_m": -4,
+          "yaw_offset_deg": 90,
+          "speed_mps": 1.3,
+          "required": true
+        }
+      ],
+      "trigger_specs": [
+        {
+          "event": "worker_crossing",
+          "source": "current_observation",
+          "distance_m": 18,
+          "ttc_s": 3.0
+        }
+      ],
+      "teacher_policy": {
+        "kind": "construction_crossing",
+        "observation_only": true,
+        "allow_opposite_lane": false,
+        "legal_left_bypass": true,
+        "yield_to_crossing_actor": true
+      },
+      "success_requirements": [
+        "actual_execution",
+        "same_frame_capture",
+        "collision_free",
+        "on_road",
+        "traffic_rules",
+        "interaction_completed",
+        "recovery_completed",
+        "arrival"
+      ]
+    },
+    {
+      "id": "demo_bad_parking",
+      "family": "BadParking",
+      "map": "Town05",
+      "seed": 731005,
+      "interaction_kind": "parked_bypass",
+      "design_status": "pending_execution",
+      "route_policy": "independent_topology_selection",
+      "approach_m": 25.0,
+      "interaction_m": 35.0,
+      "recovery_m": 20.0,
+      "cruise_speed_mps": 4.0,
+      "wait_s": 0.0,
+      "max_duration_s": 90.0,
+      "required_capabilities": [
+        "straight_route",
+        "same_direction_left_lane",
+        "crossable_left_boundary"
+      ],
+      "supported_visual_proxy": false,
+      "proxy": {
+        "description": "标准轿车斜停侵入当前车道，合法左侧绕行后返回。",
+        "limitations": "只迁移斜停几何侵入；不使用官方路线或停车姿态。独立地图位置、全新种子及标准CARLA资产；不复制正式路线、事件参数或长尾测试资产，真实闭环通过后方可入库。",
+        "official_visual_shift_reproduced": false
+      },
+      "actor_specs": [
+        {
+          "id": "parked_car",
+          "role": "blocking_vehicle",
+          "actor_type": "vehicle",
+          "blueprint_candidates": [
+            "vehicle.tesla.model3"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 37,
+          "lateral_offset_m": -0.5,
+          "yaw_offset_deg": 18,
+          "speed_mps": 0,
+          "required": true
+        }
+      ],
+      "trigger_specs": [
+        {
+          "event": "interaction_approach",
+          "source": "current_observation",
+          "distance_m": 20.0
+        }
+      ],
+      "teacher_policy": {
+        "kind": "parked_bypass",
+        "observation_only": true,
+        "allow_opposite_lane": false,
+        "legal_left_bypass": true,
+        "return_to_original_lane": true
+      },
+      "success_requirements": [
+        "actual_execution",
+        "same_frame_capture",
+        "collision_free",
+        "on_road",
+        "traffic_rules",
+        "interaction_completed",
+        "recovery_completed",
+        "arrival"
+      ]
+    },
+    {
+      "id": "demo_construction_permutations",
+      "family": "ConstructionPermutations",
+      "map": "Town05",
+      "seed": 731006,
+      "interaction_kind": "construction_bypass",
+      "design_status": "pending_execution",
+      "route_policy": "independent_topology_selection",
+      "approach_m": 25.0,
+      "interaction_m": 35.0,
+      "recovery_m": 20.0,
+      "cruise_speed_mps": 4.0,
+      "wait_s": 0.0,
+      "max_duration_s": 90.0,
+      "required_capabilities": [
+        "straight_route",
+        "same_direction_left_lane",
+        "crossable_left_boundary"
+      ],
+      "supported_visual_proxy": false,
+      "proxy": {
+        "description": "标准锥桶与路障以独立非对称布局占道，合法绕行。",
+        "limitations": "原基准包含对向交通；本示范使用同向合法邻道，不能视为对向借道经验。独立地图位置、全新种子及标准CARLA资产；不复制正式路线、事件参数或长尾测试资产，真实闭环通过后方可入库。",
+        "official_visual_shift_reproduced": false
+      },
+      "actor_specs": [
+        {
+          "id": "cone_one",
+          "role": "blocking_obstacle",
+          "actor_type": "obstacle",
+          "blueprint_candidates": [
+            "static.prop.trafficcone01"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 35,
+          "lateral_offset_m": -0.8,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        },
+        {
+          "id": "barrier",
+          "role": "blocking_obstacle",
+          "actor_type": "obstacle",
+          "blueprint_candidates": [
+            "static.prop.streetbarrier"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 38,
+          "lateral_offset_m": 0,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        },
+        {
+          "id": "cone_two",
+          "role": "blocking_obstacle",
+          "actor_type": "obstacle",
+          "blueprint_candidates": [
+            "static.prop.trafficcone01"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 41,
+          "lateral_offset_m": 0.6,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        }
+      ],
+      "trigger_specs": [
+        {
+          "event": "interaction_approach",
+          "source": "current_observation",
+          "distance_m": 20.0
+        }
+      ],
+      "teacher_policy": {
+        "kind": "construction_bypass",
+        "observation_only": true,
+        "allow_opposite_lane": false,
+        "legal_left_bypass": true,
+        "return_to_original_lane": true
+      },
+      "success_requirements": [
+        "actual_execution",
+        "same_frame_capture",
+        "collision_free",
+        "on_road",
+        "traffic_rules",
+        "interaction_completed",
+        "recovery_completed",
+        "arrival"
+      ]
+    },
+    {
+      "id": "demo_custom_obstacles",
+      "family": "CustomObstacles",
+      "map": "Town05",
+      "seed": 731007,
+      "interaction_kind": "construction_bypass",
+      "design_status": "pending_execution",
+      "route_policy": "independent_topology_selection",
+      "approach_m": 25.0,
+      "interaction_m": 35.0,
+      "recovery_m": 20.0,
+      "cruise_speed_mps": 4.0,
+      "wait_s": 0.0,
+      "max_duration_s": 90.0,
+      "required_capabilities": [
+        "straight_route",
+        "same_direction_left_lane",
+        "crossable_left_boundary"
+      ],
+      "supported_visual_proxy": false,
+      "proxy": {
+        "description": "标准路面遗落物构成占道障碍，沿合法邻道绕行。",
+        "limitations": "采用标准普通资产作几何障碍代理，不复制Fail2Drive新奇物体视觉。独立地图位置、全新种子及标准CARLA资产；不复制正式路线、事件参数或长尾测试资产，真实闭环通过后方可入库。",
+        "official_visual_shift_reproduced": false
+      },
+      "actor_specs": [
+        {
+          "id": "road_debris",
+          "role": "blocking_obstacle",
+          "actor_type": "obstacle",
+          "blueprint_candidates": [
+            "static.prop.box03"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 37,
+          "lateral_offset_m": 0,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        },
+        {
+          "id": "road_barrel",
+          "role": "blocking_obstacle",
+          "actor_type": "obstacle",
+          "blueprint_candidates": [
+            "static.prop.barrel"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 40,
+          "lateral_offset_m": -0.5,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        }
+      ],
+      "trigger_specs": [
+        {
+          "event": "interaction_approach",
+          "source": "current_observation",
+          "distance_m": 20.0
+        }
+      ],
+      "teacher_policy": {
+        "kind": "construction_bypass",
+        "observation_only": true,
+        "allow_opposite_lane": false,
+        "legal_left_bypass": true,
+        "return_to_original_lane": true
+      },
+      "success_requirements": [
+        "actual_execution",
+        "same_frame_capture",
+        "collision_free",
+        "on_road",
+        "traffic_rules",
+        "interaction_completed",
+        "recovery_completed",
+        "arrival"
+      ]
+    },
+    {
+      "id": "demo_obscured_stop",
+      "family": "ObscuredStop",
+      "map": "Town05",
+      "seed": 731008,
+      "interaction_kind": "stop_sign",
+      "design_status": "pending_execution",
+      "route_policy": "independent_topology_selection",
+      "approach_m": 25.0,
+      "interaction_m": 35.0,
+      "recovery_m": 20.0,
+      "cruise_speed_mps": 4.0,
+      "wait_s": 2.0,
+      "max_duration_s": 100.0,
+      "required_capabilities": [
+        "real_stop_sign"
+      ],
+      "supported_visual_proxy": true,
+      "proxy": {
+        "description": "真实停牌外观旁存在视觉遮挡物，仍按当前真实停牌规则停车确认后通行。",
+        "limitations": "必须选到真实停牌及其触发区；普通遮挡物不创造或替代停车规则。独立地图位置、全新种子及标准CARLA资产；不复制正式路线、事件参数或长尾测试资产，真实闭环通过后方可入库。",
+        "official_visual_shift_reproduced": false
+      },
+      "actor_specs": [
+        {
+          "id": "stop_occluder",
+          "role": "stop_sign_visual_occluder",
+          "actor_type": "visual_proxy",
+          "blueprint_candidates": [
+            "static.prop.barrel"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 37,
+          "lateral_offset_m": -3.0,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        }
+      ],
+      "trigger_specs": [
+        {
+          "event": "real_stop_sign_approach",
+          "source": "current_observation",
+          "distance_m": 20
+        }
+      ],
+      "teacher_policy": {
+        "kind": "stop_sign",
+        "observation_only": true,
+        "allow_opposite_lane": false,
+        "honor_real_stop_sign": true,
+        "minimum_stopped_s": 2
+      },
+      "success_requirements": [
+        "actual_execution",
+        "same_frame_capture",
+        "collision_free",
+        "on_road",
+        "traffic_rules",
+        "interaction_completed",
+        "recovery_completed",
+        "arrival"
+      ]
+    },
+    {
+      "id": "demo_hard_brake",
+      "family": "HardBrake",
+      "map": "Town05",
+      "seed": 731009,
+      "interaction_kind": "hard_brake",
+      "design_status": "pending_execution",
+      "route_policy": "independent_topology_selection",
+      "approach_m": 25.0,
+      "interaction_m": 75.0,
+      "recovery_m": 20.0,
+      "cruise_speed_mps": 4.0,
+      "wait_s": 10.0,
+      "max_duration_s": 100.0,
+      "required_capabilities": [
+        "straight_route"
+      ],
+      "supported_visual_proxy": false,
+      "proxy": {
+        "description": "前方标准车辆行驶后急刹、停车10秒并恢复，自车跟随响应。",
+        "limitations": "不复刻官方触发位置；禁用刹车灯仅作为可用能力，缺失则明确记录标准急刹代理。独立地图位置、全新种子及标准CARLA资产；不复制正式路线、事件参数或长尾测试资产，真实闭环通过后方可入库。",
+        "official_visual_shift_reproduced": false
+      },
+      "actor_specs": [
+        {
+          "id": "lead_car",
+          "role": "braking_lead",
+          "actor_type": "vehicle",
+          "blueprint_candidates": [
+            "vehicle.lincoln.mkz_2020"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 37,
+          "lateral_offset_m": 0,
+          "yaw_offset_deg": 0,
+          "speed_mps": 3.0,
+          "required": true
+        }
+      ],
+      "trigger_specs": [
+        {
+          "event": "lead_hard_brake",
+          "source": "current_observation",
+          "distance_m": 18
+        },
+        {
+          "event": "lead_resume_after_stop",
+          "source": "current_observation",
+          "duration_s": 10
+        }
+      ],
+      "teacher_policy": {
+        "kind": "hard_brake",
+        "observation_only": true,
+        "allow_opposite_lane": false,
+        "prefer_following": true,
+        "use_observed_lead_motion": true
+      },
+      "success_requirements": [
+        "actual_execution",
+        "same_frame_capture",
+        "collision_free",
+        "on_road",
+        "traffic_rules",
+        "interaction_completed",
+        "recovery_completed",
+        "arrival"
+      ]
+    },
+    {
+      "id": "demo_right_of_way",
+      "family": "RightOfWay",
+      "map": "Town05",
+      "seed": 731010,
+      "interaction_kind": "cross_traffic",
+      "design_status": "pending_execution",
+      "route_policy": "independent_topology_selection",
+      "approach_m": 25.0,
+      "interaction_m": 45.0,
+      "recovery_m": 20.0,
+      "cruise_speed_mps": 4.0,
+      "wait_s": 0.0,
+      "max_duration_s": 110.0,
+      "required_capabilities": [
+        "conflicting_junction"
+      ],
+      "supported_visual_proxy": false,
+      "proxy": {
+        "description": "真实冲突支路有标准车辆进入交叉口，按当前运动让行再通过。",
+        "limitations": "不使用官方优先车辆、闯灯配置或路线；自车仍遵守当前真实信号。独立地图位置、全新种子及标准CARLA资产；不复制正式路线、事件参数或长尾测试资产，真实闭环通过后方可入库。",
+        "official_visual_shift_reproduced": false
+      },
+      "actor_specs": [
+        {
+          "id": "crossing_vehicle",
+          "role": "cross_traffic_vehicle",
+          "actor_type": "vehicle",
+          "blueprint_candidates": [
+            "vehicle.audi.a2"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 37,
+          "lateral_offset_m": 9,
+          "yaw_offset_deg": 90,
+          "speed_mps": 3.0,
+          "required": true
+        }
+      ],
+      "trigger_specs": [
+        {
+          "event": "cross_traffic_approach",
+          "source": "current_observation",
+          "distance_m": 22
+        }
+      ],
+      "teacher_policy": {
+        "kind": "cross_traffic",
+        "observation_only": true,
+        "allow_opposite_lane": false,
+        "yield_to_current_conflict": true
+      },
+      "success_requirements": [
+        "actual_execution",
+        "same_frame_capture",
+        "collision_free",
+        "on_road",
+        "traffic_rules",
+        "interaction_completed",
+        "recovery_completed",
+        "arrival"
+      ]
+    },
+    {
+      "id": "demo_animals",
+      "family": "Animals",
+      "map": "Town05",
+      "seed": 731011,
+      "interaction_kind": "crossing",
+      "design_status": "pending_execution",
+      "route_policy": "independent_topology_selection",
+      "approach_m": 25.0,
+      "interaction_m": 35.0,
+      "recovery_m": 20.0,
+      "cruise_speed_mps": 4.0,
+      "wait_s": 0.0,
+      "max_duration_s": 90.0,
+      "required_capabilities": [
+        "straight_route",
+        "right_sidewalk"
+      ],
+      "supported_visual_proxy": false,
+      "proxy": {
+        "description": "标准行人代理突然横穿的可碰撞动态实体，示范减速让行及通路恢复。",
+        "limitations": "标准CARLA缺动物资产，因此仅为横穿动力学代理，不能宣称复现动物视觉识别。独立地图位置、全新种子及标准CARLA资产；不复制正式路线、事件参数或长尾测试资产，真实闭环通过后方可入库。",
+        "official_visual_shift_reproduced": false
+      },
+      "actor_specs": [
+        {
+          "id": "crossing_proxy",
+          "role": "crossing_actor",
+          "actor_type": "walker",
+          "blueprint_candidates": [
+            "walker.pedestrian.0005"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 37,
+          "lateral_offset_m": -4,
+          "yaw_offset_deg": 90,
+          "speed_mps": 1.7,
+          "required": true
+        }
+      ],
+      "trigger_specs": [
+        {
+          "event": "actor_crossing",
+          "source": "current_observation",
+          "distance_m": 20,
+          "ttc_s": 3.0
+        }
+      ],
+      "teacher_policy": {
+        "kind": "crossing",
+        "observation_only": true,
+        "allow_opposite_lane": false,
+        "yield_to_crossing_actor": true
+      },
+      "success_requirements": [
+        "actual_execution",
+        "same_frame_capture",
+        "collision_free",
+        "on_road",
+        "traffic_rules",
+        "interaction_completed",
+        "recovery_completed",
+        "arrival"
+      ]
+    },
+    {
+      "id": "demo_pedestrian_other_blocker",
+      "family": "PedestrianOtherBlocker",
+      "map": "Town05",
+      "seed": 731012,
+      "interaction_kind": "crossing",
+      "design_status": "pending_execution",
+      "route_policy": "independent_topology_selection",
+      "approach_m": 25.0,
+      "interaction_m": 35.0,
+      "recovery_m": 20.0,
+      "cruise_speed_mps": 4.0,
+      "wait_s": 0.0,
+      "max_duration_s": 90.0,
+      "required_capabilities": [
+        "straight_route",
+        "right_sidewalk"
+      ],
+      "supported_visual_proxy": false,
+      "proxy": {
+        "description": "标准路侧遮挡物后行人进入车道，先让行再恢复。",
+        "limitations": "只迁移遮挡旁横穿机制；范围内真值模式不声称视觉遮挡感知能力。独立地图位置、全新种子及标准CARLA资产；不复制正式路线、事件参数或长尾测试资产，真实闭环通过后方可入库。",
+        "official_visual_shift_reproduced": false
+      },
+      "actor_specs": [
+        {
+          "id": "roadside_blocker",
+          "role": "roadside_occluder",
+          "actor_type": "obstacle",
+          "blueprint_candidates": [
+            "static.prop.vendingmachine"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 35,
+          "lateral_offset_m": -3.5,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        },
+        {
+          "id": "crossing_pedestrian",
+          "role": "crossing_actor",
+          "actor_type": "walker",
+          "blueprint_candidates": [
+            "walker.pedestrian.0006"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 39,
+          "lateral_offset_m": -4.5,
+          "yaw_offset_deg": 90,
+          "speed_mps": 1.4,
+          "required": true
+        }
+      ],
+      "trigger_specs": [
+        {
+          "event": "actor_crossing",
+          "source": "current_observation",
+          "distance_m": 19,
+          "ttc_s": 3.0
+        }
+      ],
+      "teacher_policy": {
+        "kind": "crossing",
+        "observation_only": true,
+        "allow_opposite_lane": false,
+        "yield_to_crossing_actor": true
+      },
+      "success_requirements": [
+        "actual_execution",
+        "same_frame_capture",
+        "collision_free",
+        "on_road",
+        "traffic_rules",
+        "interaction_completed",
+        "recovery_completed",
+        "arrival"
+      ]
+    },
+    {
+      "id": "demo_right_construction",
+      "family": "RightConstruction",
+      "map": "Town05",
+      "seed": 731013,
+      "interaction_kind": "roadside_clear",
+      "design_status": "pending_execution",
+      "route_policy": "independent_topology_selection",
+      "approach_m": 25.0,
+      "interaction_m": 35.0,
+      "recovery_m": 20.0,
+      "cruise_speed_mps": 4.0,
+      "wait_s": 0.0,
+      "max_duration_s": 90.0,
+      "required_capabilities": [
+        "straight_route",
+        "same_direction_right_lane"
+      ],
+      "supported_visual_proxy": false,
+      "proxy": {
+        "description": "右侧相邻车道施工，当前车道可通行，适当减速后保持车道通过。",
+        "limitations": "必须存在真实右侧同向邻道；缺失则拒绝场景，不能将物体改放当前车道。独立地图位置、全新种子及标准CARLA资产；不复制正式路线、事件参数或长尾测试资产，真实闭环通过后方可入库。",
+        "official_visual_shift_reproduced": false
+      },
+      "actor_specs": [
+        {
+          "id": "right_cone",
+          "role": "adjacent_construction",
+          "actor_type": "obstacle",
+          "blueprint_candidates": [
+            "static.prop.trafficcone01"
+          ],
+          "lane_offset": -1,
+          "s_offset_m": 37,
+          "lateral_offset_m": 0,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        },
+        {
+          "id": "right_barrier",
+          "role": "adjacent_construction",
+          "actor_type": "obstacle",
+          "blueprint_candidates": [
+            "static.prop.streetbarrier"
+          ],
+          "lane_offset": -1,
+          "s_offset_m": 40,
+          "lateral_offset_m": 0,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        }
+      ],
+      "trigger_specs": [
+        {
+          "event": "interaction_approach",
+          "source": "current_observation",
+          "distance_m": 20.0
+        }
+      ],
+      "teacher_policy": {
+        "kind": "roadside_clear",
+        "observation_only": true,
+        "allow_opposite_lane": false,
+        "stay_in_current_clear_lane": true
+      },
+      "success_requirements": [
+        "actual_execution",
+        "same_frame_capture",
+        "collision_free",
+        "on_road",
+        "traffic_rules",
+        "interaction_completed",
+        "recovery_completed",
+        "arrival"
+      ]
+    },
+    {
+      "id": "demo_opposite_construction",
+      "family": "OppositeConstruction",
+      "map": "Town05",
+      "seed": 731014,
+      "interaction_kind": "roadside_clear",
+      "design_status": "pending_execution",
+      "route_policy": "independent_topology_selection",
+      "approach_m": 25.0,
+      "interaction_m": 35.0,
+      "recovery_m": 20.0,
+      "cruise_speed_mps": 4.0,
+      "wait_s": 0.0,
+      "max_duration_s": 90.0,
+      "required_capabilities": [
+        "straight_route",
+        "opposite_left_lane"
+      ],
+      "supported_visual_proxy": false,
+      "proxy": {
+        "description": "左侧对向车道施工，当前车道保持清空并正常通过。",
+        "limitations": "必须存在真实左侧对向车道，自车不借用该车道。独立地图位置、全新种子及标准CARLA资产；不复制正式路线、事件参数或长尾测试资产，真实闭环通过后方可入库。",
+        "official_visual_shift_reproduced": false
+      },
+      "actor_specs": [
+        {
+          "id": "opposite_cone",
+          "role": "adjacent_construction",
+          "actor_type": "obstacle",
+          "blueprint_candidates": [
+            "static.prop.trafficcone01"
+          ],
+          "lane_offset": 1,
+          "s_offset_m": 37,
+          "lateral_offset_m": 0,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        },
+        {
+          "id": "opposite_barrier",
+          "role": "adjacent_construction",
+          "actor_type": "obstacle",
+          "blueprint_candidates": [
+            "static.prop.streetbarrier"
+          ],
+          "lane_offset": 1,
+          "s_offset_m": 40,
+          "lateral_offset_m": 0,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        }
+      ],
+      "trigger_specs": [
+        {
+          "event": "interaction_approach",
+          "source": "current_observation",
+          "distance_m": 20.0
+        }
+      ],
+      "teacher_policy": {
+        "kind": "roadside_clear",
+        "observation_only": true,
+        "allow_opposite_lane": false,
+        "stay_in_current_clear_lane": true
+      },
+      "success_requirements": [
+        "actual_execution",
+        "same_frame_capture",
+        "collision_free",
+        "on_road",
+        "traffic_rules",
+        "interaction_completed",
+        "recovery_completed",
+        "arrival"
+      ]
+    },
+    {
+      "id": "demo_image_on_object",
+      "family": "ImageOnObject",
+      "map": "Town05",
+      "seed": 731015,
+      "interaction_kind": "visual_proxy",
+      "design_status": "pending_execution",
+      "route_policy": "independent_topology_selection",
+      "approach_m": 25.0,
+      "interaction_m": 35.0,
+      "recovery_m": 20.0,
+      "cruise_speed_mps": 4.0,
+      "wait_s": 0.0,
+      "max_duration_s": 90.0,
+      "required_capabilities": [
+        "straight_route",
+        "right_sidewalk"
+      ],
+      "supported_visual_proxy": true,
+      "proxy": {
+        "description": "标准路侧广告牌/公交站作不阻塞通路的视觉干扰代理。",
+        "limitations": "未复现官方交通灯或行人图片纹理；仅支持一般路侧视觉干扰示范，不能声称完整ImageOnObject视觉覆盖。独立地图位置、全新种子及标准CARLA资产；不复制正式路线、事件参数或长尾测试资产，真实闭环通过后方可入库。",
+        "official_visual_shift_reproduced": false
+      },
+      "actor_specs": [
+        {
+          "id": "visual_distractor",
+          "role": "roadside_visual_distractor",
+          "actor_type": "visual_proxy",
+          "blueprint_candidates": [
+            "static.prop.busstop"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 37,
+          "lateral_offset_m": -5,
+          "yaw_offset_deg": 180,
+          "speed_mps": 0,
+          "required": true
+        }
+      ],
+      "trigger_specs": [
+        {
+          "event": "interaction_approach",
+          "source": "current_observation",
+          "distance_m": 20.0
+        }
+      ],
+      "teacher_policy": {
+        "kind": "visual_proxy",
+        "observation_only": true,
+        "allow_opposite_lane": false,
+        "stay_in_current_clear_lane": true
+      },
+      "success_requirements": [
+        "actual_execution",
+        "same_frame_capture",
+        "collision_free",
+        "on_road",
+        "traffic_rules",
+        "interaction_completed",
+        "recovery_completed",
+        "arrival"
+      ]
+    },
+    {
+      "id": "demo_passable_obstacles",
+      "family": "PassableObstacles",
+      "map": "Town05",
+      "seed": 731016,
+      "interaction_kind": "roadside_clear",
+      "design_status": "pending_execution",
+      "route_policy": "independent_topology_selection",
+      "approach_m": 25.0,
+      "interaction_m": 35.0,
+      "recovery_m": 20.0,
+      "cruise_speed_mps": 4.0,
+      "wait_s": 0.0,
+      "max_duration_s": 90.0,
+      "required_capabilities": [
+        "straight_route",
+        "verified_passing_clearance"
+      ],
+      "supported_visual_proxy": false,
+      "proxy": {
+        "description": "标准路侧窄障碍轻微靠近边缘，但当前车道保有经实测确认的通行净空。",
+        "limitations": "实际净空必须基于实体尺寸预检，不能因归类为可通过而忽略碰撞体。独立地图位置、全新种子及标准CARLA资产；不复制正式路线、事件参数或长尾测试资产，真实闭环通过后方可入库。",
+        "official_visual_shift_reproduced": false
+      },
+      "actor_specs": [
+        {
+          "id": "edge_cone",
+          "role": "passable_edge_obstacle",
+          "actor_type": "obstacle",
+          "blueprint_candidates": [
+            "static.prop.trafficcone01"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 37,
+          "lateral_offset_m": -1.5,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        },
+        {
+          "id": "edge_cone_two",
+          "role": "passable_edge_obstacle",
+          "actor_type": "obstacle",
+          "blueprint_candidates": [
+            "static.prop.trafficcone01"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 40,
+          "lateral_offset_m": -1.5,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        }
+      ],
+      "trigger_specs": [
+        {
+          "event": "interaction_approach",
+          "source": "current_observation",
+          "distance_m": 20.0
+        }
+      ],
+      "teacher_policy": {
+        "kind": "roadside_clear",
+        "observation_only": true,
+        "allow_opposite_lane": false,
+        "stay_in_current_clear_lane": true
+      },
+      "success_requirements": [
+        "actual_execution",
+        "same_frame_capture",
+        "collision_free",
+        "on_road",
+        "traffic_rules",
+        "interaction_completed",
+        "recovery_completed",
+        "arrival"
+      ]
+    },
+    {
+      "id": "demo_pedestrian_crowd",
+      "family": "PedestrianCrowd",
+      "map": "Town05",
+      "seed": 731017,
+      "interaction_kind": "roadside_clear",
+      "design_status": "pending_execution",
+      "route_policy": "independent_topology_selection",
+      "approach_m": 25.0,
+      "interaction_m": 35.0,
+      "recovery_m": 20.0,
+      "cruise_speed_mps": 4.0,
+      "wait_s": 0.0,
+      "max_duration_s": 90.0,
+      "required_capabilities": [
+        "straight_route",
+        "right_sidewalk"
+      ],
+      "supported_visual_proxy": false,
+      "proxy": {
+        "description": "右侧人行道有静止人群；当前车道清空，审慎通过而非无条件停车。",
+        "limitations": "官方人群实际为静止路侧群体；本示范不含官方叠加开门车辆交互。独立地图位置、全新种子及标准CARLA资产；不复制正式路线、事件参数或长尾测试资产，真实闭环通过后方可入库。",
+        "official_visual_shift_reproduced": false
+      },
+      "actor_specs": [
+        {
+          "id": "crowd_one",
+          "role": "roadside_crowd",
+          "actor_type": "walker",
+          "blueprint_candidates": [
+            "walker.pedestrian.0007"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 37,
+          "lateral_offset_m": -4,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        },
+        {
+          "id": "crowd_two",
+          "role": "roadside_crowd",
+          "actor_type": "walker",
+          "blueprint_candidates": [
+            "walker.pedestrian.0008"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 39,
+          "lateral_offset_m": -4.5,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        },
+        {
+          "id": "crowd_three",
+          "role": "roadside_crowd",
+          "actor_type": "walker",
+          "blueprint_candidates": [
+            "walker.pedestrian.0009"
+          ],
+          "lane_offset": 0,
+          "s_offset_m": 41,
+          "lateral_offset_m": -4,
+          "yaw_offset_deg": 0,
+          "speed_mps": 0,
+          "required": true
+        }
+      ],
+      "trigger_specs": [
+        {
+          "event": "interaction_approach",
+          "source": "current_observation",
+          "distance_m": 20.0
+        }
+      ],
+      "teacher_policy": {
+        "kind": "roadside_clear",
+        "observation_only": true,
+        "allow_opposite_lane": false,
+        "stay_in_current_clear_lane": true
+      },
+      "success_requirements": [
+        "actual_execution",
+        "same_frame_capture",
+        "collision_free",
+        "on_road",
+        "traffic_rules",
+        "interaction_completed",
+        "recovery_completed",
+        "arrival"
+      ]
+    }
+  ]
+}

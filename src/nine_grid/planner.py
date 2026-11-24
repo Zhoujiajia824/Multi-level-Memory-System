@@ -685,7 +685,9 @@ class Planner:
             else:
                 gap,_=rectangle_gap(initial[None,:],sample[:1],scene.ego.length,scene.ego.width,actor.length,actor.width)
             initial_safety['actor_clearance:'+actor.id]=bool(gap[0]>=clearance-tolerance)
-        initial_safety['noncrossable_line']=all(initial_body.distance(item['geometry'])>=clearance-tolerance for item in physical_lines.values())
+        # 不可跨线约束对应真实车体与实线，不能把对象净空余量当成
+        # 已发生的交通违规。希望保留的净空仍在原软代价中优化。
+        initial_safety['noncrossable_line']=all(not initial_body.intersects(item['geometry']) for item in physical_lines.values())
         if stop_local is not None:
             initial_safety['yield_stop_line']=bool(np.max(project_polyline(np.asarray(initial_body.exterior.coords)[:4],global_reference)[0])<=stop_local+tolerance)
         labels=['road_clearance','nonnegative_speed','speed_limit','jerk','steering_rate','lateral_acceleration']
@@ -703,10 +705,14 @@ class Planner:
             domain_inside=potential_geometry.domain_contains(dense[:,:2])
             line_ok=np.ones(len(dense),bool)
             line_clearance_minimum=np.inf
+            line_buffer_minimum=np.inf
+            line_buffer_shortfall=np.zeros(len(dense),bool)
             for item in physical_lines.values():
                 line_distance=shapely.distance(bodies,item['geometry'])
-                line_clearance_minimum=min(line_clearance_minimum,float((line_distance-clearance).min()))
-                line_ok &= line_distance>=clearance-tolerance
+                line_clearance_minimum=min(line_clearance_minimum,float(line_distance.min()))
+                line_buffer_minimum=min(line_buffer_minimum,float((line_distance-clearance).min()))
+                line_buffer_shortfall |= line_distance<clearance
+                line_ok &= ~shapely.intersects(bodies,item['geometry'])
             actor_ok=np.ones(len(dense),bool);contacts=[];minimum=np.inf
             for actor,sample,_ in targets:
                 other=np.stack([np.interp(times,np.arange(n+1)*dt,sample[:,j]) for j in range(4)],axis=1)
@@ -735,6 +741,8 @@ class Planner:
                 'substep_s':sub_dt,'samples':len(dense),'actor_clearance_min_m':None if not np.isfinite(minimum) else minimum,
                 'offroad_samples':int((~inside).sum()),'line_violation_samples':int((~line_ok).sum()),
                 'line_clearance_min_m':None if not np.isfinite(line_clearance_minimum) else line_clearance_minimum,
+                'line_buffer_margin_min_m':None if not np.isfinite(line_buffer_minimum) else line_buffer_minimum,
+                'line_buffer_shortfall_samples':int(line_buffer_shortfall.sum()),
                 'outside_potential_domain_samples':int((~domain_inside).sum()),
                 'official_completion_evaluated':False,
                 'stop_line_passed':not stop_ok,'predicted_contacts':contacts,
@@ -792,12 +800,13 @@ class Planner:
                 factor=np.sqrt(float(weight)/n)/scale
                 residuals.append(np.asarray(value)*factor);jacobians.append((jac,factor))
                 components[name]=components.get(name,0.)+float(weight)*float(np.sum(np.asarray(value)**2))/n/scale**2
-            def penalty(name,margin,jac,scale=1.):
+            def penalty(name,margin,jac,scale=1.,hard_margin=None):
                 # 正部平方在零点一阶连续；穿透时保留几何导数，不使用截断APF的零梯度。
                 margin=np.asarray(margin);active=margin<0.
                 derivative=lambda c:(jac(c) if callable(jac) else np.asarray(jac))*active[:,None]
                 residual('penalty_'+name,np.minimum(margin,0.),derivative,penalties.get(name,100.),scale)
-                rows.append(jac);lower.append(-margin);upper.append(np.full(len(margin),np.inf))
+                constraint=margin if hard_margin is None else np.asarray(hard_margin)
+                rows.append(jac);lower.append(-constraint);upper.append(np.full(len(margin),np.inf))
             penalty('road_clearance',road_distance.ravel()+tolerance,road_jac)
             domain_inside=field_projection['domain_valid'][1:]
             domain_margin,domain_normal=potential_geometry.domain_clearance(current[:,:2])
@@ -943,13 +952,14 @@ class Planner:
                 # 保留控制节点的原代价；段间物理子步也进入同一硬约束，
                 # 不能只在最终拒绝它们，却让QP看不到修正方向。
                 penalty('noncrossable_line_clearance',signed[node_indices]-clearance,
-                        lambda c,partial=line_partial:np.einsum('ni,nij->nj',partial()[node_indices],c['sens']))
+                        lambda c,partial=line_partial:np.einsum('ni,nij->nj',partial()[node_indices],c['sens']),
+                        hard_margin=signed[node_indices])
                 if len(intermediate_indices):
                     rows.append(lambda c,partial=line_partial:np.einsum(
                         'ni,nij->nj',partial()[intermediate_indices],c['dense'][intermediate_indices]))
-                    lower.append(clearance-signed[intermediate_indices])
+                    lower.append(-signed[intermediate_indices])
                     upper.append(np.full(len(intermediate_indices),np.inf))
-                line_minimum=min(line_minimum,float((signed-clearance).min()))
+                line_minimum=min(line_minimum,float(signed.min()))
             if physical_lines:minima.append(line_minimum)
             if stop_local is not None:
                 # 将完整矩形四角投影到同一导航参考线，转弯/偏航时不能用固定L/2代替车头。
@@ -1043,12 +1053,14 @@ class Planner:
             initial_diagnostics.append({'source':source,'minimum':min(value['minima'].values()),
                 'minimum_by_group':value['minima'],'cost':value['objective'],'cost_terms':value['components']})
         record_initial(nominal,nominal_source)
+        navigation_candidate=None
         initial_reselection={'evaluated':False,'selected':False}
         if not nominal['safety_feasible']:
             initial_reselection.update(evaluated=True,original_violation=nominal['violation'])
             alternatives=[(nominal_source,nominal)]
             if warm:
                 navigation=terms(project(seed()));record_initial(navigation,'navigation_seed')
+                navigation_candidate=navigation
                 alternatives.append(('navigation_seed',navigation))
             # 风险较高时比较同一MPC的减速初值；每条均在本帧重新积分、验收并计价。
             if not any(value['safety_feasible'] for _,value in alternatives):
@@ -1087,8 +1099,30 @@ class Planner:
         trust=np.tile([float(p.get('sqp_trust_acceleration_mps2',1.5)),float(p.get('sqp_trust_steering_rad',.15))],n)
         last_iteration_seconds=0.;iteration_history=[];termination='iteration_limit'
         recovery_speed=float(p.get('warm_start_recovery_speed_mps',.3))
-        recovery={'eligible':bool(warm and stop_local is None and speed<recovery_speed),
-                  'speed_threshold_mps':recovery_speed,'evaluated':False,'selected':False}
+        recovery={'eligible':bool(not _brake_only and warm and speed<recovery_speed),
+                  'speed_threshold_mps':recovery_speed,'evaluated':False,'selected':False,
+                  'phase':'before_first_qp',
+                  'reference_source':'active_goal_seed' if active_goal is not None else 'navigation_seed'}
+        if recovery['eligible']:
+            # 静止暖解的横向敏感度可退化。必须在首次QP之前比较同一
+            # 参考、同一目标函数下的原seed，不能等QP失败或预算耗尽
+            # 后才尝试。候选只做一次完整验收，不强制起步或放宽约束。
+            alternative=navigation_candidate
+            recovery['reused_initial_evaluation']=alternative is not None
+            if alternative is None:
+                alternative=terms(project(seed()));record_initial(alternative,'navigation_seed_recovery')
+            recovery.update(evaluated=True,navigation_seed_valid=bool(alternative['valid']),
+                            navigation_seed_safety_feasible=bool(alternative['safety_feasible']),
+                            navigation_seed_cost=alternative['objective'],warm_candidate_cost=accepted['objective'])
+            if alternative['valid'] and alternative['safety_feasible'] and preference(alternative)<preference(accepted):
+                nominal=accepted=alternative;controls=alternative['controls']
+                nominal_source=initial_guess_source='navigation_seed_recovery'
+                alternative['initialization_source']=nominal_source
+                alternative['candidate_source']='validated_current_initialization'
+                recovery['selected']=True
+                restoration.update(eligible=False,source=None)
+            else:
+                recovery['reason']='not_a_better_feasible_initialization'
         for iteration in range(0 if _brake_only else int(p.get('solver_max_iterations',4))):
             # 至少尝试一次QP；随后预算到期即返回已验收的本帧最佳候选。
             if iteration and time.perf_counter()>=deadline:
@@ -1139,26 +1173,6 @@ class Planner:
                 'qp_residuals':dict(getattr(self.qp,'last_diagnostics',{}))})
             controls=next_nominal['controls'];nominal=next_nominal;last=nominal
             last_iteration_seconds=time.perf_counter()-iteration_started
-            # 低速暖解可能把加速持续推迟到时域尾部。先保留本帧已优化、
-            # 已验收的候选，再比较同一目标下的导航初值，且共享原预算。
-            if iteration==0 and recovery['eligible'] and accepted is not None:
-                if iteration+1>=int(p.get('solver_max_iterations',4)):
-                    recovery['reason']='iteration_limit'
-                elif time.perf_counter()+last_iteration_seconds*1.3+.002>=deadline:
-                    recovery['reason']='wall_budget'
-                else:
-                    alternative=terms(project(seed()));recovery['evaluated']=True
-                    exact=alternative['valid']
-                    recovery.update(navigation_seed_valid=bool(exact),navigation_seed_cost=alternative['objective'],
-                                    warm_candidate_cost=accepted['objective'])
-                    if exact and preference(alternative)<preference(accepted):
-                        controls=alternative['controls'];nominal=alternative
-                        nominal_source='navigation_seed_recovery';recovery['selected']=True
-                        alternative['initialization_source']=nominal_source
-                        alternative['candidate_source']='validated_current_initialization'
-                        accepted=alternative
-                        continue
-                    recovery['reason']='not_a_better_feasible_initialization'
             # 目标变化很小也可能只是停在低速平台，不能据此宣布收敛。
             # 小优化步才允许提前结束；QP残差同时保存以便核查原因。
             if step_norm<1e-5:
@@ -1271,11 +1285,14 @@ class Planner:
         elapsed=time.perf_counter()-started
         diagnostics={'solver_seconds':time.perf_counter()-solver_started,'planning_seconds':elapsed,'solver_status':statuses,
             'planning_object_selection':object_selection,'execution_mode':execution_mode,
+            'noncrossable_line_policy':{'hard':'physical_body_must_not_intersect_line',
+                'buffer_m':clearance,'buffer_role':'original_soft_cost_only',
+                'physical_crossing_never_accepted':True},
             'potential_field':{'version':'lane-frenet-center-ellipse-1.0','coordinates':'lane_frenet',
                 'kernel':'(1-rho)^3*(1+3*rho+6*rho^2) for rho<1; zero otherwise',
                 'sampling_point':'ego_center','source_shape':'lane_aligned_center_ellipse',
                 'physical_dimensions_used_for_potential':False,'physical_collision_constraints_retained':True,
-                'line_treatment':'full_body_geometric_constraints; no_line_APF',
+                'line_treatment':'full_body_noncrossing_hard_constraint; clearance_buffer_soft_cost; no_line_APF',
                 'domain':domain_evidence,'invalid_samples':accepted['potential_invalid_samples'],
                 'geometry':potential_geometry.diagnostics,'source_projection_uncovered_samples':source_coverage,
                 'reference_coverage':potential_reference_evidence,

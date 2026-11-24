@@ -23,6 +23,7 @@ from typing import Any
 
 TIME_TOLERANCE = 1e-6
 _STREAMS = ("plans", "frames", "timing", "model_inputs", "model_outputs",
+            "reflection_inputs", "reflection_outputs", "reflection_plans", "reflection_retrieval",
             "fast", "answers", "retrieval", "quality", "goals",
             "execution_audit", "predictions", "evaluation_events")
 _PRUNE = {".git", "node_modules", "__pycache__", ".venv", "venv", ".pytest_cache"}
@@ -463,6 +464,7 @@ class EpisodeStore:
                         model_event_indices=[frame["index"] for frame in frames
                                              if frame["frame_id"] in episode.streams["model_inputs"].by_frame],
                         model_events=[dict(frame_id=r.frame_id, time=r.time) for r in episode.streams["model_outputs"].records],
+                        reflection_events=[dict(frame_id=r.frame_id, time=r.time) for r in episode.streams["reflection_outputs"].records],
                         source_frames=[f["index"] for f in frames if f["camera_available"] or f["captured"]],
                         warnings=[w for stream in episode.streams.values() for w in stream.warnings],
                         alignment_policy="exact frame_id and source time; no nearest-frame camera substitution")
@@ -581,17 +583,32 @@ class EpisodeStore:
                 cameras.append(dict(view="highway_topdown", path=assets["highway_topdown"], image=assets["highway_topdown"],
                                     frame_id=frame_id, time=timestamp, source_time=timestamp, aligned=True, calibrated=False))
             model_input, model_output, retrieval = exact("model_inputs"), exact("model_outputs"), exact("retrieval")
+            fast_model_input, fast_model_output = model_input, model_output
+            reflection_input, reflection_output = exact("reflection_inputs"), exact("reflection_outputs")
+            reflection_retrieval = exact("reflection_retrieval")
             answer_source = (plan_record or {}).get("answer_source")
+            answer_role = ((plan_record or {}).get("answer_role") or
+                           ((plan or {}).get("diagnostics", {}).get("model_contract", {}).get("active_role")))
+            input_stream, output_stream = (("reflection_inputs", "reflection_outputs") if answer_role == "reflection"
+                                           else ("model_inputs", "model_outputs"))
+            if answer_role == "reflection" and answer_source == frame_id:
+                model_input, model_output = reflection_input, reflection_output
             active_model_input, active_model_output, active_retrieval = None, None, None
+            active_reflection_retrieval = None
             if answer_source and answer_source != frame_id:
                 # Explicit planner binding, never simply "most recent output".
-                source_ref = episode.streams["model_inputs"].by_frame.get(answer_source) or episode.streams["plans"].by_frame.get(answer_source)
+                source_ref = (episode.streams["plans"].by_frame.get(answer_source) or
+                              episode.streams["frames"].by_frame.get(answer_source))
+                if source_ref is None and answer_role != "reflection":
+                    source_ref = episode.streams[input_stream].by_frame.get(answer_source)
                 source_time = source_ref.time if source_ref else None
                 if source_time is not None and timestamp is not None and source_time <= timestamp:
-                    active_model_input = exact("model_inputs", answer_source, source_time)
-                    active_model_output = exact("model_outputs", answer_source, source_time)
+                    active_model_input = exact(input_stream, answer_source, source_time)
+                    active_model_output = exact(output_stream, answer_source, source_time)
                     active_retrieval = exact("retrieval", answer_source, source_time)
-            if model_output is None:
+                    if answer_role == "reflection":
+                        active_reflection_retrieval = exact("reflection_retrieval", answer_source, source_time)
+            if model_output is None and answer_role != "reflection":
                 model_output = exact("answers") or exact("fast")
             for model_payload in (model_input, active_model_input):
                 if isinstance(model_payload, dict):
@@ -607,8 +624,13 @@ class EpisodeStore:
                           ego=ego, actors=actors, plan=plan, plan_record=plan_record,
                           scene=scene, map=map_data, rules=scene.get("rules"),
                           model_input=model_input, model_output=model_output,
+                          fast_model_input=fast_model_input, fast_model_output=fast_model_output,
+                          reflection_input=reflection_input, reflection_output=reflection_output,
+                          reflection_plan=exact("reflection_plans"),
+                          reflection_retrieval=reflection_retrieval,
+                          active_reflection_retrieval=active_reflection_retrieval,
                           active_model_input=active_model_input, active_model_output=active_model_output,
-                          model_source_frame_id=answer_source, retrieval=retrieval,
+                          model_source_frame_id=answer_source, model_source_role=answer_role, retrieval=retrieval,
                           active_retrieval=active_retrieval, timing=exact("timing"), quality=quality,
                           predictions=exact("predictions"), execution_audit=exact("execution_audit"),
                           goals=exact("goals"), cameras=cameras, assets=assets,
