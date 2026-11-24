@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+from functools import lru_cache
 
 from .episodes import _Episode, _Record, _disk, _finite, _inside, _stat
 
@@ -36,6 +37,57 @@ _RUN_METRICS = (
 def _stage(value):
     return {"original": "stage_one", "synthetic": "stage_two",
             "stage_one": "stage_one", "stage_two": "stage_two"}.get(str(value).lower())
+
+
+@lru_cache(maxsize=1)
+def _legacy_geometry_decoder():
+    # Load only the transport helper, without modifying sys.path or importing
+    # the SDK, core package, planner, or evaluator into this viewer process.
+    import importlib.util
+    path = Path(__file__).resolve().parents[3] / "src/ep_driver_navsim/geometry_transfer.py"
+    if not path.is_file():
+        raise ValueError("Legacy NAVSIM geometry recovery requires the repository transport helper")
+    spec = importlib.util.spec_from_file_location("_epviz_navsim_geometry_transfer", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.decode_drivable
+
+
+def _drivable(packet):
+    """Decode archived binary roads locally, without importing a planner runtime.
+
+    GeoJSON carries Python's round-trippable float coordinates to the diagnostic
+    renderer. Converting back to WKT would reintroduce the collapsed-hole bug.
+    """
+    if "drivable_geometry" not in packet:
+        text = packet.get("drivable_wkt")
+        if text is None:
+            return None
+        import shapely
+        if shapely.from_wkt(text).is_valid:
+            return text
+        from shapely.geometry import mapping
+        geometry, evidence = _legacy_geometry_decoder()(packet)
+        return dict(mapping(geometry), geometry_transfer=evidence)
+    if "drivable_wkt" in packet:
+        raise ValueError("Archived NAVSIM packet has two conflicting road encodings")
+    wire = packet["drivable_geometry"]
+    if (not isinstance(wire, dict) or set(wire) != {"encoding", "data", "sha256"}
+            or wire.get("encoding") != "wkb_hex_float64_le_2d" or not isinstance(wire.get("data"), str)):
+        raise ValueError("Unrecognized archived NAVSIM road encoding")
+    raw = bytes.fromhex(wire["data"])
+    if hashlib.sha256(raw).hexdigest() != wire["sha256"]:
+        raise ValueError("Archived NAVSIM road checksum differs")
+    import numpy as np
+    import shapely
+    from shapely.geometry import mapping
+    geometry = shapely.from_wkb(raw)
+    if (geometry.geom_type not in ("Polygon", "MultiPolygon") or geometry.is_empty
+            or not geometry.is_valid or geometry.area <= 0 or shapely.has_z(geometry)
+            or not np.isfinite(shapely.get_coordinates(geometry)).all()
+            or shapely.to_wkb(geometry, byte_order=1, output_dimension=2) != raw):
+        raise ValueError("Archived NAVSIM binary road geometry is invalid")
+    return mapping(geometry)
 
 
 class NavsimRun(_Episode):
@@ -154,7 +206,7 @@ class NavsimRun(_Episode):
 def _compact(value):
     """Keep text/metadata, omit embedded map, history and feature tensors."""
     bulky = {"history", "lanes", "route", "predictions", "parameters",
-             "embedding", "features", "states", "controls", "drivable_wkt",
+             "embedding", "features", "states", "controls", "drivable_wkt", "drivable_geometry",
              "visibility_wkt", "planning_scope", "iteration_history", "_representations",
              "representations", "scene", "raw_observation"}
     if isinstance(value, dict):
@@ -532,7 +584,7 @@ class NavsimEpisode(_Episode):
                         source="official_simulated_execution_not_replanning")
         map_data = {k: packet.get(k) for k in ("lanes", "route", "route_lane_ids")}
         scene = dict(**map_data, frame_id=record.frame_id, time=record.time, ego=ego, actors=actors,
-                     drivable=packet.get("drivable_wkt"), rules=packet.get("rules") if index == 0 else None,
+                     drivable=_drivable(packet), rules=packet.get("rules") if index == 0 else None,
                      diagnostics=packet.get("diagnostics", {}) if index == 0 else {},
                      coordinates="fixed_source_rear_axle_local_xy_m;x_forward_y_left")
         assets = {}

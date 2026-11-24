@@ -14,6 +14,7 @@ from shapely.ops import unary_union
 
 from . import INPUT_PROTOCOL, INPUT_CONDITION
 from .protocol import transform_points, rotate_vectors, validate_packet, wrap, HORIZON_S
+from .geometry_transfer import drivable_roundtrip
 
 CAMERAS = ("cam_f0", "cam_l0", "cam_l1", "cam_l2", "cam_r0", "cam_r1", "cam_r2", "cam_b0")
 KINDS = {"vehicle": "vehicle", "bicycle": "bicycle", "pedestrian": "pedestrian",
@@ -61,6 +62,7 @@ def navigation_ego(rear_axle_velocity, yaw_rate, vehicle=None):
 def validate_navigation_initialization(ego, lanes, route, ids, road, association, yaw_rate, token):
     """One producer/validator path for full packets and image-free preflight."""
     from types import SimpleNamespace as NS
+    road, _, geometry_evidence = drivable_roundtrip(road)
     from nine_grid.navigation_initialization import build_initialization,initialization_geometry
     route,record = build_initialization(ego,lanes,route,ids,road,association,yaw_rate=yaw_rate)
     snapshot = NS(scenario='navsim',frame_id=str(token),time=0.,assets={},
@@ -94,6 +96,7 @@ def validate_navigation_initialization(ego, lanes, route, ids, road, association
     record['reference_quality_reasons']=sorted(set(reasons))
     record['input_contract']='causal_finite_current_state_directed_public_topology_and_coordinate_attachments'
     record['reference_feasibility_is_input_gate']=False
+    record['geometry_transfer'] = geometry_evidence
     # Preflight used to validate lane chains without constructing their final
     # lane/map intersection. Check the identical domain builder before images,
     # DINO or model calls, so numeric overlay failures are not discovered late.
@@ -382,6 +385,7 @@ def _map_packet(map_api, origin, roadblock_ids, desired_speed_mps, map_radius_m,
     road = unary_union([_local_shape(obj.polygon, origin) for layer in road_layers for obj in nearby[layer]])
     if road.is_empty or not road.is_valid or road.area <= 0:
         raise ValueError('NAVSIM official drivable road layers are empty or invalid')
+    road, _, _ = drivable_roundtrip(road)
     crosswalks = [np.asarray(_local_shape(obj.polygon, origin).exterior.coords).tolist()
                   for obj in nearby[SemanticMapLayer.CROSSWALK]]
     return lanes, route, ids, current_id, road, crosswalks, lane_objects, skipped, route_evidence
@@ -530,6 +534,7 @@ def build_packet(agent_input, scene, camera_dir, desired_speed_mps=10.0, map_rad
     route_s = _project(route, ego["position"])[0]
     speed_limit = next(lane["speed_limit"] for lane in lanes if lane["id"] == current)
     stop_s = min(stops) if stops else None
+    road, drivable_geometry, geometry_evidence = drivable_roundtrip(road)
     return validate_packet(dict(protocol=INPUT_PROTOCOL, input_condition=INPUT_CONDITION,
         identity=dict(token=str(now.token), log_name=metadata.log_name, scene_token=metadata.scene_token,
                       map_name=metadata.map_name, timestamp_us=int(now.timestamp), history_frames=4,
@@ -538,7 +543,7 @@ def build_packet(agent_input, scene, camera_dir, desired_speed_mps=10.0, map_rad
                       corresponding_original_initial_token=metadata.corresponding_original_initial_token),
         vehicle=dict(length_m=float(vehicle.length), width_m=float(vehicle.width),
                      wheelbase_m=float(vehicle.wheel_base), rear_axle_to_center_m=rear),
-        ego=ego, actors=actors, lanes=lanes, route=route.tolist(), route_lane_ids=ids, drivable_wkt=road.wkt,
+        ego=ego, actors=actors, lanes=lanes, route=route.tolist(), route_lane_ids=ids, drivable_geometry=drivable_geometry,
         rules=dict(desired_speed=min(desired_speed_mps, speed_limit), speed_limit=speed_limit,
                    navigation_command=command,
                    must_wait=stop_s is not None, wait_reason="red_light" if stop_s is not None else None,
@@ -546,7 +551,8 @@ def build_packet(agent_input, scene, camera_dir, desired_speed_mps=10.0, map_rad
                    map_available=dict(crosswalk=True, traffic_light=True, stop_line=True),
                    road_priority_available=False),
         diagnostics=dict(route_s=route_s, reference_anchor_s=route_s, stable_navigation_lane_id=current,
-            lane_map_complete=True, reference_revision=0, has_occlusion=False, visibility_wkt=road.wkt,
+            lane_map_complete=True, reference_revision=0, has_occlusion=False,
+            visibility_source='scene_drivable_no_occlusion', geometry_transfer=geometry_evidence,
             lane_map_complete_scope="local_map_query_radius_%gm" % map_radius_m,
             available_observation_history_s=float((ts[-1]-ts[0])/1e6),
             observation_policy=INPUT_CONDITION, previous_control=[float(np.clip(acceleration[0], -6, 3)),

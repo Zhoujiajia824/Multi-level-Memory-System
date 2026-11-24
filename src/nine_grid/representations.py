@@ -179,7 +179,9 @@ def _adjacent_road_evidence(scene, current, lanes, side, settings):
 def _visibility_geometry(scene):
     """保留相机可见域的孔洞和分离区域；新证据损坏时不退回旧的全覆盖多边形。"""
     try:
-        if 'visibility_wkt' in scene.diagnostics:
+        if scene.diagnostics.get('visibility_source') == 'scene_drivable_no_occlusion':
+            geometry=scene.drivable
+        elif 'visibility_wkt' in scene.diagnostics:
             raw=scene.diagnostics['visibility_wkt']
             if not isinstance(raw,str):
                 return None

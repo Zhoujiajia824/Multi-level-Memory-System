@@ -9,7 +9,7 @@ import tempfile
 import numpy as np
 from nine_grid.paths import filesystem_path
 
-from . import INPUT_PROTOCOL, INPUT_CONDITION
+from . import INPUT_PROTOCOL, LEGACY_INPUT_PROTOCOL, INPUT_CONDITION
 
 HORIZON_S = 4.0
 PLANNING_STEP_S = 0.1
@@ -113,8 +113,12 @@ def rotate_vectors(values, angle):
 def validate_packet(packet):
     """No Scene/pickle/metric cache is ever sent to the numerical process."""
     expected = {"protocol", "input_condition", "identity", "vehicle", "ego", "actors", "lanes",
-                "route", "route_lane_ids", "drivable_wkt", "rules", "diagnostics", "camera_images"}
-    if set(packet) != expected or packet["protocol"] != INPUT_PROTOCOL:
+                "route", "route_lane_ids", "rules", "diagnostics", "camera_images"}
+    protocol = packet.get("protocol")
+    if protocol not in (INPUT_PROTOCOL, LEGACY_INPUT_PROTOCOL):
+        raise ValueError("Unknown NAVSIM interchange schema")
+    expected.add("drivable_geometry" if protocol == INPUT_PROTOCOL else "drivable_wkt")
+    if set(packet) != expected:
         raise ValueError("Unknown NAVSIM interchange schema")
     if packet["input_condition"] != INPUT_CONDITION:
         raise ValueError("This adapter supports the explicitly privileged input condition only")
@@ -139,6 +143,8 @@ def validate_packet(packet):
             raise ValueError("Camera does not belong to the current anchor")
     # Recursively reject NaN/Infinity, including map coordinates and rule data.
     json.dumps(packet, allow_nan=False)
+    from .geometry_transfer import decode_drivable
+    decode_drivable(packet)
     return packet
 
 

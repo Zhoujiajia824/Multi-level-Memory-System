@@ -84,6 +84,8 @@ def planning_config(parameters, dino_model):
 
 def snapshot_from_packet(packet, config):
     packet = validate_packet(packet)
+    from .geometry_transfer import decode_drivable
+    road, geometry_evidence = decode_drivable(packet)
     def actor(row):
         row = copy.deepcopy(row)
         for key in ("position", "velocity", "acceleration"):
@@ -97,12 +99,17 @@ def snapshot_from_packet(packet, config):
         lanes.append(Lane(**row))
     identity = packet["identity"]
     diagnostics = copy.deepcopy(packet["diagnostics"])
+    diagnostics["geometry_transfer"] = geometry_evidence
+    if (diagnostics.get("has_occlusion") is False and "drivable_wkt" in packet
+            and diagnostics.get("visibility_wkt") == packet["drivable_wkt"]):
+        diagnostics.pop("visibility_wkt")
+        diagnostics["visibility_source"] = "scene_drivable_no_occlusion"
     diagnostics["bev_label_options"] = config["bev"]["labels"]
     diagnostics["planning_objects_config"] = config["planning_objects"]
     diagnostics["navsim_identity"] = identity
     return SceneSnapshot(identity["token"], 0.0, actor(packet["ego"]),
         [actor(row) for row in packet["actors"]], lanes, np.asarray(packet["route"], float),
-        packet["route_lane_ids"], shapely.from_wkt(packet["drivable_wkt"]), "navsim",
+        packet["route_lane_ids"], road, "navsim",
         rules=copy.deepcopy(packet["rules"]), assets={"camera_images": packet["camera_images"]},
         diagnostics=diagnostics)
 
