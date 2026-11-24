@@ -61,6 +61,9 @@
 !/config/fail2drive_demonstrations.json
 !/scripts/capture_fail2drive_demo.py
 !/scripts/build_fail2drive_demo_memory.py
+!/config/fail2drive_official_demonstrations.json
+!/scripts/capture_fail2drive_official.py
+!/scripts/build_fail2drive_official_memory.py
 
 # 仅发布运行需要的DINOv2 Base，权重由Git LFS管理。
 /models/*

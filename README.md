@@ -559,7 +559,41 @@ CARLA围栏、护栏、墙、杆、灯牌不当作交通障碍物。`Static/Othe
 highway-env每个低频模型源帧保存无规划叠加的原生俯视图，输入顺序为原生俯视图、BEV；前者世界x向右/y向下，自车不固定朝上，后者自车朝上。CARLA保持同帧六RGB拼图、BEV。所有图像绑定同一冻结帧，采图不推进仿真。`model_inputs.jsonl`记录实际入模ID、车道范围ID、BEV动态ID及范围外补充ID；完整原始快照独立留存。
 
 本地离线检查：`python scripts/regression_model_perception_scope.py`、`python scripts/check_lane_object_scope.py`、`python scripts/check_model_object_scope.py`、`python scripts/check_highway_model_camera.py`。CARLA另有`python scripts/check_carla_object_categories.py`；离线通过不代替真实模型或服务器闭环实验。
-# 独立长尾示范采集（开发数据，不是官方评测）
+# 官方原场景专家示范采集
+
+按官方原始场景收集经验时，使用 `scripts/capture_fail2drive_official.py`。
+它复用锁定版本的官方 evaluator、原始路线 XML、定制 CARLA 资产、地图、自车车型、
+天气、周车脚本、事件条件和随机种子，只把自车 Agent 替换为独立的官方 AutoPilot
+专家适配器；不修改官方源码、评分或60秒清障等待，不使用下节的 Town05 代理场景。
+evaluator 独占世界推进；采集 Agent 不创建或删除周车、不修改灯态、不启动 CARLA。
+专家的场景记账及随机数隔离，禁用原专家删除异常周车和卡住后强制油门的行为。
+这是程序专家示范，不标作真实人类驾驶；同一行为程序中的周车也会因自车行为不同而
+改变触发时刻及位置，不能承诺逐帧轨迹相同。
+
+`config/fail2drive_official_demonstrations.json` 默认选择每类一条原始 Generalization
+路线，共17条；`--list` 可直接列出。需要与某条实际测评路线完全对应时，使用
+`--route-ids <原始路线ID...>`，并采用相同 seed；一类的一条示范不代表该类所有路线。
+`--family BadParking` 选单类，`--all-families` 选17条。入口默认只预检并打印计划，
+缺少原始源码、速度数据、定制模拟器或SDK身份时直接失败，只有显式 `--run` 才启动
+官方 evaluator。必须先由用户启动专用官方 CARLA；不新建Python环境。
+每次使用本分支 `output/official_demonstrations/` 下的新目录，保留原路线、源码、
+实际车辆、配置、seed、命令和文件哈希，拒绝覆盖旧采集。
+
+采集保留1Hz真实六相机拼图、各相机原始同帧外参、当前公开状态，以及20Hz实际自车
+状态/踏板和1920×1080官方示例视角视频。公开模型输入不包含专家读取的隐藏场景记账。
+`scripts/build_fail2drive_official_memory.py finalize --capture <实际轮次目录>
+--checkpoint <官方结果JSON> --launch <本轮launch.json>` 在官方结算后核验并导出。
+只有完整官方路线成功、没有官方违规、Agent/资源及视频检查通过的采集才能进入
+`check` / `prepare`；保留失败证据，不能改成成功。官方整轮评分不是逐物理帧独立安全证明。
+
+`prepare --captures <已finalize采集目录> --output-dir <新build>
+--workbench-root <已有offline_memory_builder目录>` 复用原工作台，按真实制动、转向和
+重新起步选择最多3个具有后续3秒证据的锚点；仍需真实DINO、部署教师标注、人工审核
+和冻结发布。正式论文 Agent/MPC 不调用专家；新库仅由显式反思检索入口读取。
+在测评原路线采集再辅助同场景测评，应披露为已知场景示范辅助，不能当成未见路线
+零样本泛化成绩；也不保证检索到一条记忆就一定通行。
+
+# 旧独立长尾示范采集（代理开发数据）
 
 `config/fail2drive_demonstrations.json` 为17类机制各定义一项独立设计；配置中的
 `pending_execution` 不是成功经验。使用标准CARLA资产和独立开发地图，不读取正式

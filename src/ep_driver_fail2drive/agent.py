@@ -39,6 +39,8 @@ def _control_record(control):
 
 
 class EPDriverFail2DriveAgent(AutonomousAgent):
+    execution_modes = ("A_base", "B_model")
+
     def __init__(self, carla_host, carla_port, debug=False):
         super().__init__(carla_host, carla_port, debug)
         self.archive = None
@@ -67,7 +69,7 @@ class EPDriverFail2DriveAgent(AutonomousAgent):
         if type(model_hz) not in (int, float) or model_hz != 1:
             raise ValueError("this adapter uses 1Hz model source snapshots")
         self.execution_mode = self.config.get("execution_mode", "B_model")
-        if self.execution_mode not in ("A_base", "B_model"):
+        if self.execution_mode not in self.execution_modes:
             raise ValueError("Fail2Drive execution_mode must be A_base or B_model, without memory retrieval/writes")
         self.config_path = str(Path(path_to_conf_file).resolve())
         # Install before AgentWrapper creates sensors. Preserve the official
@@ -186,9 +188,13 @@ class EPDriverFail2DriveAgent(AutonomousAgent):
         self.controller = SignedAccelerationController(physical_steering, dt=1/PHYSICS_HZ,
             acceleration_min=minimum, acceleration_max=maximum,
             steering_rate=float(execution.get("steering_rate", .8)), settings=execution.get("longitudinal", {}))
-        self.worker = WorkerClient(self.config["worker_python"], self.config_path,
-                                   self.archive.directory/"worker.log", self.config.get("worker_timeout_s", 240))
+        self.worker = self._create_worker()
         self.first_frame = snapshot.frame
+
+    def _create_worker(self):
+        """Formal driving always uses the paper planner; demos override only this factory."""
+        return WorkerClient(self.config["worker_python"], self.config_path,
+                            self.archive.directory/"worker.log", self.config.get("worker_timeout_s", 240))
 
     def run_step(self, input_data, timestamp):
         started = time.monotonic()

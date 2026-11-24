@@ -1,0 +1,115 @@
+{
+  "schema": "fail2drive-official-demonstrations-1.0",
+  "official_commit": "bceb18afb7d62e06e990739e013e750d92ad7a88",
+  "purpose": "demonstration_only",
+  "scenario_mutations": false,
+  "ego_driver": "official_autopilot",
+  "selection_policy": "one_original_generalization_route_per_family; explicit_original_route_ids_supported",
+  "world_policy": "unmodified_official_evaluator_creates_map_ego_NPC_weather_events_and_score",
+  "data_use": "targeted_seen_scenario_demonstration",
+  "validation_status": "pending_actual_official_closed_loop_and_human_review",
+  "demonstrations": [
+    {
+      "family": "Wall",
+      "route_id": 1095,
+      "routes": "fail2drive_split/Generalization_Wall_1095.xml",
+      "scenario_types": ["RoadBlocked"]
+    },
+    {
+      "family": "FullyBlocked",
+      "route_id": 1030,
+      "routes": "fail2drive_split/Generalization_FullyBlocked_1030.xml",
+      "scenario_types": ["RoadBlocked"]
+    },
+    {
+      "family": "PedestriansOnRoad",
+      "route_id": 1085,
+      "routes": "fail2drive_split/Generalization_PedestriansOnRoad_1085.xml",
+      "scenario_types": ["PedestriansOnRoad"]
+    },
+    {
+      "family": "ConstructionPedestrian",
+      "route_id": 1010,
+      "routes": "fail2drive_split/Generalization_ConstructionPedestrian_1010.xml",
+      "scenario_types": ["ConstructionObstaclePedestrian"]
+    },
+    {
+      "family": "BadParking",
+      "route_id": 1000,
+      "routes": "fail2drive_split/Generalization_BadParking_1000.xml",
+      "scenario_types": ["BadParkingObstacle"]
+    },
+    {
+      "family": "ConstructionPermutations",
+      "route_id": 1015,
+      "routes": "fail2drive_split/Generalization_ConstructionPermutations_1015.xml",
+      "scenario_types": ["PermutedConstructionObstacleTwoWays"]
+    },
+    {
+      "family": "CustomObstacles",
+      "route_id": 1020,
+      "routes": "fail2drive_split/Generalization_CustomObstacles_1020.xml",
+      "scenario_types": ["CustomObstacleTwoWays"]
+    },
+    {
+      "family": "ObscuredStop",
+      "route_id": 1045,
+      "routes": "fail2drive_split/Generalization_ObscuredStop_1045.xml",
+      "scenario_types": ["ObscuredStopSign"]
+    },
+    {
+      "family": "HardBrake",
+      "route_id": 1035,
+      "routes": "fail2drive_split/Generalization_HardBrake_1035.xml",
+      "scenario_types": ["HardBrakeNoLights"]
+    },
+    {
+      "family": "RightOfWay",
+      "route_id": 1055,
+      "routes": "fail2drive_split/Generalization_RightOfWay_1055.xml",
+      "scenario_types": ["NormalVehicleRunningRedLight"]
+    },
+    {
+      "family": "Animals",
+      "route_id": 1075,
+      "routes": "fail2drive_split/Generalization_Animals_1075.xml",
+      "scenario_types": ["DynamicObjectCrossing"]
+    },
+    {
+      "family": "PedestrianOtherBlocker",
+      "route_id": 1070,
+      "routes": "fail2drive_split/Generalization_PedestrianOtherBlocker_1070.xml",
+      "scenario_types": ["DynamicObjectCrossing"]
+    },
+    {
+      "family": "RightConstruction",
+      "route_id": 1090,
+      "routes": "fail2drive_split/Generalization_RightConstruction_1090.xml",
+      "scenario_types": ["ConstructionObstacleRightLane"]
+    },
+    {
+      "family": "OppositeConstruction",
+      "route_id": 1050,
+      "routes": "fail2drive_split/Generalization_OppositeConstruction_1050.xml",
+      "scenario_types": ["ConstructionObstacleOppositeLane"]
+    },
+    {
+      "family": "ImageOnObject",
+      "route_id": 1040,
+      "routes": "fail2drive_split/Generalization_ImageOnObject_1040.xml",
+      "scenario_types": ["ImageOnObject"]
+    },
+    {
+      "family": "PassableObstacles",
+      "route_id": 1060,
+      "routes": "fail2drive_split/Generalization_PassableObstacles_1060.xml",
+      "scenario_types": ["CustomObstacle"]
+    },
+    {
+      "family": "PedestrianCrowd",
+      "route_id": 1065,
+      "routes": "fail2drive_split/Generalization_PedestrianCrowd_1065.xml",
+      "scenario_types": ["VehicleOpensDoorTwoWays", "PedestrianCrowd"]
+    }
+  ]
+}
