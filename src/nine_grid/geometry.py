@@ -2,7 +2,67 @@
 from __future__ import annotations
 
 import numpy as np
+import shapely
 from shapely.geometry import Point, Polygon
+
+
+class PolygonalGeometryError(ValueError):
+    """Invalid source area cannot be silently repaired into driving permission."""
+    def __init__(self, message, evidence):
+        super().__init__(message)
+        self.evidence = evidence
+
+
+def polygonal_area(geometry, *, context='geometry', require_nonempty=True):
+    """Return the exact union of every valid two-dimensional component.
+
+    Overlay can return a GeometryCollection containing road area and isolated
+    touching edges/points. Those lower-dimensional pieces are not drivable
+    surface. Polygon shells, holes and disconnected areas are all retained;
+    no hull, buffer, snapping, area threshold or invalid-ring repair is used.
+    Physical lane/marking boundaries remain a separate, unchanged contract.
+    """
+    evidence = dict(version='exact-polygonal-area-1.0', context=context,
+        source_type=getattr(geometry, 'geom_type', None), polygon_components=0,
+        interior_rings=0, empty_components=0, lower_dimensional_components={},
+        lower_dimensional_length_m=0., policy='all_polygon_components_union;no_buffer_hull_snap_or_ring_repair')
+    def reject(reason):
+        evidence['rejection'] = reason
+        raise PolygonalGeometryError(context+': '+reason, evidence)
+    if geometry is None or not hasattr(geometry, 'geom_type'):
+        reject('missing geometry')
+    coordinates=shapely.get_coordinates(geometry)
+    if not np.isfinite(coordinates).all():
+        reject('nonfinite coordinates')
+    parts=[]
+    def visit(item):
+        if item.is_empty:
+            evidence['empty_components'] += 1
+        elif item.geom_type == 'Polygon':
+            if not item.is_valid:
+                reject('invalid source polygon: '+str(shapely.is_valid_reason(item)))
+            parts.append(item)
+            evidence['polygon_components'] += 1
+            evidence['interior_rings'] += len(item.interiors)
+        elif item.geom_type in ('MultiPolygon', 'GeometryCollection'):
+            for child in item.geoms:
+                visit(child)
+        elif item.geom_type in ('LineString', 'LinearRing', 'MultiLineString', 'Point', 'MultiPoint'):
+            counts=evidence['lower_dimensional_components']
+            counts[item.geom_type]=counts.get(item.geom_type,0)+1
+            evidence['lower_dimensional_length_m'] += float(item.length)
+        else:
+            reject('unsupported component type: '+item.geom_type)
+    visit(geometry)
+    result=shapely.union_all(parts) if len(parts)>1 else parts[0] if parts else Polygon()
+    if result.is_empty:
+        if require_nonempty:
+            reject('no two-dimensional area')
+    elif result.geom_type not in ('Polygon','MultiPolygon') or not result.is_valid:
+        reject('polygon component union is not a valid polygonal area')
+    evidence.update(result_type=result.geom_type,area_m2=float(result.area),
+                    lower_dimensions_are_driving_surface=False,physical_boundaries_unchanged=True)
+    return result,evidence
 
 
 def wrap_angle(angle):

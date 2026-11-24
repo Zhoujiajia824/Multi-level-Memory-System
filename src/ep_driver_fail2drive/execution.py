@@ -140,7 +140,7 @@ class SignedAccelerationController:
     throttle/brake是执行器归一化输入，前馈增益仍须真实CARLA闭环验收。
     不依赖Ackermann内部将速度误差两次积分后才改变踏板的响应。
     """
-    VERSION = 'signed-acceleration-feedforward-1.1'
+    VERSION = 'signed-acceleration-feedforward-1.2'
 
     def __init__(self, maximum_steering_rad, dt=.02, acceleration_min=-6.,
                  acceleration_max=3., steering_rate=.8, settings=None):
@@ -228,7 +228,10 @@ class SignedAccelerationController:
             # 有明确制动意图时不能由滞后的正速度误差或积分生成油门。
             # 仍允许反馈减弱过强制动；下界只保留明确的制动方向，不能反向给油。
             requested_acceleration = min(requested_acceleration, .25*acceleration)
-        hold = (intent <= 0 and target_speed <= cfg['stop_speed_mps'] and
+        # The feedback deadband filters integral resets, not a request to stop.
+        # Even a small positive planned acceleration must release the holding
+        # brake; otherwise low-speed replans continually erase the start effort.
+        hold = (acceleration <= 1e-8 and target_speed <= cfg['stop_speed_mps'] and
                 abs(measured_speed) <= cfg['stop_speed_mps'])
         throttle = max(0., min(1., requested_acceleration/cfg['throttle_full_acceleration_mps2']))
         brake = max(0., min(1., -requested_acceleration/cfg['brake_full_deceleration_mps2']))

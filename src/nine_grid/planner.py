@@ -106,6 +106,16 @@ def _following_speed_with_slope(net_gap, lead_speed, minimum_gap, headway, braki
     return desired,np.where(np.isfinite(gap),derivative,0.)
 
 
+def _reference_heading_curvature(points,arc):
+    """Both derivatives use metric arc length, including nonuniform map vertices."""
+    points=np.asarray(points,float);arc=np.asarray(arc,float)
+    if len(points)<2 or not np.all(np.diff(arc)>0.):
+        raise ValueError('参考弧长必须严格递增，不能按样本序号替代米制距离')
+    derivative=np.gradient(points,arc,axis=0)
+    heading=np.unwrap(np.arctan2(derivative[:,1],derivative[:,0]))
+    return heading,np.gradient(heading,arc)
+
+
 def _project_executable_controls(controls,speed,dt,min_a,max_a,max_delta):
     """只投影执行必需的控制箱和非负速度，不混入舒适度或地图约束。"""
     result=np.asarray(controls,float).copy()
@@ -296,6 +306,12 @@ class Planner:
         braking=float(self.config.get("rules",{}).get("comfort_braking_mps2",3.))
         origin=scene.ego.position.copy();angle=scene.ego.heading
         speed=float(np.linalg.norm(scene.ego.velocity));initial=np.array([0.,0.,0.,speed])
+        execution_margin=float(p.get('execution_clearance_margin_m',.10 if scene.scenario=='fail2drive' else 0.))
+        execution_build=float(p.get('execution_clearance_build_s',1.))
+        execution_weight=float(p.get('execution_clearance_weight',1000.))
+        if (not np.isfinite([execution_margin,execution_build,execution_weight]).all()
+                or execution_margin<0. or execution_build<=0. or execution_weight<0.):
+            raise ValueError('执行净空余量必须有限非负，建立时间必须为正')
         build_seconds=0.
         dynamics_key=(n,dt,self.substeps,wheelbase,rear)
         if not hasattr(self,'dynamics') or self.dynamics_key!=dynamics_key:
@@ -361,8 +377,7 @@ class Planner:
         reference_world,_=_reference_window(selection.world_path,local_begin,local_end)
         reference=world_to_ego(reference_world,origin,angle)
         local_s0=project_polyline([0.,0.],reference)[0];reference_arc=polyline_lengths(reference)
-        tangents=np.unwrap(np.arctan2(np.gradient(reference[:,1]),np.gradient(reference[:,0])))
-        signed_curvature=np.gradient(tangents,np.maximum.accumulate(reference_arc+np.arange(len(reference_arc))*1e-9))
+        tangents,signed_curvature=_reference_heading_curvature(reference,reference_arc)
         curve_acceleration=float(self.config.get('rules',{}).get('curve_reference_lateral_acceleration_mps2',3.5))
         speed_profile=np.minimum(float(scene.rules.get('desired_speed',25.)),np.sqrt(curve_acceleration/np.maximum(np.abs(signed_curvature),.001)))
         for k in range(len(speed_profile)-2,-1,-1):
@@ -398,8 +413,7 @@ class Planner:
         else:
             seed_reference=clean_polyline(world_to_ego(seed_world,origin,angle))
             seed_arc=polyline_lengths(seed_reference)
-            seed_tangents=np.unwrap(np.arctan2(np.gradient(seed_reference[:,1]),np.gradient(seed_reference[:,0])))
-            seed_curvature=np.gradient(seed_tangents,np.maximum.accumulate(seed_arc+np.arange(len(seed_arc))*1e-9))
+            seed_tangents,seed_curvature=_reference_heading_curvature(seed_reference,seed_arc)
         goal_context=None
         if active_goal is not None:
             frozen=np.asarray(active_goal['goal_reference']['points'],float)
@@ -545,7 +559,7 @@ class Planner:
                 np.isclose(rear,scene.ego.length/2,rtol=0.,atol=1e-9)):
             for connection in confirmed_navigation_connections(scene).values():
                 points=world_to_ego(connection['points'],origin,angle)
-                derivatives=np.gradient(points,axis=0)
+                derivatives=np.gradient(points,polyline_lengths(points),axis=0)
                 seed_connections.append(dict(points=points,arc=polyline_lengths(points),
                     headings=np.unwrap(connection['headings']-angle),
                     tangents=np.unwrap(np.arctan2(derivatives[:,1],derivatives[:,0])),
@@ -609,6 +623,12 @@ class Planner:
         project=lambda value:_project_executable_controls(value,speed,dt,min_a,max_a,max_delta)
         controls=project(controls)
         initial_body=shapely.polygons(body_vertices(initial[None,:],scene.ego.length,scene.ego.width))[0]
+        def execution_reserve(initial_clearance,base=0.):
+            initial_extra=float(np.clip(initial_clearance-base,0.,execution_margin))
+            return execution_margin-(execution_margin-initial_extra)*np.exp(-np.arange(1,n+1)*dt/execution_build)
+        road_execution_reserve=execution_reserve(initial_body.distance(boundary))
+        for item in physical_lines.values():
+            item['execution_reserve']=execution_reserve(initial_body.distance(item['geometry']),clearance)
         initial_safety={'on_road':bool(shapely.covers(accepted_road,initial_body)),
                         'speed_limit':bool(speed<=max_speed+speed_tolerance)}
         initial_safety['potential_domain']=bool(potential_geometry.domain_contains(initial[:2])[0])
@@ -736,6 +756,11 @@ class Planner:
                 residual('penalty_'+name,np.minimum(margin,0.),derivative,penalties.get(name,100.),scale)
                 rows.append(jac);lower.append(-margin);upper.append(np.full(len(margin),np.inf))
             penalty('road_clearance',road_distance.ravel()+tolerance,road_jac)
+            reserve_enabled=not is_brake and execution_margin>0. and execution_weight>0.
+            if reserve_enabled:
+                reserve_gap=road_distance-road_execution_reserve[:,None]
+                residual('execution_road_reserve',np.minimum(reserve_gap,0.).ravel(),
+                    lambda c,active=(reserve_gap.ravel()<0.):road_jac(c)*active[:,None],execution_weight)
             domain_inside=field_projection['domain_valid'][1:]
             domain_margin,domain_normal=potential_geometry.domain_clearance(current[:,:2])
             penalty('potential_domain',domain_margin,
@@ -859,6 +884,7 @@ class Planner:
                     lambda c,derivative=derivative:np.einsum('ni,nij->nj',derivative,c['sens'][:,:2]),
                     weights.get('risk',2))
             line_minimum=np.inf
+            line_reserve_minimum=np.inf
             line_states=dense_states[1:]
             line_polygons=shapely.polygons(body_vertices(line_states,scene.ego.length,scene.ego.width)) if physical_lines else None
             line_count=len(line_states)
@@ -893,6 +919,12 @@ class Planner:
                 # 不能只在最终拒绝它们，却让QP看不到修正方向。
                 penalty('noncrossable_line_clearance',signed[node_indices]-clearance,
                         lambda c,partial=line_partial:np.einsum('ni,nij->nj',partial()[node_indices],c['sens']))
+                if reserve_enabled:
+                    reserve_gap=signed[node_indices]-clearance-item['execution_reserve']
+                    line_reserve_minimum=min(line_reserve_minimum,float(reserve_gap.min()))
+                    residual('execution_line_reserve',np.minimum(reserve_gap,0.),
+                        lambda c,partial=line_partial,active=(reserve_gap<0.):np.einsum(
+                            'ni,nij->nj',partial()[node_indices],c['sens'])*active[:,None],execution_weight)
                 if len(intermediate_indices):
                     rows.append(lambda c,partial=line_partial:np.einsum(
                         'ni,nij->nj',partial()[intermediate_indices],c['dense'][intermediate_indices]))
@@ -968,6 +1000,16 @@ class Planner:
                 safety_feasible=bool(safety_feasible),dense_validation=dense,is_brake=bool(is_brake),
                 violation=max(0.,-min(metrics.values()),-control_margin),goal_evidence=goal_evidence,
                 potential_invalid_samples=field_invalid)
+            result['execution_clearance']={
+                'enabled':bool(reserve_enabled),'role':'soft_internal_execution_reserve;hard_safety_unchanged',
+                'requested_extra_m':execution_margin,'build_time_s':execution_build,'weight':execution_weight,
+                'road_target_min_m':float(road_execution_reserve.min()) if reserve_enabled else None,
+                'road_target_deficit_m':max(0.,float((road_execution_reserve[:,None]-road_distance).max())) if reserve_enabled else None,
+                'line_target_deficit_m':max(0.,-line_reserve_minimum) if reserve_enabled and physical_lines else None,
+                'initial_road_clearance_m':float(initial_body.distance(boundary)),
+                'physical_road_clearance_min_m':float(metrics['road_clearance']),
+                'physical_line_clearance_min_m':None if not physical_lines else float(line_minimum+clearance),
+                'braking_exempt_from_soft_reserve_only':bool(is_brake)}
             def linearize():
                 linearization_started=time.perf_counter();evaluations['linearizations']+=1
                 sensitivity=self.dynamics.sensitivity(controls,initial)
@@ -1134,8 +1176,7 @@ class Planner:
                     self.references._continuation(scene,own,lane_table),forward_m=support_front)
                 brake_reference=clean_polyline(world_to_ego(brake_world,origin,angle))
             brake_arc=polyline_lengths(brake_reference)
-            brake_tangents=np.unwrap(np.arctan2(np.gradient(brake_reference[:,1]),np.gradient(brake_reference[:,0])))
-            brake_curvature=np.gradient(brake_tangents,brake_arc+np.arange(len(brake_arc))*1e-9)
+            brake_tangents,brake_curvature=_reference_heading_curvature(brake_reference,brake_arc)
             def brake_controls(deceleration,follow_lane,relax_initial_jerk=False):
                 trajectory=[];state=initial.copy();last=previous_control.copy();release_conflicts=[]
                 for step_index in range(n):
@@ -1261,6 +1302,7 @@ class Planner:
                 'speed_integral_distance_m_rounded_3','terminal_speed_mps_rounded_3',
                 'navigation_lateral_rms_m','navigation_direction_rms_rad','maximum_constraint_deficit'],
             'dense_validation':accepted['dense_validation'],
+            'execution_clearance':accepted['execution_clearance'],
             'following':{'lead_ids':lead_ids,'minimum_gap_m':follow_gap,'time_headway_s':headway,'terminal_braking_mps2':terminal_braking,
                 'version':'bumper-gap-time-headway-1.0','headway_is_soft_target':True,
                 'initial_net_gap_m':float(lead_rear[0]-local_s0-scene.ego.length/2) if np.isfinite(lead_rear[0]) else None,

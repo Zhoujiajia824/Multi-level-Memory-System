@@ -239,6 +239,9 @@ class EPDriverFail2DriveAgent(AutonomousAgent):
                 packet = {"schema": SCHEMA, "route_id": self.route_id, "frame": frame,
                           "time": source_time, "scene": scene, "images": images,
                           "output_dir": str(self.archive.directory.resolve())}
+                # Preserve the exact public input even when decoding or planning
+                # fails before the numeric worker can archive a Scene.
+                self.archive.append("agent_sources", {"frame": frame, "time": source_time, "scene": scene})
                 begin_plan = time.monotonic()
                 plan = self.worker.plan(packet)
                 plan_wall_s = time.monotonic()-begin_plan
@@ -251,7 +254,6 @@ class EPDriverFail2DriveAgent(AutonomousAgent):
                                       source_speed_mps=math.hypot(*scene["ego"]["velocity"]), source_tick=frame,
                                       emergency_braking=emergency)
                 self.archive.append("agent_plans", plan)
-                self.archive.append("agent_sources", {"frame": frame, "time": source_time, "scene": scene})
             selected = self.timeline.at(source_time, physical_tick=frame)
             if not selected["available"]:
                 raise RuntimeError("control sequence unavailable: "+str(selected["reason"]))

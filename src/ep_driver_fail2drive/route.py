@@ -126,6 +126,45 @@ def boundary_semantics(marking_type, waypoint_permission, marking_permission, is
         permission_source='junction_unmarked_virtual' if virtual else 'current_waypoint_and_marking')
 
 
+def _distinct_lane_samples(waypoints):
+    """Collapse SDK aliases of an exactly identical XY centre, in lane order.
+
+    Dense navigation and regular map sampling can give distinct s values whose
+    public float positions coincide. Evaluating their microscopic yaw change
+    twice makes the left/right ring backtrack and self-intersect. This is not a
+    geometric simplifier: no separated centre is moved, merged or discarded.
+    A genuine turn, width/height change or marking transition is not an alias.
+    """
+    result,removed=[],[]
+    def semantics(wp):
+        return (str(wp.lane_change),bool(wp.is_junction),
+                str(wp.left_lane_marking.type),str(wp.left_lane_marking.lane_change),
+                str(wp.right_lane_marking.type),str(wp.right_lane_marking.lane_change))
+    for waypoint in waypoints:
+        if result:
+            previous=result[-1]
+            a,b=previous.transform.location,waypoint.transform.location
+            if a.x==b.x and a.y==b.y:
+                evidence=dict(lane_id=lane_key(waypoint),position_xy=xy(a),
+                    kept_s_m=float(previous.s),removed_s_m=float(waypoint.s),
+                    elevation_difference_m=abs(a.z-b.z),
+                    heading_difference_rad=abs(wrap(math.radians(
+                        previous.transform.rotation.yaw-waypoint.transform.rotation.yaw))),
+                    width_difference_m=abs(previous.lane_width-waypoint.lane_width))
+                # Bounds only identify numerical aliases at an exact position;
+                # they never authorize a spatial tolerance or enlarge a road.
+                if (abs(previous.s-waypoint.s)>1e-3 or evidence['elevation_difference_m']>1e-3
+                        or evidence['heading_difference_rad']>1e-5 or evidence['width_difference_m']>1e-5
+                        or semantics(previous)!=semantics(waypoint)):
+                    error=ValueError('Ambiguous coincident public lane samples: '+str(evidence))
+                    error.evidence=evidence
+                    raise error
+                removed.append(evidence)
+                continue
+        result.append(waypoint)
+    return result,removed
+
+
 class RouteAdapter:
     """Frozen official world-coordinate route; public map has no scenario oracle."""
     VERSION = 'official-route-residual-1.0'
@@ -196,8 +235,12 @@ class RouteAdapter:
             groups.setdefault(lane_key(wp), {})[round(wp.s, 6)] = wp
         lanes = []
         self.lane_elevations = {}
+        self.map_sample_audit=dict(policy='exact_xy_adjacent_numerical_alias_only;first_sample_retained',
+            no_spatial_merging=True,official_navigation_unchanged=True,removed_samples=[])
         for key in sorted(groups):
             waypoints = sorted(groups[key].values(), key=lambda w:w.s, reverse=next(iter(groups[key].values())).lane_id > 0)
+            waypoints,removed=_distinct_lane_samples(waypoints)
+            self.map_sample_audit['removed_samples'].extend(removed)
             if len(waypoints) < 2:
                 continue
             center, left, right, boundaries = [], [], [], []

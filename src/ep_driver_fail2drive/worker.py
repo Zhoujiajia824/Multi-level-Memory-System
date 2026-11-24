@@ -30,6 +30,7 @@ from .protocol import SCHEMA
 from nine_grid.configuration import validate_config
 from nine_grid.contracts import Actor, Lane, SceneSnapshot, RetrievalResult, plain
 from nine_grid.goals import build_goal_reference
+from nine_grid.geometry import polygonal_area
 from nine_grid.models import (build_prompt,
                               model_image_paths, parse_answer, load_system_prompts)
 from nine_grid.perception_scope import perception_scene
@@ -112,12 +113,21 @@ def decode_scene(packet):
             if value.ndim != 2 or value.shape[1] != 2 or not np.isfinite(value).all():
                 raise ValueError('Invalid lane geometry')
             row[key] = value
+        if len(row['center'])<2 or len(row['polygon'])<3:
+            raise ValueError('Invalid public lane point count: '+str(row.get('id')))
+        polygonal_area(Polygon(row['polygon']),context='public lane polygon '+str(row.get('id')))
         lanes.append(Lane(**row))
     if len({lane.id for lane in lanes}) != len(lanes):
         raise ValueError('Duplicate public lane identities')
-    polygons = [Polygon(p) for p in raw['drivable_polygons']]
-    if not polygons or any(p.is_empty or not p.is_valid for p in polygons):
-        raise ValueError('Invalid public drivable geometry')
+    polygons=[]
+    for index,ring in enumerate(raw['drivable_polygons']):
+        coordinates=np.asarray(ring,float)
+        if (coordinates.ndim!=2 or coordinates.shape[1]!=2 or len(coordinates)<3
+                or not np.isfinite(coordinates).all()):
+            raise ValueError('Invalid public drivable polygon coordinates at index '+str(index))
+        polygon,_=polygonal_area(Polygon(coordinates),context='public drivable polygon['+str(index)+']')
+        polygons.append(polygon)
+    drivable,drivable_evidence=polygonal_area(unary_union(polygons),context='public drivable area')
     route = np.asarray(raw['route'], float)
     if route.ndim != 2 or route.shape[1] != 2 or len(route) < 2 or not np.isfinite(route).all():
         raise ValueError('Invalid official navigation geometry')
@@ -141,8 +151,10 @@ def decode_scene(packet):
     diagnostics = dict(raw.get('diagnostics', {}))
     diagnostics['observation_policy'] = 'range_limited_ground_truth_no_occlusion-1.0'
     diagnostics['privileged_input'] = True
+    diagnostics['public_drivable_geometry']=dict(drivable_evidence,
+        source_ring_count=len(polygons),source_rings_unchanged=True)
     return SceneSnapshot(raw['frame_id'], float(stamp), ego, actors, lanes, route,
-        list(raw['route_lane_ids']), unary_union(polygons), 'fail2drive',
+        list(raw['route_lane_ids']), drivable, 'fail2drive',
         rules=dict(raw.get('rules', {})), assets=assets, diagnostics=diagnostics)
 
 
@@ -163,6 +175,12 @@ class PlanningWorker:
         config['clock'].update(physics_hz=20, planner_hz=runtime.get('planner_hz', 10), fast_hz=1)
         # Each 0.1s control segment spans exactly two official 0.05s physics steps.
         config['mpc']['physics_substeps'] = 2
+        # Archive effective Fail2Drive execution reserves with the parameters,
+        # including when the caller uses an existing runtime configuration.
+        for key, value in (('execution_clearance_margin_m', .10),
+                           ('execution_clearance_build_s', 1.),
+                           ('execution_clearance_weight', 1000.)):
+            config['mpc'].setdefault(key, value)
         config['clock'].pop('episode_seconds', None)
         config['memory'].update(read_enabled=False, write_enabled=False)
         config['models'].update(fast_backend='server' if self.execution_mode == 'B_model' else 'off', reflection_backend='off')
@@ -481,8 +499,10 @@ def main():
                 response = dict(ok=True, request_id=request.get('request_id'), plan=plan)
             except Exception as exc:
                 LOG.exception('Numeric worker request failed')
+                evidence = getattr(exc, 'evidence', None)
                 response = dict(ok=False, request_id=request.get('request_id'),
-                                error={'type':type(exc).__name__, 'message':str(exc)})
+                                error={'type':type(exc).__name__, 'message':str(exc),
+                                       **({'evidence':plain(evidence)} if evidence is not None else {})})
             output.write(json.dumps(response, ensure_ascii=False, allow_nan=False)+'\n')
             output.flush()
     finally:

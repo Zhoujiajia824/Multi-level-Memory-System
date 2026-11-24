@@ -14,7 +14,9 @@ SCHEMA = "ep-driver-fail2drive-packet-v1"
 
 
 class WorkerError(RuntimeError):
-    pass
+    def __init__(self, message, evidence=None):
+        super().__init__(message)
+        self.evidence = evidence
 
 
 class WorkerClient:
@@ -111,7 +113,12 @@ class WorkerClient:
         if not isinstance(response, dict) or response.get("request_id") != request_id:
             raise WorkerError("numeric worker response request_id mismatch")
         if response.get("ok") is not True:
-            raise WorkerError("numeric worker failed: %s" % response.get("error", "unknown error"))
+            error = response.get("error", "unknown error")
+            evidence = response.get("evidence")
+            if isinstance(error, dict):
+                evidence = error.get("evidence", evidence)
+                error = "%s: %s" % (error.get("type", "Error"), error.get("message", "unknown error"))
+            raise WorkerError("numeric worker failed: %s" % error, evidence=evidence)
         plan = response.get("plan", response)
         stamp = plan.get("time") if isinstance(plan, dict) else None
         if (not isinstance(plan, dict) or plan.get("frame_id") != packet["scene"]["frame_id"] or

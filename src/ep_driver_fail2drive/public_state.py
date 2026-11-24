@@ -328,6 +328,7 @@ class PublicStateExtractor:
             diagnostics=dict(platform='fail2drive',carla_frame=frame,carla_timestamp=observed_time,
                 route_s=route_projection['trusted_progress_m'] or 0.,reference_anchor_s=route_projection['trusted_progress_m'] or 0.,
                 route_projection=route_projection,navigation_status=rules['navigation_status'],
+                public_map_sample_audit=self.route.map_sample_audit,
                 public_light_geometry_unavailable=list(self._light_stop_errors.values()),
                 stable_navigation_lane_id=ego['lane_id'],lane_map_complete=ego['lane_id'] in ids,
                 actor_classification=classifications,excluded_public_entities=excluded,

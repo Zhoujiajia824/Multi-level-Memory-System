@@ -17,7 +17,7 @@ import numpy as np
 import shapely
 from scipy.interpolate import CubicSpline
 
-from .geometry import clean_polyline, ego_to_world
+from .geometry import clean_polyline, ego_to_world, polygonal_area
 
 
 VERSION = 'lane-frenet-centre-potential-1.0'
@@ -76,10 +76,7 @@ class LanePotentialGeometry:
         if points.ndim != 2 or points.shape[1] != 2 or not np.isfinite(points).all():
             raise ValueError('potential reference must be a finite (M,2) array')
         self.reference = clean_polyline(points).copy()
-        if domain is None or domain.is_empty or not domain.is_valid:
-            raise ValueError('potential lane domain must be a nonempty valid geometry')
-        if domain.geom_type not in ('Polygon', 'MultiPolygon'):
-            raise ValueError('potential lane domain must be polygonal')
+        domain,domain_components=polygonal_area(domain,context='potential lane domain')
         self.domain = domain
         self._domain_boundary = domain.boundary
         self._domain_pose = None
@@ -120,6 +117,7 @@ class LanePotentialGeometry:
             'reference_length_m': self.length,
             'domain_coordinates': 'query_frame' if domain_pose is None else 'unchanged_world_frame',
             'domain_query': 'point_transform_only;polygon_topology_unchanged',
+            'domain_polygonal_area':domain_components,
             'limitation': 'local_normal_chart;branch/window switches are not globally smooth',
         }
 

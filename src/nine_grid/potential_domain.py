@@ -4,6 +4,7 @@ from __future__ import annotations
 import shapely
 
 from .object_scope import lane_role_geometry
+from .geometry import polygonal_area
 
 
 def build_lane_potential_domain(scene, front_m=120., rear_m=20.):
@@ -12,6 +13,7 @@ def build_lane_potential_domain(scene, front_m=120., rear_m=20.):
     parts = []
     selected = set()
     connections = set()
+    component_evidence = []
     for trace in traces.values():
         if trace is None:
             continue
@@ -19,8 +21,12 @@ def build_lane_potential_domain(scene, front_m=120., rear_m=20.):
             if identity in selected or identity not in cache:
                 continue
             lane, polygon, center = cache[identity]
+            polygon,_=polygonal_area(polygon,context='public lane source '+str(identity))
             # 宽大的交叉口地图面不能授权横向支路。保留真实多边形与车道宽带的交集。
             part = polygon.intersection(center.buffer(float(lane.width)/2, cap_style=2))
+            part,evidence=polygonal_area(part,context='potential lane '+str(identity),require_nonempty=False)
+            if evidence['source_type'] not in ('Polygon','MultiPolygon'):
+                component_evidence.append(evidence)
             if not part.is_empty:
                 parts.append(part)
                 selected.add(identity)
@@ -29,15 +35,20 @@ def build_lane_potential_domain(scene, front_m=120., rear_m=20.):
         for connection in trace.get('navigation_connections', []):
             pair = (connection['from_lane_id'], connection['to_lane_id'])
             if pair not in connections:
-                parts.append(connection['shape'])
+                area,evidence=polygonal_area(connection['shape'],
+                    context='potential navigation connection '+str(pair),require_nonempty=False)
+                if not area.is_empty:
+                    parts.append(area)
+                if evidence['source_type'] not in ('Polygon','MultiPolygon'):
+                    component_evidence.append(evidence)
                 connections.add(pair)
     if not parts:
         raise ValueError('势场缺少已确认的当前车道几何，不能使用整个可行驶地图代替')
-    domain = shapely.union_all(parts).intersection(scene.drivable)
-    if domain.is_empty or not domain.is_valid:
-        raise ValueError('导航车道势场域为空或几何无效')
+    domain,overlay_evidence=polygonal_area(shapely.union_all(parts).intersection(scene.drivable),
+        context='navigation lane potential domain')
     return domain, {
-        'version': 'lane-potential-domain-1.1',
+        'version': 'lane-potential-domain-1.2',
+        'polygonal_area':overlay_evidence,'component_overlays':component_evidence,
         'lane_ids': sorted(selected),
         'chains': {side: None if trace is None else trace['lane_ids'] for side, trace in traces.items()},
         'current_lane_association': (traces['center'].get('current_lane_association')
