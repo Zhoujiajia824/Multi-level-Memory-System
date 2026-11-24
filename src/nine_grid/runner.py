@@ -442,16 +442,12 @@ def run_episode(config,model_settings,episode_id,episodes_dir,memory_read_dir=No
             stage_started=time.perf_counter()
             plan=planner.solve(planning_input,predictions,active_answer)
             timing['mpc_s']=time.perf_counter()-stage_started
-            # 最终执行审计先于评分、记录和显示；不会将未通过的正常轨迹
-            # 写成将执行的轨迹，也不会用旧控制掩盖新目标的失败。
+            # 外部审计只评价论文规划器输出，不生成控制或接管模型意图。
             stage_started=time.perf_counter()
             audit=execution_audit(planning_input,plan,predictions,config)
-            if audit.get('alarm') and not plan.diagnostics.get('emergency',False):
-                rejected=plan
-                plan=planner.emergency_brake(planning_input,predictions,reason='正常候选执行前几何审计报警',answer=active_answer)
-                writer.append('safety_replanning',dict(frame_id=scene.frame_id,time=scene.time,
-                    rejected_plan=rejected,initial_audit=audit,replacement=plan))
-                audit=execution_audit(planning_input,plan,predictions,config)
+            audit=dict(audit,role='evaluation_only',trajectory_replaced=False)
+            plan.diagnostics['trajectory_source']='paper_planner_solve'
+            plan.diagnostics['execution_audit_policy']='record_only_no_trajectory_replacement'
             timing['execution_audit_s']=time.perf_counter()-stage_started
             timing_samples['execution_audit'].append(timing['execution_audit_s'])
             summary['safe_braking_steps']+=int(plan.diagnostics.get('execution_mode')=='safe_brake')

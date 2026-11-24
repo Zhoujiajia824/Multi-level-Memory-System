@@ -14,7 +14,6 @@
   "worker_timeout_s": 240,
   "dino_device": "cpu",
   "dino_cpu_threads": 2,
-  "speed_normalization_mps": 1.0,
   "video": true,
   "camera_width": 800,
   "camera_height": 450,

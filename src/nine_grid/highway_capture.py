@@ -117,7 +117,7 @@ def capture_episode(config, seed, output_dir, *, provenance=None, live=False):
         "feature_extraction_enabled": False, "reference_mpc_enabled": False,
         "quality_scoring_enabled": False, "complete": False,
         "frame_count": 0, "planning_steps": 0, "simulated_seconds": 0.,
-        "collision": False, "offroad": False, "emergency_steps": 0,
+        "collision": False, "offroad": False, "emergency_steps": 0, "execution_alarms": 0,
         "note": "与正式场景共用初始化、规划、执行审计和控制；动作是实际结果，不是最优示范。未来仅供离线回顾。",
     }
     _json(folder / "run.json", run)
@@ -129,7 +129,8 @@ def capture_episode(config, seed, output_dir, *, provenance=None, live=False):
         planner = create_planner(config)
         predictor = Predictor(config)
         with (folder / "frames.jsonl").open("w", encoding="utf-8", newline="\n") as frames, (
-                folder / "future_states.jsonl").open("w", encoding="utf-8", newline="\n") as future:
+                folder / "future_states.jsonl").open("w", encoding="utf-8", newline="\n") as future, (
+                folder / "execution_audit.jsonl").open("w", encoding="utf-8", newline="\n") as audits:
             def save(scene, execution=None):
                 run["simulated_seconds"] = float(scene.time)
                 audit = record_frame(adapter, scene, folder, run["frame_count"], frames, future)
@@ -152,10 +153,17 @@ def capture_episode(config, seed, output_dir, *, provenance=None, live=False):
                 scoped, predictions = prepare_planning_context(scene, config, predictor=predictor)
                 plan = planner.solve(scoped, predictions, None)
                 audit = execution_audit(scoped, plan, predictions, config)
-                if audit.get("alarm") and not plan.diagnostics.get("emergency", False):
-                    plan = planner.emergency_brake(scoped, predictions,
-                                                   reason="正常候选执行前几何审计报警")
-                    execution_audit(scoped, plan, predictions, config)
+                # 经验素材如实记录论文规划器的行为，外部评价不替换其轨迹。
+                audit = dict(audit, role="evaluation_only", trajectory_replaced=False)
+                plan.diagnostics.update(trajectory_source="paper_planner_solve",
+                    execution_audit_policy="record_only_no_trajectory_replacement")
+                _line(audits, dict(frame_id=scene.frame_id, time=float(scene.time),
+                    audit=audit, plan_valid=bool(plan.valid),
+                    planned_first_control=plain(plan.controls[0]) if len(plan.controls) else None,
+                    candidate_source=plan.diagnostics.get("candidate_source"),
+                    execution_mode=plan.diagnostics.get("execution_mode"),
+                    safety_feasible=plan.diagnostics.get("safety_feasible")))
+                run["execution_alarms"] += int(audit.get("alarm", False))
                 if not plan.valid:
                     raise RuntimeError("基础规划未产生有效控制；保留已采集记录，不伪造后续")
                 run["emergency_steps"] += int(plan.diagnostics.get("emergency", False))

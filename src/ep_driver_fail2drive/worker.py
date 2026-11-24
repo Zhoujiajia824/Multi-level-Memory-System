@@ -158,6 +158,70 @@ def decode_scene(packet):
         rules=dict(raw.get('rules', {})), assets=assets, diagnostics=diagnostics)
 
 
+class IntegrationInputError(ValueError):
+    """公开输入无效是接入失败，不能转换成额外的驾驶策略。"""
+    def __init__(self, scene, errors):
+        self.evidence = dict(classification='integration_input_error',
+            frame_id=scene.frame_id, time=float(scene.time), errors=plain(errors),
+            source='frozen_public_navigation_and_traffic_rule_input',
+            driving_action_generated=False, normal_planning_attempted=False,
+            official_score=False)
+        super().__init__('Fail2Drive integration input is invalid: '+
+                         '; '.join(str(item) for item in errors))
+
+
+def validate_planning_input(scene):
+    """仅拒绝已明确无效的必要输入；真实停车义务留给论文规划器。"""
+    errors = []
+    rules = scene.rules
+    # 新字段及旧归档中的具体错误类别均是输入证据；旧制动布尔值
+    # 本身既不是有效交通规则，也不再具有选择控制轨迹的权限。
+    for key in ('navigation_input_errors', 'navigation_brake_reasons'):
+        values = rules.get(key, [])
+        if not isinstance(values, list):
+            errors.append(dict(field=key, reason='invalid_input_error_list'))
+        else:
+            errors.extend(values)
+    projection = scene.diagnostics.get('route_projection', {})
+    if (isinstance(projection, dict) and projection.get('valid') is False
+            or rules.get('navigation_status') == 'route_projection_invalid'):
+        errors.append('route_projection_invalid')
+    if rules.get('unmapped_current_red') is True:
+        errors.append('unresolved_current_red_stop')
+    public_rules = rules.get('public_road_rules', {})
+    if isinstance(public_rules, dict) and public_rules.get('unmapped_current_stops'):
+        errors.append(dict(reason='unresolved_current_stop_sign',
+                           observations=public_rules['unmapped_current_stops']))
+    if rules.get('navigation_input_valid') is False and not errors:
+        errors.append('navigation_input_invalid_without_details')
+    if errors:
+        # 去重只压缩诊断，不删除原始状态或将未知停止线伪装成绿灯。
+        unique = {json.dumps(plain(item), sort_keys=True, ensure_ascii=False): item for item in errors}
+        raise IntegrationInputError(scene, list(unique.values()))
+
+
+def _answer_rejection_matches(answer, rejection):
+    """拒绝信号只能清除同一冻结模型答案，不能误清后来的有效意图。"""
+    if (answer is None or not isinstance(rejection, dict)
+            or rejection.get('policy') != 'reject_entire_semantics_same_mpc_base'
+            or rejection.get('attention_cleared') is not True
+            or rejection.get('goal_id') != answer.goal_id
+            or rejection.get('source_frame_id') != answer.frame_id):
+        return False
+    stamp = rejection.get('source_time')
+    if type(stamp) not in (int, float) or not math.isfinite(stamp) or abs(stamp-float(answer.time)) > 1e-8:
+        return False
+    if 'world_goal_unchanged' in rejection:
+        try:
+            target = np.asarray(rejection['world_goal_unchanged'], float)
+            if target.shape != (2,) or not np.isfinite(target).all() or not np.allclose(
+                    target, answer.world_goal, rtol=0., atol=1e-8):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 class PlanningWorker:
     """Route-local planner, filters, history and original-frame model guidance."""
     def __init__(self, runtime, *, client=None, extractor=None):
@@ -175,20 +239,16 @@ class PlanningWorker:
         config['clock'].update(physics_hz=20, planner_hz=runtime.get('planner_hz', 10), fast_hz=1)
         # Each 0.1s control segment spans exactly two official 0.05s physics steps.
         config['mpc']['physics_substeps'] = 2
-        # Archive effective Fail2Drive execution reserves with the parameters,
-        # including when the caller uses an existing runtime configuration.
-        for key, value in (('execution_clearance_margin_m', .10),
-                           ('execution_clearance_build_s', 1.),
-                           ('execution_clearance_weight', 1000.)):
-            config['mpc'].setdefault(key, value)
         config['clock'].pop('episode_seconds', None)
         config['memory'].update(read_enabled=False, write_enabled=False)
         config['models'].update(fast_backend='server' if self.execution_mode == 'B_model' else 'off', reflection_backend='off')
         config['perception'].update(fully_occluded_in_current_planning=True, bev_physical_obstacles=True)
         if not config.get('diagnostics', {}).get('enabled', True) or not config.get('diagnostics', {}).get('dino', True):
             raise ValueError('Fail2Drive keeps BEV/OCC/grid/DINO/reference/quality enabled')
-        # Freeze this integration's cost calibration explicitly; no main-branch defaults are edited.
-        config['mpc']['normalization']['speed_mps'] = float(runtime.get('speed_normalization_mps', 1.0))
+        # 论文规划参数只来自 parameters_path。兼容旧私有运行配置中的
+        # 接入标定键，但它不得覆盖论文速度代价的归一化或权重。
+        ignored_runtime_planner_overrides = {key: runtime[key]
+            for key in ('speed_normalization_mps',) if key in runtime}
         self.config = validate_config(config)
         dino = config['dino']
         dino['model'] = str(_path(runtime.get('dino_model', dino['model'])))
@@ -245,7 +305,8 @@ class PlanningWorker:
             transport_errors=0, structured_fallbacks=0, model_skipped_reference=0,
             output_failures=0, whitespace_loops=0, output_truncations=0, context_limit_failures=0,
             guided_plans=0, answer_available_plans=0, semantic_context_plans=0,
-            semantic_control_plans=0, semantic_safe_braking_plans=0)
+            semantic_control_plans=0, semantic_safe_braking_plans=0,
+            integration_input_errors=0, semantic_rejections=0)
         self.configuration_evidence = dict(parameters=self.config, official_commit=OFFICIAL_COMMIT,
             runtime=_redacted(runtime), models=_redacted(model_settings), privileged_input=True,
             memory_retrieval=False, memory_write=False, reflection=False,
@@ -257,6 +318,10 @@ class PlanningWorker:
                 fallback='explicit_400_or_422_schema_unsupported_to_text;output_rejected_add_feedback_and_json_schema_to_json_object_to_text;strict_local_validation_in_all_modes',
                 repairs='model_feedback_only;no_goal_clamping_no_ID_deletion_no_invented_reasons',
                 counter_definition='model_calls=count_of_source_frames_with_requests;http_attempts=total_requests'),
+            planner_control_policy=dict(trajectory_source='paper_planner_solve',
+                invalid_public_input='explicit_integration_failure',
+                execution_audit='record_only', external_trajectory_replacement=False),
+            ignored_runtime_planner_overrides=_redacted(ignored_runtime_planner_overrides),
             internal_quality_is_official_score=False, whole_route_duration_limit=None)
 
     def _append(self, name, value):
@@ -284,6 +349,12 @@ class PlanningWorker:
             raise ValueError('A numeric worker cannot reuse filter/planner history across official routes')
         if self.last_frame is not None and (packet['frame'] <= self.last_frame or scene.time <= self.last_time):
             raise ValueError('Planning source frame/time must increase strictly')
+        try:
+            validate_planning_input(scene)
+        except IntegrationInputError as exc:
+            self.counts['integration_input_errors'] += 1
+            self._append('integration_errors', exc.evidence)
+            raise
         model_due = scene.time >= self.next_source_time-1e-7
         if bool(scene.assets['camera_images']) != model_due:
             raise ValueError('1Hz model source images are missing or present outside the agreed source cadence')
@@ -386,22 +457,36 @@ class PlanningWorker:
                 timing['model_s'] = 0.
                 self.active_answer = None
         stamp = time.perf_counter()
-        if scene.rules.get('navigation_brake_required'):
-            self.planner.clear_semantic_guidance()
-            self.active_answer = None
-            plan = self.planner.emergency_brake(planning_input, predictions,
-                      reason='official route projection or current-lane traffic-light/stop-sign association invalid')
-            plan.diagnostics['navigation_brake_required'] = True
-        else:
-            plan = self.planner.solve(planning_input, predictions, self.active_answer)
+        plan = self.planner.solve(planning_input, predictions, self.active_answer)
         timing['mpc_s'] = time.perf_counter()-stamp
+        rejection = plan.diagnostics.get('rejected_semantics')
+        if rejection is not None:
+            matched = _answer_rejection_matches(self.active_answer, rejection)
+            handling = dict(frame_id=scene.frame_id, time=scene.time,
+                rejection=plain(rejection), matched_active_answer=matched,
+                active_source=(dict(frame_id=self.active_answer.frame_id,
+                    time=float(self.active_answer.time), goal_id=self.active_answer.goal_id)
+                    if self.active_answer is not None else None),
+                action='clear_rejected_answer' if matched else 'retain_unmatched_active_answer',
+                trajectory_replaced=False, planner_reinvoked=False)
+            self._append('semantic_rejections', handling)
+            plan.diagnostics['rejected_semantics_handling'] = handling
+            if matched:
+                # 规划器已在本次正常求解中拒绝无效语义并生成基础MPC轨迹。
+                # 这里只清除相同答案，防止下一物理源帧重新带回旧关注增权。
+                self.active_answer = None
+                self.counts['semantic_rejections'] += 1
+                if self.last_model_outcome is not None:
+                    self.last_model_outcome = dict(self.last_model_outcome,
+                        planner_rejection=dict(frame_id=scene.frame_id,time=scene.time,
+                            goal_id=rejection['goal_id'],reason=rejection.get('reason')))
         stamp = time.perf_counter()
         audit = execution_audit(planning_input, plan, predictions, self.config)
-        if audit.get('alarm') and not plan.diagnostics.get('emergency', False):
-            self._append('rejected_before_execution', dict(plan=plan, audit=audit))
-            plan = self.planner.emergency_brake(planning_input, predictions,
-                reason='independent current-perception execution audit alarm', answer=self.active_answer)
-            audit = execution_audit(planning_input, plan, predictions, self.config)
+        # 独立审计只评价论文规划结果，不生成控制、不清除模型意图、
+        # 不用额外制动轨迹替换论文规划器的输出。
+        audit = dict(audit, role='evaluation_only', trajectory_replaced=False)
+        plan.diagnostics['trajectory_source'] = 'paper_planner_solve'
+        plan.diagnostics['execution_audit_policy'] = 'record_only_no_trajectory_replacement'
         timing['execution_audit_s'] = time.perf_counter()-stamp
         self._append('execution_audit', dict(frame_id=scene.frame_id, time=scene.time, **audit))
         self.counts['plans'] += 1
@@ -419,19 +504,10 @@ class PlanningWorker:
         if model_due:
             stamp = time.perf_counter()
             reference_input, reference_predictions = prepare_planning_context(scene, self.config, existing=predictions)
-            if scene.rules.get('navigation_brake_required'):
-                reference = self.reference_planner.emergency_brake(reference_input, reference_predictions,
-                    reason='same invalid navigation/stop association as the control plan')
-                reference.diagnostics['navigation_brake_required'] = True
-            else:
-                reference = self.reference_planner.solve(reference_input, reference_predictions, None)
+            reference = self.reference_planner.solve(reference_input, reference_predictions, None)
             timing['reference_s'] = time.perf_counter()-stamp
             stamp = time.perf_counter()
             quality = evaluate(planning_input, plan, reference, predictions, self.config)
-            if scene.rules.get('navigation_brake_required'):
-                quality.valid, quality.score = False, None
-                quality.reasons.append('Navigation/stop association invalid; internal quality is unavailable')
-                quality.metrics['navigation_brake_required'] = True
             timing['quality_s'] = time.perf_counter()-stamp
             self.counts['reference_evaluations'] += 1
             self._append('quality', dict(frame_id=scene.frame_id, time=scene.time,

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from copy import deepcopy
 import numpy as np
 import shapely
 from shapely.geometry import Polygon
@@ -114,6 +115,51 @@ def _reference_heading_curvature(points,arc):
     derivative=np.gradient(points,arc,axis=0)
     heading=np.unwrap(np.arctan2(derivative[:,1],derivative[:,0]))
     return heading,np.gradient(heading,arc)
+
+
+def _finish_gate_observation(scene):
+    """只观测公开官方完成平面，不增加停车目标、约束或接管动作。"""
+    result=dict(available=False,status='finish_metadata_unavailable',
+        task_endpoint_unchanged=True,official_completion_external=True,
+        affects_planning=False,stop_constraint_enabled=False)
+    gate=scene.rules.get('finish_gate',{})
+    if scene.scenario!='fail2drive' or not isinstance(gate,dict) or gate.get('valid') is not True:
+        return result
+    result['status']='invalid_finish_metadata'
+    try:
+        point=np.asarray(gate['position_xyz_carla'],float)
+        normal=np.asarray(gate['forward_xyz_carla'],float)
+        if (gate.get('schema')!='ep-driver-f2d-finish-gate-1.0'
+                or gate.get('source')!='official_set_global_plan_dense_last_transform'
+                or gate.get('reference_point')!='carla_actor_origin'
+                or gate.get('official_endpoint_unchanged') is not True
+                or point.shape!=(3,) or normal.shape!=(3,)
+                or not np.isfinite(np.r_[point,normal]).all()
+                or abs(float(np.linalg.norm(normal))-1.)>1e-5
+                or np.linalg.norm(point[:2]*[1.,-1.]-scene.route[-1])>1e-6
+                or not scene.route_lane_ids or gate.get('terminal_lane_id')!=scene.route_lane_ids[-1]
+                or float((normal[:2]*[1.,-1.])@(scene.route[-1]-scene.route[-2]))<=0.):
+            return result
+    except (KeyError,TypeError,ValueError):
+        return result
+    result.update(available=True,status='public_finish_plane_observed',official_plane=gate.copy())
+    pose=scene.rules.get('actor_origin_pose',{})
+    if isinstance(pose,dict):
+        try:
+            location=np.asarray(pose['position_xyz_carla'],float)
+            expected=scene.diagnostics.get('carla_frame')
+            stamp=float(pose['timestamp'])
+            if (location.shape==(3,) and np.isfinite(location).all()
+                    and expected is not None and pose.get('frame')==expected
+                    and abs(stamp-scene.time)<1e-7):
+                dot=float((location-point)@normal)
+                result.update(observed_actor_origin_plane_dot_m=dot,
+                    observed_actor_origin_crossed_plane=bool(dot>0.),
+                    plane_observation_frame=expected,
+                    plane_observation_is_official_completion=False)
+        except (KeyError,TypeError,ValueError):
+            pass
+    return result
 
 
 def _project_executable_controls(controls,speed,dt,min_a,max_a,max_delta):
@@ -294,6 +340,18 @@ class Planner:
     def solve(self,scene,predictions,answer=None,*,_brake_only=False):
         started=time.perf_counter();p=self.p;n=self.n;dt=self.dt
         _validate_prediction_input(scene,predictions,n*dt)
+        # 拒绝整条语义后，须从原始当前帧重新建立无关注增权的基础规划视图。
+        source_scene,source_predictions=scene,predictions
+        rejected_semantics=None
+        previous_rejection=self.goals.records.get(answer.goal_id) if answer is not None else None
+        if (previous_rejection and previous_rejection.get('status')=='invalid'
+                and previous_rejection.get('source_frame_id')==answer.frame_id
+                and previous_rejection.get('source_time')==float(answer.time)):
+            rejected_semantics=dict(goal_id=answer.goal_id,source_frame_id=answer.frame_id,
+                source_time=float(answer.time),reason=previous_rejection.get('reason'),
+                policy='reject_entire_semantics_same_mpc_base',attention_cleared=True,
+                repeated_rejected_source=True,world_goal_unchanged=np.asarray(answer.world_goal,float).tolist())
+            answer=None
         # 完整输入必须先验明；局部MPC视图不污染模型、检索、反思和独立审计。
         scene,predictions,object_selection=planning_view(scene,predictions,self.config,answer)
         wheelbase,rear=bicycle_geometry(scene.ego.length,scene.ego.wheelbase_m,scene.ego.rear_axle_to_center_m)
@@ -306,12 +364,6 @@ class Planner:
         braking=float(self.config.get("rules",{}).get("comfort_braking_mps2",3.))
         origin=scene.ego.position.copy();angle=scene.ego.heading
         speed=float(np.linalg.norm(scene.ego.velocity));initial=np.array([0.,0.,0.,speed])
-        execution_margin=float(p.get('execution_clearance_margin_m',.10 if scene.scenario=='fail2drive' else 0.))
-        execution_build=float(p.get('execution_clearance_build_s',1.))
-        execution_weight=float(p.get('execution_clearance_weight',1000.))
-        if (not np.isfinite([execution_margin,execution_build,execution_weight]).all()
-                or execution_margin<0. or execution_build<=0. or execution_weight<0.):
-            raise ValueError('执行净空余量必须有限非负，建立时间必须为正')
         build_seconds=0.
         dynamics_key=(n,dt,self.substeps,wheelbase,rear)
         if not hasattr(self,'dynamics') or self.dynamics_key!=dynamics_key:
@@ -320,19 +372,15 @@ class Planner:
             build_seconds=self.dynamics.build_seconds
         ego_s=project_polyline(origin,scene.route,scene.diagnostics.get("route_s"),angle)[0]
         full_arc=polyline_lengths(scene.route)
-        terminal_enabled=scene.scenario=='fail2drive'
         support_front=max(20.,speed*4.)
         navigation_support,terminal_support=terminal_covered_reference(scene,scene.route,forward_m=support_front)
+        finish_observation=_finish_gate_observation(scene)
         support_arc=polyline_lengths(navigation_support)
         start_arc=max(0.,ego_s-20);end_arc=min(support_arc[-1],ego_s+max(120,speed*4))
         global_world,global_stations=_reference_window(navigation_support,start_arc,end_arc,
-                                                      anchors=(float(full_arc[-1]),))
+            anchors=(float(full_arc[-1]),))
         global_reference=world_to_ego(global_world,origin,angle)
         global_arc=polyline_lengths(global_reference)
-        terminal_local=float(full_arc[-1]-start_arc) if terminal_enabled else None
-        terminal_indices=np.flatnonzero(global_stations==full_arc[-1])
-        if terminal_enabled and len(terminal_indices):
-            terminal_local=float(global_arc[int(terminal_indices[0])])
         reference_state_before=self.export_reference_state()
         goal_revision_before=self.goals.revision
         active_goal=self.goals.update(scene,answer)
@@ -353,11 +401,19 @@ class Planner:
             try:
                 seed_world=goal_seed_path(scene,active_goal)
             except (ValueError,FloatingPointError) as error:
-                self.goals._end(active_goal,'invalid','当前物理状态无法连接原目标：'+str(error),scene)
-                self.references.reset_intent()
-                result=self.emergency_brake(scene,predictions,'目标几何连接失效：'+str(error))
-                result.diagnostics['goal_state']=self.goals.diagnostics()
-                result.diagnostics['goal_events']=self.goals.events
+                reason='当前物理状态无法连接原目标：'+str(error)
+                self.goals._end(active_goal,'invalid',reason,scene)
+                rejected=dict(goal_id=active_goal['goal_id'],source_frame_id=active_goal['source_frame_id'],
+                    source_time=active_goal['source_time'],reason=reason,
+                    policy='reject_entire_semantics_same_mpc_base',attention_cleared=True,
+                    world_goal_unchanged=deepcopy(active_goal['world_goal']))
+                self.goals.pending_events.extend(deepcopy(self.goals.events))
+                self.clear_semantic_guidance()
+                # 本次尚未完成数值求解，保留原冷/暖预算语义，基础MPC正常求解。
+                self._has_solved=not cold_start
+                result=self.solve(source_scene,source_predictions,None)
+                result.diagnostics['rejected_semantics']=rejected
+                result.diagnostics['planning_seconds']=time.perf_counter()-started
                 return result
             selection=LocalReferenceResult(seed_world,
                 int(self.references.state['revision'])+self.goals.revision,
@@ -585,9 +641,6 @@ class Planner:
                 steer=feed+1.2*float(wrap_angle(heading-state[2]))-.3*np.arctan(d/max(state[3],2.))
                 navigation_s=s if active_goal is None else project_polyline(state[:2],reference)[0]
                 desired=min(max_speed,float(scene.rules.get('desired_speed',25.))*scale,np.sqrt(max_lat*2*rear/max(2*abs(np.sin(np.arctan(axle_ratio*np.tan(steer)))),.001))*.9,float(np.interp(navigation_s,reference_arc,speed_profile)))
-                if terminal_local is not None:
-                    terminal_s=project_polyline(state[:2],global_reference)[0]
-                    desired=min(desired,float(_stop_speed_with_slope(terminal_s,terminal_local,0.,braking)[0]))
                 follow_speed,_=following_speed(np.array([navigation_s]),np.array([step_index]))
                 desired=min(desired,float(follow_speed[0]))
                 if stop_local is not None:
@@ -623,12 +676,6 @@ class Planner:
         project=lambda value:_project_executable_controls(value,speed,dt,min_a,max_a,max_delta)
         controls=project(controls)
         initial_body=shapely.polygons(body_vertices(initial[None,:],scene.ego.length,scene.ego.width))[0]
-        def execution_reserve(initial_clearance,base=0.):
-            initial_extra=float(np.clip(initial_clearance-base,0.,execution_margin))
-            return execution_margin-(execution_margin-initial_extra)*np.exp(-np.arange(1,n+1)*dt/execution_build)
-        road_execution_reserve=execution_reserve(initial_body.distance(boundary))
-        for item in physical_lines.values():
-            item['execution_reserve']=execution_reserve(initial_body.distance(item['geometry']),clearance)
         initial_safety={'on_road':bool(shapely.covers(accepted_road,initial_body)),
                         'speed_limit':bool(speed<=max_speed+speed_tolerance)}
         initial_safety['potential_domain']=bool(potential_geometry.domain_contains(initial[:2])[0])
@@ -684,16 +731,12 @@ class Planner:
             if stop_local is not None:
                 front_s=project_polyline(body_vertices(dense,scene.ego.length,scene.ego.width).reshape(-1,2),global_reference)[0]
                 stop_ok=bool(np.max(front_s)<=stop_local+tolerance)
-            terminal_overshoot=0.
-            if terminal_local is not None:
-                terminal_overshoot=max(0.,float(np.max(_path_projection(dense[:,:2],global_reference)[0])-terminal_local))
-            terminal_ok=terminal_overshoot<=tolerance
-            return {'valid':bool(inside.all() and domain_inside.all() and line_ok.all() and actor_ok.all() and stop_ok and terminal_ok),
+            return {'valid':bool(inside.all() and domain_inside.all() and line_ok.all() and actor_ok.all() and stop_ok),
                 'substep_s':sub_dt,'samples':len(dense),'actor_clearance_min_m':None if not np.isfinite(minimum) else minimum,
                 'offroad_samples':int((~inside).sum()),'line_violation_samples':int((~line_ok).sum()),
                 'line_clearance_min_m':None if not np.isfinite(line_clearance_minimum) else line_clearance_minimum,
                 'outside_potential_domain_samples':int((~domain_inside).sum()),
-                'task_terminal_passed':not terminal_ok,'task_terminal_max_overshoot_m':terminal_overshoot,
+                'official_completion_evaluated':False,
                 'stop_line_passed':not stop_ok,'predicted_contacts':contacts,
                 'limitation':'物理子步离散复核，不是连续时间碰撞证明；周车未来来自预测'}
 
@@ -756,11 +799,6 @@ class Planner:
                 residual('penalty_'+name,np.minimum(margin,0.),derivative,penalties.get(name,100.),scale)
                 rows.append(jac);lower.append(-margin);upper.append(np.full(len(margin),np.inf))
             penalty('road_clearance',road_distance.ravel()+tolerance,road_jac)
-            reserve_enabled=not is_brake and execution_margin>0. and execution_weight>0.
-            if reserve_enabled:
-                reserve_gap=road_distance-road_execution_reserve[:,None]
-                residual('execution_road_reserve',np.minimum(reserve_gap,0.).ravel(),
-                    lambda c,active=(reserve_gap.ravel()<0.):road_jac(c)*active[:,None],execution_weight)
             domain_inside=field_projection['domain_valid'][1:]
             domain_margin,domain_normal=potential_geometry.domain_clearance(current[:,:2])
             penalty('potential_domain',domain_margin,
@@ -805,18 +843,6 @@ class Planner:
                 stop_speed,stop_derivative=_stop_speed_with_slope(global_s,stop_local,scene.ego.length,braking)
                 stopped=stop_speed<target;target=np.minimum(target,stop_speed)
                 target_direction=np.where(stopped[:,None],stop_derivative[:,None]*global_tangent*global_interior[:,None],target_direction)
-            if terminal_local is not None:
-                # The task endpoint refers to the ego centre, not a red-light
-                # bumper stop. Geometry after it is support, never a new goal.
-                terminal_speed,terminal_derivative=_stop_speed_with_slope(
-                    navigation_s,terminal_local,0.,braking)
-                ending=terminal_speed<target;target=np.minimum(target,terminal_speed)
-                target_direction=np.where(ending[:,None],
-                    terminal_derivative[:,None]*navigation_tangent*navigation_interior[:,None],target_direction)
-                terminal_s_jac=lambda c:np.einsum('ni,nij->nj',
-                    navigation_tangent*navigation_interior[:,None],c['sens'][:,:2])
-                terminal_position_margin=terminal_local-navigation_s
-                penalty('route_terminal',terminal_position_margin,lambda c:-terminal_s_jac(c))
             # 线段内部等于原横向距离平方；折线端点保留完整位移，避免
             # 最近线段切换时仅取垂距造成目标跳变和错误的数值梯度。
             path_projectors=np.eye(2)[None,:,:]-tangent[:,:,None]*tangent[:,None,:]
@@ -884,7 +910,6 @@ class Planner:
                     lambda c,derivative=derivative:np.einsum('ni,nij->nj',derivative,c['sens'][:,:2]),
                     weights.get('risk',2))
             line_minimum=np.inf
-            line_reserve_minimum=np.inf
             line_states=dense_states[1:]
             line_polygons=shapely.polygons(body_vertices(line_states,scene.ego.length,scene.ego.width)) if physical_lines else None
             line_count=len(line_states)
@@ -919,12 +944,6 @@ class Planner:
                 # 不能只在最终拒绝它们，却让QP看不到修正方向。
                 penalty('noncrossable_line_clearance',signed[node_indices]-clearance,
                         lambda c,partial=line_partial:np.einsum('ni,nij->nj',partial()[node_indices],c['sens']))
-                if reserve_enabled:
-                    reserve_gap=signed[node_indices]-clearance-item['execution_reserve']
-                    line_reserve_minimum=min(line_reserve_minimum,float(reserve_gap.min()))
-                    residual('execution_line_reserve',np.minimum(reserve_gap,0.),
-                        lambda c,partial=line_partial,active=(reserve_gap<0.):np.einsum(
-                            'ni,nij->nj',partial()[node_indices],c['sens'])*active[:,None],execution_weight)
                 if len(intermediate_indices):
                     rows.append(lambda c,partial=line_partial:np.einsum(
                         'ni,nij->nj',partial()[intermediate_indices],c['dense'][intermediate_indices]))
@@ -948,12 +967,6 @@ class Planner:
                 minima.append(float(gap.min()))
             # 时域末端仍保留停车空间。车体前缘而非中心到障碍物的距离。
             terminal_margins=[]
-            if terminal_local is not None:
-                terminal_gap=float(terminal_local-navigation_s[-1]-current[-1,3]**2/(2*braking))
-                penalty('route_terminal_stopping',np.array([terminal_gap]),
-                    lambda c:(-terminal_s_jac(c)[-1]-current[-1,3]/braking*c['sens'][-1,3])[None,:])
-                metrics_terminal_position=float(terminal_position_margin.min())
-                metrics_terminal_stopping=terminal_gap
             if np.isfinite(lead_rear[-1]):
                 gap_end=lead_rear[-1]-s[-1]-scene.ego.length/2-follow_gap
                 stopping_difference=max(0.,(current[-1,3]**2-lead_speed[-1]**2)/(2*terminal_braking))
@@ -977,9 +990,6 @@ class Planner:
             for key in ('actor_risk','line_risk','goal_attraction','contour','heading'):components.setdefault(key,0.)
             metrics={name:value for name,value in zip(labels,minima)}
             metrics['tracking_corridor']=float(tracking_margin.min())
-            if terminal_local is not None:
-                metrics['route_terminal']=metrics_terminal_position
-                metrics['route_terminal_stopping']=metrics_terminal_stopping
             metrics['potential_domain']=float(domain_margin.min())
             if terminal_margins:metrics['terminal_stopping']=float(min(terminal_margins))
             control_margin=float(min(np.min(controls[:,0]-min_a),np.min(max_a-controls[:,0]),
@@ -1000,16 +1010,6 @@ class Planner:
                 safety_feasible=bool(safety_feasible),dense_validation=dense,is_brake=bool(is_brake),
                 violation=max(0.,-min(metrics.values()),-control_margin),goal_evidence=goal_evidence,
                 potential_invalid_samples=field_invalid)
-            result['execution_clearance']={
-                'enabled':bool(reserve_enabled),'role':'soft_internal_execution_reserve;hard_safety_unchanged',
-                'requested_extra_m':execution_margin,'build_time_s':execution_build,'weight':execution_weight,
-                'road_target_min_m':float(road_execution_reserve.min()) if reserve_enabled else None,
-                'road_target_deficit_m':max(0.,float((road_execution_reserve[:,None]-road_distance).max())) if reserve_enabled else None,
-                'line_target_deficit_m':max(0.,-line_reserve_minimum) if reserve_enabled and physical_lines else None,
-                'initial_road_clearance_m':float(initial_body.distance(boundary)),
-                'physical_road_clearance_min_m':float(metrics['road_clearance']),
-                'physical_line_clearance_min_m':None if not physical_lines else float(line_minimum+clearance),
-                'braking_exempt_from_soft_reserve_only':bool(is_brake)}
             def linearize():
                 linearization_started=time.perf_counter();evaluations['linearizations']+=1
                 sensitivity=self.dynamics.sensitivity(controls,initial)
@@ -1290,11 +1290,10 @@ class Planner:
             'emergency':execution_mode=='emergency_unverified',
             'braking_release_conflicts':accepted.get('braking_release_conflicts',[]),
             'emergency_jerk_relaxation':accepted.get('emergency_jerk_relaxation',{'active':False}),
-            'task_terminal':dict(enabled=terminal_enabled,reference_point='ego_center',
+            'task_terminal':dict(enabled=False,role='official_finish_observation_only',
                 task_endpoint=scene.route[-1].tolist(),remaining_m=float(full_arc[-1]-ego_s),
-                navigation_window_start_s_m=float(start_arc),terminal_chart_s_m=terminal_local,
-                terminal_anchor_in_window=bool(len(terminal_indices)),
-                braking_mps2=braking,official_arrival_unchanged=True,
+                finish_observation=finish_observation,
+                navigation_window_start_s_m=float(start_arc),official_arrival_unchanged=True,
                 navigation_support=terminal_support,control_support=control_support,seed_support=seed_support),
             'braking_risk_metrics':accepted.get('braking_risk_metrics'),
             'braking_risk_order_fields':['not_safety_feasible','predicted_contact','maximum_contact_closing_speed_mps',
@@ -1302,7 +1301,6 @@ class Planner:
                 'speed_integral_distance_m_rounded_3','terminal_speed_mps_rounded_3',
                 'navigation_lateral_rms_m','navigation_direction_rms_rad','maximum_constraint_deficit'],
             'dense_validation':accepted['dense_validation'],
-            'execution_clearance':accepted['execution_clearance'],
             'following':{'lead_ids':lead_ids,'minimum_gap_m':follow_gap,'time_headway_s':headway,'terminal_braking_mps2':terminal_braking,
                 'version':'bumper-gap-time-headway-1.0','headway_is_soft_target':True,
                 'initial_net_gap_m':float(lead_rear[0]-local_s0-scene.ego.length/2) if np.isfinite(lead_rear[0]) else None,
@@ -1360,11 +1358,11 @@ class Planner:
             safety_feasible=accepted['safety_feasible'],initial_safety_checks=initial_safety,
             speed_numerical_tolerance_mps=speed_tolerance,
             hard_constraint_groups=['dynamics','acceleration','steering','nonnegative_speed','jerk','steering_rate',
-                'road','potential_domain','noncrossable_line','actor_clearance','speed_limit','lateral_acceleration','stop_line','terminal_stopping','tracking_corridor']+
-                (['route_terminal','route_terminal_stopping'] if terminal_enabled else []),
+                'road','potential_domain','noncrossable_line','actor_clearance','speed_limit','lateral_acceleration','stop_line','terminal_stopping','tracking_corridor'],
             soft_constraint_violations={key:max(0.,-value) for key,value in accepted['minima'].items()
                                         if key not in ('nonnegative_speed','control_box')},
             geometry_progress='closest_point_eliminated_free_progress')
+        if rejected_semantics is not None:diagnostics['rejected_semantics']=rejected_semantics
         # 首控制差分锚定真实已执行控制；数值热启动不等于硬连续性保证。
         diagnostics['control_transition']={
             'previous_executed':previous_control.tolist(),

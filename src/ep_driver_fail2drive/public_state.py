@@ -6,7 +6,7 @@ privileged current-state adapter, not an image-only perception implementation.
 """
 import math
 
-from .route import RouteAdapter, lane_key, point_in_polygon, polygons_intersect, project, xy
+from .route import RouteAdapter, lane_key, point_in_polygon, polygons_intersect, project, xy, wrap
 from .traffic_rules import PublicTrafficRules
 from .vehicle_geometry import SCHEMA as GEOMETRY_SCHEMA
 
@@ -47,6 +47,47 @@ def _location(template, position):
 
 def _state_name(state):
     return str(state).split('.')[-1].lower()
+
+
+def _actor_origin_pose(transform, frame, timestamp):
+    """Archive the frozen CARLA Actor origin, independently of the box centre."""
+    matrix=[[float(v) for v in row] for row in transform.get_matrix()]
+    position=[float(getattr(transform.location,key)) for key in ('x','y','z')]
+    if (len(matrix)!=4 or any(len(row)!=4 for row in matrix)
+            or not all(math.isfinite(v) for row in matrix for v in row)
+            or not all(math.isfinite(v) for v in position)
+            or any(abs(matrix[i][3]-position[i])>1e-5 for i in range(3))):
+        raise ValueError('Invalid frozen CARLA Actor origin transform')
+    forward=[matrix[i][0] for i in range(3)]
+    if abs(sum(v*v for v in forward)-1.)>1e-5:
+        raise ValueError('Invalid frozen CARLA Actor forward vector')
+    orientation={key:(float(getattr(transform.rotation,key)) if hasattr(transform.rotation,key) else None)
+                 for key in ('yaw','pitch','roll')}
+    if any(v is not None and not math.isfinite(v) for v in orientation.values()):
+        raise ValueError('Invalid frozen CARLA Actor orientation')
+    return dict(valid=True,source='frozen_ego_actor_snapshot_transform',reference_point='carla_actor_origin',
+        position_xyz_carla=position,forward_xyz_carla=forward,orientation_deg=orientation,
+        matrix_xyz_carla=matrix,frame=int(frame),timestamp=float(timestamp))
+
+
+def _scope_lane_projection(position, center):
+    """Reject ambiguous lane stations rather than projecting to another loop."""
+    rows=[];arc=0.
+    for a,b in zip(center,center[1:]):
+        dx,dy=b[0]-a[0],b[1]-a[1];length=math.hypot(dx,dy)
+        if length<=1e-8:continue
+        fraction=max(0.,min(1.,((position[0]-a[0])*dx+(position[1]-a[1])*dy)/(length*length)))
+        foot=[a[0]+fraction*dx,a[1]+fraction*dy]
+        rows.append(dict(s_m=arc+fraction*length,position=foot,heading_rad=math.atan2(dy,dx),
+                         distance_m=math.dist(position,foot)))
+        arc+=length
+    if not rows:raise ValueError('lane_has_no_projectable_segment')
+    best=min(rows,key=lambda row:row['distance_m'])
+    close=[row for row in rows if row['distance_m']<=best['distance_m']+.05]
+    best['near_station_span_m']=max(row['s_m'] for row in close)-min(row['s_m'] for row in close)
+    if best['distance_m']>.1:raise ValueError('stop_or_finish_not_on_lane_center')
+    if best['near_station_span_m']>1.:raise ValueError('ambiguous_lane_station')
+    return best
 
 
 class PublicStateExtractor:
@@ -170,8 +211,56 @@ class PublicStateExtractor:
             return None,'unregistered_prop_outside_driving_surface'
         return 'static_obstacle','unregistered_physical_body_intersects_driving_surface'
 
+    def _continuation_stop_association(self, position, lane_id, elevation_m, stop_heading_rad, ego):
+        """Map a real stop to the same public lane beyond the finite task route.
+
+        This only supplies a traffic-rule coordinate. The paper planner decides
+        the trajectory; no red light is waived and no braking control is chosen.
+        """
+        evidence=dict(scope='unresolved',resolved=False,reason='public_stop_coordinate_unavailable')
+        try:
+            if (not self.route.lane_ids or lane_id!=ego['lane_id']
+                    or lane_id!=self.route.lane_ids[-1]):
+                raise ValueError('stop_not_on_current_and_terminal_lane')
+            end=list(self.route.points[-1]);end_z=float(self.route.elevations[-1])
+            if (not all(math.isfinite(v) for v in [*position,*end,end_z,elevation_m,stop_heading_rad])):
+                raise ValueError('nonfinite_stop_or_route_geometry')
+            lane=next(row for row in self.route.lanes if row['id']==lane_id)
+            stop_projection=_scope_lane_projection(position,lane['center'])
+            finish_projection=_scope_lane_projection(end,lane['center'])
+            gap=stop_projection['s_m']-finish_projection['s_m']
+            evidence.update(lane_id=lane_id,stop_lane_s_m=stop_projection['s_m'],
+                finish_lane_s_m=finish_projection['s_m'],gap_after_finish_m=gap,
+                stop_center_residual_m=stop_projection['distance_m'],
+                finish_center_residual_m=finish_projection['distance_m'])
+            if gap<=0.:raise ValueError('stop_not_after_official_finish')
+            height_limit=float(self.config.get('same_level_tolerance_m',1.5))
+            stop_height=self.route.lane_height_at(lane_id,position,elevation_m)
+            finish_height=self.route.lane_height_at(lane_id,end,end_z)
+            if not all(math.isfinite(v) for v in (height_limit,stop_height,finish_height)):
+                raise ValueError('lane_elevation_unavailable')
+            evidence.update(stop_elevation_error_m=abs(stop_height-elevation_m),
+                            finish_elevation_error_m=abs(finish_height-end_z))
+            if (height_limit<=0. or abs(stop_height-elevation_m)>height_limit
+                    or abs(finish_height-end_z)>height_limit):
+                raise ValueError('stop_or_finish_elevation_ambiguous')
+            before=self.route.points[-2]
+            heading=math.atan2(end[1]-before[1],end[0]-before[0])
+            if (abs(wrap(finish_projection['heading_rad']-heading))>.35
+                    or abs(wrap(stop_projection['heading_rad']-stop_heading_rad))>.1):
+                raise ValueError('stop_or_finish_direction_not_confirmed')
+            station=float(self.route.length)+gap
+            if not math.isfinite(station):raise ValueError('nonfinite_continuation_stop_station')
+            evidence.update(scope='public_lane_continuation',resolved=True,stop_s_m=station,
+                reason='same_lane_public_stop_coordinate_after_task_end',
+                traffic_constraint_retained=True,trajectory_decided_by='paper_planner')
+        except (ValueError,TypeError,KeyError,AttributeError,OverflowError,StopIteration) as exc:
+            evidence['reason']=str(exc) if isinstance(exc,ValueError) else 'scope_geometry_unavailable:'+type(exc).__name__
+        return evidence
+
     def _lights(self, actors, ego, frame):
         records, stop_s, unmapped = [],None,False
+        self._last_light_association_audit=[]
         current_light = self.ego.get_traffic_light() if self.ego.is_at_traffic_light() else None
         for actor in actors:
             if not actor.type_id.startswith('traffic.traffic_light'):
@@ -180,7 +269,8 @@ class PublicStateExtractor:
                 try:
                     self._light_stops[actor.id]=[
                         dict(lane_id=lane_key(wp),position=xy(wp.transform.location),
-                             elevation_m=float(wp.transform.location.z))
+                             elevation_m=float(wp.transform.location.z),
+                             heading_rad=-math.radians(wp.transform.rotation.yaw))
                         for wp in actor.get_stop_waypoints()]
                 except (AttributeError,RuntimeError) as exc:
                     self._light_stops[actor.id]=[]
@@ -193,27 +283,59 @@ class PublicStateExtractor:
                 continue
             state = _state_name(actor.get_state())
             relevant,considered = [],[]
+            light_unmapped=False
+            current_reason=None
             for stop in stops:
                 identity = stop['lane_id']
                 if identity not in self.route.lane_ids and identity != ego['lane_id']:
                     continue
                 position = stop['position']
-                considered.append(dict(lane_id=identity,position=position,elevation_m=stop['elevation_m']))
+                detail=dict(lane_id=identity,position=position,elevation_m=stop['elevation_m'],
+                            position_xyz_carla=[position[0],-position[1],stop['elevation_m']],
+                            heading_rad=stop.get('heading_rad'))
+                considered.append(detail)
                 s = self.route.stop_projection(position,identity,ego['lane_id'],stop['elevation_m'])
+                detail['task_stop_s']=s
                 if s is not None:
+                    detail['association_reason']='upcoming_stop_on_official_route'
                     relevant.append(s)
                 elif identity == ego['lane_id'] and state in ('red','yellow'):
+                    association=self._continuation_stop_association(
+                        position,identity,stop['elevation_m'],stop.get('heading_rad'),ego)
+                    detail['continuation_association']=association
+                    if association['resolved']:
+                        s=association['stop_s_m']
+                        detail.update(task_stop_s=s,association_reason='public_lane_continuation_stop')
+                        relevant.append(s)
                     lane = next((l for l in self.route.lanes if l['id'] == identity),None)
                     if lane:
                         along = project(position,lane['center'])['s_m']-project(ego['position'],lane['center'])['s_m']
-                        unmapped |= 0. <= along <= 40.
+                        detail['ahead_on_current_lane_m']=along
+                        detail['unmapped_affected']=bool(0.<=along<=40. and not association['resolved'])
+                        light_unmapped |= detail['unmapped_affected']
             if current_light is not None and current_light.id == actor.id and state in ('red','yellow') and not relevant:
-                unmapped = True
-            if relevant or (current_light is not None and current_light.id == actor.id):
+                current_stops=[row for row in considered if row['lane_id']==ego['lane_id']]
+                # Unknown rule coordinates are an input error, not permission
+                # to replace the paper planner with an external brake command.
+                if not current_stops or not all(row.get('continuation_association',{}).get('resolved',False) for row in current_stops):
+                    light_unmapped=True
+                    current_reason=('current_affected_light_without_stop_waypoints' if not stops else
+                                    'current_affected_light_without_proven_stop_scope')
+            unmapped |= light_unmapped
+            current=bool(current_light is not None and current_light.id==actor.id)
+            if (considered and any('continuation_association' in row for row in considered)) or current or light_unmapped:
+                self._last_light_association_audit.append(dict(id=actor.id,state=state,source_frame=frame,
+                    current_affected_light=current,unmapped_affected=light_unmapped,stops=considered,
+                    reason=current_reason or ('public_stop_association_unresolved' if light_unmapped else 'public_stop_scope_classified'),
+                    geometry_error=self._light_stop_errors.get(actor.id)))
+            if relevant or current or light_unmapped:
                 selected = min(relevant) if relevant else None
                 trigger = getattr(actor,'trigger_volume',None)
                 records.append(dict(id=actor.id,state=state,stop_s=selected,stops=considered,
-                    association='public_controlled_stop_waypoints' if relevant else 'current_lane_red_stop_unmapped',
+                    association=('public_controlled_stop_waypoints' if relevant else
+                                 'current_lane_red_stop_unmapped' if light_unmapped else
+                                 'current_light_without_upcoming_task_stop'),
+                    unmapped_affected=light_unmapped,
                     source_frame=frame,trigger_volume_local=({
                         'center':[trigger.location.x,trigger.location.y,trigger.location.z],
                         'extent':[trigger.extent.x,trigger.extent.y,trigger.extent.z]} if trigger is not None else None)))
@@ -233,6 +355,7 @@ class PublicStateExtractor:
         frozen_ego = snapshot.find(self.ego.id)
         if frozen_ego is None:
             raise ValueError('Official ego is absent from the frozen actor snapshot')
+        actor_origin_pose=_actor_origin_pose(frozen_ego.get_transform(),frame,observed_time)
         ego,ego_evidence = self._actor(self.ego,frozen_ego,observed_time,True)
         if ego is None:
             raise ValueError('Official ego has no finite physical body')
@@ -290,16 +413,20 @@ class PublicStateExtractor:
                 del self.history[identity]
         for row in [ego]+actors:
             row['history']=[dict(value) for value in self.history.get(row['id'],[])]
+        speed_limit=float(self.ego.get_speed_limit())/3.6
+        if not math.isfinite(speed_limit) or speed_limit <= 0:
+            raise ValueError('Current public CARLA ego speed limit is unavailable')
         lights,light_stop_s,unmapped = self._lights(current_actors,ego,frame)
         stop_s=light_stop_s
         public_rules=self.traffic_rules.update(current_actors,snapshot,ego,frozen_ego,observed_time)
         if public_rules['stop_s'] is not None:
             stop_s=public_rules['stop_s'] if stop_s is None else min(stop_s,public_rules['stop_s'])
-        speed_limit=float(self.ego.get_speed_limit())/3.6
-        if not math.isfinite(speed_limit) or speed_limit <= 0:
-            raise ValueError('Current public CARLA ego speed limit is unavailable')
         desired=min(speed_limit,float(self.config.get('desired_speed_mps',10.)))
         valid=route_projection['valid']
+        input_errors=[]
+        if not valid:input_errors.append('route_projection_invalid')
+        if unmapped:input_errors.append('unresolved_current_red_stop')
+        if public_rules['unmapped_current_stops']:input_errors.append('unresolved_current_stop_sign')
         stop_sign_active=(public_rules['stop_s'] is not None and
                           (light_stop_s is None or public_rules['stop_s']<=light_stop_s))
         rules=dict(desired_speed=desired,speed_limit=speed_limit,stop_s=stop_s,must_wait=stop_s is not None,
@@ -310,7 +437,10 @@ class PublicStateExtractor:
                 stop_line=not self._light_stop_errors and not unmapped and public_rules['stop_sign_geometry_available']),
             road_priority_available=False,public_road_rules=dict(public_rules,rules=[]),
             navigation_status='following' if valid else 'route_projection_invalid',
-            navigation_brake_required=not valid or unmapped or bool(public_rules['unmapped_current_stops']),
+            navigation_input_valid=not input_errors,navigation_input_errors=input_errors,
+            finish_gate=dict(getattr(self.route,'finish_gate',{})),
+            actor_origin_pose={key:actor_origin_pose[key] for key in
+                               ('valid','source','reference_point','position_xyz_carla','forward_xyz_carla','frame','timestamp')},
             unmapped_current_red=unmapped,stop_sign_obligations=public_rules['stop_obligations'])
         # An exact-input frame must remain frozen throughout all public reads.
         if self.world.get_snapshot().frame != frame:
@@ -330,6 +460,8 @@ class PublicStateExtractor:
                 route_projection=route_projection,navigation_status=rules['navigation_status'],
                 public_map_sample_audit=self.route.map_sample_audit,
                 public_light_geometry_unavailable=list(self._light_stop_errors.values()),
+                public_light_association_audit=list(self._last_light_association_audit),
+                frozen_actor_origin_pose=actor_origin_pose,
                 stable_navigation_lane_id=ego['lane_id'],lane_map_complete=ego['lane_id'] in ids,
                 actor_classification=classifications,excluded_public_entities=excluded,
                 visibility_polygon=visibility,visibility_evidence=dict(valid=True,

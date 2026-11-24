@@ -6,6 +6,37 @@ official success. Projection failure remains visible instead of jumping a lap.
 """
 import math
 
+FINISH_GATE_SCHEMA = 'ep-driver-f2d-finish-gate-1.0'
+
+
+def _finish_gate(transform, endpoint_xy, terminal_lane_id):
+    """Retain the public official finish plane; never infer an orientation."""
+    result = dict(schema=FINISH_GATE_SCHEMA, valid=False,
+        source='official_set_global_plan_dense_last_transform',
+        reference_point='carla_actor_origin',
+        terminal_lane_id=terminal_lane_id, official_endpoint_unchanged=True,
+        official_completion_external=True)
+    try:
+        point, rotation = transform.location, transform.rotation
+        direction = transform.get_forward_vector()
+        position = [float(point.x), float(point.y), float(point.z)]
+        forward = [float(direction.x), float(direction.y), float(direction.z)]
+        angles = dict(yaw=float(rotation.yaw), pitch=float(rotation.pitch), roll=float(rotation.roll))
+    except (AttributeError, TypeError, ValueError):
+        result['reason'] = 'legacy_navigation_without_complete_transform'
+        return result
+    if (not all(math.isfinite(v) for v in position+forward+list(angles.values()))
+            or abs(math.sqrt(sum(v*v for v in forward))-1.) > 1e-5):
+        result['reason'] = 'invalid_public_finish_transform'
+        return result
+    if math.dist([position[0], -position[1]], endpoint_xy) > 1e-6:
+        result['reason'] = 'official_finish_not_the_retained_route_endpoint'
+        return result
+    result.update(valid=True, position_xyz_carla=position, forward_xyz_carla=forward,
+        orientation_deg=angles, position_xy=[position[0], -position[1]],
+        reason='complete_unmodified_official_finish_plane')
+    return result
+
 
 def lane_key(waypoint):
     return None if waypoint is None else '{}|{}|{}'.format(
@@ -172,8 +203,10 @@ class RouteAdapter:
     def __init__(self, road_map, global_plan_world_coord, config=None):
         self.map, self.config = road_map, dict(config or {})
         self.points, self.elevations, self.waypoints, self.lane_ids = [], [], [], []
+        last_transform = None
         for entry in global_plan_world_coord:
             transform = entry[0] if isinstance(entry, (tuple, list)) else entry
+            last_transform = transform
             location = getattr(transform, 'location', transform)
             if not all(hasattr(location, key) for key in ('x', 'y', 'z')):
                 raise ValueError('Expected the official world-coordinate plan, not the GPS plan')
@@ -189,6 +222,7 @@ class RouteAdapter:
                 self.lane_ids.append(key)
         if len(self.points) < 2:
             raise ValueError('Official world-coordinate plan must contain two distinct points')
+        self.finish_gate = _finish_gate(last_transform, self.points[-1], lane_key(self.waypoints[-1]))
         self.maximum_gap=max(math.dist(a,b) for a,b in zip(self.points,self.points[1:]))
         if self.maximum_gap>float(self.config.get('maximum_official_route_gap_m',8.)):
             raise ValueError('Official route is sparse; retain the evaluator dense plan before base-agent downsampling')

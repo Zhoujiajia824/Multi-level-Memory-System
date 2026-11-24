@@ -127,9 +127,10 @@ class EPDriverFail2DriveAgent(AutonomousAgent):
         self.archive.json("category.json", {"track": "MAP", "input_category": "privileged_current_state",
             "source": "current_public_world_and_dense_official_navigation", "future_events": False,
             "note": "This is not a sensor-only perception submission."})
-        self.archive.json("navigation.json", {"route_id": self.route_id, "public_route_xy": route_signature,
-                          "source": "official_set_global_plan_dense", "official_score": False,
-                          "checkpoint_association": self.config.get("archive_association", {})})
+        navigation_record = {"route_id": self.route_id, "public_route_xy": route_signature,
+                             "source": "official_set_global_plan_dense", "official_score": False,
+                             "checkpoint_association": self.config.get("archive_association", {})}
+        self.archive.json("navigation.json", navigation_record)
         import os
         viz_root = Path(os.environ.get("VIZ_PATH", str(Path(self.config["output_dir"])/"official_visualization")))
         self.viz_path = viz_root/(self.route_id+"_"+unique)
@@ -166,6 +167,12 @@ class EPDriverFail2DriveAgent(AutonomousAgent):
         self.archive.json("ego_geometry.json", geometry)
         self.extractor = PublicStateExtractor(self.world, self.ego, self._global_plan_world_coord,
             config=self.config.get("public_state", {}), route_id=self.route_id, ego_geometry=geometry)
+        # Preserve the exact published finish transform separately from the
+        # rounded XY route signature; no official score or live route index is read.
+        finish_gate = getattr(getattr(self.extractor, "route", None), "finish_gate", None)
+        if finish_gate is not None:
+            navigation_record["finish_gate"] = json_safe(finish_gate)
+            self.archive.json("navigation.json", navigation_record)
         execution = dict(self.config.get("execution", {}))
         minimum = float(execution.get("acceleration_min", -6.0))
         maximum = float(execution.get("acceleration_max", 3.0))

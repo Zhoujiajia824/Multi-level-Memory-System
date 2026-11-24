@@ -139,8 +139,10 @@ class SignedAccelerationController:
 
     throttle/brake是执行器归一化输入，前馈增益仍须真实CARLA闭环验收。
     不依赖Ackermann内部将速度误差两次积分后才改变踏板的响应。
+    规划目标按MPC物理界限幅；反馈努力按既有满踏板换算界限幅，
+    后者不是车辆已实现的加速度，也不回填规划连续性。
     """
-    VERSION = 'signed-acceleration-feedforward-1.2'
+    VERSION = 'signed-acceleration-feedforward-1.3'
 
     def __init__(self, maximum_steering_rad, dt=.02, acceleration_min=-6.,
                  acceleration_max=3., steering_rate=.8, settings=None):
@@ -214,11 +216,15 @@ class SignedAccelerationController:
             self.integral+cfg['acceleration_ki']*acceleration_error*self.dt))
         without_integral = acceleration+cfg['speed_kp']*speed_error+cfg['acceleration_kp']*acceleration_error
         unsaturated = without_integral+proposed_integral
-        # 到达加速度限幅时，只允许能解除饱和的积分变化。
-        if not ((unsaturated > self.maximum and acceleration_error > 0) or
-                (unsaturated < self.minimum and acceleration_error < 0)):
+        # 规划加速度是物理目标；反馈努力是按现有满踏板标定换算的执行量。
+        # MPC 的[-6,3]不能再用来截断补偿，否则正常油门永远不超过3/6。
+        effort_min=-cfg['brake_full_deceleration_mps2']
+        effort_max=cfg['throttle_full_acceleration_mps2']
+        # 仅在真实执行器饱和、且积分会加重饱和时停止积分。
+        if not ((unsaturated > effort_max and acceleration_error > 0) or
+                (unsaturated < effort_min and acceleration_error < 0)):
             self.integral = proposed_integral
-        requested_acceleration = max(self.minimum, min(self.maximum, without_integral+self.integral))
+        requested_acceleration = max(effort_min, min(effort_max, without_integral+self.integral))
         if emergency_braking:
             # A zero/release segment of an emergency stop must not acquire
             # throttle from velocity feedback or an earlier positive integral.
@@ -228,10 +234,11 @@ class SignedAccelerationController:
             # 有明确制动意图时不能由滞后的正速度误差或积分生成油门。
             # 仍允许反馈减弱过强制动；下界只保留明确的制动方向，不能反向给油。
             requested_acceleration = min(requested_acceleration, .25*acceleration)
-        # The feedback deadband filters integral resets, not a request to stop.
-        # Even a small positive planned acceleration must release the holding
-        # brake; otherwise low-speed replans continually erase the start effort.
-        hold = (acceleration <= 1e-8 and target_speed <= cfg['stop_speed_mps'] and
+        requested_acceleration=max(effort_min,min(effort_max,requested_acceleration))
+        # 停车保持只落实规划器的明确零速目标；低速爬行仍按原目标跟踪。
+        # 实测低速阈值仅决定保持制动的接合时机，不能把正目标速度改成停车。
+        hold_target_epsilon = 1e-8
+        hold = (acceleration <= 1e-8 and target_speed <= hold_target_epsilon and
                 abs(measured_speed) <= cfg['stop_speed_mps'])
         throttle = max(0., min(1., requested_acceleration/cfg['throttle_full_acceleration_mps2']))
         brake = max(0., min(1., -requested_acceleration/cfg['brake_full_deceleration_mps2']))
@@ -250,9 +257,16 @@ class SignedAccelerationController:
             'measured_longitudinal_acceleration_mps2': measured_acceleration,
             'speed_error_mps': speed_error, 'acceleration_error_mps2': acceleration_error,
             'integral_mps2': self.integral, 'requested_acceleration_mps2': requested_acceleration,
+            'requested_acceleration_semantics': 'legacy_alias_of_actuator_effort_not_physical_acceleration',
+            'actuator_effort_mps2': requested_acceleration,
+            'actuator_effort_semantics': 'requested_equivalent_effort_before_stop_hold_not_measured_acceleration',
+            'actuator_effort_limits_mps2': [effort_min,effort_max],
+            'returned_pedal_effort_mps2': throttle*cfg['throttle_full_acceleration_mps2']-brake*cfg['brake_full_deceleration_mps2'],
+            'planned_acceleration_limits_mps2': [self.minimum,self.maximum],
             'emergency_braking': emergency_braking,
             'continuity_acceleration_source': 'planned_acceleration_mps2',
             'throttle': throttle, 'brake': brake, 'stop_hold': hold,
+            'stop_hold_target_speed_epsilon_mps': hold_target_epsilon,
             'steer_normalized_right': -self.steering/self.maximum_steering,
             'steering_rad_left': self.steering, 'maximum_steering_rad': self.maximum_steering}
         self.previous_intent, self.last_tick, self.last_result = intent, tick, result
