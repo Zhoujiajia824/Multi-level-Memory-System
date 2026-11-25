@@ -30,6 +30,8 @@ class CoreProcess:
         worker_settings.update(resume=settings.get("resume", True),
                                model_revision=settings.get("model_revision"),
                                model_service=settings.get("model_service", {}),
+                               model_service_validation=settings.get("model_service_validation"),
+                               model_request_policy=settings.get("model_request_policy", {}),
                                model_goal_retry_limit=settings.get("model_goal_retry_limit",
                                    1 if settings["fast"] == "server" else 0),
                                structured_model_output=settings.get("structured_model_output", False))

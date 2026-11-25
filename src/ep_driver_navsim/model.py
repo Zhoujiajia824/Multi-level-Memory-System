@@ -13,10 +13,11 @@ from nine_grid.decision_protocol import LATERAL_ACTIONS, LONGITUDINAL_ACTIONS
 from nine_grid.models import VisionClient, _goal_reference, attention_ids
 from nine_grid.geometry import polyline_lengths
 
-STRUCTURED_OUTPUT_PROTOCOL = "navsim-scoped-response-schema-1.1"
+STRUCTURED_OUTPUT_PROTOCOL = "navsim-scoped-response-schema-1.2"
 STRUCTURED_DECODING = {"policy": "greedy", "temperature": 0.0}
-MODEL_ATTEMPT_PROTOCOL = "ep-navsim-model-attempts-1"
-GOAL_RETRY_PROTOCOL = "navsim-model-goal-retry-1"
+MODEL_ATTEMPT_PROTOCOL = "ep-navsim-model-attempts-2"
+GOAL_RETRY_PROTOCOL = "navsim-model-goal-retry-2"
+SEMANTIC_RETRY_STAGES = ("goal_geometry", "attention_identity", "decision_goal_mismatch")
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +26,8 @@ def goal_retry_policy(settings):
     limit = settings.get("model_goal_retry_limit", 1 if settings["fast"] == "server" else 0)
     if type(limit) is not int or limit not in (0, 1) or (settings["fast"] == "off" and limit):
         raise ValueError("model_goal_retry_limit must be 0 or 1; off requires 0")
-    return dict(protocol=GOAL_RETRY_PROTOCOL, limit=limit, trigger="goal_geometry_only",
-                reference="same_source_frame")
+    return dict(protocol=GOAL_RETRY_PROTOCOL, limit=limit, trigger="correctable_answer_only",
+                stages=list(SEMANTIC_RETRY_STAGES), reference="same_source_frame")
 
 
 def rejection_stage(raw, scene, config, reference):
@@ -56,12 +57,14 @@ def rejection_stage(raw, scene, config, reference):
     return "goal_geometry"
 
 
-def goal_retry_prompt(prompt, raw, reason, attempt):
+def goal_retry_prompt(prompt, raw, reason, attempt, stage="goal_geometry"):
     """Ask the model again; never clamp, snap or substitute its goal locally."""
-    feedback = dict(attempt=attempt, rejected_answer=raw, rejection=str(reason),
+    feedback = dict(attempt=attempt, rejected_answer=raw, rejection=str(reason), stage=stage,
                     coordinate_policy="原始输入帧及原规划参考不变；不得更换坐标原点或使用未来状态")
-    return (prompt + "\n局部目标几何校验未通过。请根据原始场景、同一规划参考和下面的拒绝原因，"
+    return (prompt + "\n回答校验未通过。请根据原始场景、同一规划参考和下面的拒绝原因，"
             "重新给出完整四部分JSON回答。程序没有修改你的目标点；仍须由你重新选择可达目标。\n"
+            "必须纠正被指出的坐标、重复对象或行动矛盾；不要原样重复被拒绝的回答。"
+            "delta_s_m是从自车投影向前的增量，不是source_s_ego_m；d_m表示车体中心位置。\n"
             + json.dumps(feedback, ensure_ascii=False))
 
 
@@ -245,6 +248,12 @@ def structured_response_format(scene, config=None, reference=None):
     if upper < lower:
         raise NoLegalGoalReference("empty_longitudinal_goal_interval",
             "Structured output has no legal longitudinal goal interval")
+    from .model_guidance import (GuidanceUnavailable, validate_request_state,
+                                 allowed_lateral_actions)
+    try:
+        validate_request_state(scene, reference)
+    except GuidanceUnavailable as exc:
+        raise NoLegalGoalReference(exc.reason_code, str(exc)) from exc
     ids = sorted(attention_ids(scene, config))
     text = dict(type="string", minLength=1, maxLength=192)
     identity = dict(type="string", enum=ids) if ids else dict(text)
@@ -256,7 +265,8 @@ def structured_response_format(scene, config=None, reference=None):
         return _object(dict(action=dict(type="string", enum=list(actions)), reason=dict(text)))
     schema = _object(dict(
         scene=_object(dict(description=dict(text), reason=dict(text))),
-        decision=_object(dict(lateral=decision(LATERAL_ACTIONS), longitudinal=decision(LONGITUDINAL_ACTIONS))),
+        decision=_object(dict(lateral=decision(allowed_lateral_actions(scene, reference)),
+                              longitudinal=decision(LONGITUDINAL_ACTIONS))),
         attention=dict(type="array", maxItems=min(3, len(ids)),
                        items=_object(dict(id=identity, reason=dict(text)))),
         local_goal=_object(dict(delta_s_m=dict(type="number", minimum=lower, maximum=upper),
@@ -265,22 +275,11 @@ def structured_response_format(scene, config=None, reference=None):
                                                      strict=True, schema=schema))
 
 
-class _SchemaTransport:
-    def __init__(self, transport, response_format):
-        self.transport = transport
-        self.response_format = copy.deepcopy(response_format)
-        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
-
-    def create(self, **kwargs):
-        kwargs["response_format"] = copy.deepcopy(self.response_format)
-        # NAVSIM server evaluation uses greedy decoding; shared API clients keep
-        # their existing settings and every retry retains the same strict schema.
-        kwargs["temperature"] = STRUCTURED_DECODING["temperature"]
-        return self.transport.chat.completions.create(**kwargs)
+from .model_transport import BoundedStructuredVisionClient
 
 
-class StructuredServerVisionClient(AuditedVisionClient):
-    """Keep the core image payload/retries while adding one mandatory server field."""
+class StructuredServerVisionClient(BoundedStructuredVisionClient):
+    """NAVSIM-only compact structured requests with a shared bounded deadline."""
     def __init__(self, role, settings, **kwargs):
         if settings.get("backend") != "server":
             raise ValueError("NAVSIM structured_model_output requires the server backend")
@@ -288,13 +287,3 @@ class StructuredServerVisionClient(AuditedVisionClient):
         self.settings["structured_decoding"] = copy.deepcopy(STRUCTURED_DECODING)
         logger.info("NAVSIM structured output protocol=%s decoding=%s",
                     STRUCTURED_OUTPUT_PROTOCOL, STRUCTURED_DECODING)
-
-    def call_structured(self, prompt, image_paths, response_format):
-        # A worker processes anchors sequentially. Every retry keeps this exact
-        # schema; unsupported response_format errors never retry unconstrained.
-        original = self.client
-        self.client = _SchemaTransport(original, response_format)
-        try:
-            return super().call(prompt, image_paths)
-        finally:
-            self.client = original

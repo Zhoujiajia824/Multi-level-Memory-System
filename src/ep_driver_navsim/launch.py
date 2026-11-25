@@ -17,6 +17,7 @@ import yaml
 
 from . import INPUT_CONDITION, OFFICIAL_COMMIT
 from .protocol import digest, write_json
+from .progress import ProgressMonitor, progress_interval
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -26,6 +27,20 @@ def evaluation_worker_count(value=1, platform=None):
     if type(value) is not int or not 1 <= value <= 8:
         raise ValueError("evaluation_workers must be an integer between 1 and 8")
     return 1 if (platform or sys.platform) == "win32" else value
+
+
+def freeze_model_request_budget(settings):
+    """Record the exact policy used by the bounded NAVSIM structured client."""
+    if "model_request_policy" not in settings and not settings.get("structured_model_output", False):
+        return
+    from .model_transport import model_request_policy
+    policy = model_request_policy(settings)
+    if settings.get("fast", "off") != "off":
+        outer = settings.get("timeout_s", 600.)
+        if (isinstance(outer, bool) or not isinstance(outer, (int, float))
+                or not math.isfinite(outer) or policy["total_deadline_s"]+60 > outer):
+            raise ValueError("Core timeout must reserve at least 60 seconds beyond the shared model deadline")
+    settings["model_request_policy"] = policy
 
 
 def source_fingerprint(root, subdir="navsim"):
@@ -124,13 +139,14 @@ def prepare_settings(config_path, split_override=None, output_override=None, bev
                     memory_read_dir=None, desired_speed_mps=10.0, map_radius_m=160.0,
                     dino_device="cpu", timeout_s=600.0, bev_video=True, resume=True,
                     model_revision=None, model_service={}, structured_model_output=False,
-                    evaluation_workers=1)
+                    evaluation_workers=1, progress_interval_s=15.)
     settings = dict(defaults, **settings)
     settings.setdefault("model_goal_retry_limit", 1 if settings["fast"] == "server" else 0)
     if (type(settings["model_goal_retry_limit"]) is not int or settings["model_goal_retry_limit"] not in (0, 1)
             or (settings["fast"] == "off" and settings["model_goal_retry_limit"] != 0)):
         raise ValueError("model_goal_retry_limit must be 0 or 1 (0 when fast=off)")
     settings["evaluation_workers"] = evaluation_worker_count(settings["evaluation_workers"])
+    settings["progress_interval_s"] = progress_interval(settings["progress_interval_s"])
     if split_override:
         settings["split"] = split_override
     if output_override:
@@ -151,6 +167,7 @@ def prepare_settings(config_path, split_override=None, output_override=None, bev
         raise ValueError("Invalid model/retrieval mode")
     if settings["structured_model_output"] and settings["fast"] != "server":
         raise ValueError("structured_model_output requires fast=server")
+    freeze_model_request_budget(settings)
     if settings["retrieve"] and (settings["fast"] == "off" or not settings["memory_read_dir"]):
         raise ValueError("Frozen retrieval requires an enabled fast model and memory_read_dir")
     for key in required | {"parameters", "models_config", "prompts_config"}:
@@ -175,6 +192,16 @@ def prepare_settings(config_path, split_override=None, output_override=None, bev
         if settings["fast"] == "api" and not os.environ.get(model.get("api_key_env", "")):
             raise ValueError("Set the fast model API key environment variable before starting: " +
                              str(model.get("api_key_env", "<missing api_key_env>")))
+    # Validate before loading all scene indices, maps, DINO or the official SDK.
+    # A declaration that says compact while the live service permits runaway
+    # whitespace must never silently start another full B evaluation.
+    from .service_validation import validate_model_service
+    settings.pop("model_service_validation", None)
+    service_validation = validate_model_service(settings)
+    if service_validation is not None:
+        settings["model_service_validation"] = service_validation
+        print("Model service validation: " + ("verified" if service_validation["verified"] else "MANUAL_UNVERIFIED")
+              + " (" + service_validation["verification_method"] + ")", flush=True)
     data = Path(settings["data_root"])
     for name in ("maps", "navsim_logs/test", "sensor_blobs/test", settings["split"] + "/sensor_blobs",
                  settings["split"] + "/synthetic_scene_pickles"):
@@ -207,6 +234,8 @@ def prepare_settings(config_path, split_override=None, output_override=None, bev
     if frozen.exists() and json.loads(frozen.read_text(encoding="utf-8")) != settings:
         raise ValueError("Output directory belongs to different settings/code; choose a new output_dir")
     write_json(frozen, settings)
+    if service_validation is not None:
+        write_json(Path(settings["output_dir"]) / "model_service_validation.json", service_validation)
     return settings
 
 
@@ -348,6 +377,10 @@ def verify_scores(settings, csv_path):
                 split=settings["split"], settings_sha256=digest(settings))
     result["trajectory_sampling"] = dict(horizon_s=4.0, interval_s=0.5, poses=8,
                                          short_plan_padding_allowed=False)
+    if settings.get("model_service_validation") is not None:
+        # This is the safe allowlisted summary frozen by prepare_settings, not
+        # the service's raw configuration or environment.
+        result["model_service_validation"] = json.loads(json.dumps(settings["model_service_validation"]))
     if settings.get("output_dir") is not None:
         audits = []
         model_requested = settings.get("fast", "off") in ("api", "server")
@@ -453,19 +486,35 @@ def _stop_official_child(child):
 
 def run_official(settings, lease):
     """Keep ownership until the official child exits, including interruption."""
+    interval = progress_interval(settings.get("progress_interval_s", 15.))
+    monitor = ProgressMonitor(settings) if interval else None
     child = subprocess.Popen(official_command(settings), env=scoring_environment(settings), cwd=ROOT,
                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                              start_new_session=os.name != "nt", **lease.child_options())
     try:
-        code = child.wait()
+        if monitor is not None:
+            monitor.emit("official_scoring_started")
+        while True:
+            try:
+                code = child.wait(timeout=interval or None)
+                break
+            except subprocess.TimeoutExpired:
+                if monitor is not None:
+                    monitor.emit()
     except BaseException:
         # No PID scan: only the child/session explicitly created immediately
         # above is managed. External deployed model/viewer services are outside.
         _stop_official_child(child)
+        if monitor is not None:
+            monitor.emit("official_scoring_interrupted")
         raise
     if code:
         _stop_official_child(child)
+        if monitor is not None:
+            monitor.emit("official_scoring_failed")
         raise subprocess.CalledProcessError(code, child.args)
+    if monitor is not None:
+        monitor.emit("official_scoring_finished")
 
 
 def _evaluate_locked(settings, lease):

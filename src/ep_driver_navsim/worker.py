@@ -26,7 +26,11 @@ from .resume import (build_run_identity, sample_identity, load_completed_sample,
 from .memory import check_memory_disjoint, load_memory_snapshot
 from .model import (NoLegalGoalReference, AuditedVisionClient, StructuredServerVisionClient,
                     structured_response_format, goal_retry_policy, rejection_stage,
-                    goal_retry_prompt, MODEL_ATTEMPT_PROTOCOL)
+                    goal_retry_prompt, MODEL_ATTEMPT_PROTOCOL, SEMANTIC_RETRY_STAGES)
+from .model_transport import model_request_policy
+from .model_guidance import (GuidanceMismatch, guidance_prompt, validate_answer_consistency,
+                             refine_model_prompt)
+from .progress import record_sample_progress
 from nine_grid.contracts import Actor, Lane, SceneSnapshot, RetrievalResult, plain
 from nine_grid.configuration import validate_config
 from nine_grid.models import (VisionClient, load_system_prompts, build_prompt, parse_answer,
@@ -133,6 +137,8 @@ class NumericalPipeline:
         prompts = load_system_prompts(settings["prompts_config"])
         models = yaml.safe_load(Path(settings["models_config"]).read_text(encoding="utf-8"))
         fast = dict(models["fast"], backend=settings["fast"], system_prompt=prompts["fast"])
+        if structured:
+            fast["model_request_policy"] = model_request_policy(settings)
         if settings["retrieve"]:
             self.records, self.memory_snapshot_id, selection = load_memory_snapshot(
                 settings["memory_read_dir"], settings["evaluation_logs"], settings["evaluation_tokens"])
@@ -161,6 +167,8 @@ class NumericalPipeline:
             token = source.get("token") if isinstance(source, dict) else None
             try:
                 fail_sample(output_dir, exc, attempt.get("state"), source_token=token)
+                if attempt.get("state"):
+                    record_sample_progress(output_dir, attempt["state"], "failed")
             except Exception as state_error:
                 logger = logging.getLogger(__name__)
                 logger.error("Failed to publish sample failure state: %s", type(state_error).__name__)
@@ -177,16 +185,19 @@ class NumericalPipeline:
             if cached is not None:
                 return cached
         attempt["state"] = begin_sample(root, identity)
+        state = attempt["state"]
         scene = snapshot_from_packet(packet, self.config)
         packet_path = write_input_packet(root, packet)
         config_hash = digest(self.config)
         timing = {}
         tick = time.perf_counter()
+        record_sample_progress(root, state, "representations")
         reps = build_representations(scene, root / "representations", self.extractor, NineGridBuilder(self.config))
         timing["representations_s"] = time.perf_counter() - tick
         retrieved = RetrievalResult(scene.frame_id, snapshot_id=self.memory_snapshot_id, time=0.0)
         if self.settings["retrieve"]:
             tick = time.perf_counter()
+            record_sample_progress(root, state, "retrieval")
             retrieved = retrieve(reps, self.records, self.memory_snapshot_id, self.config)
             timing["retrieval_s"] = time.perf_counter() - tick
         answer, model_error, model_error_detail, raw = None, None, None, None
@@ -196,26 +207,38 @@ class NumericalPipeline:
         retry_policy = goal_retry_policy(self.settings)
         model_call_attempts = 0
         model_request_sent = False
+        model_consistency = None
+        transport_events = []
+        effective_request_policy = None
         response_format = None
         scoped_for_model, _ = perception_scene(scene, self.config)
         if self.fast.enabled:
             tick = time.perf_counter()
+            record_sample_progress(root, state, "model_preparation")
             attempts_before = int(getattr(self.fast, "attempts", 0))
             structured = self.settings.get("structured_model_output", False)
+            effective_request_policy = model_request_policy(self.settings) if structured else None
+            model_deadline = (time.monotonic() + effective_request_policy["total_deadline_s"]
+                              if effective_request_policy else None)
             # Cache before build_prompt: prompt, request schema and strict parser
             # must use this exact original-frame reference and configured limits.
             reference = _goal_reference(scoped_for_model, self.config)
             # Frame/source/image integrity remains a hard input error, even if a
             # valid numerical base plan could be produced without model semantics.
             images = model_image_paths(scene, reps)
+            current_scene_prompt = build_prompt(scoped_for_model, reps, retrieved)
+            if structured:
+                current_scene_prompt = refine_model_prompt(current_scene_prompt)
             prompt = ("评测输入条件：NAVSIM特权输入基线，使用当前及历史交通对象、车道地图、导航和当前灯态真值。"
                       "本帧候选真值不判断遮挡；只从给定候选ID中选择最多3个关注对象。"
                       "禁止推测任何未提供的未来真值。\n"
-                      + build_prompt(scoped_for_model, reps, retrieved))
+                      + current_scene_prompt)
             (root / "model_prompt.txt").write_text(prompt, encoding="utf-8")
             try:
                 if structured:
                     response_format = structured_response_format(scoped_for_model, self.config, reference)
+                    prompt += "\n" + guidance_prompt(scoped_for_model, reference)
+                    (root / "model_prompt.txt").write_text(prompt, encoding="utf-8")
             except NoLegalGoalReference as exc:
                 # Only an explicitly unavailable semantic reference/goal interval
                 # skips HTTP. It does not request braking or alter the base MPC.
@@ -235,21 +258,63 @@ class NumericalPipeline:
                         prompt_sha256=hashlib.sha256(current_prompt.encode("utf-8")).hexdigest(),
                         original_reference_id=reference["reference_id"],
                         response_format_sha256=digest(response_format) if response_format else None)
-                    raw, model_error, model_error_detail = None, None, None
+                    raw, answer, model_error, model_error_detail = None, None, None, None
+                    model_consistency = None
+
+                    def audit_transport(row):
+                        transport_events.append(dict(semantic_attempt=semantic_index+1,
+                                                     **copy.deepcopy(row)))
+                        write_json_gz(root / "model_transport_events.json.gz", dict(
+                            schema="navsim-model-transport-events-1", frame_id=scene.frame_id,
+                            sample_attempt_id=state["attempt_id"],
+                            policy=effective_request_policy, events=transport_events))
+                        choices = row.get("choices", [])
+                        record_sample_progress(root, state, "model_request",
+                            model_semantic_attempt=semantic_index+1,
+                            model_request_attempt=int(getattr(self.fast, "attempts", 0))-attempts_before,
+                            last_finish_reason=choices[0].get("finish_reason") if choices else None,
+                            model_elapsed_s=time.perf_counter()-tick,
+                            model_deadline_remaining_s=max(0., model_deadline-time.monotonic())
+                                if model_deadline is not None else None)
+
+                    def transport_progress(row):
+                        record_sample_progress(root, state, "model_request",
+                            model_semantic_attempt=semantic_index+1,
+                            model_request_attempt=int(getattr(self.fast, "attempts", 0))-attempts_before,
+                            model_elapsed_s=time.perf_counter()-tick,
+                            model_deadline_remaining_s=max(0., model_deadline-time.monotonic())
+                                if model_deadline is not None else None)
+
                     try:
-                        raw = (self.fast.call_structured(current_prompt, images, response_format) if structured
+                        record_sample_progress(root, state, "model_request",
+                            model_semantic_attempt=semantic_index+1,
+                            model_request_attempt=int(getattr(self.fast, "attempts", 0))-attempts_before+1)
+                        raw = (self.fast.call_structured(current_prompt, images, response_format,
+                                    deadline=model_deadline, on_attempt=audit_transport,
+                                    on_progress=transport_progress) if structured
                                else self.fast.call(current_prompt, images))
                     except Exception as exc:
                         # Record only remote exception types, never credential-bearing text.
                         model_error = type(exc).__name__
                         transport = copy.deepcopy(getattr(self.fast, "last_transport_attempts", []))
                         choices = transport[-1].get("choices", []) if transport else []
-                        model_validation_stage = ("response_truncated" if choices and
-                            choices[0].get("finish_reason") == "length" else "transport_error")
+                        model_validation_stage = getattr(exc, "validation_stage", None) or (
+                            "response_truncated" if choices and choices[0].get("finish_reason") == "length"
+                            else "transport_error")
+                        model_error_detail = getattr(exc, "safe_detail", None)
                         raw = choices[0].get("raw") if choices else None
                     else:
+                        record_sample_progress(root, state, "model_validation",
+                            model_semantic_attempt=semantic_index+1)
                         try:
-                            answer = parse_answer(raw, scoped_for_model, config=self.config, reference=reference)
+                            candidate_answer = parse_answer(raw, scoped_for_model, config=self.config, reference=reference)
+                            model_consistency = (validate_answer_consistency(candidate_answer, scoped_for_model, reference)
+                                                 if structured else None)
+                            answer = candidate_answer
+                        except GuidanceMismatch as exc:
+                            model_error, model_error_detail = type(exc).__name__, str(exc)
+                            model_validation_stage = ("attention_identity" if exc.reason_code == "attention_duplicate"
+                                                      else "decision_goal_mismatch")
                         except ValueError as exc:
                             model_error, model_error_detail = type(exc).__name__, str(exc)
                             model_validation_stage = rejection_stage(raw, scoped_for_model, self.config, reference)
@@ -260,15 +325,23 @@ class NumericalPipeline:
                             model_validation_stage = "accepted"
                     record.update(raw=raw, validation_stage=model_validation_stage,
                         error=model_error, error_detail=model_error_detail,
+                        consistency=copy.deepcopy(model_consistency),
                         transport=copy.deepcopy(getattr(self.fast, "last_transport_attempts", [])))
                     if semantic_index:
                         record["feedback"] = dict(rejected_attempt=semantic_index,
-                            reason=model_attempts[-1]["error_detail"], stage="goal_geometry")
+                            reason=model_attempts[-1]["error_detail"], stage=model_attempts[-1]["validation_stage"])
                     model_attempts.append(record)
-                    if (model_validation_stage != "goal_geometry"
+                    write_json_gz(root / "model_attempts.json.gz", dict(schema=MODEL_ATTEMPT_PROTOCOL,
+                        frame_id=scene.frame_id, policy=retry_policy, request_policy=effective_request_policy,
+                        attempts=model_attempts, final_stage=model_validation_stage))
+                    record_sample_progress(root, state, "model_validation",
+                        validation_stage=model_validation_stage,
+                        model_elapsed_s=time.perf_counter()-tick)
+                    if (model_validation_stage not in SEMANTIC_RETRY_STAGES
                             or semantic_index == retry_policy["limit"]):
                         break
-                    current_prompt = goal_retry_prompt(prompt, raw, model_error_detail, semantic_index+2)
+                    current_prompt = goal_retry_prompt(prompt, raw, model_error_detail, semantic_index+2,
+                                                      stage=model_validation_stage)
             model_call_attempts = int(getattr(self.fast, "attempts", 0)) - attempts_before
             model_request_sent = model_call_attempts > 0
             timing["model_s"] = time.perf_counter() - tick
@@ -276,21 +349,26 @@ class NumericalPipeline:
             # the original answer, each bounded correction and transport evidence.
             write_json_gz(root / "model_attempts.json.gz", dict(schema=MODEL_ATTEMPT_PROTOCOL,
                 frame_id=scene.frame_id, policy=retry_policy, attempts=model_attempts,
+                request_policy=effective_request_policy,
                 final_stage=model_validation_stage))
         tick = time.perf_counter()
+        record_sample_progress(root, state, "prediction")
         scoped, predictions = prepare_planning_context(scene, self.config, answer=answer)
         timing["prediction_s"] = time.perf_counter() - tick
         # Official tokens may be processed in any order, including nearby samples
         # and synthetic follow-ups. Do not reuse state across independent anchors.
         planner = create_planner(self.config)
         tick = time.perf_counter()
+        record_sample_progress(root, state, "planning")
         plan = planner.solve(scoped, predictions, answer)
         timing["planner_s"] = time.perf_counter() - tick
         tick = time.perf_counter()
+        record_sample_progress(root, state, "reference")
         base_scene, base_predictions = prepare_planning_context(scene, self.config)
         baseline = create_planner(self.config).solve(base_scene, base_predictions)
         timing["reference_s"] = time.perf_counter() - tick
         tick = time.perf_counter()
+        record_sample_progress(root, state, "quality")
         quality = evaluate(scoped, plan, baseline, predictions, self.config)
         audit = execution_audit(scoped, plan, predictions, self.config,
             execution_horizon_s=self.config["navsim_execution"]["audit_horizon_s"])
@@ -312,6 +390,8 @@ class NumericalPipeline:
             model_answer=plain(answer), model_error=model_error, model_error_detail=model_error_detail, model_raw=raw,
             model_preparation_fallback=model_preparation_fallback,
             model_validation_stage=model_validation_stage, model_goal_retry_policy=retry_policy,
+            model_request_policy=effective_request_policy, model_consistency=model_consistency,
+            model_transport_events_asset="model_transport_events.json.gz" if transport_events else None,
             model_semantic_attempts=len(model_attempts),
             model_attempts_asset="model_attempts.json.gz" if self.fast.enabled else None,
             model_call_attempts=model_call_attempts, model_request_sent=model_request_sent,
@@ -345,6 +425,7 @@ class NumericalPipeline:
             model_call_attempts=model_call_attempts, model_request_sent=model_request_sent,
             model_error=model_error, model_error_detail=model_error_detail,
             model_validation_stage=model_validation_stage, model_goal_retry_policy=retry_policy,
+            model_request_policy=effective_request_policy, model_consistency=model_consistency,
             model_semantic_attempts=len(model_attempts),
             structured_model_output=self.settings.get("structured_model_output", False),
             retrieval_enabled=self.settings["retrieve"],
@@ -358,9 +439,12 @@ class NumericalPipeline:
         if self.fast.enabled:
             artifact_paths.append(root / "model_prompt.txt")
             artifact_paths.append(root / "model_attempts.json.gz")
+            if transport_events:
+                artifact_paths.append(root / "model_transport_events.json.gz")
         if response_format is not None:
             artifact_paths.append(root / "model_response_format.json")
         complete_sample(root, identity, artifact_paths, attempt_id=attempt["state"]["attempt_id"])
+        record_sample_progress(root, state, "complete", validation_stage=model_validation_stage)
         return result
 
 

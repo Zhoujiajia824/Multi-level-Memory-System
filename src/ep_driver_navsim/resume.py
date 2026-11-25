@@ -20,7 +20,9 @@ from nine_grid.paths import filesystem_path
 from . import INPUT_PROTOCOL
 from .archive import read_input_packet, read_json
 from .protocol import digest, horizon_contract, relative_asset_path, trajectory_from_centers, write_json
-from .model import STRUCTURED_OUTPUT_PROTOCOL, goal_retry_policy, goal_retry_prompt, MODEL_ATTEMPT_PROTOCOL
+from .model import (STRUCTURED_OUTPUT_PROTOCOL, goal_retry_policy, goal_retry_prompt,
+                    MODEL_ATTEMPT_PROTOCOL, SEMANTIC_RETRY_STAGES)
+from .model_transport import model_request_policy
 
 SCHEMA = "ep-navsim-completion-1"
 COMPLETION_FILE = "sample_complete.json"
@@ -79,6 +81,8 @@ def build_run_identity(settings, effective_config, model_settings, system_prompt
                 config_file_sha256={key: settings["config_file_sha256"][key]
                                     for key in ("parameters", "prompts_config")},
                 model=model, model_service=settings.get("model_service", {}),
+                model_service_validation=settings.get("model_service_validation"),
+                model_request_policy=(model_request_policy(settings) if settings.get("structured_model_output") else None),
                 structured_model_output=settings.get("structured_model_output", False),
                 model_goal_retry_policy=goal_retry_policy(settings),
                 structured_output_protocol=(STRUCTURED_OUTPUT_PROTOCOL
@@ -164,7 +168,8 @@ def _unsent_semantic_preparation(result, evidence):
     required = {"reason", "detail", "stage", "request_sent", "policy"}
     if (not isinstance(fallback, dict) or set(fallback) != required
             or not isinstance(fallback.get("reason"), str)
-            or fallback["reason"] not in {"semantic_reference_invalid", "empty_longitudinal_goal_interval"}
+            or fallback["reason"] not in {"semantic_reference_invalid", "empty_longitudinal_goal_interval",
+                                          "current_state_not_forward_frenet", "current_state_frenet_boundary_nonfinite"}
             or not isinstance(fallback.get("detail"), str) or not fallback["detail"].strip()
             or fallback.get("stage") != "structured_request_preparation"
             or fallback.get("request_sent") is not False
@@ -203,6 +208,7 @@ def _validate_output(root, identity, assets):
         raise ValueError("Checkpoint packet/camera content differs")
     result = read_json(root / "trajectory.json")
     evidence = read_json(root / "planning_evidence.json")
+    attempts = {}
     policy = identity["run"].get("model_goal_retry_policy")
     if policy is not None:
         for record in (result.get("condition_audit", {}), evidence):
@@ -228,11 +234,13 @@ def _validate_output(root, identity, assets):
                 prompt = base_prompt
                 if index:
                     previous = rows[index-1]
-                    if (previous.get("validation_stage") != "goal_geometry"
+                    stage = previous.get("validation_stage")
+                    if (stage not in SEMANTIC_RETRY_STAGES
                             or row.get("feedback") != dict(rejected_attempt=index,
-                                reason=previous.get("error_detail"), stage="goal_geometry")):
-                        raise ValueError("Checkpoint correction does not follow a geometric rejection")
-                    prompt = goal_retry_prompt(base_prompt, previous.get("raw"), previous.get("error_detail"), index+1)
+                                reason=previous.get("error_detail"), stage=stage)):
+                        raise ValueError("Checkpoint correction does not follow a correctable rejection")
+                    prompt = goal_retry_prompt(base_prompt, previous.get("raw"), previous.get("error_detail"), index+1,
+                                               stage=stage)
                 if (row.get("attempt") != index+1
                         or row.get("prompt_sha256") != hashlib.sha256(prompt.encode("utf-8")).hexdigest()
                         or row.get("original_reference_id") != rows[0].get("original_reference_id")
@@ -242,6 +250,24 @@ def _validate_output(root, identity, assets):
                     or (evidence.get("model_answer") is not None and evidence.get("model_validation_stage") != "accepted")):
                 raise ValueError("Checkpoint model acceptance stage differs")
     if identity["run"].get("structured_model_output"):
+        request_policy = identity["run"].get("model_request_policy")
+        if request_policy is not None:
+            for record in (result.get("condition_audit", {}), evidence):
+                if record.get("model_request_policy") != request_policy:
+                    raise ValueError("Checkpoint bounded model request policy differs")
+            if attempts.get("request_policy") != request_policy:
+                raise ValueError("Checkpoint model attempt deadline policy differs")
+            if evidence.get("model_request_sent"):
+                name = "model_transport_events.json.gz"
+                if name not in assets or evidence.get("model_transport_events_asset") != name:
+                    raise ValueError("Checkpoint per-request transport audit is missing")
+                events = read_json(root / name)
+                state = read_json(root / SAMPLE_STATE_FILE)
+                if (events.get("frame_id") != packet["identity"]["token"]
+                        or events.get("sample_attempt_id") != state.get("attempt_id")
+                        or events.get("policy") != request_policy
+                        or len(events.get("events", [])) != evidence.get("model_call_attempts")):
+                    raise ValueError("Checkpoint per-request transport audit differs from this attempt")
         unsent = _unsent_semantic_preparation(result, evidence)
         has_schema = "model_response_format.json" in assets
         if not has_schema and not unsent:
