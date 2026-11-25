@@ -42,6 +42,9 @@ class OfficialDemonstrationAgent(EPDriverFail2DriveAgent):
         self._native_count = 0
         self._demo_taps = {}
         self._demo_behavior = DemonstrationBehaviorAudit()
+        self._segment_runtime = None
+        self._segment_hook = None
+        self._segment_source_ego = None
 
     def setup(self,path_to_conf_file):
         super().setup(path_to_conf_file)
@@ -62,7 +65,14 @@ class OfficialDemonstrationAgent(EPDriverFail2DriveAgent):
                 tap = SensorPoseTap(self.sensor_interface,camera_id=sensor['id'],camera_mount_matrix_m=mount.get_matrix())
                 self._demo_taps[sensor['id']] = tap
                 tap.install()
+            if spec.get('capture_mode') == 'interaction_segment':
+                from ep_driver_fail2drive.demo_segment import validate_spec
+                from ep_driver_fail2drive.demo_segment_runtime import install_manager_hook
+                validate_spec(spec['segment'])
+                install_manager_hook(self)
         except Exception:
+            from ep_driver_fail2drive.demo_segment_runtime import restore_manager_hook
+            restore_manager_hook(self)
             for tap in self._demo_taps.values():tap.close()
             self._demo_taps.clear()
             if self._pose_tap is not None:
@@ -103,11 +113,17 @@ class OfficialDemonstrationAgent(EPDriverFail2DriveAgent):
             human_driving_quality_review_required=True,
             model_calls=0,retrieval_enabled=False,write_memory_enabled=False,
             complete=False,completed_without_agent_error=False,errors=[])
+        if self.config['official_demo'].get('capture_mode') == 'interaction_segment':
+            self._demo_run.update(capture_mode='interaction_segment',segment_capture_path='segment_capture.json')
         self.archive.json('run.json',self._demo_run)
         (self.archive.directory/'native').mkdir()
         self.expert = OfficialExpert(self.config['official_demo']['official_root'],seed=association['repetition_seed'])
         self.expert.setup(self._global_plan,self._global_plan_world_coord)
         self.archive.json('expert_world_guard.json',self.expert.evidence())
+        if self.config['official_demo'].get('capture_mode') == 'interaction_segment':
+            from ep_driver_fail2drive.demo_segment_runtime import SegmentRuntime
+            self._segment_runtime = SegmentRuntime(self)
+            self._segment_runtime.write()
 
     def _display(self,input_data,frame,stamp,relative):
         image = input_data.get('rgb')
@@ -242,6 +258,8 @@ class OfficialDemonstrationAgent(EPDriverFail2DriveAgent):
                 expert_decision=self.expert.decision_evidence(),
                 audit=dict(source='official_checkpoint_after_run',collision=None,offroad=None,rule_violation=None),
                 agent_wall_s=time.monotonic()-started))
+            if self._segment_runtime is not None:
+                self._segment_source_ego = (frame,observed_ego)
             if source:
                 self._record_source(input_data,scene,images,frame,stamp)
                 self.archive.append('agent_sources',dict(frame=frame,time=stamp,scene=scene))
@@ -263,9 +281,19 @@ class OfficialDemonstrationAgent(EPDriverFail2DriveAgent):
             return
         self._closed = True
         archive = self.archive
+        errors = list(self._demo_errors)
+        try:
+            from ep_driver_fail2drive.demo_segment_runtime import restore_manager_hook
+            restore_manager_hook(self)
+        except Exception as error:
+            errors.append(dict(type=type(error).__name__,error=str(error),resource='segment_manager_hook'))
+        try:
+            if self._segment_runtime is not None:
+                self._segment_runtime.write()
+        except Exception as error:
+            errors.append(dict(type=type(error).__name__,error=str(error),resource='segment_capture_evidence'))
         if archive is None:
             return super().destroy()
-        errors = list(self._demo_errors)
         guard = dict(complete=False,world_mutations_allowed=False,non_ego_mutation_attempts=[],failures=[],scope='ego_control_only')
         try:
             if self.expert is not None:

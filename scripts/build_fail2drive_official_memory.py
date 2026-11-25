@@ -1,4 +1,4 @@
-"""Finalize official expert captures, check evidence, or prepare offline tasks."""
+"""Finalize full-route or interaction-segment expert captures and prepare offline tasks."""
 import argparse
 import json
 from pathlib import Path
@@ -21,7 +21,7 @@ def main(argv=None):
         command.add_argument('--captures',required=True,action='append')
         command.add_argument('--anchor-frame',action='append')
         command.add_argument('--require-all-families',action='store_true')
-        command.add_argument('--collection-split',help='Fixed 34-route memory partition; reject held-out test routes and partners')
+        command.add_argument('--collection-split',help='Fixed paired collection partition; reject held-out test routes and partners')
         command.add_argument('--allow-partial-collection',action='store_true',
             help='With --collection-split only, admit an explicitly selected successful subset; keep quality and held-out isolation checks')
         command.add_argument('--allow-min-speed-only',action='store_true',help='Explicitly allow previously frozen minimum-speed-only sources; never waive other infractions or process checks')

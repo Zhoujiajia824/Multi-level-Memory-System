@@ -1,4 +1,4 @@
-"""Read-only check of the fixed 34-demo/17-test route partition; no CARLA."""
+"""Read-only check of the selected demonstration/test route partition; no CARLA."""
 import argparse
 import json
 from pathlib import Path

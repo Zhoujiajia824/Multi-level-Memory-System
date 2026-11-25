@@ -1,7 +1,8 @@
 """Official-world demonstration launch plans, separate from paper A/B/C methods.
 
 The official evaluator remains the sole owner of the world, actors, route,
-weather, event triggers and scoring. Only its ego Agent entry point changes.
+weather, event triggers and scoring. Segment collection additionally stops its
+manager after the observed interaction; it never claims official route success.
 Planning this command never constructs a CARLA client or starts a simulator.
 """
 from __future__ import annotations
@@ -117,6 +118,8 @@ def _expert_hashes(source, launcher):
 def _code_hashes(launcher):
     files = [ROOT/'scripts'/'capture_fail2drive_official.py',Path(__file__),AGENT,
              ROOT/'src'/'ep_driver_fail2drive'/'official_expert.py']
+    files.extend(sorted((ROOT/'src'/'ep_driver_fail2drive').glob('demo_segment*.py')))
+    files.append(ROOT/'src'/'ep_driver_fail2drive'/'memory_split.py')
     result = {}
     for path in files:
         if not path.is_file():
@@ -192,7 +195,12 @@ def select_routes(args, catalog, source, launcher):
         if details['official_route_id'] in indexed:
             raise ValueError('Official route IDs repeat in the selected input')
         indexed[details['official_route_id']] = (path,details)
-    if args.route_ids is not None:
+    if getattr(args,'selected_collection',False):
+        from .memory_split import load_transfer_split,route_ids,validate_transfer_source
+        split=load_transfer_split(getattr(args,'collection_split',None))
+        validate_transfer_source(split,source)
+        wanted=route_ids(split,'collection')
+    elif args.route_ids is not None:
         wanted = list(args.route_ids)
         if not wanted or len(set(wanted))!=len(wanted) or any(type(x) is not int for x in wanted):
             raise ValueError('Choose distinct explicit official route IDs')
@@ -205,7 +213,7 @@ def select_routes(args, catalog, source, launcher):
     if not set(wanted).issubset(indexed):
         raise ValueError('Selected original official routes are absent: '+str(sorted(set(wanted)-set(indexed))))
     rows = [indexed[identity] for identity in wanted]
-    if args.route_ids is None:
+    if args.route_ids is None and not getattr(args,'selected_collection',False):
         canonical = {row['route_id']:row for row in catalog['demonstrations']}
         for path,details in rows:
             expected = canonical[details['official_route_id']]
@@ -231,6 +239,28 @@ def plan(args, *, preflight=None, launcher=None):
         sdk = launcher.verify_sdk(args.evaluator_python or sys.executable,simulator)
         preflight = official,simulator,sdk
     routes = select_routes(args,catalog,source,launcher)
+    capture_mode=getattr(args,'capture_mode',None) or (
+        'interaction_segment' if getattr(args,'selected_collection',False) else 'full_route')
+    segment_specs={}
+    split=None
+    if capture_mode=='interaction_segment':
+        from .memory_split import load_transfer_split,validate_transfer_source
+        from .demo_segment import build_segment_spec
+        split=load_transfer_split(getattr(args,'collection_split',None))
+        validate_transfer_source(split,source)
+        records={record['route_id']:(row,record) for row in split['rows'] for record in row['collection']}
+        if seeds!=[split['collection_seed']]:
+            raise ValueError('Interaction collection must use its fixed collection seed')
+        for route,details in routes:
+            identity=details['official_route_id']
+            if identity not in records:
+                raise ValueError('Interaction capture must use the collection partition; held-out routes and partners are forbidden')
+            row,record=records[identity]
+            if details['routes_sha256']!=record['sha256']:
+                raise ValueError('Interaction capture XML differs from its frozen collection identity')
+            partner=next(r for r in row['collection'] if r['variant']=='Generalization')
+            segment_specs[identity]=build_segment_spec(route,source/partner['routes'],
+                max_seconds=getattr(args,'segment_max_seconds',90.))
     implementation = _code_hashes(launcher)
     expert = _expert_hashes(source,launcher)
     expert_identity = _digest(expert)
@@ -257,6 +287,10 @@ def plan(args, *, preflight=None, launcher=None):
                 official_route_id=details['official_route_id'],scenario_mutations=False,
                 official_expert_source_sha256=expert_identity,expert_privileged_only_offline=True,
                 data_use='targeted_seen_scenario_demonstration')
+            if capture_mode=='interaction_segment':
+                config['official_demo'].update(capture_mode=capture_mode,
+                    segment=segment_specs[details['official_route_id']],
+                    collection_split_sha256=_digest(split))
             command=list(command)
             command[command.index('--agent')+1] = str(AGENT)
             # Preserve the official import search path. The expert adapter
@@ -291,10 +325,18 @@ def plan(args, *, preflight=None, launcher=None):
                 ego_policy_is_the_only_substitution=True,
                 batch_scheduling_policy=inputs['batch_scheduling_policy'],
                 trajectory_identity_note='NPC positions and activation times may react to the changed ego trajectory; scenario code and seed are unchanged')
+            if capture_mode=='interaction_segment':
+                metadata.update(capture_mode=capture_mode,segment=config['official_demo']['segment'],
+                    collection_split_sha256=_digest(split),
+                    acceptance='independently_audited_interaction_segment;not_official_route_completion',
+                    custom_episode_limit=config['official_demo']['segment']['max_sim_seconds'],
+                    collection_only_early_stop=True,official_route_success_claimed=False,
+                    ego_policy_is_the_only_substitution=False,official_scoring_unmodified=True)
             jobs.append(dict(config=config,runtime_path=runtime,launch_path=launch,checkpoint=checkpoint,
                 agent_output=Path(config['output_dir']),command=command,env=env,metadata=metadata))
     return dict(output_dir=base,jobs=jobs,implementation_sha256=implementation,expert_sha256=expert,
                 catalog=catalog,official_root=source,launcher=launcher,
+                capture_mode=capture_mode,
                 continue_on_route_failure=bool(getattr(args,'continue_on_route_failure',False)))
 
 
@@ -306,7 +348,10 @@ def preview(planned):
             traffic_manager_seed=job['metadata']['traffic_manager_seed'],command=job['command'],
             runtime_path=str(job['runtime_path']),checkpoint=str(job['checkpoint']),
             agent_output=str(job['agent_output']),fingerprint=job['metadata']['fingerprint']) for job in planned['jobs']],
-        official_routes_unmodified=True,scenario_mutations=False,custom_episode_limit=None,
+        official_routes_unmodified=True,scenario_mutations=False,
+        capture_mode=planned.get('capture_mode','full_route'),
+        custom_episode_limit=(planned['jobs'][0]['metadata']['custom_episode_limit']
+                              if planned.get('capture_mode')=='interaction_segment' else None),
         simulator_started_by_launcher=False,accepted_for_memory=False,memory_published=False,
         continue_on_known_route_rejection=planned.get('continue_on_route_failure',False))
 
@@ -422,7 +467,10 @@ def run_plan(planned):
             checkpoint=str(job['checkpoint']),launch_path=str(job['launch_path']),runtime_path=str(job['runtime_path']),
             agent_output=str(job['agent_output']),run_dir=str(archives[0].parent) if len(archives)==1 else None,
             archive_count=len(archives),finalization_required=True,accepted_for_memory=False,memory_published=False)
+        segment_mode=metadata.get('capture_mode','full_route')=='interaction_segment'
+        result['capture_mode']='interaction_segment' if segment_mode else 'full_route'
         fatal=None;capture=None;failure={}
+        segment_rejection=None
         if code:
             fatal='evaluator_process_failed'
         elif len(archives)!=1:
@@ -440,6 +488,24 @@ def run_plan(planned):
         if fatal is None and (verdict.get('official_result_valid') is False
                 or verdict.get('official_status')=='result_missing_or_invalid'):
             fatal='invalid_official_result'
+        if segment_mode and fatal is None:
+            try:
+                from .demo_segment import validate_segment_report
+                segment=_read(archives[0].parent/'segment_capture.json')
+                status=validate_segment_report(segment,run=capture,spec=job['config']['official_demo']['segment'])
+                result.update(segment_completed=status['completed'],segment_controlled_stop=status['controlled_stop'],
+                    segment_status=segment['status'],segment_evidence_path=str(archives[0].parent/'segment_capture.json'))
+                if not status['completed']:
+                    natural=(verdict.get('route_completed') is True and not status['controlled_stop']
+                             and segment.get('termination')=='official_route_ended_naturally')
+                    result['natural_full_route_completion']=natural
+                    if not natural:
+                        fatal='interaction_segment_not_completed'
+                        if status['controlled_stop'] and segment['status']=='failed':
+                            segment_rejection='route_interaction_segment_rejection'
+            except (ValueError,KeyError,TypeError,OSError) as error:
+                fatal='invalid_segment_closing_metadata'
+                result['segment_evidence_error']=str(error)[:1200]
         if len(archives)==1 and fatal:
             result['failure_summary'],failure=_failure_summary(archives[0].parent,capture)
         elif fatal:
@@ -447,7 +513,13 @@ def run_plan(planned):
                 message='No unique complete Agent capture; inspect the preserved evaluator logs',
                 stdout_path=str(seed_root/'out'/('%04d_out.log'%route)),
                 stderr_path=str(seed_root/'err'/('%04d_err.log'%route)))
-        rejection=(_known_route_rejection(archives[0].parent,capture,failure,verdict)
+        if segment_rejection:
+            events=segment.get('events',[])
+            last=events[-1] if isinstance(events,list) and events and isinstance(events[-1],dict) else {}
+            result['failure_summary']=dict(type='InteractionSegmentRejected',
+                classification=segment_rejection,message=str(segment.get('reason') or last.get('reason','incomplete interaction'))[:1200],
+                frame=segment.get('end_frame'),time=segment.get('end_time'))
+        rejection=segment_rejection or (_known_route_rejection(archives[0].parent,capture,failure,verdict)
                    if fatal and code==0 and len(archives)==1 else None)
         continue_route=bool(planned.get('continue_on_route_failure',False) and rejection)
         result.update(route_failure_reason=fatal,known_route_rejection=rejection,
@@ -473,13 +545,20 @@ def run_plan(planned):
     healthy=not any(row.get('route_failure_reason') for row in outcomes)
     processes_ok=finished and healthy and all(row['evaluator_returncode']==0 for row in outcomes)
     routes_ok=finished and healthy and all(row['official_result'].get('route_completed') is True for row in outcomes)
+    segment_mode=planned.get('capture_mode','full_route')=='interaction_segment'
+    segments_ok=segment_mode and finished and healthy and all(row.get('segment_completed') is True or
+        row.get('natural_full_route_completion') is True for row in outcomes)
     return dict(schema=SCHEMA,collection_finished=finished,results=outcomes,
         planned_jobs=len(planned['jobs']),finished_jobs=len(outcomes),stopped_early=not finished,batch_stop_reason=stop_reason,
         all_routes_attempted=finished,
         completed_with_route_failures=finished and any(row.get('route_failure_reason') or
-            row['official_result'].get('route_completed') is not True for row in outcomes),
+            (not (row.get('segment_completed') is True or row.get('natural_full_route_completion') is True) if segment_mode else
+             row['official_result'].get('route_completed') is not True) for row in outcomes),
         continue_on_known_route_rejection=planned.get('continue_on_route_failure',False),
-        collection_succeeded=processes_ok and routes_ok,
+        collection_succeeded=processes_ok and (segments_ok if segment_mode else routes_ok),
+        capture_mode='interaction_segment' if segment_mode else 'full_route',
+        interaction_segments_completed=segment_mode and finished and healthy and all(row.get('segment_completed') is True for row in outcomes),
+        natural_full_route_captures=sum(row.get('natural_full_route_completion') is True for row in outcomes),
         evaluator_runs_completed=processes_ok,
         official_routes_completed=routes_ok,
         finalization_required=True,accepted_for_memory=False,memory_published=False)
@@ -493,6 +572,13 @@ def parser():
     selection.add_argument('--family',choices=FAMILIES)
     selection.add_argument('--route-ids',nargs='+',type=int)
     selection.add_argument('--all-families',action='store_true')
+    selection.add_argument('--selected-collection',action='store_true',
+        help='Collect both Base/Generalization partners of the selected 10-family split; defaults to interaction segments')
+    result.add_argument('--collection-split',help='Frozen collection/test partition; defaults to the selected 10-family split')
+    result.add_argument('--capture-mode',choices=('full_route','interaction_segment'),
+        help='Interaction segments stop after the actual target interaction and recovery; official evaluation is unchanged')
+    result.add_argument('--segment-max-seconds',type=float,default=90.,
+        help='Simulation budget for segment collection only; reaching it without completion is a rejection')
     result.add_argument('--fail2drive-root')
     result.add_argument('--simulator-root')
     result.add_argument('--routes',default='fail2drive_split')
@@ -521,12 +607,23 @@ def main(argv=None):
     command=parser();args=command.parse_args(argv)
     try:
         if args.list:
-            print(json.dumps(load_catalog(args.catalog),ensure_ascii=False,indent=2))
+            if args.selected_collection:
+                from .memory_split import load_transfer_split,route_ids
+                split=load_transfer_split(args.collection_split)
+                listed=dict(schema=SCHEMA,selection='selected_collection',
+                    capture_mode=args.capture_mode or 'interaction_segment',
+                    collection_route_ids=route_ids(split,'collection'),
+                    evaluation_route_ids=route_ids(split,'evaluation'),
+                    families=[row['family'] for row in split['rows']],
+                    source_preflight_required_before_run=True,connected_to_carla=False)
+            else:
+                listed=load_catalog(args.catalog)
+            print(json.dumps(listed,ensure_ascii=False,indent=2))
             return 0
         if not args.fail2drive_root or not args.simulator_root:
             command.error('--fail2drive-root and --simulator-root are required for validated plans')
-        if not (args.family or args.route_ids is not None or args.all_families):
-            command.error('Select --family, --route-ids or --all-families explicitly')
+        if not (args.family or args.route_ids is not None or args.all_families or args.selected_collection):
+            command.error('Select --selected-collection, --family, --route-ids or --all-families explicitly')
         planned=plan(args)
         if args.run:
             result=run_plan(planned)

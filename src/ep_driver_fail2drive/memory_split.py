@@ -26,14 +26,18 @@ def _digest(value):
 def load_transfer_split(path=None):
     value=json.loads(filesystem_path(path or DEFAULT).read_text(encoding='utf-8-sig'))
     if (not isinstance(value,dict) or value.get('schema')!=SCHEMA or value.get('official_commit')!=OFFICIAL_COMMIT
-            or value.get('collection_route_count')!=34 or value.get('evaluation_route_count')!=17
             or value.get('evaluation_variant')!='Generalization'
             or any(type(value.get(k)) is not int or value[k]<1 for k in ('collection_seed','evaluation_seed'))):
         raise ValueError('Wrong memory-transfer split version or official identity')
     rows=value.get('rows',[])
-    if (not isinstance(rows,list) or len(rows)!=17 or not all(isinstance(row,dict) for row in rows)
-            or {row.get('family') for row in rows}!=set(FAMILIES)):
-        raise ValueError('Split must contain the exact 17 distinct official families')
+    if (not isinstance(rows,list) or not rows or not all(isinstance(row,dict) for row in rows)
+            or any(row.get('family') not in FAMILIES for row in rows)
+            or len({row['family'] for row in rows})!=len(rows)
+            or type(value.get('collection_route_count')) is not int
+            or type(value.get('evaluation_route_count')) is not int
+            or value['collection_route_count']!=2*len(rows)
+            or value['evaluation_route_count']!=len(rows)):
+        raise ValueError('Split needs distinct official families and matching pair/test counts')
     collection=[];evaluation=[];reserved=[]
     for row in rows:
         pair=row.get('collection',[])
@@ -61,7 +65,7 @@ def load_transfer_split(path=None):
         collection.extend(pair);evaluation.append(test);reserved.extend([test,counterpart])
     cids=[r['route_id'] for r in collection];eids=[r['route_id'] for r in evaluation]
     reserved_ids=[r['route_id'] for r in reserved]
-    if (len(set(cids))!=34 or len(set(eids))!=17 or len(set(reserved_ids))!=34
+    if (len(set(cids))!=2*len(rows) or len(set(eids))!=len(rows) or len(set(reserved_ids))!=2*len(rows)
             or set(cids)&set(reserved_ids)):
         raise ValueError('Route identities or reserved pairs overlap across partitions')
     return value
@@ -101,7 +105,7 @@ def validate_transfer_source(split, official_root):
         raise ValueError('Collection and evaluation share an exact sparse route, including across families')
     return dict(schema=SCHEMA,valid=True,split_sha256=_digest(split),
         collection_routes=route_ids(split,'collection'),evaluation_routes=route_ids(split,'evaluation'),
-        collection_count=34,evaluation_count=17,families=17,
+        collection_count=len(route_ids(split,'collection')),evaluation_count=len(split['rows']),families=len(split['rows']),
         source_check='original_XML_bytes_ID_map_and_sparse_waypoints',
         whole_pair_isolation=True,exact_sparse_geometry_overlap=False,
         limitation='same_Town13;partial_road_overlap_possible;not_unseen_map_or_family_generalization')
@@ -146,10 +150,11 @@ def validate_collection_partition(split, episodes, *, allow_partial=False):
         captures=sorted(selected,key=lambda r:r['official_route_id']),
         evaluation_route_ids=evaluation,evaluation_seed=split['evaluation_seed'])
     return dict(schema=SCHEMA,valid=not errors,split_sha256=_digest(split),errors=errors,
-        expected_routes=34,observed_unique_routes=len(observed),missing_route_ids=missing,
+        expected_routes=len(expected),observed_unique_routes=len(observed),missing_route_ids=missing,
         collection_seed=split['collection_seed'],evaluation_route_ids=evaluation,
         evaluation_seed=split['evaluation_seed'],family_or_route_id_used_for_retrieval=False,
-        allow_partial_collection=allow_partial,all_34_collected=not missing and not errors,
+        allow_partial_collection=allow_partial,all_selected_collected=not missing and not errors,
+        all_34_collected=len(expected)==34 and not missing and not errors,
         selected_route_ids=selected_ids,selected_families=families,
         complete_pair_families=sorted(complete_pairs),partial_pair_families=sorted(partial_pairs),
         selection_snapshot=selection,selection_sha256=_digest(selection),

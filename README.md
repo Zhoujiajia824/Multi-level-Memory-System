@@ -587,14 +587,14 @@ evaluator 独占世界推进；采集 Agent 不创建或删除周车、不修改
 直接判为离路；不修改官方规划游标、不凭空连接路线，也不放宽真实横向偏离资格。
 
 同类型经验迁移实验的完整预设划分使用 `config/fail2drive_memory_transfer_split.json`：
-每类一组Base/Generalization采集，共34条；每类另一组的Generalization留作测试，共17条。
+当前选择10类，每类一组Base/Generalization采集，共20条；每类另一组的Generalization留作测试，共10条。
 测试组对应的Base也禁止进入记忆，原始XML哈希、配对关系及跨类别完全相同的稀疏路线
 均检查。允许同Town13部分道路重叠，不宣称跨地图或跨类别泛化。
 `scripts/check_fail2drive_memory_split.py --fail2drive-root <官方源码目录>` 只读验证划分；
 加 `--ids collection` 或 `--ids evaluation` 输出现有入口可用的 `--route-ids` 参数列表。
-本次34/17入口显式使用这些ID，不再用旧 `--all-families` 代替34条采集。
+本次20/10划分使用这些ID，`--selected-collection`选取全部20条采集；旧 `--all-families` 仍是17条诊断路线。
 采集和测试seed均固定1；完整方案下A基础、B模型加失败反思、C同B但反思检索新库
-各测17条，共51轮。也可先采集，再按成功与完整视频质量选取少量示范，冻结选集后
+各测10条，共30轮。也可先采集，再按成功与完整视频质量选取少量示范，冻结选集后
 只评测这些家族原预设的保留路线。实际数量及Base/Generalization覆盖如实记录，不
 把失败采集变成成功，不把仅选中部分场景的结果称为全量成绩。B/C模型、提示词、
 规划器和失败反思条件一致，测试中不写库。
@@ -602,17 +602,26 @@ evaluator 独占世界推进；采集 Agent 不创建或删除周车、不修改
 测试案例在看A/B/C结果前固定，失败照实报告，不按成功率换样本。
 
 新库 `build_fail2drive_official_memory.py check/prepare` 需加
-`--collection-split config/fail2drive_memory_transfer_split.json`，默认要求34条都通过既有满分
-及采集检查。选择少量优质示范时显式加`--allow-partial-collection`，并用多个`--captures`
+`--collection-split config/fail2drive_memory_transfer_split.json`，默认要求20条均通过相应的整路线或交互片段验收。选择少量优质示范时显式加`--allow-partial-collection`，并用多个`--captures`
 指定已finalize且实际选中的成功叶子目录，不要把混有失败记录的整批根目录当作选集。
 该选项只允许缺少未选案例，仍拒绝测试路线、保留配对、错seed、错XML或重复轮次；
 报告保留原完整划分、实际选集指纹、覆盖家族、不完整采集配对及对应保留测试ID，并将来源
 留在待整理任务的来源中。冻结库后再测试，不用测试失败记录补充该库。
-当前的相机、地面和驾驶问题仍需分别验证，这一划分不代表34条已实际成功。
+当前的相机、地面和驾驶问题仍需分别验证，这一划分不代表20条已实际成功。
+
+快速采集使用`--selected-collection --run`，默认`--capture-mode interaction_segment`；
+单条补采使用`--route-ids <采集ID> --capture-mode interaction_segment`。从原官方起点、
+原seed正常运行，记录目标交互出现、应对及恢复5秒后，由采集专用hook在官方tick和
+criteria更新后停止manager；不移动起点、不改NPC或场景触发，不给正式测评增加短时限。
+无附加事件的Base按其Generalization配对的目标路段保留正常通行对照。默认90秒仅为
+采集预算，耗尽但交互未完成仍拒收。每个入库锚点须有真实当前及后1/2/3秒证据。
+片段保存`segment_capture.json`与逐物理帧证据，原官方部分路线状态/分数不改写；
+片段完成不等于官方路线成功。已有合格完整路线仍可复用。`--capture-mode full_route`
+保留旧完整路线采集方式，独立`run_fail2drive.py`正式A/B/C评测结束条件保持原样。
 
 若示范完整通行且只被官方最低速度项扣分，`finalize/check/prepare`可显式使用
 `--allow-min-speed-only`。原始分数、全部扣分消息及实际接受策略保留并冻结，不改成满分；
-后续检查和整理同样需要该显式选项。碰撞、交通规则、离路、超时、未完成、未知扣分、
+后续检查和整理同样需要该显式选项。碰撞、交通规则、离路、超时、目标交互未完成、未知扣分、
 采集失败和不合理驾驶均不能借此放行，仍需20Hz过程检查及完整视频人工审核。数量子集
 与低速项例外是两个独立开关，不改变论文正式评测的官方计分。
 
@@ -652,14 +661,14 @@ evaluator 独占世界推进；采集 Agent 不创建或删除周车、不修改
 最低速度扣分、官方满分与完整交通安全证明分别看待。
 `scripts/build_fail2drive_official_memory.py finalize --capture <实际轮次目录>
 --checkpoint <官方结果JSON> --launch <本轮launch.json>` 在官方结算后核验并导出。
-只有完整官方路线成功、没有官方违规、Agent/资源及视频检查通过的采集才能进入
-`check` / `prepare`；保留失败证据，不能改成成功。官方整轮评分不是逐物理帧独立安全证明。
+完整路线须成功；交互片段须通过独立的目标交互、恢复、违规及完整证据验收。
+两者均需Agent/资源及视频检查通过才能进入`check` / `prepare`；保留失败证据，不能改成成功。官方整轮评分不是逐物理帧独立安全证明。
 
 `prepare --captures <已finalize采集目录> --output-dir <新build>
 --workbench-root <已有offline_memory_builder目录>` 复用原工作台，按真实制动、转向和
 重新起步选择最多3个具有后续3秒证据的锚点；仍需真实DINO、部署教师标注、人工审核
 和冻结发布。正式论文 Agent/MPC 不调用专家；新库仅由显式反思检索入口读取。
-若采用旧的测评原路线采集方案，应披露为已知场景示范辅助。34/17划分则报告同类型
+若采用旧的测评原路线采集方案，应披露为已知场景示范辅助。20/10划分则报告同类型
 未入库路线案例对照，不作未见类别/城市或完整排行榜成绩主张；每类一个案例不能替代
 该类别的重复试验，也不保证检索到一条记忆就一定通行。
 

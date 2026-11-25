@@ -65,6 +65,86 @@ def _admission_policy(allow_min_speed_only=False):
         official_scores_preserved=True,non_min_speed_infraction_free_required=True,human_review_required=True)
 
 
+def _segment_admission_policy(allow_min_speed_only=False):
+    _admission_policy(allow_min_speed_only)
+    return dict(schema='official-demo-segment-admission-policy-1.0',
+        mode='interaction_segment_allow_min_speed_only' if allow_min_speed_only else 'interaction_segment_strict',
+        official_scores_preserved=True,whole_route_completion_required=False,
+        non_min_speed_infraction_free_required=True,human_review_required=True,
+        segment_completion_evidence_required=True,official_route_success_claimed=False)
+
+
+def _capture_mode(run):
+    mode=run.get('capture_mode','full_route')
+    if mode not in ('full_route','interaction_segment'):
+        raise ValueError('Unknown official demonstration capture mode')
+    return mode
+
+
+def segment_official_outcome(data, route_id, *, allow_min_speed_only=False):
+    """Check unchanged official partial-route results, without claiming route success.
+
+    Only a separate, source-bound segment-completion audit can admit a capture.
+    A bare failed/partial official result is never sufficient.
+    """
+    profile=_segment_admission_policy(allow_min_speed_only)
+    reasons=[]
+    checkpoint=data.get('_checkpoint',{}) if isinstance(data,dict) else {}
+    if not isinstance(checkpoint,dict):checkpoint={}
+    records=checkpoint.get('records')
+    record=records[0] if isinstance(records,list) and len(records)==1 and isinstance(records[0],dict) else {}
+    global_record=checkpoint.get('global_record',{})
+    if not isinstance(global_record,dict):global_record={}
+    if (not isinstance(data,dict) or data.get('entry_status')!='Finished' or data.get('eligible') is not True
+            or checkpoint.get('progress')!=[1,1]):
+        reasons.append('official_evaluator_not_finished_or_ineligible')
+    if type(route_id) is not int or record.get('route_id')!='RouteScenario_%s_rep0'%route_id:
+        reasons.append('official_route_identity_mismatch')
+    infractions=record.get('infractions');totals=global_record.get('infractions')
+    minor=infractions.get('min_speed_infractions') if isinstance(infractions,dict) else None
+    if (not isinstance(infractions,dict) or set(infractions)!=INFRACTIONS
+            or any(not isinstance(v,list) for v in infractions.values())
+            or any(v for k,v in infractions.items() if k!='min_speed_infractions')
+            or not isinstance(minor,list) or minor and not allow_min_speed_only
+            or type(record.get('num_infractions')) is not int
+            or record['num_infractions']!=len(minor)):
+        reasons.append('segment_non_min_speed_or_unknown_infraction_present')
+    percentages=[]
+    for message in minor or []:
+        match=re.fullmatch(r"Average speed is ([0-9]+(?:\.[0-9]{1,2})?)% of the surrounding traffic's one",message) if isinstance(message,str) else None
+        value=float(match.group(1)) if match else None
+        if value is None or not 0<=value<100:
+            reasons.append('unrecognized_min_speed_penalty_evidence');break
+        percentages.append(value)
+    penalty=math.prod(1.-.3*(1.-v/100.) for v in percentages)
+    scores=record.get('scores',{});means=global_record.get('scores_mean')
+    if not isinstance(scores,dict):scores={}
+    route=scores.get('score_route')
+    if (not _number(route) or not 0<route<=100
+            or any(not _number(scores.get(k)) for k in ('score_penalty','score_composed'))
+            or not _same(scores.get('score_penalty'),round(penalty,6),1e-6)
+            or not _same(scores.get('score_composed'),round((route or 0)*penalty,6),1e-6)
+            or not isinstance(means,dict) or any(not _same(means.get(k),scores.get(k),1e-6)
+                for k in ('score_route','score_penalty','score_composed'))):
+        reasons.append('segment_original_scores_inconsistent')
+    expected_status=('Completed' if minor else 'Perfect') if _number(route) and route>=100 else 'Failed'
+    if record.get('status')!=expected_status or global_record.get('status')!=expected_status:
+        reasons.append('segment_official_status_has_unknown_failure_or_error')
+    length=record.get('meta',{}).get('route_length') if isinstance(record.get('meta'),dict) else None
+    if (not isinstance(totals,dict) or set(totals)!=INFRACTIONS
+            or any(not _number(v) or v<0 for v in totals.values())
+            or any(v!=0 for k,v in totals.items() if k!='min_speed_infractions')
+            or not _number(length) or length<=0 or not _number(route)):
+        reasons.append('segment_global_infractions_or_route_metadata_invalid')
+    elif not _same(totals['min_speed_infractions'],round(len(minor or []) / max(length/1000.*route/100.,.001),3),1e-6):
+        reasons.append('segment_original_min_speed_rate_inconsistent')
+    return dict(valid=not reasons,passed=not reasons,reasons=reasons,entry_status=data.get('entry_status') if isinstance(data,dict) else None,
+        status=record.get('status'),scores=scores,infractions=infractions,global_infractions=totals,official_route_id=route_id,
+        admission_policy=profile,accepted_with_min_speed_penalty=bool(minor and not reasons),
+        whole_route_completed=bool(_number(route) and route>=100),official_route_success_claimed=False,
+        scope='captured_interaction_segment',human_driving_quality_review_required=True)
+
+
 def official_outcome(data, route_id, *, allow_min_speed_only=False):
     """Validate the complete upstream single-route checkpoint, including every infraction."""
     reasons=[]
@@ -150,6 +230,7 @@ def _require_complete_capture(run):
 
 def _identity(root, run, launch):
     _require_complete_capture(run)
+    _capture_mode(run)
     if (run.get('demo_suite')!=SUITE or run.get('source')!='carla' or run.get('split')!=SPLIT
             or run.get('test_only') is not False or run.get('official_evaluation') is not True
             or run.get('read_future_during_current_representation') is not False
@@ -229,6 +310,8 @@ def _binding(root,run,launch,guard):
             or spec.get('driver')!='official_autopilot' or spec.get('purpose')!='demonstration_only'
             or spec.get('scenario_mutations') is not False):
         raise ValueError('Recorded expert configuration differs from its official scenario')
+    if spec.get('capture_mode','full_route')!=_capture_mode(run):
+        raise ValueError('Recorded capture mode differs from its fingerprinted official launch')
     expert=launch.get('official_expert_files_sha256',{})
     if (guard.get('official_commit')!=OFFICIAL_COMMIT or guard.get('sources_sha256')!=SOURCES
             or guard.get('data_sha256')!=SPEED_LIMIT_DATA
@@ -403,12 +486,18 @@ def _behavior(root,run,execution):
             first_source_time=execution[0]['time'],last_source_time=execution[-1]['time']),
         review_required_topics=['actual_target_interaction_present_and_completed',
             'pedestrian_and_vehicle_clearance','appropriate_local_approach_speed',
-            'smooth_bypass_wait_and_recovery','all_flagged_intervals_and_full_route_video'],
+            'smooth_bypass_wait_and_recovery',('all_flagged_intervals_and_full_captured_segment_video'
+                if _capture_mode(run)=='interaction_segment' else 'all_flagged_intervals_and_full_route_video')],
         observed_proximity_does_not_identify_official_target=True)
     return report,rows
 
 
-def _observations(root, execution_by_frame, *, normalized):
+def _observations(root, execution_by_frame, *, normalized, admission_outcome=None):
+    run=_json(_contained(root,'run.json'))
+    requested_segment=_capture_mode(run)=='interaction_segment'
+    if admission_outcome is None and normalized and (root/'official_demo_evaluation.json').is_file():
+        admission_outcome=_json(root/'official_demo_evaluation.json').get('admission_outcome')
+    segment=requested_segment and (admission_outcome is None or admission_outcome.get('scope')=='captured_interaction_segment')
     raw=_rows(_contained(root,'raw_frames.jsonl'))
     frames=_rows(_contained(root,'frames.jsonl')) if normalized else None
     if frames is not None and len(frames)!=len(raw):
@@ -419,6 +508,10 @@ def _observations(root, execution_by_frame, *, normalized):
         required.add('physical_world_audit.jsonl')
     if _json(_contained(root,'run.json')).get('demonstration_behavior_audit') is not None:
         required.add('demonstration_behavior_audit.jsonl')
+    if requested_segment:
+        required.update(('segment_capture.json','segment_ticks.jsonl'))
+        if _json(_contained(root,'configuration.json')).get('official_demo',{}).get('segment',{}).get('variant')=='Base':
+            required.add('paired_generalization_route.xml')
     prior=None
     for index,row in enumerate(raw):
         frame,now=_frame(row),row.get('time');scene=row.get('scene',{})
@@ -468,9 +561,12 @@ def _observations(root, execution_by_frame, *, normalized):
             if snapshot.get('assets',{}).get('camera_images')!=expected_images:
                 raise ValueError('Normalized camera assets differ from their relocatable raw evidence')
             audit=exported.get('audit',{})
-            if (audit.get('source')!='official_episode_outcome' or audit.get('scope')!='whole_episode'
+            if (audit.get('source')!=('official_segment_outcome' if segment else 'official_episode_outcome')
+                    or audit.get('scope')!=('captured_interaction_segment' if segment else 'whole_episode')
                     or any(audit.get(k) is not False for k in ('collision','offroad','rule_violation'))):
-                raise ValueError('Normalized driving outcome is not attributed to the official whole episode')
+                raise ValueError('Normalized driving outcome is not attributed to its actual audited scope')
+            if segment and audit.get('official_route_success_claimed') is not False:
+                raise ValueError('Partial capture cannot claim whole-route official success')
         prior=frame,now
     if len(raw)<4:
         raise ValueError('Missing actual current/+1/+2/+3-second source evidence')
@@ -573,15 +669,118 @@ def _export(root,run,raw,official=None):
             snapshot=plain(scene)
             snapshot['diagnostics']['captured_motion_models']={actor['id']:actor.pop('motion_model',None)
                 for actor in [snapshot['ego'],*snapshot['actors']]}
-            audit=dict(source='official_episode_outcome',scope='whole_episode',collision=False,offroad=False,rule_violation=False,
+            segment=_capture_mode(run)=='interaction_segment' and (official or {}).get('scope')=='captured_interaction_segment'
+            audit=dict(source='official_segment_outcome' if segment else 'official_episode_outcome',
+                scope='captured_interaction_segment' if segment else 'whole_episode',collision=False,offroad=False,rule_violation=False,
                 per_frame_independent_safety_claimed=False,
                 rule_violation_scope='non_min_speed_traffic_safety_items_only',
                 official_infraction_free=not bool((official or {}).get('accepted_with_min_speed_penalty')),
                 benchmark_min_speed_penalty=bool((official or {}).get('accepted_with_min_speed_penalty')),
                 benchmark_min_speed_infraction_count=len((official or {}).get('infractions',{}).get('min_speed_infractions',[])))
+            if segment:audit['official_route_success_claimed']=False
             stream.write(json.dumps(dict(index=index,frame=row['frame'],time=row['time'],snapshot=snapshot,
                 native_image=row['native_image'],camera_manifest=row['camera_manifest'],audit=audit),ensure_ascii=False,allow_nan=False)+'\n')
     temporary.replace(destination)
+
+
+def _segment_source_binding(root,run,launch,*,freeze=False):
+    """Rebuild target geometry from frozen original bytes after server transfer."""
+    spec=launch.get('config',{}).get('official_demo',{}).get('segment')
+    if not isinstance(spec,dict):raise ValueError('Missing fingerprinted interaction segment specification')
+    original=_contained(root,'official_route.xml')
+    variant=spec.get('variant');rid=run['official_route_id'];family=run['scenario_family']
+    if (variant not in ('Base','Generalization') or spec.get('route_id')!=rid or spec.get('family')!=family
+            or spec.get('map')!=run['world_map'].split('/')[-1]
+            or spec.get('original_xml_sha256')!=_hash(original)):
+        raise ValueError('Segment target does not match original route/map/family bytes')
+    if variant=='Base':
+        expected='Generalization_%s_%04d.xml'%(family,rid+1000)
+        paired=root/'paired_generalization_route.xml'
+        if freeze:
+            source=filesystem_path(launch['official_routes_path']).with_name(expected)
+            if not source.is_file() or _hash(source)!=spec.get('paired_generalization_xml_sha256'):
+                raise ValueError('Paired Generalization source is missing or changed')
+            _copy_once(source,paired)
+        paired=_contained(root,'paired_generalization_route.xml');paired_id=rid+1000
+    else:
+        paired=original;paired_id=rid
+    if spec.get('paired_generalization_route_id')!=paired_id or _hash(paired)!=spec.get('paired_generalization_xml_sha256'):
+        raise ValueError('Frozen paired Generalization route bytes changed')
+    def scenarios(path,identity):
+        routes=ET.parse(path).getroot().findall('route')
+        if len(routes)!=1 or routes[0].get('id')!=str(identity) or routes[0].get('town')!=spec['map']:
+            raise ValueError('Frozen segment XML route/map identity changed')
+        rows=[]
+        for item in routes[0].findall('.//scenario'):
+            trigger=item.find('trigger_point');distance=item.find('distance');kind=item.get('type')
+            if trigger is None:raise ValueError('Frozen segment target lacks original trigger geometry')
+            rows.append(dict(type=kind,name=item.get('name',''),
+                trigger_xyz_carla=[float(trigger.get(k)) for k in ('x','y','z')],
+                distance_m=float(distance.get('value')) if distance is not None else (12. if kind=='DynamicObjectCrossing' else 0.)))
+        return rows
+    if (spec.get('expected_scenarios')!=scenarios(original,rid)
+            or spec.get('paired_gen_scenarios')!=scenarios(paired,paired_id)):
+        raise ValueError('Segment target geometry does not reproduce the frozen original XML')
+    return spec
+
+
+def _segment_evidence(root,run,launch,execution,raw,*,natural_full_route=False):
+    from .demo_segment import validate_segment_evidence
+    if (run.get('segment_capture_path')!='segment_capture.json'
+            or run.get('physical_world_audit') is None or run.get('demonstration_behavior_audit') is None):
+        raise ValueError('Interaction segment requires declared full physical and behavior evidence')
+    summary=_json(_contained(root,'segment_capture.json'))
+    spec=_segment_source_binding(root,run,launch)
+    if summary.get('spec')!=spec:
+        raise ValueError('Segment specification differs from its frozen launch')
+    ticks=_rows(_contained(root,'segment_ticks.jsonl'))
+    result=validate_segment_evidence(summary,ticks,execution=execution,source_times=[row['time'] for row in raw],
+        **({'allow_natural_full_route':True} if natural_full_route else {}))
+    if not isinstance(result,dict) or result.get('valid') is not True or result.get('passed') is False:
+        raise ValueError('Interaction segment did not pass source-bound completion audit: '+str(result))
+    return summary
+
+
+def _capture_outcomes(root,run,launch,*,allow_min_speed_only=False):
+    data=_json(_contained(root,'official_result.json'))
+    official=official_outcome(data,launch.get('official_route_id',-1),allow_min_speed_only=allow_min_speed_only)
+    # A short route can naturally end before the five-second recovery tail.
+    # Its genuine complete official result remains valid full-route evidence;
+    # do not fabricate a segment-completed state or alter the original run.
+    admitted=(segment_official_outcome(data,launch.get('official_route_id',-1),allow_min_speed_only=allow_min_speed_only)
+              if _capture_mode(run)=='interaction_segment' and not official['valid'] else official)
+    return official,admitted
+
+
+def _anchors_for_capture(frames,execution,requested=None,behavior_rows=None,segment=None):
+    if segment is None:return select_anchors(frames,execution,requested,behavior_rows)
+    if requested:return select_anchors(frames,execution,requested)
+    eligible=[row for row in frames if all(any(_same(other['time'],row['time']+offset)
+        for other in frames) for offset in (0.,1.,2.,3.))]
+    events=segment.get('events',[])
+    onset=next((e.get('time') for e in events if e.get('phase')=='interaction'),None)
+    finish=segment.get('interaction_completed_time')
+    if onset is None:onset=next((e.get('time') for e in events if e.get('phase')=='recovery'),None)
+    if not _number(onset) or not _number(finish) or finish<onset:
+        raise ValueError('Segment anchors lack source-bound interaction/recovery times')
+    during=[r for r in execution if onset<=r['time']<=finish]
+    if not during:raise ValueError('No actual controls in captured interaction')
+    strongest=max(during,key=lambda r:r['returned_control']['brake']+abs(r['returned_control']['steer']))
+    # One difficult decision state is the default memory key. Extra anchors
+    # remain an explicit human selection, rather than filling the library with
+    # easy post-interaction recovery states.
+    targets=[('interaction_decision_context',onset-1.),
+             ('interaction_brake_or_bypass_context',max(onset,strongest['time']-1.))]
+    selected=[];used=set()
+    for reason,target in targets:
+        candidates=[r for r in eligible if abs(r['time']-target)<=1.+1e-5]
+        if not candidates:continue
+        row=min(candidates,key=lambda r:(abs(r['time']-target),r['time']))
+        identity=row['snapshot']['frame_id']
+        if identity not in used:
+            selected.append(dict(frame_id=identity,time=row['time'],anchor_reason=reason));break
+    if not selected:raise ValueError('No interaction anchor with complete actual three-second future evidence')
+    return selected
 
 
 def finalize_official_capture(run_dir, official_checkpoint, launch_metadata,*,allow_min_speed_only=False):
@@ -605,27 +804,31 @@ def finalize_official_capture(run_dir, official_checkpoint, launch_metadata,*,al
     if (root/'official_launch.json').exists() and _json(root/'official_launch.json')!=launch:
         raise ValueError('Original launch evidence changed')
     _write(root/'official_launch.json',launch)
-    outcome=official_outcome(_json(root/'official_result.json'),launch.get('official_route_id',-1),
-        allow_min_speed_only=allow_min_speed_only)
-    report=dict(protocol=PROTOCOL,run_dir=str(root),memory_published=False,official_outcome=outcome,
+    official,outcome=_capture_outcomes(root,run,launch,allow_min_speed_only=allow_min_speed_only)
+    report=dict(protocol=PROTOCOL,run_dir=str(root),memory_published=False,official_outcome=official,
         valid=False,passed=False,reasons=list(outcome['reasons']),evaluation_path=str(root/'official_demo_evaluation.json'),
+        capture_mode=_capture_mode(run),actual_admission_scope=outcome.get('scope','whole_episode'),admission_outcome=outcome,
         admission_policy=deepcopy(outcome['admission_policy']),
         accepted_with_min_speed_penalty=outcome['accepted_with_min_speed_penalty'])
     try:
         _identity(root,run,launch);guard=_guard(root);_binding(root,run,launch,guard)
+        if _capture_mode(run)=='interaction_segment':_segment_source_binding(root,run,launch,freeze=True)
         execution,by_frame=_execution(root);_video(root,execution)
         raw,_,_=_observations(root,by_frame,normalized=False)
         _counts(run,guard,execution,raw)
         physical=_physical_world(root,run,execution,raw)
         behavior,behavior_rows=_behavior(root,run,execution)
+        segment=(_segment_evidence(root,run,launch,execution,raw,natural_full_route=official['valid'])
+                 if _capture_mode(run)=='interaction_segment' else None)
         if outcome['valid']:
             if not (root/'frames.jsonl').exists():_export(root,run,raw,outcome)
-            _,frames,_=_observations(root,by_frame,normalized=True)
+            _,frames,_=_observations(root,by_frame,normalized=True,admission_outcome=outcome)
             report.update(valid=True,passed=True,capture_count=len(raw),execution_count=len(execution),
                 physical_world_audit=physical,
                 demonstration_behavior_audit=behavior,
-                anchors=select_anchors(frames,execution,behavior_rows=behavior_rows),scenario_family=run['scenario_family'],
+                anchors=_anchors_for_capture(frames,execution,behavior_rows=behavior_rows,segment=segment),scenario_family=run['scenario_family'],
                 official_route_id=launch['official_route_id'],seed=launch['repetition_seed'])
+            if segment is not None:report.update(segment_capture=segment,official_route_success_claimed=False)
     except (ValueError,KeyError,TypeError,OSError,ImportError) as exc:
         report['reasons'].append(str(exc))
     _write(root/'official_demo_evaluation.json',report)
@@ -651,10 +854,13 @@ def _check_episode(root,requested=None,*,allow_min_speed_only=False):
     launch=_json(_contained(root,'official_launch.json'))
     route_id=_identity(root,run,launch);guard=_guard(root);_binding(root,run,launch,guard)
     frozen_policy=manifest.get('admission_policy',_admission_policy(False))
-    if frozen_policy not in (_admission_policy(False),_admission_policy(True)):
+    if frozen_policy not in (_admission_policy(False),_admission_policy(True),
+                             _segment_admission_policy(False),_segment_admission_policy(True)):
         raise ValueError('Frozen official admission policy is missing or unsupported')
-    outcome=official_outcome(_json(_contained(root,'official_result.json')),route_id,
-        allow_min_speed_only=frozen_policy['mode']=='allow_min_speed_only')
+    official,outcome=_capture_outcomes(root,run,launch,
+        allow_min_speed_only=frozen_policy['mode'] in ('allow_min_speed_only','interaction_segment_allow_min_speed_only'))
+    if outcome['admission_policy']!=frozen_policy:
+        raise ValueError('Frozen admission policy differs from its source capture mode')
     if outcome['accepted_with_min_speed_penalty'] and not allow_min_speed_only:
         raise ValueError('Frozen source has an original minimum-speed penalty; explicitly pass --allow-min-speed-only')
     if not outcome['valid']:raise ValueError('Official demonstration failed: '+str(outcome['reasons']))
@@ -670,10 +876,16 @@ def _check_episode(root,requested=None,*,allow_min_speed_only=False):
     if evaluation.get('valid') is not True or evaluation.get('passed') is not True or evaluation.get('reasons')!=[]:
         raise ValueError('Demonstration was not successfully finalized')
     execution,by_frame=_execution(root);_video(root,execution)
-    raw,frames,required=_observations(root,by_frame,normalized=True)
+    raw,frames,required=_observations(root,by_frame,normalized=True,admission_outcome=outcome)
     _counts(run,guard,execution,raw)
     physical=_physical_world(root,run,execution,raw)
     behavior,behavior_rows=_behavior(root,run,execution)
+    segment=(_segment_evidence(root,run,launch,execution,raw,natural_full_route=official['valid'])
+             if _capture_mode(run)=='interaction_segment' else None)
+    if segment is not None and (evaluation.get('segment_capture')!=segment
+            or evaluation.get('official_route_success_claimed') is not False
+            or evaluation.get('official_outcome')!=official or evaluation.get('admission_outcome')!=outcome):
+        raise ValueError('Frozen segment completion or original official outcome changed')
     required.add('frames.jsonl')
     video=_json(root/'planning/video_recording.json');required.add('planning/'+video['path'])
     sums=manifest.get('source_hashes')
@@ -686,8 +898,9 @@ def _check_episode(root,requested=None,*,allow_min_speed_only=False):
         driver=run['reference_driver'],capture_count=len(frames),execution_count=len(execution),
         physical_world_audit=physical,
         demonstration_behavior_audit=behavior,
-        anchors=select_anchors(frames,execution,requested,behavior_rows),source_manifest_sha256=_hash(root/'capture_manifest.json'),
-        source_hashes=sums,memory_published=False,official_outcome=outcome,
+        anchors=_anchors_for_capture(frames,execution,requested,behavior_rows,segment),source_manifest_sha256=_hash(root/'capture_manifest.json'),
+        source_hashes=sums,memory_published=False,official_outcome=official,admission_outcome=outcome,
+        capture_mode=_capture_mode(run),actual_admission_scope=outcome.get('scope','whole_episode'),segment_capture=segment,
         human_driving_quality_approved=False,review_status='pending_real_human_driving_quality_review',
         admission_policy=deepcopy(frozen_policy),accepted_with_min_speed_penalty=outcome['accepted_with_min_speed_penalty'])
 
@@ -803,6 +1016,9 @@ def _bind_behavior_review(output,checked,write_json):
             official_result_admission_policy=episode.get('admission_policy',_admission_policy(False)),
             original_min_speed_penalty=bool(episode.get('accepted_with_min_speed_penalty',False)),
             review_must_include_full_interaction_video=True)
+        if episode.get('capture_mode')=='interaction_segment':
+            review.update(capture_mode='interaction_segment',segment_completion_evidence=episode['segment_capture'],
+                original_official_outcome=episode['official_outcome'],official_route_success_claimed=False)
         if task.get('demonstration_review') not in (None,review):
             raise ValueError('Workbench task carries different demonstration review evidence')
         task['demonstration_review']=review;write_json(path,task)
