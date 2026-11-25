@@ -1,8 +1,9 @@
 """Offline evidence gate for demonstrations in unchanged official scenarios.
 
 This module never imports CARLA, drives actors, calls an annotation model,
-approves text or publishes a library. Official episode outcomes certify driving;
-raw observations remain current-only and are never rewritten to hide failures.
+approves text or publishes a library. Official outcomes validate the benchmark
+result, not human driving quality; raw observations are never rewritten to hide
+failures. Demonstrations still require review of the full observed interaction.
 """
 from copy import deepcopy
 import importlib
@@ -312,6 +313,42 @@ def _physical_world(root,run,execution,raw):
         scope='gross_grounding_source_validity_only;not_a_driving_safety_certificate')
 
 
+def _behavior(root,run,execution):
+    """Independent sampled process evidence, not an official-score substitute."""
+    from .demo_behavior import SCHEMA,POLICY,validate_rows,interaction_windows
+    declaration=run.get('demonstration_behavior_audit')
+    if declaration is None:
+        return dict(declared=False,verified=False,human_review_required=True,
+            automatic_human_quality_approval=False,interaction_windows=[],
+            scope='legacy_capture_without_new_behavior_review_evidence'),None
+    if (declaration!=SCHEMA or run.get('demonstration_quality_policy')!=POLICY
+            or run.get('human_driving_quality_review_required') is not True):
+        raise ValueError('Declared demonstration behavior policy is missing or unsupported')
+    rows=_rows(_contained(root,'demonstration_behavior_audit.jsonl'))
+    physical=_rows(_contained(root,'physical_world_audit.jsonl'))
+    if len(physical)!=len(execution):raise ValueError('Behavior audit lacks the complete physical source binding')
+    report=validate_rows(rows,execution,physical)
+    windows=interaction_windows(rows)
+    for window in windows:
+        review_start=max(execution[0]['frame'],window['start_frame']-40)
+        review_end=min(execution[-1]['frame'],window['end_frame']+60)
+        window.update(review_start_frame=review_start,review_end_frame=review_end,
+            video_first_frame_index=review_start-execution[0]['frame'],
+            video_last_frame_index=review_end-execution[0]['frame'],
+            approach_context_available_s=(window['start_frame']-review_start)*.05,
+            recovery_context_available_s=(review_end-window['end_frame'])*.05)
+    video=_json(_contained(root,'planning/video_recording.json'))
+    report.update(interaction_windows=windows,
+        full_video=dict(path='planning/'+video['path'],fps=20.,
+            first_source_frame=execution[0]['frame'],last_source_frame=execution[-1]['frame'],
+            first_source_time=execution[0]['time'],last_source_time=execution[-1]['time']),
+        review_required_topics=['actual_target_interaction_present_and_completed',
+            'pedestrian_and_vehicle_clearance','appropriate_local_approach_speed',
+            'smooth_bypass_wait_and_recovery','all_flagged_intervals_and_full_route_video'],
+        observed_proximity_does_not_identify_official_target=True)
+    return report,rows
+
+
 def _observations(root, execution_by_frame, *, normalized):
     raw=_rows(_contained(root,'raw_frames.jsonl'))
     frames=_rows(_contained(root,'frames.jsonl')) if normalized else None
@@ -321,6 +358,8 @@ def _observations(root, execution_by_frame, *, normalized):
               'official_result.json','official_launch.json','official_demo_evaluation.json','planning/video_recording.json'}
     if _json(_contained(root,'run.json')).get('physical_world_audit') is not None:
         required.add('physical_world_audit.jsonl')
+    if _json(_contained(root,'run.json')).get('demonstration_behavior_audit') is not None:
+        required.add('demonstration_behavior_audit.jsonl')
     prior=None
     for index,row in enumerate(raw):
         frame,now=_frame(row),row.get('time');scene=row.get('scene',{})
@@ -379,7 +418,7 @@ def _observations(root, execution_by_frame, *, normalized):
     return raw,frames,required
 
 
-def select_anchors(frames,execution,requested=None):
+def select_anchors(frames,execution,requested=None,behavior_rows=None):
     """Use actual controls offline, not scenario labels or hidden event plans."""
     eligible=[row for row in frames if all(any(_same(other['time'],row['time']+offset)
               for other in frames) for offset in (0.,1.,2.,3.))]
@@ -391,6 +430,29 @@ def select_anchors(frames,execution,requested=None):
         if len(selected)!=len(requested):
             raise ValueError('Explicit anchor is absent or lacks actual three-second evidence')
         return selected
+    if behavior_rows:
+        from .demo_behavior import interaction_windows
+        windows=interaction_windows(behavior_rows)
+        if windows:
+            # Real observed neighboring bodies give interaction context. A first
+            # unrelated road bend must not consume the sole turning anchor.
+            primary=min(windows,key=lambda w:(-len(w['review_flags']),w['minimum_clearance_m'],w['start_time']))
+            low,high=primary['start_time'],primary['end_time']
+            during=[r for r in execution if low<=r['time']<=high]
+            strongest=max(during,key=lambda r:(r['returned_control']['brake']+abs(r['returned_control']['steer'])))
+            selected=[];used=set()
+            for reason,target,start,end in (('observed_interaction_approach',low-1.,low-2.,low),
+                    ('observed_interaction_brake_or_bypass',strongest['time'],low,high),
+                    ('observed_interaction_recovery',high+1.,high+.001,high+3.)):
+                candidates=[r for r in eligible if start<=r['time']<=end
+                    and r['snapshot']['frame_id'] not in used]
+                if not candidates:continue
+                row=min(candidates,key=lambda r:(abs(r['time']-target),r['time']))
+                used.add(row['snapshot']['frame_id'])
+                selected.append(dict(frame_id=row['snapshot']['frame_id'],time=row['time'],anchor_reason=reason,
+                    observed_actor_ids=primary['actor_ids'],interaction_start_time=low,interaction_end_time=high,
+                    target_interaction_requires_human_confirmation=True))
+            if selected:return selected
     events={};stopped_since=None;previous=None
     for row in execution:
         speed=math.hypot(*row['observed_ego']['velocity']);control=row['returned_control'];stamp=row['time']
@@ -489,12 +551,14 @@ def finalize_official_capture(run_dir, official_checkpoint, launch_metadata):
         raw,_,_=_observations(root,by_frame,normalized=False)
         _counts(run,guard,execution,raw)
         physical=_physical_world(root,run,execution,raw)
+        behavior,behavior_rows=_behavior(root,run,execution)
         if outcome['valid']:
             if not (root/'frames.jsonl').exists():_export(root,run,raw)
             _,frames,_=_observations(root,by_frame,normalized=True)
             report.update(valid=True,passed=True,capture_count=len(raw),execution_count=len(execution),
                 physical_world_audit=physical,
-                anchors=select_anchors(frames,execution),scenario_family=run['scenario_family'],
+                demonstration_behavior_audit=behavior,
+                anchors=select_anchors(frames,execution,behavior_rows=behavior_rows),scenario_family=run['scenario_family'],
                 official_route_id=launch['official_route_id'],seed=launch['repetition_seed'])
     except (ValueError,KeyError,TypeError,OSError,ImportError) as exc:
         report['reasons'].append(str(exc))
@@ -526,6 +590,7 @@ def _check_episode(root,requested=None):
     raw,frames,required=_observations(root,by_frame,normalized=True)
     _counts(run,guard,execution,raw)
     physical=_physical_world(root,run,execution,raw)
+    behavior,behavior_rows=_behavior(root,run,execution)
     required.add('frames.jsonl')
     video=_json(root/'planning/video_recording.json');required.add('planning/'+video['path'])
     sums=manifest.get('source_hashes')
@@ -537,8 +602,10 @@ def _check_episode(root,requested=None):
         scenario_family=run['scenario_family'],official_route_id=route_id,seed=launch['repetition_seed'],
         driver=run['reference_driver'],capture_count=len(frames),execution_count=len(execution),
         physical_world_audit=physical,
-        anchors=select_anchors(frames,execution,requested),source_manifest_sha256=_hash(root/'capture_manifest.json'),
-        source_hashes=sums,memory_published=False,official_outcome=outcome)
+        demonstration_behavior_audit=behavior,
+        anchors=select_anchors(frames,execution,requested,behavior_rows),source_manifest_sha256=_hash(root/'capture_manifest.json'),
+        source_hashes=sums,memory_published=False,official_outcome=outcome,
+        human_driving_quality_approved=False,review_status='pending_real_human_driving_quality_review')
 
 
 def check_official_demonstrations(captures,*,anchor_frames=None,require_all_families=False,collection_split=None):
@@ -608,10 +675,12 @@ def prepare_official_demonstrations(captures,output,workbench_root,*,pipeline_co
             if _hash(source/'capture_manifest.json')!=episode['source_manifest_sha256']:raise ValueError('Source changed during preparation')
             for name,digest in episode['source_hashes'].items():
                 if _hash(_contained(source,name))!=digest:raise ValueError('Source asset changed during preparation: '+name)
+        behavior_tasks=_bind_behavior_review(output,checked,storage.atomic_json)
         partition_tasks=None
         if split_snapshot is not None:
             partition_tasks=_bind_prepared_partition(output,checked,split_snapshot,storage.atomic_json)
-        report=dict(checked,status='prepared_pending_real_teacher_and_human_review',preparations=results,published=False,reviewed=False)
+        report=dict(checked,status='prepared_pending_real_teacher_and_human_review',preparations=results,published=False,reviewed=False,
+            demonstration_review_task_binding=behavior_tasks)
         if split_snapshot is not None:
             report.update(collection_split_snapshot=split_snapshot,partition_task_binding=partition_tasks)
         storage.atomic_json(output/'official_demo_preparation.json',report)
@@ -620,6 +689,33 @@ def prepare_official_demonstrations(captures,output,workbench_root,*,pipeline_co
         sys.path[:]=original_path;sys.dont_write_bytecode=old_bytecode
         if old_mpl is None:os.environ.pop('MPLCONFIGDIR',None)
         else:os.environ['MPLCONFIGDIR']=old_mpl
+
+
+def _bind_behavior_review(output,checked,write_json):
+    """Retain full-video/interaction review requirements in task audit metadata.
+
+    This records pending human review; it never fabricates a review decision or
+    adds audit measurements to a teacher/model's ordinary current-frame input.
+    """
+    approved={_digest(_json(filesystem_path(ep['episode'])/'run.json')):ep for ep in checked['episodes']}
+    tasks=sorted((output/'tasks').glob('*/task.json'))
+    if not tasks:raise ValueError('No workbench tasks available to bind required demonstration review')
+    for path in tasks:
+        task=_json(path);episode=approved.get(_digest(task.get('capture',{})))
+        if episode is None:raise ValueError('Review task is not bound to an admitted demonstration')
+        if any((path.parent/name).exists() for name in ('annotations','experience.json','review.json')):
+            raise ValueError('Demonstration review requirements must be attached before annotation or human review')
+        review=dict(schema='official-demonstration-human-review-requirement-1.0',required=True,
+            status='pending_real_human_review',approved=False,model_input=False,
+            source_manifest_sha256=episode['source_manifest_sha256'],source_capture=episode['episode'],
+            evidence=episode.get('demonstration_behavior_audit',dict(declared=False,verified=False)),
+            review_must_include_full_interaction_video=True)
+        if task.get('demonstration_review') not in (None,review):
+            raise ValueError('Workbench task carries different demonstration review evidence')
+        task['demonstration_review']=review;write_json(path,task)
+    return dict(task_count=len(tasks),human_review_required=True,review_approval_fabricated=False,
+        preserved_by_upstream='audit/task.json included in review evidence and published checksums',
+        limitation='pending_requirement_metadata;human_must_actually_review_full_video_and_interaction')
 
 
 def _bind_prepared_partition(output,checked,split_snapshot,write_json):

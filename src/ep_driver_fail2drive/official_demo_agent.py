@@ -22,6 +22,7 @@ from ep_driver_fail2drive.archive import _png
 from ep_driver_fail2drive.official_expert import OfficialExpert
 from ep_driver_fail2drive.sensor_pose import SensorPoseTap
 from ep_driver_fail2drive.source_world import source_world_geometry
+from ep_driver_fail2drive.demo_behavior import DemonstrationBehaviorAudit, SCHEMA as BEHAVIOR_SCHEMA, POLICY as BEHAVIOR_POLICY
 
 
 def get_entry_point():
@@ -40,6 +41,7 @@ class OfficialDemonstrationAgent(EPDriverFail2DriveAgent):
         self._closed = False
         self._native_count = 0
         self._demo_taps = {}
+        self._demo_behavior = DemonstrationBehaviorAudit()
 
     def setup(self,path_to_conf_file):
         super().setup(path_to_conf_file)
@@ -96,6 +98,9 @@ class OfficialDemonstrationAgent(EPDriverFail2DriveAgent):
             read_future_during_current_representation=False,test_only=False,
             physics_hz=PHYSICS_HZ,record_hz=1,frames_path='frames.jsonl',
             physical_world_audit='official-source-grounding-1.0',
+            demonstration_behavior_audit=BEHAVIOR_SCHEMA,
+            demonstration_quality_policy=dict(BEHAVIOR_POLICY),
+            human_driving_quality_review_required=True,
             model_calls=0,retrieval_enabled=False,write_memory_enabled=False,
             complete=False,completed_without_agent_error=False,errors=[])
         self.archive.json('run.json',self._demo_run)
@@ -182,14 +187,33 @@ class OfficialDemonstrationAgent(EPDriverFail2DriveAgent):
             source = relative % PHYSICS_HZ == 0
             health = source_world_geometry(snapshot,self.ego.id,self.extractor.route)
             self.archive.append('physical_world_audit',health)
+            behavior = None
+            if health['valid']:
+                lanes=[row[0]['polygon'] for row in getattr(self.extractor,'_lane_bounds',())]
+                try:
+                    behavior=self._demo_behavior.observe(snapshot,self.ego,self.world.get_actors(),lanes)
+                except Exception as error:
+                    # A bad body/pose source can fail before a valid audit row
+                    # exists. Still preserve this exact input frame for diagnosis;
+                    # never call the teacher or return a control for that frame.
+                    self.archive.capture_images(input_data,frame,stamp,[name for name,_ in CAMERA_POSES],save=True)
+                    self._display(input_data,frame,stamp,relative)
+                    error.evidence=dict(classification='invalid_demonstration_behavior_source',
+                        frame=frame,time=stamp,reason=str(error))
+                    raise
+                self.archive.append('demonstration_behavior_audit',behavior)
             # Preserve the actual failure-frame images before rejecting a bad
             # physical source, including a failure between 1Hz source frames.
             images = self.archive.capture_images(input_data,frame,stamp,[name for name,_ in CAMERA_POSES],
-                save=source or not health['valid'])
+                save=source or not health['valid'] or behavior is not None and not behavior['valid'])
             self._display(input_data,frame,stamp,relative)
             if not health['valid']:
                 error = ValueError('Official physical world is invalid: '+health['reason'])
                 error.evidence = health
+                raise error
+            if not behavior['valid']:
+                error=ValueError('Official demonstration has measured bounding-box penetration')
+                error.evidence=behavior
                 raise error
             imu = input_data.get('imu')
             if imu is None or imu[0] != frame:
