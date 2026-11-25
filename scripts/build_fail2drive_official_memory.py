@@ -15,12 +15,16 @@ def main(argv=None):
     finish.add_argument('--capture','--run-dir',dest='capture',required=True)
     finish.add_argument('--checkpoint',required=True)
     finish.add_argument('--launch',required=True)
+    finish.add_argument('--allow-min-speed-only',action='store_true',help='Explicitly accept only official minimum-speed penalties; retain original scores and every other gate')
     for name in ('check','prepare'):
         command=commands.add_parser(name)
         command.add_argument('--captures',required=True,action='append')
         command.add_argument('--anchor-frame',action='append')
         command.add_argument('--require-all-families',action='store_true')
         command.add_argument('--collection-split',help='Fixed 34-route memory partition; reject held-out test routes and partners')
+        command.add_argument('--allow-partial-collection',action='store_true',
+            help='With --collection-split only, admit an explicitly selected successful subset; keep quality and held-out isolation checks')
+        command.add_argument('--allow-min-speed-only',action='store_true',help='Explicitly allow previously frozen minimum-speed-only sources; never waive other infractions or process checks')
         if name=='prepare':
             command.add_argument('--workbench-root',required=True)
             command.add_argument('--output-dir',required=True)
@@ -28,19 +32,23 @@ def main(argv=None):
             command.add_argument('--dino-model')
             command.add_argument('--device',default='cpu')
     args=parser.parse_args(argv)
+    if args.command in ('check','prepare') and args.allow_partial_collection and not args.collection_split:
+        parser.error('--allow-partial-collection requires --collection-split')
     from ep_driver_fail2drive.official_demo_memory import (finalize_official_capture,
         check_official_demonstrations,prepare_official_demonstrations)
     try:
         if args.command=='finalize':
-            result=finalize_official_capture(args.capture,args.checkpoint,args.launch)
+            result=finalize_official_capture(args.capture,args.checkpoint,args.launch,allow_min_speed_only=args.allow_min_speed_only)
         elif args.command=='check':
             result=check_official_demonstrations(args.captures,anchor_frames=args.anchor_frame,
-                require_all_families=args.require_all_families,collection_split=args.collection_split)
+                require_all_families=args.require_all_families,collection_split=args.collection_split,
+                allow_partial_collection=args.allow_partial_collection,allow_min_speed_only=args.allow_min_speed_only)
         else:
             result=prepare_official_demonstrations(args.captures,args.output_dir,args.workbench_root,
                 pipeline_config=args.pipeline_config,dino_model=args.dino_model,device=args.device,
                 anchor_frames=args.anchor_frame,require_all_families=args.require_all_families,
-                collection_split=args.collection_split)
+                collection_split=args.collection_split,allow_partial_collection=args.allow_partial_collection,
+                allow_min_speed_only=args.allow_min_speed_only)
         print(json.dumps(result,ensure_ascii=False,indent=2))
         return 0 if result['valid'] else 2
     except (ValueError,KeyError,TypeError,OSError,ImportError) as exc:

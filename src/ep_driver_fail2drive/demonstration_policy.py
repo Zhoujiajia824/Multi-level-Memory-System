@@ -55,6 +55,55 @@ def _project(point,path,arc,stop=None,start=0.):
     return best
 
 
+def _projection_failure(message,evidence):
+    error=ValueError(message)
+    error.evidence=dict(schema='demonstration-reference-projection-1.0',**evidence)
+    raise error
+
+
+def _angle(first,second):
+    delta=first-second
+    return abs(math.atan2(math.sin(delta),math.cos(delta)))
+
+
+def _qualified_projection(point,path,arc,limits,heading,evidence):
+    """Project within a causal route interval; reject another level/direction."""
+    start,stop=limits;rows=[]
+    for index,(a,b) in enumerate(zip(path,path[1:])):
+        if arc[index]>stop:break
+        if arc[index+1]<start:continue
+        dx,dy=b[0]-a[0],b[1]-a[1];ds=arc[index+1]-arc[index]
+        u=max(0.,min(1.,((point[0]-a[0])*dx+(point[1]-a[1])*dy)/(ds*ds)))
+        station=arc[index]+u*ds
+        if station<start-1e-6 or station>stop+1e-6:continue
+        residual=math.hypot(point[0]-a[0]-u*dx,point[1]-a[1]-u*dy)
+        height=a[2]+u*(b[2]-a[2])
+        error=_angle(heading,math.atan2(dy,dx))
+        if abs(point[2]-height)<=3. and error<=math.pi/3.:
+            rows.append((residual,station,(dx/ds,dy/ds),height,error))
+    if not rows:
+        _projection_failure('No same-direction same-level demonstration reference in the verified local interval',
+            dict(evidence,ego_position_xyz_m=list(point),ego_heading_rad=heading,search_station_m=list(limits)))
+    rows.sort(key=lambda row:row[0]);best=rows[0]
+    # Adjacent segments represent one projection. A near-tied, far-away station
+    # indicates a loop/parallel branch; never silently jump to the other pass.
+    alternatives=[r for r in rows if r[0]<=best[0]+.25 and abs(r[1]-best[1])>8.]
+    if alternatives:
+        _projection_failure('Ambiguous demonstration reference across separate route stations',
+            dict(evidence,ego_position_xyz_m=list(point),projection_candidates=[list(best[:2]),list(alternatives[0][:2])]))
+    return best[:4]
+
+
+def _at(value,x,y):
+    """Linear coordinate mapping only; does not add or alter route geometry."""
+    if value<=x[0]:return float(y[0])
+    for i in range(len(x)-1):
+        if value<=x[i+1]:
+            u=(value-x[i])/(x[i+1]-x[i])
+            return float(y[i]+u*(y[i+1]-y[i]))
+    return float(y[-1])
+
+
 def _support(body,tangent,normal=False):
     axis=(-tangent[1],tangent[0]) if normal else tangent
     c,s=math.cos(body['heading']),math.sin(body['heading'])
@@ -74,7 +123,8 @@ def _same_height(first,second,shift=0.):
     return min(b,d+shift)+SETTINGS['vertical_margin_m']>=max(a,c+shift)
 
 
-def speed_envelope(ego,path,arc,bodies,target_speed,map_limit,offsets=()):
+def speed_envelope(ego,path,arc,bodies,target_speed,map_limit,offsets=(),*,
+                   ego_search_range=(0.,8.),reference_context=None):
     """Pure current-frame computation, also used for recorded-source replay.
 
     Coordinates here are CARLA world XYZ, not the paper adapter's flipped Y.
@@ -82,8 +132,19 @@ def speed_envelope(ego,path,arc,bodies,target_speed,map_limit,offsets=()):
     """
     values=[target_speed,map_limit,ego['speed'],ego['length'],ego['width'],*ego['position']]
     if not _finite(values) or target_speed<0 or map_limit<=0:raise ValueError('Invalid demonstration speed/ego measurement')
-    ep=_project(ego['position'],path,arc,stop=8.)
-    if ep[0]>4.:raise ValueError('Demonstration ego is too far from its current reference')
+    context=dict(reference_context or {})
+    if reference_context is None:
+        ep=_project(ego['position'],path,arc,stop=ego_search_range[1],start=ego_search_range[0])
+    else:
+        ep=_qualified_projection(ego['position'],path,arc,ego_search_range,ego['heading'],context)
+    if ep is None or ep[0]>4.:
+        _projection_failure('Demonstration ego is too far from its current reference',dict(context,
+            ego_position_xyz_m=list(ego['position']),ego_heading_rad=ego.get('heading'),
+            search_station_m=list(ego_search_range),reference_first_xyz_m=list(path[0]),
+            reference_last_xyz_m=list(path[-1]),projection_residual_m=ep[0] if ep else None,
+            projection_station_m=ep[1] if ep else None,
+            projection_heading_rad=math.atan2(ep[2][1],ep[2][0]) if ep else None,
+            projection_height_m=ep[3] if ep else None))
     limits=[dict(reason='current_map_vehicle_limit',speed_mps=float(map_limit),distance_m=0.)]
     settings=SETTINGS
     entity_horizon=min(settings['lookahead_m'],max(40.,ego['speed']**2/(2.*settings['normal_deceleration_mps2'])+
@@ -165,6 +226,7 @@ def speed_envelope(ego,path,arc,bodies,target_speed,map_limit,offsets=()):
         binding_reasons=[row for row in limits if row['speed_mps']<=chosen+1e-6][:12],
         relevant_limits=limits[:16],settings=dict(settings),current_entity_count=len(bodies),
         actual_reference_residual_m=ep[0],actual_reference_heading_error_rad=heading_error,
+        ego_reference_station_m=ep[1],reference_projection=context,
         source='current_frozen_world_and_current_ego_reference',
         future_NPC_script_read=False,scenario_id_used=False,paper_planner_modified=False,
         hazard_checks_follow=True,limitation='causal_constant_velocity_envelope;not_a_collision_free_proof')
@@ -172,6 +234,89 @@ def speed_envelope(ego,path,arc,bodies,target_speed,map_limit,offsets=()):
 
 class CautiousDemonstrationPolicy:
     """Read current frozen geometry; return a speed upper bound, never controls."""
+    def __init__(self):self._projection_state=None
+
+    def _reference(self,pilot,route_np,ego,snapshot):
+        planner=pilot._waypoint_planner;cursor=int(planner.route_index)
+        ppm=float(pilot.config.points_per_meter)
+        if not math.isfinite(ppm) or ppm<=0:raise ValueError('Invalid expert reference sampling density')
+        full=getattr(planner,'route_points',None)
+        if full is None:
+            # A complete zero-cursor explicit route needs no history. The real
+            # upstream planner always exposes route_points; a missing nonzero
+            # prefix cannot be silently reconstructed from the current slice.
+            if cursor!=0:raise ValueError('Nonzero expert cursor has no complete reference geometry')
+            full=route_np
+        original=planner.original_route_points
+        if cursor<0 or cursor>=len(full)-1 or len(original)!=len(full):
+            raise ValueError('Expert reference cursor/original arrays are inconsistent')
+        frame=int(snapshot.frame);stamp=float(snapshot.timestamp.elapsed_seconds)
+        previous=self._projection_state
+        if previous is not None and previous['pilot']!=id(pilot):previous=None
+        first=previous is None
+        if first:
+            history=min(60.,max(15.,float(getattr(pilot.config,'extra_route_length',50.))+8.))
+            begin=max(0,cursor-int(math.ceil(history*ppm)))
+            end=min(len(full),cursor+int(math.ceil((SETTINGS['lookahead_m']+8.)*ppm))+2)
+        else:
+            delta=stamp-previous['time']
+            if frame<previous['frame'] or delta<0:
+                _projection_failure('Demonstration projection source moved backwards',dict(source_frame=frame,source_time=stamp))
+            movement=math.dist(ego['position'][:2],previous['position'][:2])
+            allowance=max(2.,2.*max(ego['speed'],previous['speed'])*max(delta,.05)+.5)
+            if movement>allowance or (frame==previous['frame'] and math.dist(ego['position'],previous['position'])>.01):
+                _projection_failure('Demonstration physical source jumped outside its causal projection neighborhood',
+                    dict(source_frame=frame,source_time=stamp,observed_movement_m=movement,allowed_movement_m=allowance,
+                        previous_position_xyz_m=previous['position'],ego_position_xyz_m=list(ego['position'])))
+            anchor=previous['index']
+            begin=max(0,int(math.floor(anchor-15.*ppm)))
+            end=min(len(full),int(math.ceil(anchor+(SETTINGS['lookahead_m']+allowance+3.)*ppm))+2)
+        selected=full[begin:end]
+        horizon=(end-begin)/ppm+2.
+        path,arc,indices=_sample_route(selected,ppm,horizon)
+        absolute=[begin+index for index in indices]
+        context=dict(source_frame=frame,source_time=stamp,upstream_cursor=cursor,window_begin_index=begin,
+            window_end_index=end,window_first_xyz_m=list(path[0]),window_last_xyz_m=list(path[-1]),
+            initialization_prefix_window=first,geometry_source='same_upstream_private_route_points',
+            upstream_cursor_changed=False,fabricated_connection=False,global_relocalization=False)
+        if first and cursor>0:
+            published=getattr(pilot,'org_dense_route_world_coord',None)
+            if not published:
+                _projection_failure('Expanded startup projection lacks the published original route start',context)
+            start=published[0][0].location
+            seed=[float(getattr(start,k)) for k in ('x','y','z')]
+            following=next((row[0].location for row in published[1:] if math.hypot(row[0].location.x-seed[0],
+                row[0].location.y-seed[1])>.2),None)
+            if following is None:
+                _projection_failure('Published original route has no initial direction',context)
+            heading=math.atan2(following.y-seed[1],following.x-seed[0])
+            if (math.dist(seed[:2],ego['position'][:2])>4. or abs(seed[2]-ego['position'][2])>3.
+                    or _angle(ego['heading'],heading)>math.pi/3.):
+                _projection_failure('Startup source is not at the published original route start/direction/level',
+                    dict(context,published_start_xyz_m=seed,published_heading_rad=heading,
+                        ego_position_xyz_m=list(ego['position']),ego_heading_rad=ego['heading']))
+            original_path=[list(map(float,original[index][:3])) for index in absolute]
+            original_arc=[0.]
+            for a,b in zip(original_path,original_path[1:]):original_arc.append(original_arc[-1]+math.dist(a[:2],b[:2]))
+            # Anchor the broad startup window to the *published start*, not to
+            # whichever parallel road happens to be nearest the current car.
+            seed_stop=_at(min(end-1,cursor+8.*ppm),absolute,original_arc)
+            seed_projection=_qualified_projection(seed,original_path,original_arc,
+                (0.,seed_stop),heading,context)
+            if seed_projection[0]>.5:
+                _projection_failure('Published start is absent from the bounded true reference prefix',
+                    dict(context,published_start_xyz_m=seed,published_start_residual_m=seed_projection[0]))
+            anchor=_at(seed_projection[1],original_arc,absolute)
+            low,high=max(begin,anchor-2.*ppm),min(end-1,anchor+8.*ppm)
+            context.update(published_start_xyz_m=seed,published_start_index=anchor,published_heading_rad=heading)
+        elif first:
+            anchor=0.;low,high=0.,min(end-1,8.*ppm)
+        else:
+            low=max(begin,anchor-2.*ppm);high=min(end-1,anchor+(allowance+3.)*ppm)
+        search=(_at(low,absolute,arc),_at(high,absolute,arc))
+        context.update(search_index_range=[low,high],search_station_m=list(search))
+        return selected,path,arc,indices,absolute,search,context
+
     def limit(self,pilot,route_np,target_speed,ego_speed):
         snapshot=pilot._world.get_snapshot();hero=pilot._vehicle
         frozen=snapshot.find(hero.id)
@@ -182,8 +327,7 @@ class CautiousDemonstrationPolicy:
             heading=math.radians(pose.rotation.yaw))
         ego_vertices=hero.bounding_box.get_world_vertices(pose)
         ego.update(z_min=min(float(v.z) for v in ego_vertices),z_max=max(float(v.z) for v in ego_vertices))
-        ppm=float(pilot.config.points_per_meter)
-        path,arc,indices=_sample_route(route_np,ppm,SETTINGS['lookahead_m'])
+        selected,path,arc,indices,absolute,search,context=self._reference(pilot,route_np,ego,snapshot)
         bodies=[]
         for actor in pilot._world.get_actors():
             if actor.id==hero.id:continue
@@ -210,12 +354,15 @@ class CautiousDemonstrationPolicy:
                 velocity=[float(v.x),float(v.y),float(v.z)],length=2.*box.extent.x,width=2.*box.extent.y,
                 z_min=min(float(v.z) for v in vertices),z_max=max(float(v.z) for v in vertices),
                 heading=math.radians(transform.rotation.yaw+box.rotation.yaw)))
-        planner=pilot._waypoint_planner;offsets=[]
-        original=planner.original_route_points;start=planner.route_index
-        for station,index in zip(arc,indices):
-            if start+index>=len(original):break
-            offsets.append((station,math.hypot(route_np[index][0]-original[start+index][0],route_np[index][1]-original[start+index][1])))
-        result,evidence=speed_envelope(ego,path,arc,bodies,float(target_speed),float(hero.get_speed_limit())/3.6,offsets)
+        original=pilot._waypoint_planner.original_route_points;offsets=[]
+        for station,index,global_index in zip(arc,indices,absolute):
+            offsets.append((station,math.hypot(selected[index][0]-original[global_index][0],selected[index][1]-original[global_index][1])))
+        result,evidence=speed_envelope(ego,path,arc,bodies,float(target_speed),float(hero.get_speed_limit())/3.6,offsets,
+            ego_search_range=search,reference_context=context)
+        physical_index=_at(evidence['ego_reference_station_m'],arc,absolute)
+        self._projection_state=dict(pilot=id(pilot),frame=int(snapshot.frame),time=float(snapshot.timestamp.elapsed_seconds),
+            index=physical_index,position=list(ego['position']),speed=ego['speed'])
+        evidence['reference_projection']['actual_projection_index']=physical_index
         evidence.update(source_frame=int(snapshot.frame),source_time=float(snapshot.timestamp.elapsed_seconds),
             expert_speed_xyz_mps=float(ego_speed),speed_semantics='limits_use_frozen_horizontal_speed')
         return result,evidence

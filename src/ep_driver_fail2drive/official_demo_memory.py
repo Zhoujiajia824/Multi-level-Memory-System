@@ -58,41 +58,100 @@ def _root(directory):
     return candidates[0]
 
 
-def official_outcome(data, route_id):
+def _admission_policy(allow_min_speed_only=False):
+    if type(allow_min_speed_only) is not bool:raise ValueError('Minimum-speed admission must be explicitly boolean')
+    return dict(schema='official-demo-admission-policy-1.0',
+        mode='allow_min_speed_only' if allow_min_speed_only else 'strict_perfect',
+        official_scores_preserved=True,non_min_speed_infraction_free_required=True,human_review_required=True)
+
+
+def official_outcome(data, route_id, *, allow_min_speed_only=False):
     """Validate the complete upstream single-route checkpoint, including every infraction."""
     reasons=[]
+    if not isinstance(data,dict):data={}
     checkpoint=data.get('_checkpoint',{})
+    if not isinstance(checkpoint,dict):checkpoint={}
     records=checkpoint.get('records')
     record=records[0] if isinstance(records,list) and len(records)==1 and isinstance(records[0],dict) else {}
     global_record=checkpoint.get('global_record',{})
+    if not isinstance(global_record,dict):global_record={}
     if data.get('entry_status')!='Finished' or data.get('eligible') is not True or checkpoint.get('progress')!=[1,1]:
         reasons.append('official_evaluator_not_finished_or_ineligible')
     if type(route_id) is not int or record.get('route_id')!='RouteScenario_%s_rep0'%route_id:
         reasons.append('official_route_identity_mismatch')
-    if record.get('status')!='Perfect' or global_record.get('status')!='Perfect':
+    profile=_admission_policy(allow_min_speed_only)
+    infractions=record.get('infractions')
+    minor=(infractions.get('min_speed_infractions') if isinstance(infractions,dict) else None)
+    relaxed=allow_min_speed_only and isinstance(minor,list) and bool(minor)
+    if not relaxed and (record.get('status')!='Perfect' or global_record.get('status')!='Perfect'):
         reasons.append('official_route_not_perfect')
     scores=record.get('scores',{})
-    if (not _same(scores.get('score_route'),100.) or not _same(scores.get('score_penalty'),1.)
+    if not isinstance(scores,dict):scores={}
+    if not relaxed and (not _same(scores.get('score_route'),100.) or not _same(scores.get('score_penalty'),1.)
             or not _same(scores.get('score_composed'),100.)):
         reasons.append('official_route_incomplete_or_penalized')
-    infractions=record.get('infractions')
-    if (not isinstance(infractions,dict) or not INFRACTIONS.issubset(infractions)
+    if not relaxed and (not isinstance(infractions,dict) or not INFRACTIONS.issubset(infractions)
             or any(not isinstance(value,list) or value for value in infractions.values())
             or record.get('num_infractions')!=0):
         reasons.append('official_infractions_nonempty_or_unknown')
     totals=global_record.get('infractions')
-    if (not isinstance(totals,dict) or not INFRACTIONS.issubset(totals)
+    if not relaxed and (not isinstance(totals,dict) or not INFRACTIONS.issubset(totals)
             or any(not _number(value) or value!=0 for value in totals.values())):
         reasons.append('official_global_infractions_nonzero_or_unknown')
+    if relaxed:
+        if (record.get('status')!='Completed'
+                or global_record.get('status')!=record.get('status')):
+            reasons.append('min_speed_only_requires_completed_consistent_status')
+        if (set(infractions)!=INFRACTIONS or any(not isinstance(v,list) for v in infractions.values())
+                or any(v for k,v in infractions.items() if k!='min_speed_infractions')
+                or type(record.get('num_infractions')) is not int or record['num_infractions']!=len(minor)):
+            reasons.append('non_min_speed_or_unknown_infraction_present')
+        percentages=[]
+        for message in minor:
+            match=re.fullmatch(r"Average speed is ([0-9]+(?:\.[0-9]{1,2})?)% of the surrounding traffic's one",message) if isinstance(message,str) else None
+            value=float(match.group(1)) if match else None
+            if value is None or not 0<=value<100:
+                reasons.append('unrecognized_min_speed_penalty_evidence');break
+            percentages.append(value)
+        penalty=math.prod(1.-(1.-.7)*(1.-v/100.) for v in percentages)
+        if (len(percentages)!=len(minor) or any(not _number(scores.get(k)) for k in ('score_route','score_penalty','score_composed'))
+                or abs(scores.get('score_route',0)-100.)>1e-6
+                or abs(scores.get('score_penalty',0)-round(penalty,6))>1e-6
+                or abs(scores.get('score_composed',0)-round(100.*penalty,6))>1e-6):
+            reasons.append('scores_do_not_match_only_official_min_speed_penalties')
+        if (not isinstance(totals,dict) or set(totals)!=INFRACTIONS
+                or any(not _number(v) or v<0 for v in totals.values())
+                or any(v!=0 for k,v in totals.items() if k!='min_speed_infractions')):
+            reasons.append('official_global_non_min_speed_or_unknown_infraction')
+        else:
+            meta=record.get('meta',{});length=meta.get('route_length') if isinstance(meta,dict) else None
+            if (not _number(length) or length<=0
+                    or abs(totals['min_speed_infractions']-round(len(minor)/max(length/1000.,.001),3))>1e-6):
+                reasons.append('global_min_speed_rate_does_not_match_actual_route')
+        means=global_record.get('scores_mean')
+        if (not isinstance(means,dict) or any(not _number(means.get(k))
+                or not _number(scores.get(k)) or abs(means[k]-scores[k])>1e-6
+                for k in ('score_route','score_penalty','score_composed'))):
+            reasons.append('official_global_scores_disagree_with_single_route')
     return dict(valid=not reasons,passed=not reasons,reasons=reasons,
         entry_status=data.get('entry_status'),status=record.get('status'),scores=scores,
-        infractions=infractions,global_infractions=totals,official_route_id=route_id)
+        infractions=infractions,global_infractions=totals,official_route_id=route_id,
+        admission_policy=profile,accepted_with_min_speed_penalty=bool(relaxed and not reasons),
+        human_driving_quality_review_required=True)
+
+
+def _require_complete_capture(run):
+    if run.get('complete') is not True or run.get('errors')!=[]:
+        errors=run.get('errors')
+        first=errors[0] if isinstance(errors,list) and errors and isinstance(errors[0],dict) else {}
+        detail=('%s: %s'%(first.get('type','capture_error'),first.get('error','closing metadata is incomplete')))[:1200]
+        raise ValueError('Demonstration capture did not close successfully; '+detail)
 
 
 def _identity(root, run, launch):
+    _require_complete_capture(run)
     if (run.get('demo_suite')!=SUITE or run.get('source')!='carla' or run.get('split')!=SPLIT
-            or run.get('complete') is not True or run.get('test_only') is not False
-            or run.get('official_evaluation') is not True or run.get('errors')!=[]
+            or run.get('test_only') is not False or run.get('official_evaluation') is not True
             or run.get('read_future_during_current_representation') is not False
             or run.get('normalization_protocol')!=INPUT_PROTOCOL):
         raise ValueError('Incomplete, test-only or non-official-scenario demonstration')
@@ -485,7 +544,7 @@ def select_anchors(frames,execution,requested=None,behavior_rows=None):
     return selected
 
 
-def _export(root,run,raw):
+def _export(root,run,raw,official=None):
     from shapely.geometry import Polygon
     from nine_grid.contracts import plain
     from .protocol import SCHEMA
@@ -515,13 +574,17 @@ def _export(root,run,raw):
             snapshot['diagnostics']['captured_motion_models']={actor['id']:actor.pop('motion_model',None)
                 for actor in [snapshot['ego'],*snapshot['actors']]}
             audit=dict(source='official_episode_outcome',scope='whole_episode',collision=False,offroad=False,rule_violation=False,
-                per_frame_independent_safety_claimed=False)
+                per_frame_independent_safety_claimed=False,
+                rule_violation_scope='non_min_speed_traffic_safety_items_only',
+                official_infraction_free=not bool((official or {}).get('accepted_with_min_speed_penalty')),
+                benchmark_min_speed_penalty=bool((official or {}).get('accepted_with_min_speed_penalty')),
+                benchmark_min_speed_infraction_count=len((official or {}).get('infractions',{}).get('min_speed_infractions',[])))
             stream.write(json.dumps(dict(index=index,frame=row['frame'],time=row['time'],snapshot=snapshot,
                 native_image=row['native_image'],camera_manifest=row['camera_manifest'],audit=audit),ensure_ascii=False,allow_nan=False)+'\n')
     temporary.replace(destination)
 
 
-def finalize_official_capture(run_dir, official_checkpoint, launch_metadata):
+def finalize_official_capture(run_dir, official_checkpoint, launch_metadata,*,allow_min_speed_only=False):
     """Freeze new derivative evidence after evaluator/Agent teardown; never edit raw data."""
     root=_root(run_dir)
     checkpoint=filesystem_path(official_checkpoint)
@@ -532,7 +595,7 @@ def finalize_official_capture(run_dir, official_checkpoint, launch_metadata):
         if (_hash(checkpoint)!=_hash(_contained(root,'official_result.json'))
                 or launch!=_json(_contained(root,'official_launch.json'))):
             raise ValueError('Frozen capture cannot be rebound to another official result or launch')
-        return _check_episode(root)
+        return _check_episode(root,allow_min_speed_only=allow_min_speed_only)
     run=_json(_contained(root,'run.json'))
     if not checkpoint.is_file():raise ValueError('Official checkpoint is missing')
     _copy_once(checkpoint,root/'official_result.json')
@@ -542,9 +605,12 @@ def finalize_official_capture(run_dir, official_checkpoint, launch_metadata):
     if (root/'official_launch.json').exists() and _json(root/'official_launch.json')!=launch:
         raise ValueError('Original launch evidence changed')
     _write(root/'official_launch.json',launch)
-    outcome=official_outcome(_json(root/'official_result.json'),launch.get('official_route_id',-1))
+    outcome=official_outcome(_json(root/'official_result.json'),launch.get('official_route_id',-1),
+        allow_min_speed_only=allow_min_speed_only)
     report=dict(protocol=PROTOCOL,run_dir=str(root),memory_published=False,official_outcome=outcome,
-        valid=False,passed=False,reasons=list(outcome['reasons']),evaluation_path=str(root/'official_demo_evaluation.json'))
+        valid=False,passed=False,reasons=list(outcome['reasons']),evaluation_path=str(root/'official_demo_evaluation.json'),
+        admission_policy=deepcopy(outcome['admission_policy']),
+        accepted_with_min_speed_penalty=outcome['accepted_with_min_speed_penalty'])
     try:
         _identity(root,run,launch);guard=_guard(root);_binding(root,run,launch,guard)
         execution,by_frame=_execution(root);_video(root,execution)
@@ -553,7 +619,7 @@ def finalize_official_capture(run_dir, official_checkpoint, launch_metadata):
         physical=_physical_world(root,run,execution,raw)
         behavior,behavior_rows=_behavior(root,run,execution)
         if outcome['valid']:
-            if not (root/'frames.jsonl').exists():_export(root,run,raw)
+            if not (root/'frames.jsonl').exists():_export(root,run,raw,outcome)
             _,frames,_=_observations(root,by_frame,normalized=True)
             report.update(valid=True,passed=True,capture_count=len(raw),execution_count=len(execution),
                 physical_world_audit=physical,
@@ -567,23 +633,40 @@ def finalize_official_capture(run_dir, official_checkpoint, launch_metadata):
         sums={p.relative_to(root).as_posix():_hash(p) for p in sorted(root.rglob('*')) if p.is_file() and p.name!='capture_manifest.json'}
         _write(root/'capture_manifest.json',dict(protocol=INPUT_PROTOCOL,demo_suite=SUITE,source='carla',
             source_version=run['source_version'],split=SPLIT,reference_driver=run['reference_driver'],frames_path='frames.jsonl',
-            execution_path='execution.jsonl',demo_evaluation_path='official_demo_evaluation.json',source_hashes=sums))
+            execution_path='execution.jsonl',demo_evaluation_path='official_demo_evaluation.json',source_hashes=sums,
+            admission_policy=deepcopy(outcome['admission_policy']),
+            accepted_with_min_speed_penalty=outcome['accepted_with_min_speed_penalty']))
         # Re-read frozen bytes exactly as the later local workstation will.
-        return _check_episode(root)
+        return _check_episode(root,allow_min_speed_only=allow_min_speed_only)
     return report
 
 
-def _check_episode(root,requested=None):
-    run=_json(_contained(root,'run.json'));manifest=_json(_contained(root,'capture_manifest.json'))
+def _check_episode(root,requested=None,*,allow_min_speed_only=False):
+    _admission_policy(allow_min_speed_only)
+    run=_json(_contained(root,'run.json'))
+    _require_complete_capture(run)
+    if not (root/'capture_manifest.json').is_file():
+        raise ValueError('Successful Agent capture is not finalized; run finalize to create capture_manifest.json')
+    manifest=_json(_contained(root,'capture_manifest.json'))
     launch=_json(_contained(root,'official_launch.json'))
     route_id=_identity(root,run,launch);guard=_guard(root);_binding(root,run,launch,guard)
-    outcome=official_outcome(_json(_contained(root,'official_result.json')),route_id)
+    frozen_policy=manifest.get('admission_policy',_admission_policy(False))
+    if frozen_policy not in (_admission_policy(False),_admission_policy(True)):
+        raise ValueError('Frozen official admission policy is missing or unsupported')
+    outcome=official_outcome(_json(_contained(root,'official_result.json')),route_id,
+        allow_min_speed_only=frozen_policy['mode']=='allow_min_speed_only')
+    if outcome['accepted_with_min_speed_penalty'] and not allow_min_speed_only:
+        raise ValueError('Frozen source has an original minimum-speed penalty; explicitly pass --allow-min-speed-only')
     if not outcome['valid']:raise ValueError('Official demonstration failed: '+str(outcome['reasons']))
     if (manifest.get('protocol')!=INPUT_PROTOCOL or manifest.get('demo_suite')!=SUITE or manifest.get('source')!='carla'
             or manifest.get('split')!=SPLIT or manifest.get('source_version')!=run['source_version']
             or manifest.get('reference_driver')!=run['reference_driver'] or manifest.get('frames_path')!='frames.jsonl'):
         raise ValueError('Frozen official demonstration provenance mismatch')
     evaluation=_json(_contained(root,'official_demo_evaluation.json'))
+    if 'admission_policy' in manifest and (evaluation.get('admission_policy')!=frozen_policy
+            or evaluation.get('accepted_with_min_speed_penalty')!=outcome['accepted_with_min_speed_penalty']
+            or manifest.get('accepted_with_min_speed_penalty')!=outcome['accepted_with_min_speed_penalty']):
+        raise ValueError('Frozen admission policy or original minimum-speed outcome was changed')
     if evaluation.get('valid') is not True or evaluation.get('passed') is not True or evaluation.get('reasons')!=[]:
         raise ValueError('Demonstration was not successfully finalized')
     execution,by_frame=_execution(root);_video(root,execution)
@@ -605,10 +688,15 @@ def _check_episode(root,requested=None):
         demonstration_behavior_audit=behavior,
         anchors=select_anchors(frames,execution,requested,behavior_rows),source_manifest_sha256=_hash(root/'capture_manifest.json'),
         source_hashes=sums,memory_published=False,official_outcome=outcome,
-        human_driving_quality_approved=False,review_status='pending_real_human_driving_quality_review')
+        human_driving_quality_approved=False,review_status='pending_real_human_driving_quality_review',
+        admission_policy=deepcopy(frozen_policy),accepted_with_min_speed_penalty=outcome['accepted_with_min_speed_penalty'])
 
 
-def check_official_demonstrations(captures,*,anchor_frames=None,require_all_families=False,collection_split=None):
+def check_official_demonstrations(captures,*,anchor_frames=None,require_all_families=False,collection_split=None,
+                                 allow_partial_collection=False,allow_min_speed_only=False):
+    _admission_policy(allow_min_speed_only)
+    if type(allow_partial_collection) is not bool or allow_partial_collection and collection_split is None:
+        raise ValueError('Explicit partial collection requires --collection-split')
     roots=[]
     for directory in captures:
         path=filesystem_path(directory)
@@ -618,7 +706,7 @@ def check_official_demonstrations(captures,*,anchor_frames=None,require_all_fami
     if anchor_frames and len(roots)!=1:raise ValueError('Explicit anchors require one capture')
     episodes=[];rejected=[]
     for root in roots:
-        try:episodes.append(_check_episode(root,anchor_frames))
+        try:episodes.append(_check_episode(root,anchor_frames,**({'allow_min_speed_only':True} if allow_min_speed_only else {})))
         except (ValueError,KeyError,TypeError,OSError) as exc:rejected.append(dict(episode=str(root),reason=str(exc)))
     families=sorted({episode['scenario_family'] for episode in episodes})
     if require_all_families and set(families)!=set(FAMILIES):
@@ -629,16 +717,19 @@ def check_official_demonstrations(captures,*,anchor_frames=None,require_all_fami
         data_use='targeted_seen_scenario_demonstration;not_unseen_route_generalization')
     if collection_split is not None:
         from .memory_split import load_transfer_split,validate_collection_partition
-        partition=validate_collection_partition(load_transfer_split(collection_split),episodes)
+        partition=validate_collection_partition(load_transfer_split(collection_split),episodes,
+            allow_partial=allow_partial_collection)
         report.update(collection_partition=partition,valid=report['valid'] and partition['valid'],
             data_use='same_family_heldout_route_pair;not_unseen_map_or_family_generalization')
     return report
 
 
 def prepare_official_demonstrations(captures,output,workbench_root,*,pipeline_config=None,dino_model=None,
-                                    device='cpu',anchor_frames=None,require_all_families=False,collection_split=None):
+                                    device='cpu',anchor_frames=None,require_all_families=False,collection_split=None,
+                                    allow_partial_collection=False,allow_min_speed_only=False):
     checked=check_official_demonstrations(captures,anchor_frames=anchor_frames,
-        require_all_families=require_all_families,collection_split=collection_split)
+        require_all_families=require_all_families,collection_split=collection_split,
+        allow_partial_collection=allow_partial_collection,allow_min_speed_only=allow_min_speed_only)
     if not checked['valid']:
         raise ValueError('Official demonstrations not eligible: '+str(dict(
             rejected=checked['rejected'],partition=checked.get('collection_partition'))))
@@ -668,7 +759,7 @@ def prepare_official_demonstrations(captures,output,workbench_root,*,pipeline_co
         results=[]
         for episode in checked['episodes']:
             source=filesystem_path(episode['episode']);ids=[a['frame_id'] for a in episode['anchors']]
-            current=_check_episode(source,ids)
+            current=_check_episode(source,ids,**({'allow_min_speed_only':True} if allow_min_speed_only else {}))
             if current['source_manifest_sha256']!=episode['source_manifest_sha256']:raise ValueError('Source changed before preparation')
             results.append(pipeline.prepare(cfg,source,output,model_path=cfg['features']['dino_model'],device=device,
                 anchor_alignment='strict',selected_anchor_frame_ids=ids))
@@ -709,6 +800,8 @@ def _bind_behavior_review(output,checked,write_json):
             status='pending_real_human_review',approved=False,model_input=False,
             source_manifest_sha256=episode['source_manifest_sha256'],source_capture=episode['episode'],
             evidence=episode.get('demonstration_behavior_audit',dict(declared=False,verified=False)),
+            official_result_admission_policy=episode.get('admission_policy',_admission_policy(False)),
+            original_min_speed_penalty=bool(episode.get('accepted_with_min_speed_penalty',False)),
             review_must_include_full_interaction_video=True)
         if task.get('demonstration_review') not in (None,review):
             raise ValueError('Workbench task carries different demonstration review evidence')
@@ -745,8 +838,19 @@ def _bind_prepared_partition(output,checked,split_snapshot,write_json):
             official_route_id=rid,official_route_variant=record['variant'],official_route_sha256=record['sha256'],
             scenario_family=family,collection_seed=episode['seed'],
             source_manifest_sha256=episode['source_manifest_sha256'],
+            source_admission_policy=episode.get('admission_policy',_admission_policy(False)),
+            accepted_with_min_speed_penalty=bool(episode.get('accepted_with_min_speed_penalty',False)),
             model_input=False,retrieval_key=False,
             publication_path='record/audit/task.json:experiment_partition')
+        partition=checked['collection_partition']
+        if partition.get('selection_snapshot') is not None:
+            selection=deepcopy(partition['selection_snapshot'])
+            if (_digest(selection)!=partition.get('selection_sha256')
+                    or selection.get('split_sha256')!=signature
+                    or rid not in {r['official_route_id'] for r in selection.get('captures',[])}):
+                raise ValueError('Prepared task selection differs from the admitted successful captures')
+            provenance.update(selection_snapshot=selection,selection_sha256=partition['selection_sha256'],
+                allow_partial_collection=partition['allow_partial_collection'])
         if task.get('experiment_partition') not in (None,provenance):
             raise ValueError('Workbench task already carries another experiment partition')
         task['experiment_partition']=provenance

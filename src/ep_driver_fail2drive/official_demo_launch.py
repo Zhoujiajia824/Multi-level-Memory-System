@@ -12,6 +12,7 @@ from datetime import datetime
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -273,6 +274,7 @@ def plan(args, *, preflight=None, launcher=None):
                 demonstration_implementation_sha256=implementation,
                 official_expert_files_sha256=expert,official_expert_source_sha256=expert_identity,
                 expert_dependency_preflight=dependencies,
+                batch_scheduling_policy=dict(continue_on_known_route_rejection=bool(getattr(args,'continue_on_route_failure',False))),
                 controlled_environment={key:env.get(key) for key in
                     ('PYTHONPATH','DATAGEN','DEBUG_CHALLENGE','HISTOGRAM','TP_STATS','SAVE_PATH')})
             identity=_digest(inputs)
@@ -287,11 +289,13 @@ def plan(args, *, preflight=None, launcher=None):
                 acceptance='official_result_and_finalized_physical_evidence_required',
                 data_use='targeted_seen_scenario_demonstration',simulator_started_by_launcher=False,
                 ego_policy_is_the_only_substitution=True,
+                batch_scheduling_policy=inputs['batch_scheduling_policy'],
                 trajectory_identity_note='NPC positions and activation times may react to the changed ego trajectory; scenario code and seed are unchanged')
             jobs.append(dict(config=config,runtime_path=runtime,launch_path=launch,checkpoint=checkpoint,
                 agent_output=Path(config['output_dir']),command=command,env=env,metadata=metadata))
     return dict(output_dir=base,jobs=jobs,implementation_sha256=implementation,expert_sha256=expert,
-                catalog=catalog,official_root=source,launcher=launcher)
+                catalog=catalog,official_root=source,launcher=launcher,
+                continue_on_route_failure=bool(getattr(args,'continue_on_route_failure',False)))
 
 
 def preview(planned):
@@ -303,7 +307,8 @@ def preview(planned):
             runtime_path=str(job['runtime_path']),checkpoint=str(job['checkpoint']),
             agent_output=str(job['agent_output']),fingerprint=job['metadata']['fingerprint']) for job in planned['jobs']],
         official_routes_unmodified=True,scenario_mutations=False,custom_episode_limit=None,
-        simulator_started_by_launcher=False,accepted_for_memory=False,memory_published=False)
+        simulator_started_by_launcher=False,accepted_for_memory=False,memory_published=False,
+        continue_on_known_route_rejection=planned.get('continue_on_route_failure',False))
 
 
 def _write(path,value):
@@ -335,6 +340,63 @@ def write_plan(planned):
         _write(job['runtime_path'],job['config']);_write(job['launch_path'],job['metadata'])
 
 
+def _failure_summary(root,capture):
+    """Print bounded diagnostics while retaining the complete raw evidence."""
+    failure=None
+    try:
+        path=root/'capture_failure.json'
+        if path.is_file():failure=_read(path)
+    except (OSError,ValueError,TypeError):pass
+    if not isinstance(failure,dict):
+        errors=capture.get('errors',[]) if isinstance(capture,dict) else []
+        failure=errors[0] if isinstance(errors,list) and errors and isinstance(errors[0],dict) else {}
+    evidence=failure.get('evidence')
+    evidence=evidence if isinstance(evidence,dict) else {}
+    result=dict(type=str(failure.get('type','unknown_capture_failure'))[:100],
+        message=str(failure.get('error','No complete failure record was archived'))[:1200],
+        classification=str(evidence.get('classification',evidence.get('schema','unclassified')))[:160])
+    for key in ('frame','time'):
+        value=failure.get(key)
+        if type(value) in (int,float) and math.isfinite(value):result[key]=value
+    return result,failure
+
+
+def _known_route_rejection(root,capture,failure,verdict):
+    """Whitelist route-level quality stops; never skip unknown runtime faults."""
+    if (not isinstance(capture,dict) or capture.get('complete') is not False
+            or not isinstance(capture.get('errors'),list) or len(capture['errors'])!=1
+            or verdict.get('official_result_valid') is not True
+            or verdict.get('entry_status')!='Finished'
+            or verdict.get('official_status')!='Failed - Agent crashed'
+            or verdict.get('route_completed') is not False):return None
+    recorded=capture['errors'][0]
+    if (not isinstance(recorded,dict) or failure.get('type')!='ValueError'
+            or any(recorded.get(k)!=failure.get(k) for k in ('frame','time','type','error'))):return None
+    try:video=_read(root/'planning'/'video_recording.json')
+    except (OSError,ValueError,TypeError):return None
+    if (not isinstance(video,dict) or video.get('status')!='complete'
+            or video.get('playback_verified') is not True):return None
+    evidence=failure.get('evidence')
+    if not isinstance(evidence,dict) or evidence.get('valid') is not False:return None
+    if (any(type(failure.get(k)) not in (int,float) or not math.isfinite(failure[k]) for k in ('frame','time'))
+            or any(evidence.get(k)!=failure.get(k) for k in ('frame','time'))):return None
+    from .source_world import SCHEMA as PHYSICAL_SCHEMA
+    from .demo_behavior import SCHEMA as BEHAVIOR_SCHEMA
+    if (evidence.get('schema')==PHYSICAL_SCHEMA
+            and evidence.get('classification')=='physical_world_invalid'
+            and evidence.get('reason')=='ego_falling_below_published_road'
+            and evidence.get('world_modified') is False
+            and failure.get('error')=='Official physical world is invalid: ego_falling_below_published_road'):
+        return 'route_physical_grounding_rejection'
+    contacts=evidence.get('hard_geometry_penetration_ids')
+    if (evidence.get('schema')==BEHAVIOR_SCHEMA and isinstance(contacts,list) and contacts
+            and all(type(v) is int for v in contacts)
+            and evidence.get('driving_control_generated') is False
+            and failure.get('error')=='Official demonstration has measured bounding-box penetration'):
+        return 'route_demonstration_geometry_rejection'
+    return None
+
+
 def run_plan(planned):
     write_plan(planned)
     outcomes=[]
@@ -360,7 +422,7 @@ def run_plan(planned):
             checkpoint=str(job['checkpoint']),launch_path=str(job['launch_path']),runtime_path=str(job['runtime_path']),
             agent_output=str(job['agent_output']),run_dir=str(archives[0].parent) if len(archives)==1 else None,
             archive_count=len(archives),finalization_required=True,accepted_for_memory=False,memory_published=False)
-        fatal=None
+        fatal=None;capture=None;failure={}
         if code:
             fatal='evaluator_process_failed'
         elif len(archives)!=1:
@@ -368,13 +430,29 @@ def run_plan(planned):
         else:
             try:
                 capture=_read(archives[0])
+                if not isinstance(capture,dict):raise ValueError('Agent closing metadata must be an object')
                 if capture.get('complete') is not True or capture.get('errors'):
                     fatal='agent_or_physical_source_failed'
             except (OSError,ValueError,TypeError):
                 fatal='invalid_agent_closing_metadata'
         if fatal is None and 'Agent crashed' in str(verdict.get('official_status','')):
             fatal='official_agent_crashed'
-        result['batch_stop_reason']=fatal
+        if fatal is None and (verdict.get('official_result_valid') is False
+                or verdict.get('official_status')=='result_missing_or_invalid'):
+            fatal='invalid_official_result'
+        if len(archives)==1 and fatal:
+            result['failure_summary'],failure=_failure_summary(archives[0].parent,capture)
+        elif fatal:
+            result['failure_summary']=dict(type=fatal,classification='capture_unavailable',
+                message='No unique complete Agent capture; inspect the preserved evaluator logs',
+                stdout_path=str(seed_root/'out'/('%04d_out.log'%route)),
+                stderr_path=str(seed_root/'err'/('%04d_err.log'%route)))
+        rejection=(_known_route_rejection(archives[0].parent,capture,failure,verdict)
+                   if fatal and code==0 and len(archives)==1 else None)
+        continue_route=bool(planned.get('continue_on_route_failure',False) and rejection)
+        result.update(route_failure_reason=fatal,known_route_rejection=rejection,
+            continued_after_route_rejection=continue_route,
+            batch_stop_reason=None if continue_route else fatal)
         if len(archives)==1:
             command=[job['config']['worker_python'],str(ROOT/'scripts'/'build_fail2drive_official_memory.py'),
                 'finalize','--capture',str(archives[0].parent),'--checkpoint',str(job['checkpoint']),
@@ -384,7 +462,7 @@ def run_plan(planned):
         _write(job['launch_path'].with_name('%04d_collection.json'%route),result)
         outcomes.append(result)
         print(json.dumps(result,ensure_ascii=False),flush=True)
-        if fatal is not None:
+        if fatal is not None and not continue_route:
             stop_reason=fatal
             break
     finished=len(outcomes)==len(planned['jobs'])
@@ -392,11 +470,15 @@ def run_plan(planned):
     # the last process may return zero/Perfect before Agent teardown reports a
     # physical-source or archive failure. Keep attempt counts separate while
     # making every batch-success flag fail closed on that outcome.
-    healthy=stop_reason is None
+    healthy=not any(row.get('route_failure_reason') for row in outcomes)
     processes_ok=finished and healthy and all(row['evaluator_returncode']==0 for row in outcomes)
     routes_ok=finished and healthy and all(row['official_result'].get('route_completed') is True for row in outcomes)
     return dict(schema=SCHEMA,collection_finished=finished,results=outcomes,
         planned_jobs=len(planned['jobs']),finished_jobs=len(outcomes),stopped_early=not finished,batch_stop_reason=stop_reason,
+        all_routes_attempted=finished,
+        completed_with_route_failures=finished and any(row.get('route_failure_reason') or
+            row['official_result'].get('route_completed') is not True for row in outcomes),
+        continue_on_known_route_rejection=planned.get('continue_on_route_failure',False),
         collection_succeeded=processes_ok and routes_ok,
         evaluator_runs_completed=processes_ok,
         official_routes_completed=routes_ok,
@@ -430,6 +512,8 @@ def parser():
     result.add_argument('--port',type=int,default=39000)
     result.add_argument('--traffic-manager-port',type=int,default=39003)
     result.add_argument('--debug',type=int,choices=(0,1,2,3),default=0)
+    result.add_argument('--continue-on-route-failure',action='store_true',
+        help='Continue after a structured route grounding/geometry rejection only; unknown Agent, SDK, encoder and source failures still stop; any failure retains exit 2')
     return result
 
 

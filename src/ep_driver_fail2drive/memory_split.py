@@ -107,10 +107,11 @@ def validate_transfer_source(split, official_root):
         limitation='same_Town13;partial_road_overlap_possible;not_unseen_map_or_family_generalization')
 
 
-def validate_collection_partition(split, episodes):
+def validate_collection_partition(split, episodes, *, allow_partial=False):
     """Audit admitted actual captures before preparing any annotation tasks."""
+    if type(allow_partial) is not bool:raise ValueError('Partial collection admission must be explicitly boolean')
     expected={r['route_id']:(row['family'],r) for row in split['rows'] for r in row['collection']}
-    observed=Counter();errors=[]
+    observed=Counter();errors=[];selected=[]
     for episode in episodes:
         rid=episode['official_route_id'];observed[rid]+=1
         if rid not in expected:
@@ -121,11 +122,35 @@ def validate_collection_partition(split, episodes):
         if (episode['scenario_family']!=family or episode['seed']!=split['collection_seed']
                 or hashlib.sha256((root/'official_route.xml').read_bytes()).hexdigest()!=record['sha256']):
             errors.append('Capture %s differs from its frozen family/seed/XML'%rid)
+            continue
+        selected.append(dict(official_route_id=rid,scenario_family=family,seed=episode['seed'],
+            official_route_sha256=record['sha256'],source_manifest_sha256=episode.get('source_manifest_sha256'),
+            source_admission_policy=episode.get('admission_policy'),
+            accepted_with_min_speed_penalty=bool(episode.get('accepted_with_min_speed_penalty',False))))
     missing=sorted(set(expected)-set(observed))
     duplicates=sorted(rid for rid,count in observed.items() if count!=1)
-    if missing:errors.append('Missing successful collection routes: '+str(missing))
+    if not selected:errors.append('Select at least one strictly admitted successful collection route')
+    if missing and not allow_partial:errors.append('Missing successful collection routes: '+str(missing))
     if duplicates:errors.append('Select one successful capture per route; duplicates: '+str(duplicates))
+    families=sorted({r['scenario_family'] for r in selected})
+    selected_ids=sorted({r['official_route_id'] for r in selected})
+    complete_pairs=[];partial_pairs=[]
+    for row in split['rows']:
+        present=set(selected_ids)&{r['route_id'] for r in row['collection']}
+        if len(present)==2:complete_pairs.append(row['family'])
+        elif present:partial_pairs.append(row['family'])
+    evaluation=[row['evaluation']['route_id'] for row in split['rows'] if row['family'] in families]
+    selection=dict(schema='fail2drive-successful-collection-selection-1.0',split_sha256=_digest(split),
+        allow_partial_collection=allow_partial,
+        selection_policy='explicit_input_captures_after_strict_admission_and_pending_human_review',
+        captures=sorted(selected,key=lambda r:r['official_route_id']),
+        evaluation_route_ids=evaluation,evaluation_seed=split['evaluation_seed'])
     return dict(schema=SCHEMA,valid=not errors,split_sha256=_digest(split),errors=errors,
         expected_routes=34,observed_unique_routes=len(observed),missing_route_ids=missing,
-        collection_seed=split['collection_seed'],evaluation_route_ids=route_ids(split,'evaluation'),
-        evaluation_seed=split['evaluation_seed'],family_or_route_id_used_for_retrieval=False)
+        collection_seed=split['collection_seed'],evaluation_route_ids=evaluation,
+        evaluation_seed=split['evaluation_seed'],family_or_route_id_used_for_retrieval=False,
+        allow_partial_collection=allow_partial,all_34_collected=not missing and not errors,
+        selected_route_ids=selected_ids,selected_families=families,
+        complete_pair_families=sorted(complete_pairs),partial_pair_families=sorted(partial_pairs),
+        selection_snapshot=selection,selection_sha256=_digest(selection),
+        quality_admission_unchanged=True,human_quality_approval_fabricated=False)
