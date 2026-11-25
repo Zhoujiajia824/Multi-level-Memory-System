@@ -101,7 +101,7 @@ class EPDriverFail2DriveAgent(AutonomousAgent):
                         "height": 1080, "fov": 110, "id": "rgb"})
         return sensors
 
-    def _initialize(self, snapshot):
+    def _initialize(self, snapshot, input_data=None):
         self.world = CarlaDataProvider.get_world()
         client = CarlaDataProvider.get_client()
         client_version, server_version = client.get_client_version(), client.get_server_version()
@@ -149,7 +149,8 @@ class EPDriverFail2DriveAgent(AutonomousAgent):
             frozen_ego = snapshot.find(self.ego.id)
             if frozen_ego is None:
                 raise ValueError("ego is absent from the source world snapshot")
-            pose = self._pose_tap.for_frame(snapshot.frame, source_time)
+            pixels = input_data['front_rgb'][1] if input_data is not None else None
+            pose = self._pose_tap.for_frame(snapshot.frame, source_time, pixels=pixels)
             physics = self.ego.get_physics_control()
             box = self.ego.bounding_box
             geometry = measure_vehicle_geometry(
@@ -206,7 +207,7 @@ class EPDriverFail2DriveAgent(AutonomousAgent):
             raise RuntimeError("official physical source frames must be consecutive")
         try:
             if self.extractor is None:
-                self._initialize(snapshot)
+                self._initialize(snapshot, input_data)
             relative_tick = frame-self.first_frame
             plan_due = relative_tick % (PHYSICS_HZ//self.planner_hz) == 0
             model_due = relative_tick % PHYSICS_HZ == 0

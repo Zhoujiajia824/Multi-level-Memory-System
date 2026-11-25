@@ -271,6 +271,47 @@ def _counts(run,guard,execution,raw):
         raise ValueError('Guard/run counters do not bind the complete source and execution streams')
 
 
+def _physical_world(root,run,execution,raw):
+    """Verify an explicitly declared grounding audit; never invent legacy data."""
+    declaration=run.get('physical_world_audit')
+    if declaration is None:
+        return dict(declared=False,verified=False,scope='legacy_capture_without_grounding_audit')
+    from .source_world import SCHEMA
+    if declaration!=SCHEMA:
+        raise ValueError('Unsupported declared physical-world audit')
+    rows=_rows(_contained(root,'physical_world_audit.jsonl'))
+    if len(rows)!=len(execution):
+        raise ValueError('Physical-world audit does not cover every executed source frame')
+    observed={_frame(row):row for row in raw}
+    expected_limits=dict(below_route_m=3.,descending_below_route_m=1.,downward_speed_mps=5.)
+    for row,step in zip(rows,execution):
+        if (row.get('schema')!=SCHEMA or _frame(row)!=step['frame'] or not _same(row.get('time'),step['time'])
+                or row.get('valid') is not True or row.get('classification')!='physical_source_valid'
+                or row.get('reason')!='within_gross_grounding_limits'
+                or row.get('limits')!=expected_limits
+                or any(row.get(k) is not False for k in ('source_height_corrected','world_modified','driving_control_generated'))):
+            raise ValueError('Physical-world audit is invalid or mismatched to the actual execution source')
+        for key in ('position_xyz_carla_m','velocity_xyz_carla_mps','acceleration_xyz_carla_mps2'):
+            vector=row.get(key)
+            if not isinstance(vector,list) or len(vector)!=3 or not all(map(_number,vector)):
+                raise ValueError('Physical-world audit lacks actual finite XYZ measurements')
+        xyz=row['position_xyz_carla_m'];velocity=row['velocity_xyz_carla_mps']
+        road=row.get('public_route_height_m');residual=row.get('actor_origin_minus_route_height_m')
+        if (not _number(road) or not _same(residual,xyz[2]-road)
+                or residual < -3. or residual < -1. and velocity[2] < -5.
+                or not _same(row.get('speed_xy_mps'),math.hypot(*velocity[:2]))
+                or not _same(row.get('speed_xyz_mps'),math.sqrt(sum(v*v for v in velocity)))):
+            raise ValueError('Physical-world audit contradicts its recorded grounding measurements')
+        if row['frame'] in observed:
+            pose=observed[row['frame']]['scene']['diagnostics'].get('frozen_actor_origin_pose',{})
+            origin=pose.get('position_xyz_carla')
+            if (not isinstance(origin,list) or len(origin)!=3
+                    or any(not _same(a,b) for a,b in zip(xyz,origin))):
+                raise ValueError('Physical-world audit and raw image source have different frozen actor origins')
+    return dict(declared=True,verified=True,schema=SCHEMA,frames=len(rows),
+        scope='gross_grounding_source_validity_only;not_a_driving_safety_certificate')
+
+
 def _observations(root, execution_by_frame, *, normalized):
     raw=_rows(_contained(root,'raw_frames.jsonl'))
     frames=_rows(_contained(root,'frames.jsonl')) if normalized else None
@@ -278,6 +319,8 @@ def _observations(root, execution_by_frame, *, normalized):
         raise ValueError('Normalized and raw observation counts differ')
     required={'run.json','configuration.json','carla_identity.json','raw_frames.jsonl','execution.jsonl','expert_world_guard.json','official_route.xml',
               'official_result.json','official_launch.json','official_demo_evaluation.json','planning/video_recording.json'}
+    if _json(_contained(root,'run.json')).get('physical_world_audit') is not None:
+        required.add('physical_world_audit.jsonl')
     prior=None
     for index,row in enumerate(raw):
         frame,now=_frame(row),row.get('time');scene=row.get('scene',{})
@@ -445,10 +488,12 @@ def finalize_official_capture(run_dir, official_checkpoint, launch_metadata):
         execution,by_frame=_execution(root);_video(root,execution)
         raw,_,_=_observations(root,by_frame,normalized=False)
         _counts(run,guard,execution,raw)
+        physical=_physical_world(root,run,execution,raw)
         if outcome['valid']:
             if not (root/'frames.jsonl').exists():_export(root,run,raw)
             _,frames,_=_observations(root,by_frame,normalized=True)
             report.update(valid=True,passed=True,capture_count=len(raw),execution_count=len(execution),
+                physical_world_audit=physical,
                 anchors=select_anchors(frames,execution),scenario_family=run['scenario_family'],
                 official_route_id=launch['official_route_id'],seed=launch['repetition_seed'])
     except (ValueError,KeyError,TypeError,OSError,ImportError) as exc:
@@ -480,6 +525,7 @@ def _check_episode(root,requested=None):
     execution,by_frame=_execution(root);_video(root,execution)
     raw,frames,required=_observations(root,by_frame,normalized=True)
     _counts(run,guard,execution,raw)
+    physical=_physical_world(root,run,execution,raw)
     required.add('frames.jsonl')
     video=_json(root/'planning/video_recording.json');required.add('planning/'+video['path'])
     sums=manifest.get('source_hashes')
@@ -490,11 +536,12 @@ def _check_episode(root,requested=None):
     return dict(protocol=PROTOCOL,valid=True,passed=True,run_dir=str(root),episode=str(root),
         scenario_family=run['scenario_family'],official_route_id=route_id,seed=launch['repetition_seed'],
         driver=run['reference_driver'],capture_count=len(frames),execution_count=len(execution),
+        physical_world_audit=physical,
         anchors=select_anchors(frames,execution,requested),source_manifest_sha256=_hash(root/'capture_manifest.json'),
         source_hashes=sums,memory_published=False,official_outcome=outcome)
 
 
-def check_official_demonstrations(captures,*,anchor_frames=None,require_all_families=False):
+def check_official_demonstrations(captures,*,anchor_frames=None,require_all_families=False,collection_split=None):
     roots=[]
     for directory in captures:
         path=filesystem_path(directory)
@@ -509,16 +556,31 @@ def check_official_demonstrations(captures,*,anchor_frames=None,require_all_fami
     families=sorted({episode['scenario_family'] for episode in episodes})
     if require_all_families and set(families)!=set(FAMILIES):
         rejected.append(dict(episode=None,reason='Expected actual official demonstrations for all 17 families'))
-    return dict(protocol=PROTOCOL,demo_suite=SUITE,valid=bool(episodes) and not rejected,episodes=episodes,rejected=rejected,
+    report=dict(protocol=PROTOCOL,demo_suite=SUITE,valid=bool(episodes) and not rejected,episodes=episodes,rejected=rejected,
         successful_episodes=len(episodes),scenario_families=families,all_17_families_present=set(families)==set(FAMILIES),
         memory_published=False,teacher_called=False,human_review_fabricated=False,
         data_use='targeted_seen_scenario_demonstration;not_unseen_route_generalization')
+    if collection_split is not None:
+        from .memory_split import load_transfer_split,validate_collection_partition
+        partition=validate_collection_partition(load_transfer_split(collection_split),episodes)
+        report.update(collection_partition=partition,valid=report['valid'] and partition['valid'],
+            data_use='same_family_heldout_route_pair;not_unseen_map_or_family_generalization')
+    return report
 
 
 def prepare_official_demonstrations(captures,output,workbench_root,*,pipeline_config=None,dino_model=None,
-                                    device='cpu',anchor_frames=None,require_all_families=False):
-    checked=check_official_demonstrations(captures,anchor_frames=anchor_frames,require_all_families=require_all_families)
-    if not checked['valid']:raise ValueError('Official demonstrations not eligible: '+str(checked['rejected']))
+                                    device='cpu',anchor_frames=None,require_all_families=False,collection_split=None):
+    checked=check_official_demonstrations(captures,anchor_frames=anchor_frames,
+        require_all_families=require_all_families,collection_split=collection_split)
+    if not checked['valid']:
+        raise ValueError('Official demonstrations not eligible: '+str(dict(
+            rejected=checked['rejected'],partition=checked.get('collection_partition'))))
+    split_snapshot=None
+    if collection_split is not None:
+        from .memory_split import load_transfer_split
+        split_snapshot=load_transfer_split(collection_split)
+        if _digest(split_snapshot)!=checked['collection_partition']['split_sha256']:
+            raise ValueError('Collection split changed between admission and preparation')
     output=filesystem_path(output);workbench=filesystem_path(workbench_root)
     if output.exists():raise ValueError('Use a new preparation output directory')
     for source in [workbench,*[filesystem_path(x['episode']) for x in checked['episodes']]]:
@@ -546,10 +608,53 @@ def prepare_official_demonstrations(captures,output,workbench_root,*,pipeline_co
             if _hash(source/'capture_manifest.json')!=episode['source_manifest_sha256']:raise ValueError('Source changed during preparation')
             for name,digest in episode['source_hashes'].items():
                 if _hash(_contained(source,name))!=digest:raise ValueError('Source asset changed during preparation: '+name)
+        partition_tasks=None
+        if split_snapshot is not None:
+            partition_tasks=_bind_prepared_partition(output,checked,split_snapshot,storage.atomic_json)
         report=dict(checked,status='prepared_pending_real_teacher_and_human_review',preparations=results,published=False,reviewed=False)
+        if split_snapshot is not None:
+            report.update(collection_split_snapshot=split_snapshot,partition_task_binding=partition_tasks)
         storage.atomic_json(output/'official_demo_preparation.json',report)
         return report
     finally:
         sys.path[:]=original_path;sys.dont_write_bytecode=old_bytecode
         if old_mpl is None:os.environ.pop('MPLCONFIGDIR',None)
         else:os.environ['MPLCONFIGDIR']=old_mpl
+
+
+def _bind_prepared_partition(output,checked,split_snapshot,write_json):
+    """Add audit-only provenance before annotation/review; upstream publish retains task.json."""
+    expected={r['route_id']:(row['family'],r) for row in split_snapshot['rows'] for r in row['collection']}
+    approved={_digest(_json(filesystem_path(ep['episode'])/'run.json')):ep for ep in checked['episodes']}
+    signature=_digest(split_snapshot)
+    if signature!=checked['collection_partition']['split_sha256']:
+        raise ValueError('Prepared partition differs from admitted split identity')
+    tasks=sorted((output/'tasks').glob('*/task.json'))
+    if not tasks:
+        raise ValueError('No actual workbench tasks were prepared for the frozen collection partition')
+    bound=[]
+    for path in tasks:
+        task=_json(path);capture=task.get('capture',{})
+        episode=approved.get(_digest(capture))
+        if episode is None or episode['official_route_id'] not in expected:
+            raise ValueError('Workbench task source is not one of the admitted collection captures')
+        rid=episode['official_route_id'];family,record=expected[rid]
+        if (capture.get('official_route_id')!=rid or capture.get('scenario_family')!=family
+                or capture.get('seed')!=split_snapshot['collection_seed']):
+            raise ValueError('Workbench task capture changed its official collection identity')
+        if any((path.parent/name).exists() for name in ('annotations','experience.json','review.json')):
+            raise ValueError('Partition provenance may only be attached before teacher annotation or human review')
+        provenance=dict(schema='fail2drive-task-partition-audit-1.0',role='collection',
+            split_sha256=signature,split_snapshot=deepcopy(split_snapshot),
+            official_route_id=rid,official_route_variant=record['variant'],official_route_sha256=record['sha256'],
+            scenario_family=family,collection_seed=episode['seed'],
+            source_manifest_sha256=episode['source_manifest_sha256'],
+            model_input=False,retrieval_key=False,
+            publication_path='record/audit/task.json:experiment_partition')
+        if task.get('experiment_partition') not in (None,provenance):
+            raise ValueError('Workbench task already carries another experiment partition')
+        task['experiment_partition']=provenance
+        write_json(path,task);bound.append(task['id'])
+    return dict(schema='fail2drive-task-partition-audit-1.0',split_sha256=signature,
+        task_count=len(bound),task_ids=bound,preserved_by_upstream='audit/task.json included in review digest and published checksums',
+        teacher_called=False,human_review_fabricated=False)

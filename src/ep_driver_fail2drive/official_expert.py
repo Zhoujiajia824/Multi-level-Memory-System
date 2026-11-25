@@ -20,6 +20,7 @@ from . import OFFICIAL_COMMIT
 
 
 SCHEMA = 'ep-driver-f2d-official-expert-adapter-1.0'
+DECISION_SCHEMA = 'ep-driver-f2d-offline-expert-decision-1.0'
 SOURCES = {
     'autopilot.py': '8e05a4e489530c9a40a7a458ce0b1661180bf2f9c50bb0f5e3c7500b1008e92d',
     'transfuser_utils.py': '6e47c04d8279cd968698cab0f638b3192f49cd088c60dec7809d63ff30c34449',
@@ -49,6 +50,26 @@ _SIDE_EFFECT_METHODS = frozenset({
 
 def _number(value):
     return type(value) in (int, float) and math.isfinite(value)
+
+
+def _decision_record(ego_speed_xyz, target_speed, speed_limit, keep_driving,
+                     brake_hazard, control_brake, carla_vehicle_limit_kmh=None):
+    """Scalar evidence from the existing decision, never a new driving action."""
+    numbers = dict(ego_speed_xyz=float(ego_speed_xyz), target_speed=float(target_speed),
+                   speed_limit=float(speed_limit))
+    if any(not _number(value) for value in numbers.values()):
+        raise ValueError('Official expert decision contains a nonfinite speed')
+    carla_limit=(float(carla_vehicle_limit_kmh)/3.6 if carla_vehicle_limit_kmh is not None else None)
+    if carla_limit is not None and (not _number(carla_limit) or carla_limit<=0):
+        carla_limit=None
+    return dict(numbers, keep_driving=bool(keep_driving),brake_hazard=bool(brake_hazard),
+        control_brake=bool(control_brake),carla_vehicle_limit_mps=carla_limit,
+        npy_route_limit_mps=numbers['speed_limit'],
+        speed_limit_conflict=(abs(carla_limit-numbers['speed_limit'])>1e-3 if carla_limit is not None else None),
+        speed_limit_source='pinned_preprocessed_NPY_route_nearest_point',
+        carla_limit_source='Vehicle.get_speed_limit_current',
+        limit_conflict_is_speeding_proof=False,
+        limit_preprocessing='upstream_5m_neighborhood_max_and_round_up_to_50_80_100_120_kmh')
 
 
 def _container_copy(value):
@@ -167,6 +188,7 @@ def _expert_tree(text, filename):
     if len(classes) != 1:
         raise ValueError('Pinned source no longer has exactly one AutoPilot class')
     patched = 0
+    decision_patches = 0
     for method in classes[0].body:
         if not isinstance(method, ast.FunctionDef):
             continue
@@ -184,8 +206,31 @@ def _expert_tree(text, filename):
             RejectDeletion().visit(method)
         elif method.name == 'toggle_recording':
             method.body = [ast.Expr(value=ast.Call(func=ast.Name(id='_disabled_recorder',ctx=ast.Load()),args=[],keywords=[]))]
+        elif method.name == '_get_control':
+            # Keep all existing route, hazard, IDM and actuator calculations.
+            # Read their final local scalars immediately before the sole return.
+            class RecordDecision(ast.NodeTransformer):
+                def visit_Return(self, node):
+                    nonlocal decision_patches
+                    if (not isinstance(node.value, ast.Tuple) or len(node.value.elts) != 2
+                            or any(not isinstance(value,ast.Name) or value.id != expected
+                                   for value,expected in zip(node.value.elts,('control','driving_data')))):
+                        raise ValueError('Unexpected control return shape in pinned expert')
+                    decision_patches += 1
+                    target=ast.Attribute(value=ast.Name(id='self',ctx=ast.Load()),
+                                         attr='_ep_last_decision',ctx=ast.Store())
+                    call=ast.Call(func=ast.Name(id='_decision_record',ctx=ast.Load()),
+                        args=[ast.Name(id=name,ctx=ast.Load()) for name in
+                              ('ego_speed','target_speed','speed_limit','keep_driving','brake','control_brake')]+[
+                            ast.Call(func=ast.Attribute(value=ast.Attribute(value=ast.Name(id='self',ctx=ast.Load()),
+                                attr='_vehicle',ctx=ast.Load()),attr='get_speed_limit',ctx=ast.Load()),args=[],keywords=[])],
+                        keywords=[])
+                    return [ast.copy_location(ast.Assign(targets=[target],value=call),node),node]
+            RecordDecision().visit(method)
     if patched != 1:
         raise ValueError('Unexpected NPC cleanup shape in pinned expert')
+    if decision_patches != 1:
+        raise ValueError('Unexpected decision recording shape in pinned expert')
     effects = _side_effects(tree)
     if effects:
         raise ValueError('Expert attempted a forbidden world/actor mutation: '+str(effects))
@@ -225,11 +270,14 @@ def _load_utilities(path, carla, numpy):
 
 class OfficialExpert:
     """Official candidate teacher, confined to ego control for data collection."""
-    def __init__(self, official_root, *, seed=1):
+    def __init__(self, official_root, *, seed=1, cruise_ratio=None):
         if type(seed) is not int or not 0 <= seed < 2**32:
             raise ValueError('Expert private seed must be an unsigned 32-bit integer')
+        if cruise_ratio is not None and (not _number(cruise_ratio) or not 0<cruise_ratio<=1.):
+            raise ValueError('Explicit offline expert cruise ratio must be finite in (0,1]')
         self.root = filesystem_path(official_root)
         self.seed = seed
+        self._requested_cruise_ratio = cruise_ratio
         self._identity = source_identity(self.root)
         self._pilot = self._provider = self._carla = None
         self._last_frame = self._last_time = None
@@ -237,6 +285,8 @@ class OfficialExpert:
         self._calls, self._closed = 0, False
         self._guard_complete = False
         self._failures, self._mutation_attempts = [], []
+        self._cruise_policy = None
+        self._last_decision = None
 
     def _reject_npc_deletion(self, actor):
         self._mutation_attempts.append(dict(method='actor.destroy',actor_id=actor.id,
@@ -279,7 +329,8 @@ class OfficialExpert:
             ScenarioLogger=_disabled_recorder,
             LongitudinalLinearRegressionController=modules['longitudinal_controller'].LongitudinalLinearRegressionController,
             KinematicBicycleModel=modules['kinematic_bicycle_model'].KinematicBicycleModel,
-            _no_npc_deletion=self._reject_npc_deletion,_disabled_recorder=_disabled_recorder)
+            _no_npc_deletion=self._reject_npc_deletion,_disabled_recorder=_disabled_recorder,
+            _decision_record=_decision_record)
         exec(compile(_expert_tree(path.read_text(encoding='utf-8'),str(path)),str(path),'exec'),module.__dict__)
         pilot = module.AutoPilot(None)
         pilot.set_global_plan(global_plan_gps,dense_plan)
@@ -289,6 +340,18 @@ class OfficialExpert:
         # only for this teacher, never added to the paper planner.
         pilot.config.max_blocked_ticks = 2**63-1
         pilot.config.steer_noise = 0.
+        # The NPY map limit has upstream preprocessing and can differ from the
+        # vehicle's live limit. Preserve the original 72% default; changing the
+        # offline cruise fraction must be explicit, never score-driven.
+        upstream_ratio=float(pilot.config.ratio_target_speed_limit)
+        selected_ratio=(upstream_ratio if self._requested_cruise_ratio is None else float(self._requested_cruise_ratio))
+        self._cruise_policy = dict(upstream_ratio=upstream_ratio,adapted_ratio=selected_ratio,
+            selection='pinned_default' if self._requested_cruise_ratio is None else 'explicit_offline_argument',
+            maximum_target_speed_mps=20.,maximum_junction_speed_mps=float(pilot.config.max_speed_in_junction),
+            hazard_and_idm_reductions='unchanged',score_feedback_used=False,
+            full_score_guaranteed=False,scope='offline_demonstration_only',
+            npy_limit_is_unmodified_legal_limit_claimed=False)
+        pilot.config.ratio_target_speed_limit = selected_ratio
         self._pilot,self._carla = pilot,carla
 
     def step(self, input_data, timestamp):
@@ -339,7 +402,16 @@ class OfficialExpert:
             raise ValueError('Official expert returned an invalid ego control')
         self._last_frame,self._last_time,self._calls = frame,world_time,self._calls+1
         self._last_game_time = float(timestamp)
+        decision=getattr(self._pilot,'_ep_last_decision',None)
+        self._last_decision=(dict(decision,schema=DECISION_SCHEMA,source_frame=frame,
+            source_time=world_time,official_game_time=float(timestamp),speed_unit='m/s',
+            speed_semantics='CARLA.get_velocity().length_xyz',
+            archived_ego_velocity_semantics='world_xy_m_per_s') if decision is not None else None)
         return control
+
+    def decision_evidence(self):
+        """Return a copy of the last successful source-bound scalar decision."""
+        return dict(self._last_decision) if self._last_decision is not None else None
 
     def evidence(self):
         return dict(self._identity,teacher='pinned_official_AutoPilot_with_confined_offline_adapter',
@@ -352,6 +424,8 @@ class OfficialExpert:
             official_game_time=self._last_game_time,
             adaptations=dict(npc_cleanup='reject_instead_of_destroy',scenario_bookkeeping='private_container_copy',
                 numpy_randomness='private_RandomState_not_global',steer_noise=0.,
+                cruise_target_speed=dict(self._cruise_policy) if self._cruise_policy is not None else None,
+                decision_logging='finite_existing_scalars;XYZ_expert_speed_distinct_from_XY_archive_speed',
                 anti_blocking_forced_throttle='disabled',official_datagen=False,official_logger=False,
                 official_recorder=False,utilities='six_pinned_pure_functions_no_torch',
                 serialization='stdlib_json_for_disabled_official_logger',

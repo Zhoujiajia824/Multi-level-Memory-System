@@ -21,6 +21,7 @@ from ep_driver_fail2drive.agent import (EPDriverFail2DriveAgent, CAMERA_POSES,
 from ep_driver_fail2drive.archive import _png
 from ep_driver_fail2drive.official_expert import OfficialExpert
 from ep_driver_fail2drive.sensor_pose import SensorPoseTap
+from ep_driver_fail2drive.source_world import source_world_geometry
 
 
 def get_entry_point():
@@ -76,8 +77,8 @@ class OfficialDemonstrationAgent(EPDriverFail2DriveAgent):
         # used later for read-only export/feature construction only.
         return None
 
-    def _initialize(self,snapshot):
-        super()._initialize(snapshot)
+    def _initialize(self,snapshot,input_data=None):
+        super()._initialize(snapshot,input_data)
         association = self.config['archive_association']
         self._demo_run = dict(protocol='ep-driver-f2d-official-capture-1.0',
             demo_suite='fail2drive-official-demonstrations-1.0',
@@ -94,6 +95,7 @@ class OfficialDemonstrationAgent(EPDriverFail2DriveAgent):
             normalization_protocol='observable-driving-recording-1.0',
             read_future_during_current_representation=False,test_only=False,
             physics_hz=PHYSICS_HZ,record_hz=1,frames_path='frames.jsonl',
+            physical_world_audit='official-source-grounding-1.0',
             model_calls=0,retrieval_enabled=False,write_memory_enabled=False,
             complete=False,completed_without_agent_error=False,errors=[])
         self.archive.json('run.json',self._demo_run)
@@ -138,7 +140,7 @@ class OfficialDemonstrationAgent(EPDriverFail2DriveAgent):
             if spec['id'] != image['id']:
                 raise ValueError('Camera order differs from the frozen capture contract')
             tap = self._pose_tap if image['id']=='front_rgb' else self._demo_taps[image['id']]
-            pose = tap.for_frame(frame,stamp)
+            pose = tap.for_frame(frame,stamp,pixels=input_data[image['id']][1])
             matrix = np.asarray(pose['camera_world_matrix_m'],float)
             mount = np.asarray(pose['camera_mount_matrix_m'],float)
             origin = np.asarray(scene['diagnostics']['frozen_actor_origin_pose']['matrix_xyz_carla'],float)
@@ -151,7 +153,8 @@ class OfficialDemonstrationAgent(EPDriverFail2DriveAgent):
                 world_to_camera_ue=inverse.tolist(),camera_world_matrix_m=matrix.tolist(),
                 camera_mount_matrix_m=mount.tolist(),
                 api_global_minus_ue_origin_m=(origin[:3,3]-actor_ue[:3,3]).tolist(),
-                calibration_source=pose['capture_method'],coordinate_frame='CARLA_sensor_UE_world_xyz_m'))
+                calibration_source=pose['capture_method'],image_selection=pose.get('image_selection'),
+                coordinate_frame='CARLA_sensor_UE_world_xyz_m'))
         offsets = np.asarray([camera['api_global_minus_ue_origin_m'] for camera in cameras])
         # A LargeMap origin shift is shared by all rigid cameras. Do not absorb
         # a different camera capture pose into a per-view "origin correction".
@@ -174,14 +177,23 @@ class OfficialDemonstrationAgent(EPDriverFail2DriveAgent):
             if self.last_frame is not None and frame != self.last_frame+1:
                 raise ValueError('Official demonstration physical frames are not consecutive')
             if self.extractor is None:
-                self._initialize(snapshot)
+                self._initialize(snapshot,input_data)
             relative = frame-self.first_frame
             source = relative % PHYSICS_HZ == 0
+            health = source_world_geometry(snapshot,self.ego.id,self.extractor.route)
+            self.archive.append('physical_world_audit',health)
+            # Preserve the actual failure-frame images before rejecting a bad
+            # physical source, including a failure between 1Hz source frames.
+            images = self.archive.capture_images(input_data,frame,stamp,[name for name,_ in CAMERA_POSES],
+                save=source or not health['valid'])
+            self._display(input_data,frame,stamp,relative)
+            if not health['valid']:
+                error = ValueError('Official physical world is invalid: '+health['reason'])
+                error.evidence = health
+                raise error
             imu = input_data.get('imu')
             if imu is None or imu[0] != frame:
                 raise ValueError('Official expert IMU/source frame mismatch')
-            images = self.archive.capture_images(input_data,frame,stamp,[name for name,_ in CAMERA_POSES],save=source)
-            self._display(input_data,frame,stamp,relative)
             if source:
                 scene = self.extractor.capture(frame,camera_images=images,world_snapshot=snapshot)
                 observed_ego = scene['ego']
@@ -203,6 +215,7 @@ class OfficialDemonstrationAgent(EPDriverFail2DriveAgent):
                 source_frame=frame,source_time=stamp,applied_control=_control_record(actual),
                 observed_applied_control=_control_record(actual),returned_control=_control_record(control),
                 observed_ego=observed_ego,driver='official_autopilot',control_applied_by='official_evaluator',
+                expert_decision=self.expert.decision_evidence(),
                 audit=dict(source='official_checkpoint_after_run',collision=None,offroad=None,rule_violation=None),
                 agent_wall_s=time.monotonic()-started))
             if source:
@@ -217,7 +230,8 @@ class OfficialDemonstrationAgent(EPDriverFail2DriveAgent):
             self._demo_errors.append(dict(frame=frame,time=stamp,type=type(error).__name__,error=str(error)))
             if self.archive is not None:
                 self.archive.append('agent_errors',self._demo_errors[-1])
-                self.archive.json('capture_failure.json',dict(self._demo_errors[-1],traceback=traceback.format_exc()))
+                self.archive.json('capture_failure.json',dict(self._demo_errors[-1],traceback=traceback.format_exc(),
+                    evidence=getattr(error,'evidence',None)))
             raise
 
     def destroy(self):

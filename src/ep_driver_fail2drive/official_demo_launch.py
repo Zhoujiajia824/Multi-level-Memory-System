@@ -338,6 +338,7 @@ def write_plan(planned):
 def run_plan(planned):
     write_plan(planned)
     outcomes=[]
+    stop_reason=None
     for job in planned['jobs']:
         launcher=planned['launcher']
         if (_code_hashes(launcher)!=planned['implementation_sha256']
@@ -359,6 +360,21 @@ def run_plan(planned):
             checkpoint=str(job['checkpoint']),launch_path=str(job['launch_path']),runtime_path=str(job['runtime_path']),
             agent_output=str(job['agent_output']),run_dir=str(archives[0].parent) if len(archives)==1 else None,
             archive_count=len(archives),finalization_required=True,accepted_for_memory=False,memory_published=False)
+        fatal=None
+        if code:
+            fatal='evaluator_process_failed'
+        elif len(archives)!=1:
+            fatal='missing_or_ambiguous_agent_capture'
+        else:
+            try:
+                capture=_read(archives[0])
+                if capture.get('complete') is not True or capture.get('errors'):
+                    fatal='agent_or_physical_source_failed'
+            except (OSError,ValueError,TypeError):
+                fatal='invalid_agent_closing_metadata'
+        if fatal is None and 'Agent crashed' in str(verdict.get('official_status','')):
+            fatal='official_agent_crashed'
+        result['batch_stop_reason']=fatal
         if len(archives)==1:
             command=[job['config']['worker_python'],str(ROOT/'scripts'/'build_fail2drive_official_memory.py'),
                 'finalize','--capture',str(archives[0].parent),'--checkpoint',str(job['checkpoint']),
@@ -368,11 +384,22 @@ def run_plan(planned):
         _write(job['launch_path'].with_name('%04d_collection.json'%route),result)
         outcomes.append(result)
         print(json.dumps(result,ensure_ascii=False),flush=True)
-        if code:
+        if fatal is not None:
+            stop_reason=fatal
             break
-    return dict(schema=SCHEMA,collection_finished=True,results=outcomes,
-        evaluator_runs_completed=all(row['evaluator_returncode']==0 for row in outcomes),
-        official_routes_completed=all(row['official_result'].get('route_completed') is True for row in outcomes),
+    finished=len(outcomes)==len(planned['jobs'])
+    # Finishing every scheduled process does not certify collection success:
+    # the last process may return zero/Perfect before Agent teardown reports a
+    # physical-source or archive failure. Keep attempt counts separate while
+    # making every batch-success flag fail closed on that outcome.
+    healthy=stop_reason is None
+    processes_ok=finished and healthy and all(row['evaluator_returncode']==0 for row in outcomes)
+    routes_ok=finished and healthy and all(row['official_result'].get('route_completed') is True for row in outcomes)
+    return dict(schema=SCHEMA,collection_finished=finished,results=outcomes,
+        planned_jobs=len(planned['jobs']),finished_jobs=len(outcomes),stopped_early=not finished,batch_stop_reason=stop_reason,
+        collection_succeeded=processes_ok and routes_ok,
+        evaluator_runs_completed=processes_ok,
+        official_routes_completed=routes_ok,
         finalization_required=True,accepted_for_memory=False,memory_published=False)
 
 
@@ -420,7 +447,7 @@ def main(argv=None):
         if args.run:
             result=run_plan(planned)
             print(json.dumps(result,ensure_ascii=False,indent=2))
-            return 0 if result['evaluator_runs_completed'] and result['official_routes_completed'] else 2
+            return 0 if result['collection_succeeded'] else 2
         if args.prepare_only:
             write_plan(planned)
         result=preview(planned)

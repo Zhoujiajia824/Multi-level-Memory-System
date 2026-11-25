@@ -23,6 +23,7 @@ _METHOD = "_parse_image_cb"
 _MISSING = object()
 _REGISTRY_LOCK = threading.RLock()
 _PATCHES = {}
+_ACTIVE_CAPTURE = threading.local()
 
 
 class SensorPoseError(ValueError):
@@ -82,6 +83,7 @@ class _Patch:
         self.original = original
         self.previous_attribute = callback_class.__dict__.get(_METHOD, _MISSING)
         self.providers = {}
+        self.provider_parsers = {}
         self.description = _parser_description(callback_class, original)
 
         @functools.wraps(original)
@@ -89,23 +91,33 @@ class _Patch:
             # Never hold the registry lock while calling CARLA accessors, a tap,
             # or the official parser. A close racing this snapshot is harmless:
             # each tap checks its own closed state before publishing metadata.
+            captures = []
+            provider = getattr(callback, "_data_provider", None)
             try:
-                provider = getattr(callback, "_data_provider", None)
                 with _REGISTRY_LOCK:
                     references = tuple(self.providers.get(id(provider), {}).values())
                 for reference in references:
                     tap = reference()
                     if tap is not None and tap._provider is provider and tag == tap.camera_id:
                         try:
-                            tap._capture(image)
+                            record = tap._capture(image)
                         except Exception as exc:
                             # Preserve an unexpected tap failure as evidence,
                             # rather than dropping the image or hiding the error.
-                            tap._unexpected_error(image, exc)
+                            record = tap._unexpected_error(image, exc)
+                        captures.append((tap, record))
             finally:
                 # Even an unexpected instrumentation failure must not prevent
                 # the original parser from receiving this image exactly once.
-                result = original(callback, image, tag)
+                previous = getattr(_ACTIVE_CAPTURE, "current", _MISSING)
+                _ACTIVE_CAPTURE.current = (provider, tag, captures)
+                try:
+                    result = original(callback, image, tag)
+                finally:
+                    if previous is _MISSING:
+                        del _ACTIVE_CAPTURE.current
+                    else:
+                        _ACTIVE_CAPTURE.current = previous
             return result
 
         self.wrapper = wrapper
@@ -117,6 +129,9 @@ class _Patch:
                 providers.pop(tap_id, None)
                 if not providers:
                     self.providers.pop(provider_id, None)
+                    parser = self.provider_parsers.pop(provider_id, None)
+                    if parser is not None:
+                        parser.close()
             if self.providers:
                 return
             # Do not overwrite instrumentation installed by another owner later.
@@ -127,6 +142,45 @@ class _Patch:
                     setattr(self.callback_class, _METHOD, self.previous_attribute)
             if _PATCHES.get(self.callback_class) is self:
                 _PATCHES.pop(self.callback_class, None)
+
+    def bind_provider(self, provider):
+        identity = id(provider)
+        if identity not in self.provider_parsers and callable(getattr(provider, "update_sensor", None)):
+            self.provider_parsers[identity] = _ProviderParser(provider)
+
+
+class _ProviderParser:
+    """Bind the exact parser output array before its original queue insertion.
+
+The official parser builds an owned ndarray then passes that same object to
+update_sensor. SensorInterface.get_data returns it without copying. Thread-local
+callback context prevents parallel camera callbacks from exchanging poses.
+"""
+    def __init__(self, provider):
+        self.provider = provider
+        self.original = provider.update_sensor
+        self.previous_attribute = getattr(provider, "__dict__", {}).get("update_sensor", _MISSING)
+
+        def wrapper(tag, data, frame):
+            context = getattr(_ACTIVE_CAPTURE, "current", None)
+            if context is not None and context[0] is provider and context[1] == tag:
+                for tap, record in context[2]:
+                    try:
+                        tap._bind_array(data, frame, record)
+                    except Exception as exc:
+                        # Instrumentation must not drop an official image.
+                        tap._binding_error(frame, exc)
+            return self.original(tag, data, frame)
+
+        self.wrapper = wrapper
+        provider.update_sensor = wrapper
+
+    def close(self):
+        if getattr(self.provider, "update_sensor", None) is self.wrapper:
+            if self.previous_attribute is _MISSING:
+                delattr(self.provider, "update_sensor")
+            else:
+                self.provider.update_sensor = self.previous_attribute
 
 
 class SensorPoseTap:
@@ -145,6 +199,7 @@ class SensorPoseTap:
         self._maximum = max_frames
         self._lock = threading.RLock()
         self._records = {}
+        self._array_records = {}
         self._unframed_error = None
         self._patch = None
         self._parser = None
@@ -172,6 +227,7 @@ class SensorPoseTap:
                     setattr(callback_class, _METHOD, patch.wrapper)
                     _PATCHES[callback_class] = patch
                 provider_id, tap_id = id(self._provider), id(self)
+                patch.bind_provider(self._provider)
                 reference = weakref.ref(self, lambda _reference, state=patch,
                     owner=provider_id, key=tap_id: state.remove(owner, key))
                 patch.providers.setdefault(provider_id, {})[tap_id] = reference
@@ -209,6 +265,7 @@ class SensorPoseTap:
                       "capture_method": CAPTURE_METHOD, "error_type": type(exc).__name__,
                       "error": str(exc)}}
         self._publish(frame, record)
+        return record
 
     def _unexpected_error(self, image, exc):
         try:
@@ -217,9 +274,42 @@ class SensorPoseTap:
                 frame = None
         except Exception:
             frame = None
-        self._publish(frame, {"error": {"schema": SCHEMA, "reason": "metadata_copy_failed",
+        record = {"error": {"schema": SCHEMA, "reason": "metadata_copy_failed",
             "camera_id": self.camera_id, "frame": frame, "capture_method": CAPTURE_METHOD,
-            "stage": "unexpected_tap_error", "error_type": type(exc).__name__, "error": str(exc)}})
+            "stage": "unexpected_tap_error", "error_type": type(exc).__name__, "error": str(exc)}}
+        self._publish(frame, record)
+        return record
+
+    def _binding_error(self, frame, exc):
+        self._publish(frame, {"error": {"schema": SCHEMA, "reason": "array_identity_binding_failed",
+            "camera_id": self.camera_id, "frame": frame, "capture_method": CAPTURE_METHOD,
+            "error_type": type(exc).__name__, "error": str(exc)}})
+
+    def _bind_array(self, array, frame, record):
+        if record is None:
+            raise ValueError("callback metadata was not captured")
+        if record.get("frame", record.get("error", {}).get("frame")) != frame:
+            raise ValueError("official parser output frame differs from its raw image")
+        identity = id(array)
+        owner = weakref.ref(self)
+
+        def discarded(reference):
+            tap = owner()
+            if tap is not None:
+                with tap._lock:
+                    saved = tap._array_records.get(identity)
+                    if saved is not None and saved[0] is reference:
+                        tap._array_records.pop(identity, None)
+
+        reference = weakref.ref(array, discarded)
+        with self._lock:
+            if self._closed:
+                return
+            self._array_records[identity] = (reference, copy.deepcopy(record))
+            # Queued images retain their own arrays. Only metadata and weak
+            # references are held here, with a bound even for duplicate frames.
+            while len(self._array_records) > 4*self._maximum:
+                self._array_records.pop(next(iter(self._array_records)))
 
     def _publish(self, frame, record):
         with self._lock:
@@ -230,15 +320,21 @@ class SensorPoseTap:
                 return
             previous = self._records.get(frame)
             if previous is not None and previous != record:
+                initial = previous.get("error", {}).get("first_observation", previous)
+                if "error" in initial:
+                    initial = {"error": initial["error"].get("reason")}
                 record = {"error": {"schema": SCHEMA, "reason": "conflicting_frame_metadata",
                           "camera_id": self.camera_id, "frame": frame,
-                          "capture_method": CAPTURE_METHOD}}
+                          "capture_method": CAPTURE_METHOD,
+                          "first_observation": copy.deepcopy(initial),
+                          "incoming_observation": copy.deepcopy(record),
+                          "conflict_count": previous.get("error", {}).get("conflict_count", 0)+1}}
             self._records[frame] = record
             # Retain the latest source frames, even if a late callback is old.
             while len(self._records) > self._maximum:
                 self._records.pop(min(self._records))
 
-    def for_frame(self, frame, timestamp):
+    def for_frame(self, frame, timestamp, *, pixels=None):
         if type(frame) is not int or frame < 0:
             raise self._failure("invalid_requested_frame", "pose lookup requires a nonnegative integer frame",
                                 requested_frame=repr(frame))
@@ -250,7 +346,17 @@ class SensorPoseTap:
                 raise self._failure("tap_closed", "sensor pose tap is closed", requested_frame=frame)
             if self._patch is None:
                 raise self._failure("tap_not_installed", "sensor pose tap has not been installed", requested_frame=frame)
-            record = copy.deepcopy(self._records.get(frame))
+            if pixels is None:
+                record = copy.deepcopy(self._records.get(frame))
+            else:
+                bound = self._array_records.get(id(pixels))
+                if bound is None or bound[0]() is not pixels:
+                    raise self._failure("source_array_not_bound", "exact official parser image array has no raw pose binding",
+                        requested_frame=frame, requested_timestamp=float(timestamp))
+                record = copy.deepcopy(bound[1])
+                if record.get("frame", record.get("error", {}).get("frame")) != frame:
+                    raise self._failure("source_array_frame_mismatch", "requested frame differs from the exact image array",
+                        requested_frame=frame, captured_frame=record.get("frame"))
             available = sorted(self._records)
             unframed_error = copy.deepcopy(self._unframed_error)
         if record is None:
@@ -263,6 +369,8 @@ class SensorPoseTap:
             raise self._failure("source_timestamp_mismatch", "raw camera pose timestamp differs from the source state",
                 requested_frame=frame, requested_timestamp=float(timestamp),
                 captured_timestamp=record["timestamp"], tolerance_s=TIMESTAMP_TOLERANCE_S)
+        if pixels is not None:
+            record["image_selection"] = "exact_official_parser_array_identity"
         return record
 
     def describe(self):
@@ -272,6 +380,7 @@ class SensorPoseTap:
                     "original_parser": copy.deepcopy(self._parser),
                     "filter": "callback._data_provider is registered_provider and exact camera_id",
                     "instrumentation": "shared class method wrapper; original image parser called exactly once",
+                    "image_selection": "optional exact parser output array identity; frame-only lookup rejects conflicts",
                     "lifecycle": "one wrapper per callback class; last close restores only its own wrapper",
                     "installed": self._patch is not None, "closed": self._closed,
                     "max_frames": self._maximum, "timestamp_tolerance_s": TIMESTAMP_TOLERANCE_S,
@@ -283,6 +392,7 @@ class SensorPoseTap:
             if self._closed:
                 return
             self._closed = True
+            self._array_records.clear()
             patch, self._patch = self._patch, None
         if patch is not None:
             patch.remove(id(self._provider), id(self))
