@@ -1,0 +1,25 @@
+{
+  "schema": "ep-navsim-owned-model-service-1",
+  "id": "shared_qwen3_32b",
+  "public_root": "/data/llm-server",
+  "model_path": "models/Qwen3-VL-32B-Instruct",
+  "python_executable": "/home/zjj/miniconda3/envs/ep-qwen-server/bin/python",
+  "host": "127.0.0.1",
+  "port": 8003,
+  "served_model_name": "qwen3-vl-32b",
+  "max_model_len": 45304,
+  "max_new_tokens": 16384,
+  "max_num_seqs": 1,
+  "image_limit": 9,
+  "max_pixels_per_image": 602112,
+  "vllm_version": "0.32.0",
+  "structured_outputs": {
+    "backend": "xgrammar",
+    "disable_any_whitespace": true
+  },
+  "enable_thinking": false,
+  "dtype": "bfloat16",
+  "gpu_memory_utilization": 0.9,
+  "gpu_counts": [2, 4],
+  "min_total_memory_gib": 88
+}

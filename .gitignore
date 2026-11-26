@@ -24,6 +24,7 @@
 /config/navsim/*
 !/config/navsim/official_v2_2.json
 !/config/navsim/official_v1_1.json
+!/config/navsim/shared_qwen3_32b.json
 !/config/navsim/sdk-requirements.txt
 /config/navsim.local.json
 /config/models.yaml
@@ -36,6 +37,7 @@
 !/scripts/run_navsim.py
 !/scripts/export_navsim_test_assets.py
 !/scripts/prepare_navsim_runtime.py
+!/scripts/start_navsim_shared_model.py
 !/scripts/sync_navsim_viewer.py
 !/scripts/capture_highway.py
 !/scripts/memory_admin.py
