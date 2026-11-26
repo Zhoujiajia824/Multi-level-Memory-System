@@ -84,6 +84,39 @@ def _container_copy(value):
     return value
 
 
+def _json_decision_copy(value, path='expert_decision'):
+    """Copy evidence into strict JSON types without changing live decisions.
+
+    NumPy route-index comparisons return numpy.bool_, and other expert evidence
+    may retain NumPy integer/float scalars. Only those real scalar types are
+    normalized; arrays, SDK objects and nonfinite values remain invalid.
+    """
+    kind=type(value)
+    if value is None or kind in (bool,int,str):
+        return value
+    if kind is float:
+        if not math.isfinite(value):
+            raise ValueError('Nonfinite official expert decision at '+path)
+        return value
+    if kind is dict:
+        if any(type(key) is not str for key in value):
+            raise TypeError('Official expert decision keys must be strings at '+path)
+        return {key:_json_decision_copy(item,path+'.'+key) for key,item in value.items()}
+    if kind in (list,tuple):
+        return [_json_decision_copy(item,'%s[%d]'%(path,index)) for index,item in enumerate(value)]
+    # Keep importing/preflighting this module stdlib-only. Do not accept an
+    # arbitrary object's .item()/__float__ method as a serialization fallback.
+    if kind.__module__.split('.')[0]=='numpy':
+        import numpy as np
+        if isinstance(value,np.bool_):
+            return bool(value)
+        if isinstance(value,np.integer):
+            return int(value)
+        if isinstance(value,np.floating):
+            return _json_decision_copy(float(value),path)
+    raise TypeError('Unsupported official expert decision at %s: %s'%(path,kind.__name__))
+
+
 def _ep_cautious_target(pilot, route_points, target_speed, ego_speed):
     """Apply only the explicit offline teacher policy, before hazard prediction."""
     policy = getattr(pilot, '_ep_caution_policy', None)
@@ -243,7 +276,7 @@ def _maneuver_record(pilot, provider):
         evaluated = (bool(getattr(pilot,'_ep_entry_gap_evaluated',False)) and not committed
                      and key==getattr(pilot,'_ep_entry_gap_key',None))
         rows.append(dict(kind=kind,route_index=route_index,from_index=int(start),to_index=int(end),
-            reference_shift_started=route_index>start,maneuver_committed=committed,
+            reference_shift_started=bool(route_index>start),maneuver_committed=committed,
             physical_entry_evidence=_container_copy(getattr(pilot,'_ep_entry_commit_evidence',{}).get(key)),
             last_preentry_vehicle_gap_clear=bool(gap),
             current_preentry_vehicle_gap_clear=bool(gap) if evaluated else None,
@@ -692,7 +725,7 @@ class OfficialExpert:
 
     def decision_evidence(self):
         """Return a copy of the last successful source-bound scalar decision."""
-        return _container_copy(self._last_decision) if self._last_decision is not None else None
+        return _json_decision_copy(self._last_decision) if self._last_decision is not None else None
 
     def evidence(self):
         return dict(self._identity,teacher='pinned_official_AutoPilot_with_confined_offline_adapter',
