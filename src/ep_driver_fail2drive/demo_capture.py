@@ -557,11 +557,17 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
         errors.append(type(exc).__name__+': '+str(exc))
         try:
             archive.json('capture_failure.json',dict(error=errors[-1],traceback=traceback.format_exc(),
+                walker_placements=events.walker_placements if events is not None else [],
                 frame=locals().get('frame'),time=locals().get('stamp'),successful_memory_created=False))
         except Exception as write_error:
             errors.append('failure evidence write: '+str(write_error))
         raise
     finally:
+        if events is not None and events.walker_placements:
+            try:
+                archive.json('walker_placements.json', events.walker_placements)
+            except Exception as exc:
+                errors.append('walker placement evidence: '+str(exc))
         if events is not None and events.geometry_audit is not None:
             try:
                 archive.json('development_site_geometry.json',events.geometry_audit)
@@ -601,8 +607,9 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
             archive.close()
             if video:
                 status = json.loads((output/'planning'/'video_recording.json').read_text(encoding='utf-8'))
-                if (status.get('status') != 'complete' or status.get('playback_verified') is not True
-                        or status.get('frames') != len(audit_rows)
+                init_failed_before_video = errors and not audit_rows and status.get('status') == 'no_frames'
+                if not init_failed_before_video and (status.get('status') != 'complete'
+                        or status.get('playback_verified') is not True or status.get('frames') != len(audit_rows)
                         or status.get('decoded_frames') != len(audit_rows)):
                     errors.append('Recorded video did not pass full physical-frame decode verification')
         except Exception as exc:

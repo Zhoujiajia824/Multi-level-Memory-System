@@ -76,21 +76,71 @@ def batch_lock(root):
 
 
 def check_capture(episode, record, worker, audit_path):
-    if not (episode / 'capture_manifest.json').is_file():
-        return False
     try:
+        if not (episode / 'capture_manifest.json').is_file():
+            raise ValueError('缺少 capture_manifest.json')
         run = read_json(episode / 'run.json')
-        if (digest(run.get('parameters')) != record['spec_sha256']
-                or run.get('implementation_sha256') != capture_implementation()
-                or run.get('capture_mode') != 'interaction_segment' or
-                (episode / 'planning' / 'video.mp4').stat().st_size == 0):
-            return False
-    except (OSError, ValueError):
+        if digest(run.get('parameters')) != record['spec_sha256']:
+            raise ValueError('采集参数与此变体不一致')
+        if run.get('implementation_sha256') != capture_implementation():
+            raise ValueError('采集代码指纹与当前版本不一致')
+        if run.get('capture_mode') != 'interaction_segment':
+            raise ValueError('采集模式与交互片段不一致')
+        if not (episode / 'planning' / 'video.mp4').stat().st_size:
+            raise ValueError('planning/video.mp4 为空')
+    except (OSError, ValueError) as error:
+        write_json(audit_path, dict(valid=False, error=str(error)))
         return False
     with audit_path.open('w', encoding='utf-8') as audit:
         result = subprocess.run([worker, str(ROOT / 'scripts/build_fail2drive_demo_memory.py'),
-                                 'check', '--captures', str(episode)], stdout=audit, cwd=ROOT)
+                                 'check', '--captures', str(episode)], stdout=audit, stderr=subprocess.PIPE,
+                                encoding='utf-8', errors='replace', cwd=ROOT)
+    if result.returncode and result.stderr:
+        write_text(audit_path.with_suffix('.stderr.log'), result.stderr)
+    if result.returncode and not audit_path.stat().st_size:
+        reason = result.stderr.strip() if result.stderr else f'验收进程退出码 {result.returncode}'
+        try:
+            reason = json.loads(reason)['error']
+        except (ValueError, KeyError, TypeError):
+            reason = reason.splitlines()[-1] if reason else f'验收进程退出码 {result.returncode}'
+        write_json(audit_path, dict(valid=False, error=reason, check_exit=result.returncode))
     return result.returncode == 0
+
+
+def failure_reason(episode, evidence, stage):
+    paths = [evidence] if stage == 'check' else [episode / 'capture_failure.json', episode / 'demo_evaluation.json']
+    for path in paths:
+        try:
+            report = read_json(path)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(report, dict):
+            continue
+        reasons = [report.get('error'), *(report.get('errors') or []),
+                   *(entry.get('reason') for entry in report.get('rejected', []) if isinstance(entry, dict))]
+        if report.get('passed') is False:
+            reasons.extend(key + '=false' for key in ('interaction_complete', 'recovery_complete',
+                           'projection_valid', 'world_settings_restored') if report.get(key) is False)
+            reasons.extend(f'{key}={report[key]}' for key in ('collision_count', 'offroad_count',
+                           'rule_violation_count') if report.get(key))
+        message = ' / '.join(str(value) for value in reasons if value)
+        if message:
+            return ' '.join(message.split())[:500]
+    # A startup/import error can precede all episode artifacts.
+    try:
+        with evidence.open('rb') as handle:
+            handle.seek(max(0, evidence.stat().st_size - 8192))
+            lines = handle.read().decode('utf-8', errors='replace').strip().splitlines()
+        if lines:
+            line = lines[-1]
+            try:
+                line = json.loads(line)['error']
+            except (KeyError, TypeError, ValueError):
+                pass
+            return str(line)[:500]
+    except OSError:
+        pass
+    return '子进程未提供错误文本'
 
 
 def collect_one(tag, record, plan, root, args):
@@ -117,9 +167,13 @@ def collect_one(tag, record, plan, root, args):
         result = subprocess.run(command, stdout=handle, stderr=subprocess.STDOUT, cwd=ROOT)
     if result.returncode in (-signal.SIGINT, -signal.SIGTERM):
         raise RuntimeError('Capture process terminated by signal: ' + str(-result.returncode))
-    passed = result.returncode == 0 and check(episode)
-    return dict(status='ready_for_video_review' if passed else 'failed',
-                path='clips/' + episode.name, capture_exit=result.returncode, log='logs/' + log.name)
+    item = dict(path='clips/' + episode.name, capture_exit=result.returncode, log='logs/' + log.name)
+    if result.returncode == 0 and check(episode):
+        return dict(item, status='ready_for_video_review')
+    stage = 'capture' if result.returncode else 'check'
+    evidence = log if result.returncode else log.with_suffix('.check.json')
+    return dict(item, status='failed', failure_stage=stage, reason=failure_reason(episode, evidence, stage),
+                failure_log='logs/' + evidence.name)
 
 
 def main(argv=None):
@@ -178,7 +232,11 @@ def main(argv=None):
             write_json(summary, results)
             ready = [results[t]['path'] for t in routes if results.get(t, {}).get('status') == 'ready_for_video_review']
             write_text(root / 'review_paths.txt', ''.join(p + '\n' for p in ready))
-            print(f"[{tag}] {item['status']} ({len(ready)}/{len(routes)})  {item.get('log', item['path'])}", flush=True)
+            if item['status'] == 'failed':
+                detail = f"{item['failure_stage']}: {item['reason']}  ({item['failure_log']})"
+            else:
+                detail = item['path']
+            print(f"[{tag}] {item['status']} ({len(ready)}/{len(routes)})  {detail}", flush=True)
         return 0 if all(results[t]['status'] == 'ready_for_video_review' for t in selected) else 2
 
 

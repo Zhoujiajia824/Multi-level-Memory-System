@@ -96,6 +96,64 @@ def _slice_interval(polygon, center, heading):
     return (min(values), max(values)) if values else None
 
 
+def _adjacent_lanes(wp, *, right):
+    """Traverse one geographic side even when the adjacent lane faces the opposite way."""
+    cursor = wp
+    yaw = wp.transform.rotation.yaw
+    visited = {(wp.road_id, wp.section_id, wp.lane_id)}
+    while True:
+        same_direction = math.cos(math.radians(cursor.transform.rotation.yaw-yaw)) >= 0.
+        cursor = cursor.get_right_lane() if right == same_direction else cursor.get_left_lane()
+        if cursor is None:
+            return
+        key = (cursor.road_id, cursor.section_id, cursor.lane_id)
+        if key in visited:
+            return
+        visited.add(key)
+        yield cursor
+
+
+def _walker_starts(wp, lateral, crossing):
+    """Same route station. Keep crossing starts on the right and road walkers in their lane."""
+    origin = wp.transform.location
+    if not crossing:
+        return [(lateral, origin.z, str(wp.lane_type).split('.')[-1])]
+    yaw = math.radians(wp.transform.rotation.yaw)
+    bands = []
+    outer_edge = -wp.lane_width/2.
+    # A roadside actor may need to start just beyond a whole neighboring
+    # travel lane (1075). Bound the displacement to one lane plus kerb clearance.
+    max_side_shift = wp.lane_width+.4
+    for neighbor in _adjacent_lanes(wp, right=True):
+        p = neighbor.transform.location
+        center = (p.x-origin.x)*math.sin(yaw)-(p.y-origin.y)*math.cos(yaw)
+        half = neighbor.lane_width/2.
+        kind = str(neighbor.lane_type).split('.')[-1]
+        if center < 0. and kind in ('Driving', 'Parking', 'Shoulder', 'Sidewalk', 'Biking', 'Curb'):
+            outer_edge = min(outer_edge, center-half)
+        if kind in ('Sidewalk', 'Shoulder') and half > .4 and center < 0.:
+            # A centre on a kerb/outer edge can pass a point-on-lane check while
+            # the pedestrian capsule is already inside adjacent static geometry.
+            inside = min(center+half-.4, max(center-half+.4, lateral))
+            for offset in (inside, center):
+                if abs(offset-lateral) <= max_side_shift and offset < -wp.lane_width/2.:
+                    bands.append((offset, p.z, kind))
+    bands.sort(key=lambda item: abs(item[0]-lateral))
+    # Unmapped starts need a real surface beyond the outer edge. An adjacent
+    # driving lane or the edge of a narrow shoulder is not a roadside fallback.
+    verge = outer_edge-.45
+    if lateral <= verge:
+        bands.insert(0, (lateral, origin.z, None))
+    for offset in (min(lateral-.5, verge), lateral+.5, verge):
+        if offset <= verge and abs(offset-lateral) <= max_side_shift:
+            bands.append((offset, origin.z, None))
+    poses = []
+    for candidate in bands:
+        if all(abs(candidate[0]-saved[0]) > .05 for saved in poses):
+            poses.append(candidate)
+    return poses
+
+
 class DemoEvents:
     def __init__(self, world, waypoints, spec, carla):
         self.world, self.waypoints, self.spec, self.carla = world, waypoints, spec, carla
@@ -111,6 +169,7 @@ class DemoEvents:
         self.stop_encounters = {}
         self.last_time = None
         self.geometry_audit = None
+        self.walker_placements = []
 
     def _cross_branch(self, desired_station):
         result = crossing_drive_path(self.waypoints, desired_station)
@@ -121,18 +180,65 @@ class DemoEvents:
     def _crossing_left_limit(self, waypoint):
         origin, yaw = waypoint.transform.location, math.radians(waypoint.transform.rotation.yaw)
         limit = waypoint.lane_width/2.
-        seen, cursor = set(), waypoint
-        for _ in range(12):
-            cursor = cursor.get_left_lane()
-            if cursor is None or (cursor.road_id,cursor.section_id,cursor.lane_id) in seen:
-                break
-            seen.add((cursor.road_id,cursor.section_id,cursor.lane_id))
+        for cursor in _adjacent_lanes(waypoint, right=False):
             if str(cursor.lane_type).split('.')[-1] != 'Driving':
                 break
             p = cursor.transform.location
             left = (p.x-origin.x)*math.sin(yaw)-(p.y-origin.y)*math.cos(yaw)
             limit = max(limit,left+cursor.lane_width/2.)
-        return limit+1.5
+        return limit
+
+    def _spawn_walker(self, blueprint, wp, lateral, rotation, config):
+        origin = wp.transform.location
+        yaw = math.radians(wp.transform.rotation.yaw)
+        crossing = config['role'] == 'crossing_actor'
+        attempts = []
+        self.walker_placements.append(dict(id=config['id'], blueprint=blueprint.id,
+            station_m=config['s_offset_m'], requested_lateral_m=lateral, attempts=attempts))
+        for offset, road_z, mapped in _walker_starts(wp, lateral, crossing):
+            x, y = origin.x+offset*math.sin(yaw), origin.y-offset*math.cos(yaw)
+            location = self.carla.Location(x=x, y=y, z=road_z+1.8)
+            row = dict(lateral_m=offset, mapped_surface=mapped, xy_carla_m=[x,y], spawns=[])
+            attempts.append(row)
+            hit = self.world.ground_projection(location, 3.6)
+            # A ray without a same-level, global-XY hit cannot establish a
+            # surface outside mapped lanes (e.g. a large-map tile origin shift).
+            if hit is not None and math.hypot(hit.location.x-x, hit.location.y-y) <= .15:
+                label = str(hit.label).split('.')[-1]
+                row['ray_label'] = label
+                row['ray_z_m'] = hit.location.z
+                if not math.isfinite(hit.location.z) or abs(hit.location.z-road_z) > 1.8:
+                    row['rejected'] = 'surface at different elevation'
+                    continue
+                if label not in ('Roads','RoadLines','Sidewalks','Ground','Terrain'):
+                    row['rejected'] = 'surface is not walkable'
+                    continue
+                ground_z = hit.location.z
+                row['height_source'] = 'ground_projection'
+            elif mapped is not None:
+                ground_z = road_z
+                row['height_source'] = 'mapped_surface'
+            else:
+                row['rejected'] = 'no measured roadside surface'
+                continue
+            row['ground_z_m'] = ground_z
+            # Spawn transforms refer to the walker origin. Keep the same XY
+            # and try a bounded capsule clearance if the engine reports overlap.
+            for lift in (.9, 1.15):
+                pos = self.carla.Location(x=x, y=y, z=ground_z+lift)
+                attempt = dict(z_m=pos.z)
+                row['spawns'].append(attempt)
+                try:
+                    actor = self.world.spawn_actor(blueprint, self.carla.Transform(pos, rotation))
+                except RuntimeError as exc:
+                    attempt['error'] = str(exc)
+                    if 'collision' not in str(exc).lower():
+                        raise
+                    continue
+                attempt['actor_id'] = actor.id
+                return actor
+        raise RuntimeError('Required walker spawn failed: %s (%s); see capture_failure.json walker_placements'
+                           % (config['id'], blueprint.id))
 
     def spawn(self):
         library = self.world.get_blueprint_library()
@@ -166,7 +272,7 @@ class DemoEvents:
                     sidewalk = sidewalk.get_right_lane()
                 if sidewalk is None:
                     raise RuntimeError('Crowd requires a real right sidewalk')
-                pose,lateral = sidewalk.transform,0.
+                wp,pose,lateral = sidewalk,sidewalk.transform,0.
             if role == 'stop_sign_visual_occluder':
                 signs = [sign for sign in self.world.get_actors().filter('traffic.stop')
                          if _stop_controls_route(sign,self.waypoints,target_station=config['s_offset_m'])]
@@ -195,7 +301,12 @@ class DemoEvents:
             # A public cross branch supplies the actual actor heading. Applying
             # the catalog's generic +90 offset again would point it off-road.
             rotation = self.carla.Rotation(yaw=pose.rotation.yaw+(0. if cross_path else config['yaw_offset_deg']))
-            actor = self.world.try_spawn_actor(blueprint,self.carla.Transform(location,rotation))
+            if config['actor_type'] == 'walker':
+                if role == 'crossing_actor':
+                    rotation = self.carla.Rotation(yaw=wp.transform.rotation.yaw-90.)
+                actor = self._spawn_walker(blueprint, wp, lateral, rotation, config)
+            else:
+                actor = self.world.try_spawn_actor(blueprint,self.carla.Transform(location,rotation))
             if actor is None:
                 raise RuntimeError('Required actor spawn failed: '+config['id'])
             self.actors.append(actor)
@@ -428,14 +539,19 @@ class DemoEvents:
                 origin = row['original_waypoint'].transform.location
                 location = a.get_location()
                 lateral = (location.x-origin.x)*math.sin(yaw)-(location.y-origin.y)*math.cos(yaw)
-                clearance = min(_path_body_distance(path,_body(a)) for path in (self.route,self.teaching_path))
-                complete = lateral >= row['crossing_left_limit_m'] and clearance > self.ego_width/2.+.2
+                body = _body(a)
+                # Hull is in public XY (CARLA Y negated). The entire body must
+                # leave the driving lanes, while the opposite shoulder can be narrow.
+                trailing_edge = min((x-origin.x)*math.sin(yaw)+(y+origin.y)*math.cos(yaw) for x,y in body)
+                clearance = min(_path_body_distance(path,body) for path in (self.route,self.teaching_path))
+                complete = trailing_edge >= row['crossing_left_limit_m']+.1 and clearance > self.ego_width/2.+.2
                 a.apply_control(self.carla.WalkerControl(direction=self.carla.Vector3D(x=math.sin(yaw),y=-math.cos(yaw)),speed=0. if complete else speed))
                 moving_complete.append(complete)
                 if complete and not row['finished']:
                     row['finished'] = True
                     events.append(dict(phase='interact',event='crossing_body_observed_clear',actor_id=a.id,
-                                       lateral_m=lateral,path_body_clearance_m=clearance,completed=False))
+                                       lateral_m=lateral,body_trailing_lateral_m=trailing_edge,
+                                       path_body_clearance_m=clearance,completed=False))
             elif role == 'braking_lead':
                 observed_speed = math.hypot(*observed['velocity']) if observed is not None else math.hypot(a.get_velocity().x,a.get_velocity().y)
                 row['prior_motion_observed'] |= not row['brake_observed'] and observed_speed > 1.
