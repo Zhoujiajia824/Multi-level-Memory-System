@@ -556,6 +556,69 @@ def _observations(root, execution_by_frame, *, normalized, admission_outcome=Non
     return raw,frames,required
 
 
+def _borrow_anchors(eligible,execution,*,earliest_entry=-math.inf):
+    """Map actual opposing-lane decisions to their latest available 1Hz observation."""
+    maneuvers={}
+    for step in execution:
+        decision=step.get('expert_decision') or {}
+        policy=decision.get('maneuver_policy') or {}
+        update=policy.get('return_update')
+        if not policy.get('maneuvers') and update is None:continue
+        frame,time=step['frame'],step['time']
+        if decision.get('source_frame')!=frame or not _same(decision.get('source_time'),time):
+            raise ValueError('Borrow decision does not match its executed source frame')
+        for row in policy.get('maneuvers',[]):
+            key=(row['kind'],row['from_index'])
+            events=maneuvers.setdefault(key,{})
+            if (row.get('current_preentry_vehicle_gap_clear') is False
+                    and row.get('maneuver_committed') is False
+                    and math.hypot(*step['observed_ego']['velocity'])<.15):
+                reason='stopped_without_borrow_clearance'
+                stopped=events.setdefault(reason,dict(frame=frame,time=time))
+                blocker=policy.get('entry_gap_blocker')
+                if blocker and 'blocker_actor_id' not in stopped:
+                    if (type(blocker.get('actor_id')) is not int or blocker.get('reason')
+                            not in ('vehicle_between_ego_and_return','arrival_gap_too_small')):
+                        raise ValueError('Invalid current vehicle evidence for denied borrowing clearance')
+                    # Prefer the first actual stopped frame with an identified
+                    # vehicle over an earlier denial without an attributed cause.
+                    events[reason]=dict(frame=frame,time=time,blocker_actor_id=blocker['actor_id'],
+                                        blocker_reason=blocker['reason'])
+            entry=row.get('physical_entry_evidence')
+            if entry and entry.get('source_frame')==frame and row.get('maneuver_committed') is True:
+                if not _same(entry.get('source_time'),time):
+                    raise ValueError('Physical opposing-lane entry has inconsistent source time')
+                events.setdefault('physical_borrow_entry',dict(frame=frame,time=time,
+                    original_lane_id=entry['original_lane_id'],borrowed_side=entry['borrowed_side']))
+        if update is not None:
+            if (update.get('source_frame')!=frame or not _same(update.get('source_time'),time)
+                    or type(update.get('oncoming_actor_id')) is not int
+                    or not all(type(update.get(k)) is int for k in ('from_index','updated_return_index','previous_return_index'))
+                    or not update['from_index']<update['updated_return_index']<update['previous_return_index']
+                    or not _number(update.get('advancement_m')) or update['advancement_m']<=0):
+                raise ValueError('Earlier return lacks a source-bound oncoming actor and shortened reference')
+            key=(update['kind'],update['from_index'])
+            if 'physical_borrow_entry' not in maneuvers.get(key,{}):
+                raise ValueError('Earlier return decision has no observed entry into the borrowed lane')
+            maneuvers[key].setdefault('earlier_return_decision',dict(frame=frame,time=time,
+                oncoming_actor_id=update['oncoming_actor_id'],advancement_m=update['advancement_m']))
+    # Keep one coherent maneuver per capture even if multiple objects are passed.
+    choices=[(key,events) for key,events in maneuvers.items()
+             if 'physical_borrow_entry' in events and events['physical_borrow_entry']['time']>=earliest_entry]
+    if not choices:return []
+    (kind,start),events=max(choices,key=lambda item:(len(item[1]),'earlier_return_decision' in item[1]))
+    anchors={}
+    for reason,observed in sorted(events.items(),key=lambda item:item[1]['time']):
+        candidates=[r for r in eligible if -1e-5<=observed['time']-r['time']<1.+1e-5]
+        if not candidates:continue
+        source=max(candidates,key=lambda r:r['time']);identity=source['snapshot']['frame_id']
+        anchor=anchors.setdefault(identity,dict(frame_id=identity,time=source['time'],anchor_reason=reason,
+            maneuver_kind=kind,maneuver_from_index=start,observed_decisions=[],
+            target_interaction_requires_human_confirmation=True))
+        anchor['observed_decisions'].append(dict(phase=reason,**observed))
+    return list(anchors.values())
+
+
 def select_anchors(frames,execution,requested=None,behavior_rows=None):
     """Use actual controls offline, not scenario labels or hidden event plans."""
     eligible=[row for row in frames if all(any(_same(other['time'],row['time']+offset)
@@ -568,6 +631,8 @@ def select_anchors(frames,execution,requested=None,behavior_rows=None):
         if len(selected)!=len(requested):
             raise ValueError('Explicit anchor is absent or lacks actual three-second evidence')
         return selected
+    borrowing=_borrow_anchors(eligible,execution)
+    if borrowing:return borrowing
     if behavior_rows:
         from .demo_behavior import interaction_windows
         windows=interaction_windows(behavior_rows)
@@ -737,7 +802,13 @@ def _capture_outcomes(root,run,launch,*,allow_min_speed_only=False):
 
 def _anchors_for_capture(frames,execution,requested=None,behavior_rows=None,segment=None):
     if segment is None:return select_anchors(frames,execution,requested,behavior_rows)
-    if requested:return select_anchors(frames,execution,requested)
+    spec=segment.get('spec',{})
+    ordinary=(spec.get('variant')=='Base' and spec.get('expected_scenarios')==[])
+    if requested:
+        selected=select_anchors(frames,execution,requested)
+        if ordinary:
+            for item in selected:item['capture_context']='paired_region_ordinary_driving'
+        return selected
     eligible=[row for row in frames if all(any(_same(other['time'],row['time']+offset)
         for other in frames) for offset in (0.,1.,2.,3.))]
     events=segment.get('events',[])
@@ -746,6 +817,9 @@ def _anchors_for_capture(frames,execution,requested=None,behavior_rows=None,segm
     if onset is None:onset=next((e.get('time') for e in events if e.get('phase')=='recovery'),None)
     if not _number(onset) or not _number(finish) or finish<onset:
         raise ValueError('Segment anchors lack source-bound interaction/recovery times')
+    if not ordinary:
+        borrowing=_borrow_anchors(eligible,[r for r in execution if r['time']<=finish],earliest_entry=onset)
+        if borrowing:return borrowing
     during=[r for r in execution if onset<=r['time']<=finish]
     if not during:raise ValueError('No actual controls in captured interaction')
     strongest=max(during,key=lambda r:r['returned_control']['brake']+abs(r['returned_control']['steer']))
@@ -761,7 +835,10 @@ def _anchors_for_capture(frames,execution,requested=None,behavior_rows=None,segm
         row=min(candidates,key=lambda r:(abs(r['time']-target),r['time']))
         identity=row['snapshot']['frame_id']
         if identity not in used:
-            selected.append(dict(frame_id=identity,time=row['time'],anchor_reason=reason));break
+            selected.append(dict(frame_id=identity,time=row['time'],anchor_reason=reason))
+            if ordinary:
+                selected[-1].update(anchor_reason='paired_region_ordinary_driving',capture_context='paired_region_ordinary_driving')
+            break
     if not selected:raise ValueError('No interaction anchor with complete actual three-second future evidence')
     return selected
 
@@ -999,6 +1076,15 @@ def _bind_behavior_review(output,checked,write_json):
             official_result_admission_policy=episode.get('admission_policy',_admission_policy(False)),
             original_min_speed_penalty=bool(episode.get('accepted_with_min_speed_penalty',False)),
             review_must_include_full_interaction_video=True)
+        spec=(episode.get('segment_capture') or {}).get('spec',{})
+        if spec.get('variant')=='Base' and spec.get('expected_scenarios')==[]:
+            review.update(capture_context='paired_region_ordinary_driving',official_scripted_target_present=False)
+        decision_anchor=next((a for a in episode.get('anchors',[]) if a['frame_id']==task.get('anchor_frame_id')
+                              and a.get('observed_decisions')),None)
+        if decision_anchor:
+            review.update(borrow_decision_evidence=decision_anchor,
+                review_borrowing=['confirm_oncoming_vehicles_and_wait_in_video','check_clearance_before_borrow',
+                                  'confirm_actual_return_to_original_lane_clear_of_obstacle_and_traffic'])
         if episode.get('capture_mode')=='interaction_segment':
             review.update(capture_mode='interaction_segment',segment_completion_evidence=episode['segment_capture'],
                 original_official_outcome=episode['official_outcome'],official_route_success_claimed=False)

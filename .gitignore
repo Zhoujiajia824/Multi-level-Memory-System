@@ -61,6 +61,7 @@
 !/config/fail2drive_demonstrations.json
 !/scripts/capture_fail2drive_demo.py
 !/scripts/collect_fail2drive_interactions.py
+!/scripts/collect_fail2drive_reconstructions.py
 !/scripts/build_fail2drive_demo_memory.py
 !/config/fail2drive_official_demonstrations.json
 !/scripts/capture_fail2drive_official.py

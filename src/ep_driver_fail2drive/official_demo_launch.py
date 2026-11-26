@@ -88,6 +88,9 @@ def _route_details(path, source, launcher):
         map=route.attrib['town'],official_routes_path=str(path),
         routes_sha256=hashlib.sha256(launcher.io_path(path).read_bytes()).hexdigest(),
         scenario_types=[row.attrib['type'] for row in route.findall('.//scenario')],
+        scenario_parameters=[dict(name=scenario.attrib.get('name'),type=scenario.attrib['type'],
+            parameters=[dict(tag=child.tag,attributes=dict(child.attrib)) for child in scenario])
+            for scenario in route.findall('.//scenario')],
         declared_actor_models=[dict(scenario_type=scenario.attrib['type'],parameter=child.tag,attributes=dict(child.attrib))
             for scenario in route.findall('.//scenario') for child in scenario
             if child.tag in ('vehicle','walker','pedestrian','prop','image','objects','blocker_model')],
@@ -499,7 +502,12 @@ def run_plan(planned):
                     natural=(verdict.get('route_completed') is True and not status['controlled_stop']
                              and segment.get('termination')=='official_route_ended_naturally')
                     result['natural_full_route_completion']=natural
-                    if not natural:
+                    observed=(segment.get('target_observed') is True
+                              and segment.get('interaction_completed_frame') is not None)
+                    if natural and not observed:
+                        fatal='official_route_ended_without_completed_interaction'
+                        segment_rejection='route_interaction_segment_rejection'
+                    elif not natural:
                         fatal='interaction_segment_not_completed'
                         if status['controlled_stop'] and segment['status']=='failed':
                             segment_rejection='route_interaction_segment_rejection'
@@ -528,7 +536,8 @@ def run_plan(planned):
             events=segment.get('events',[])
             last=events[-1] if isinstance(events,list) and events and isinstance(events[-1],dict) else {}
             result['failure_summary']=dict(type='InteractionSegmentRejected',
-                classification=segment_rejection,message=str(segment.get('reason') or last.get('reason','incomplete interaction'))[:1200],
+                classification=segment_rejection,message=str(fatal if result.get('natural_full_route_completion')
+                    else segment.get('stop_reason') or last.get('reason','incomplete interaction'))[:1200],
                 frame=segment.get('end_frame'),time=segment.get('end_time'))
         rejection=segment_rejection or (_known_route_rejection(archives[0].parent,capture,failure,verdict)
                    if fatal and code==0 and len(archives)==1 else None)
@@ -540,8 +549,25 @@ def run_plan(planned):
             command=[job['config']['worker_python'],str(ROOT/'scripts'/'build_fail2drive_official_memory.py'),
                 'finalize','--capture',str(archives[0].parent),'--checkpoint',str(job['checkpoint']),
                 '--launch',str(job['launch_path'])]
+            if planned.get('review_policy')=='allow_min_speed_only':
+                command.append('--allow-min-speed-only')
             result['finalize_command']=command
             result['finalize_command_posix']=shlex.join(command)
+            if planned.get('review_policy') and fatal is None:
+                admission=seed_root/'run'/('%04d_admission.json'%route)
+                error_log=seed_root/'err'/('%04d_admission.log'%route)
+                with admission.open('xb') as out,error_log.open('xb') as err:
+                    check=subprocess.run(command,cwd=ROOT,stdout=out,stderr=err,
+                        env=dict(os.environ,PYTHONIOENCODING='utf-8'))
+                try:
+                    report=_read(admission)
+                except (ValueError,OSError):
+                    report={}
+                ready=check.returncode==0 and isinstance(report,dict) and report.get('valid') is True
+                result.update(finalization_required=False,admission_exit=check.returncode,
+                    review_status='ready_for_video_review' if ready else 'admission_failed',
+                    admission_report=str(admission),admission_stderr=str(error_log))
+                if ready:result['review_video']=str(archives[0].parent/'planning'/'video.mp4')
         _write(job['launch_path'].with_name('%04d_collection.json'%route),result)
         outcomes.append(result)
         print(json.dumps(result,ensure_ascii=False),flush=True)
@@ -555,8 +581,10 @@ def run_plan(planned):
     # making every batch-success flag fail closed on that outcome.
     healthy=not any(row.get('route_failure_reason') for row in outcomes)
     processes_ok=finished and healthy and all(row['evaluator_returncode']==0 for row in outcomes)
-    routes_ok=finished and healthy and all(row['official_result'].get('route_completed') is True for row in outcomes)
+    routes_ok=finished and all(row['official_result'].get('route_completed') is True and
+        row.get('route_failure_reason') in (None,'official_route_ended_without_completed_interaction') for row in outcomes)
     segment_mode=planned.get('capture_mode','full_route')=='interaction_segment'
+    review_ok=not planned.get('review_policy') or all(row.get('review_status')=='ready_for_video_review' for row in outcomes)
     segments_ok=segment_mode and finished and healthy and all(row.get('segment_completed') is True or
         row.get('natural_full_route_completion') is True for row in outcomes)
     return dict(schema=SCHEMA,collection_finished=finished,results=outcomes,
@@ -566,27 +594,34 @@ def run_plan(planned):
             (not (row.get('segment_completed') is True or row.get('natural_full_route_completion') is True) if segment_mode else
              row['official_result'].get('route_completed') is not True) for row in outcomes),
         continue_on_known_route_rejection=planned.get('continue_on_route_failure',False),
-        collection_succeeded=processes_ok and (segments_ok if segment_mode else routes_ok),
+        collection_succeeded=processes_ok and (segments_ok if segment_mode else routes_ok) and review_ok,
         capture_mode='interaction_segment' if segment_mode else 'full_route',
         interaction_segments_completed=segment_mode and finished and healthy and all(row.get('segment_completed') is True for row in outcomes),
         natural_full_route_captures=sum(row.get('natural_full_route_completion') is True for row in outcomes),
         evaluator_runs_completed=processes_ok,
         official_routes_completed=routes_ok,
-        finalization_required=True,accepted_for_memory=False,memory_published=False)
+        finalization_required=any(row['finalization_required'] for row in outcomes),
+        accepted_for_memory=False,memory_published=False)
 
 
-def parser():
+def parser(*, collection_entry=False):
     result=argparse.ArgumentParser(description=__doc__)
-    result.add_argument('--list',action='store_true',help='Print canonical official routes without simulator/SDK preflight')
+    result.add_argument('--list',action='store_true',help='List original routes without simulator/SDK preflight')
     result.add_argument('--catalog',default=str(CATALOG))
     selection=result.add_mutually_exclusive_group()
-    selection.add_argument('--family',choices=FAMILIES)
     selection.add_argument('--route-ids',nargs='+',type=int)
-    selection.add_argument('--all-families',action='store_true')
+    if collection_entry:
+        result.set_defaults(family=None,all_families=False)
+        result.add_argument('--allow-min-speed-only',action='store_true',
+            help='Accept only the official minimum-speed penalty during post-capture review admission')
+    else:
+        selection.add_argument('--family',choices=FAMILIES)
+        selection.add_argument('--all-families',action='store_true')
     selection.add_argument('--selected-collection',action='store_true',
         help='Collect both Base/Generalization partners of the selected 10-family split; defaults to interaction segments')
     result.add_argument('--collection-split',help='Frozen collection/test partition; defaults to the selected 10-family split')
-    result.add_argument('--capture-mode',choices=('full_route','interaction_segment'),
+    result.add_argument('--capture-mode',choices=(('interaction_segment',) if collection_entry else ('full_route','interaction_segment')),
+        default='interaction_segment' if collection_entry else None,
         help='Interaction segments stop after the actual target interaction and recovery; official evaluation is unchanged')
     result.add_argument('--segment-max-seconds',type=float,default=90.,
         help='Simulation budget for segment collection only; reaching it without completion is a rejection')
@@ -614,9 +649,30 @@ def parser():
     return result
 
 
-def main(argv=None):
-    command=parser();args=command.parse_args(argv)
+def main(argv=None, *, collection_entry=False):
+    command=parser(collection_entry=collection_entry);args=command.parse_args(argv)
     try:
+        if collection_entry:
+            args.selected_collection=args.route_ids is None
+            if args.list:
+                if not args.fail2drive_root:
+                    command.error('Use --fail2drive-root to inspect the original collection XML')
+                from .memory_split import load_transfer_split,validate_transfer_source
+                split=load_transfer_split(args.collection_split)
+                launcher=_launcher()
+                source=launcher.absolute(args.fail2drive_root)
+                if args.route_ids is not None:
+                    validate_transfer_source(split,source)
+                records={record['route_id']:record for row in split['rows'] for record in row['collection']}
+                for _,details in select_routes(args,load_catalog(args.catalog),source,launcher):
+                    record=records.get(details['official_route_id'])
+                    if (not record or record['routes']!=details['source_relative_path']
+                            or record['sha256']!=details['routes_sha256']):
+                        raise ValueError('Select the original XML from the frozen collection partition')
+                    print(json.dumps({k:details[k] for k in ('official_route_id','scenario_family',
+                        'variant','map','source_relative_path','routes_sha256','scenario_types',
+                        'scenario_parameters')},ensure_ascii=False))
+                return 0
         if args.list:
             if args.selected_collection:
                 from .memory_split import load_transfer_split,route_ids
@@ -637,6 +693,8 @@ def main(argv=None):
             command.error('Select --selected-collection, --family, --route-ids or --all-families explicitly')
         planned=plan(args)
         if args.run:
+            if collection_entry:
+                planned['review_policy']='allow_min_speed_only' if args.allow_min_speed_only else 'strict'
             result=run_plan(planned)
             print(json.dumps(result,ensure_ascii=False,indent=2))
             return 0 if result['collection_succeeded'] else 2

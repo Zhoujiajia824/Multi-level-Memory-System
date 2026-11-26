@@ -22,6 +22,8 @@ from . import OFFICIAL_COMMIT
 SCHEMA = 'ep-driver-f2d-official-expert-adapter-1.0'
 DECISION_SCHEMA = 'ep-driver-f2d-offline-expert-decision-1.0'
 DRIVING_POLICY_SCHEMA = 'ep-driver-f2d-cautious-demonstration-1.0'
+_TWO_WAY = frozenset({'ConstructionObstacleTwoWays','ParkedObstacleTwoWays',
+                      'AccidentTwoWays','VehicleOpensDoorTwoWays'})
 SOURCES = {
     'autopilot.py': '8e05a4e489530c9a40a7a458ce0b1661180bf2f9c50bb0f5e3c7500b1008e92d',
     'transfuser_utils.py': '6e47c04d8279cd968698cab0f638b3192f49cd088c60dec7809d63ff30c34449',
@@ -136,6 +138,240 @@ def _maneuver_key(kind,start,end):
     return (str(kind),int(start),int(end))
 
 
+def _crossing_allowed(wp, side, returning):
+    other = getattr(wp, 'get_' + side + '_lane')()
+    if other is None or str(other.lane_type).split('.')[-1] != 'Driving':
+        return False
+    def broken(lane, edge):
+        marking = getattr(lane, edge + '_lane_marking')
+        return str(marking.type).split('.')[-1].lower() in ('broken', 'brokenbroken')
+    if other.transform.get_forward_vector().dot(wp.transform.get_forward_vector()) < -.8:
+        # The official TwoWays task specifically authorizes borrowing across
+        # a broken divider. CARLA reports LaneChange.NONE for opposing lanes
+        # on Town13 even when both faces of that divider are broken.
+        adjacent = getattr(other, 'get_' + side + '_lane')()
+        return (adjacent is not None and (adjacent.road_id, adjacent.section_id, adjacent.lane_id)
+                == (wp.road_id, wp.section_id, wp.lane_id) and broken(wp,side) and broken(other,side))
+    if returning:
+        wp, side = other, 'right' if side == 'left' else 'left'
+    return (broken(wp, side)
+            and str(wp.lane_change).split('.')[-1].lower() in (side, 'both'))
+
+
+def _borrow_crossings_allowed(planner, path, start, side, half_width, *, returning_only=False):
+    import numpy as np
+    offsets = np.linalg.norm(path[:, :2] - planner.original_route_points[start:start+len(path), :2], axis=1)
+    peak = int(np.argmax(offsets))
+    for i, offset in enumerate(offsets):
+        wp = planner.route_waypoints[start + i]
+        if abs(offset - float(wp.lane_width) / 2.) <= half_width:
+            if not _crossing_allowed(wp, side, returning_only or i > peak):
+                return False
+    return True
+
+
+def _permitted_borrow(pilot, kind, direction, start, end):
+    key = _maneuver_key(kind, start, end)
+    cache = pilot._ep_crossing_permissions
+    if key not in cache:
+        planner = pilot._waypoint_planner
+        cache[key] = (0 <= start < end < len(planner.route_points) and _borrow_crossings_allowed(
+            planner, planner.route_points[start:end+1], start, 'left' if direction == 'right' else 'right',
+            float(pilot._vehicle.bounding_box.extent.y)))
+    return cache[key]
+
+
+def _control_reference(pilot, provider, route):
+    if not provider.active_scenarios:
+        return route
+    kind, data = provider.active_scenarios[0]
+    if kind not in _TWO_WAY or len(data) != 7 or not data[3] or data[6]:
+        return route
+    # The candidate is shifted upstream before clearance. Keep the physical
+    # steering lookahead AND the bicycle-model forecast on the home reference
+    # while waiting. The next frame needs the candidate for a fresh gap check.
+    planner = pilot._waypoint_planner
+    pilot._ep_waiting_reference = planner.route_points
+    planner.route_points = planner.original_route_points
+    return planner.route_points[planner.route_index:]
+
+
+def _past_ego_body(pilot, actor):
+    snapshot = pilot._world.get_snapshot()
+    hero = pilot._vehicle
+    ego_state, other = snapshot.find(hero.id), snapshot.find(actor.id)
+    if ego_state is None or other is None:
+        return False
+    pose = ego_state.get_transform()
+    unit = pose.get_forward_vector()
+    def along(box, transform):
+        return [(p.x-pose.location.x)*unit.x+(p.y-pose.location.y)*unit.y
+                for p in box.get_world_vertices(transform)]
+    own = along(hero.bounding_box,pose)
+    other_body = along(actor.bounding_box,other.get_transform())
+    return (len(own)==len(other_body)==8 and all(math.isfinite(x) for x in [*own,*other_body])
+            and max(other_body)+.75 < min(own))
+
+
+def _clear_return_path(path, ego_box, speed, bodies):
+    """Check the ego sweep against frozen body vertices and constant-velocity traffic."""
+    import numpy as np
+    from .demonstration_policy import SETTINGS
+    delta = np.diff(path[:, :2], axis=0)
+    ds = np.linalg.norm(delta, axis=1)
+    if np.any(ds < 1e-4) or not np.isfinite(path).all():
+        return False
+    tangent = delta / ds[:, None]
+    # SDK world coordinates are float32; 10 cm second differences at Town13
+    # coordinates are noisy. Evaluate curvature over half-metre chords,
+    # retaining every dense point for the swept-body occupancy below.
+    step = max(1, round(.5/float(np.median(ds))))
+    mid = path[step:-step, :2]
+    before = mid-path[:-2*step, :2]
+    after = path[2*step:, :2]-mid
+    wide = before+after
+    denom = np.linalg.norm(before,axis=1)*np.linalg.norm(after,axis=1)*np.linalg.norm(wide,axis=1)
+    if not len(denom) or np.any(denom < 1e-6):
+        return False
+    curvature = 2.*abs(before[:,0]*after[:,1] - before[:,1]*after[:,0])/denom
+    if np.any(curvature > min(.21, SETTINGS['lateral_acceleration_mps2']/speed**2)):
+        return False
+    normal = np.column_stack((-tangent[:, 1], tangent[:, 0]))
+    centers = (path[:-1] + path[1:]) * .5
+    times = (np.cumsum(ds) - ds*.5) / speed
+    ex, ey, zlow, zhigh = ego_box
+    for vertices, velocity in bodies:
+        # Check a time interval around each sample. Current full actor boxes,
+        # gaps and the upstream per-frame hazard forecast remain independent.
+        relative = vertices[None, :, :] - centers[:, None, :] + times[:, None, None]*velocity
+        duration = .6 + ds/(2*speed)
+        a = np.einsum('pvi,pi->pv', relative[:, :, :2], tangent)
+        b = np.einsum('pvi,pi->pv', relative[:, :, :2], normal)
+        longitudinal = ex + .5 + ds*.5 + duration*abs(tangent@velocity[:2])
+        lateral = ey + .35 + duration*abs(normal@velocity[:2])
+        z = relative[:, :, 2]
+        if np.any((a.min(1) <= longitudinal) & (a.max(1) >= -longitudinal)
+                  & (b.min(1) <= lateral) & (b.max(1) >= -lateral)
+                  & (z.min(1) <= zhigh+.3) & (z.max(1) >= zlow-.3)):
+            return False
+    return True
+
+
+def _update_return_reference(pilot, provider, vehicles):
+    """Advance a committed overtaking return only for current approaching traffic."""
+    import numpy as np
+    if not provider.active_scenarios:
+        return None
+    kind, data = provider.active_scenarios[0]
+    if len(data) != 7 or not pilot._ep_committed_maneuvers:
+        return None
+    if kind not in _TWO_WAY or not data[3]:
+        return None
+    first, last, direction, _, start, end, _ = data
+    key = _maneuver_key(kind, start, end)
+    if key not in pilot._ep_committed_maneuvers or key in pilot._ep_adjusted_returns:
+        return None
+    planner = pilot._waypoint_planner
+    cursor = int(planner.route_index)
+    if not 0 <= start <= cursor < end < len(planner.route_points):
+        return None
+    road = planner.original_route_points[cursor:end+1]
+    private = planner.route_points[cursor:end+1]
+    if len(road) < 4:
+        return None
+    arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(road[:, :2], axis=0), axis=1))]
+    offset = private-road
+    offsets = np.linalg.norm(offset[:, :2], axis=1)
+    # Do not cut towards an obstruction during the outward lane change.
+    if arc[-1] < 8. or offsets[0] < .6 or offsets.max()-offsets[0] > .2:
+        return None
+    world = pilot._world
+    snapshot = world.get_snapshot()
+    ego = pilot._vehicle
+    frozen = snapshot.find(ego.id)
+    pose = frozen.get_transform()
+    if np.linalg.norm(private[0, :2]-[pose.location.x, pose.location.y]) > .8:
+        return None
+    wp = planner.route_waypoints[cursor]
+    forward = wp.transform.get_forward_vector()
+    side = 'left' if direction == 'right' else 'right'
+    neighbor = getattr(wp, 'get_' + side + '_lane')()
+    if neighbor is None or neighbor.transform.get_forward_vector().dot(forward) > -.8:
+        return None
+    speed = math.hypot(frozen.get_velocity().x, frozen.get_velocity().y)
+    if speed < .4:
+        return None
+    approaching = []
+    for actor in vehicles:
+        if actor.id == ego.id:
+            continue
+        item = snapshot.find(actor.id)
+        if item is None:
+            continue
+        location = item.get_transform().location
+        longitudinal = (location.x-pose.location.x)*forward.x + (location.y-pose.location.y)*forward.y
+        closing = -item.get_velocity().dot(forward)
+        if not (0 < longitudinal <= 100 and closing > .5 and abs(location.z-pose.location.z) < 3.):
+            continue
+        lane = pilot.world_map.get_waypoint(location)
+        if (lane.road_id, lane.section_id, lane.lane_id) != (neighbor.road_id, neighbor.section_id, neighbor.lane_id):
+            continue
+        meeting_time = longitudinal/(closing+speed)
+        if meeting_time <= arc[-1]/speed + 2.:
+            approaching.append((meeting_time, actor.id))
+    if not approaching:
+        return None
+    box = ego.bounding_box
+    ego_vertices = box.get_local_vertices()
+    ego_box = (max(abs(v.x) for v in ego_vertices), max(abs(v.y) for v in ego_vertices),
+               min(v.z for v in ego_vertices), max(v.z for v in ego_vertices))
+    bodies = []
+    known = {first.id, (last or first).id}
+    if any(snapshot.find(actor_id) is None for actor_id in known):
+        return None
+    for actor in world.get_actors():
+        if actor.id == ego.id or not (actor.id in known or actor.type_id.startswith(
+                ('vehicle.', 'walker.', 'static.prop.', 'animal.'))):
+            continue
+        item = snapshot.find(actor.id)
+        if item is None:
+            if actor.id in known:
+                return None
+            continue
+        transform = item.get_transform()
+        velocity = item.get_velocity()
+        center = actor.bounding_box.location
+        radius = actor.bounding_box.extent.length() + math.hypot(center.x, center.y, center.z)
+        if transform.location.distance(pose.location) > arc[-1] + radius + velocity.length()*arc[-1]/speed + 8.:
+            continue
+        vertices = np.array([[v.x, v.y, v.z] for v in actor.bounding_box.get_world_vertices(transform)])
+        v = np.array([velocity.x, velocity.y, velocity.z])
+        if vertices.shape != (8,3) or not np.isfinite(vertices).all() or not np.isfinite(v).all():
+            return None
+        bodies.append((vertices,v))
+    # Keep the current tangent and steering continuity, taper lateral offset
+    # towards the actual original route. Candidates use metres of route arc.
+    for length in np.arange(max(7., arc[-1]*.55), arc[-1]-.45, .5):
+        index = int(np.searchsorted(arc, length))
+        u = np.minimum(arc/arc[index], 1.)
+        ahead = arc + (arc[-1]-arc[index])*u*u*(3.-2.*u)
+        smaller = np.interp(ahead,arc,offsets,right=0.)
+        weight = np.minimum(1.,np.divide(smaller,offsets,out=np.zeros_like(smaller),where=offsets>1e-7))
+        candidate = road + offset*weight[:, None]
+        if not _clear_return_path(candidate, ego_box, speed, bodies):
+            continue
+        if not _borrow_crossings_allowed(planner, candidate, cursor, side, ego_box[1], returning_only=True):
+            continue
+        private[:] = candidate
+        pilot._ep_adjusted_returns.add(key)
+        arrival, actor_id = min(approaching)
+        return dict(source_frame=int(snapshot.frame), source_time=float(snapshot.timestamp.elapsed_seconds),
+                    kind=kind, from_index=int(start), previous_return_index=int(end), updated_return_index=cursor+index,
+                    advancement_m=float(arc[-1]-arc[index]), oncoming_actor_id=int(actor_id),
+                    estimated_meeting_s=float(arrival), source='frozen_actors_and_current_private_reference')
+    return None
+
+
 def _ep_before_opposing_entry(pilot,kind,direction,start,end):
     """Keep checking the gap until the frozen ego body enters the borrowed lane.
 
@@ -176,6 +412,8 @@ def _ep_before_opposing_entry(pilot,kind,direction,start,end):
     extreme=-min(lateral) if direction=='right' else max(lateral)
     entered=extreme>=width/2.
     if entered:
+        if key not in pilot._ep_cleared_entries:
+            raise ValueError('Physical opposing-lane entry occurred without a preceding clear gap')
         pilot._ep_committed_maneuvers.add(key)
         pilot._ep_entry_commit_evidence[key]=dict(source_frame=int(snapshot.frame),
             source_time=float(snapshot.timestamp.elapsed_seconds),
@@ -188,7 +426,46 @@ def _ep_before_opposing_entry(pilot,kind,direction,start,end):
     return not entered
 
 
-def _ep_cautious_gap_time(pilot,distance,target_speed,ego_speed,min_speed,to_index=None):
+def _borrow_release(pilot,start,end):
+    """Last body overlap with the opposing lane on the actual candidate curve."""
+    import numpy as np
+    planner = pilot._waypoint_planner
+    key = (int(start),int(end))
+    if key in pilot._ep_release_indices:
+        return pilot._ep_release_indices[key]
+    if not 0 <= start < end < len(planner.route_points):
+        return None
+    path = planner.route_points[start:end+1, :2]
+    original = planner.original_route_points[start:end+1, :2]
+    if len(path) < 4 or np.max(np.linalg.norm(path-original,axis=1)) < .5:
+        # Unshifted references (e.g. the bicyclist branch) retain the original estimate.
+        return None
+    tangent = np.gradient(path,axis=0)
+    norm = np.linalg.norm(tangent,axis=1)
+    if np.min(norm) < 1e-4:
+        return None
+    tangent /= norm[:,None]
+    orthogonal = np.column_stack((-tangent[:,1],tangent[:,0]))
+    lane = planner.route_waypoints[start:end+1]
+    widths = np.array([wp.lane_width for wp in lane])
+    right = [wp.transform.get_right_vector() for wp in lane]
+    normals = np.array([[v.x,v.y] for v in right])
+    # The endpoint arrival test below uses longitudinal separation. Keep the
+    # original full-maneuver estimate for bends and ambiguous projections.
+    if np.min(normals@normals[0]) < .985 or np.min(widths) <= 0:
+        return None
+    vertices = pilot._vehicle.bounding_box.get_local_vertices()
+    ex = max(abs(v.x) for v in vertices)
+    ey = max(abs(v.y) for v in vertices)
+    lateral = abs(np.einsum('ij,ij->i',path-original,normals))
+    extent = ex*abs(np.einsum('ij,ij->i',tangent,normals))+ey*abs(np.einsum('ij,ij->i',orthogonal,normals))
+    occupied = np.flatnonzero(lateral+extent+.35 >= widths*.5)
+    index = int(start+occupied[-1]+1) if len(occupied) and occupied[-1]+1 < len(path)-1 else None
+    pilot._ep_release_indices[key] = index
+    return index
+
+
+def _ep_cautious_gap_time(pilot,distance,target_speed,ego_speed,min_speed,to_index=None,body_release=False):
     """Estimate the complete borrowed-lane occupancy at the teacher's speed.
 
     The upstream minimum-time acceleration model is inappropriate after slowing
@@ -229,7 +506,14 @@ def _ep_cautious_gap_time(pilot,distance,target_speed,ego_speed,min_speed,to_ind
             raise ValueError('Invalid original opposing-gap body/safety margin')
         # Preserve every original margin while replacing a curved-road chord
         # with the longer actual borrowed-and-return reference.
-        distance=max(supplied_distance,arc_distance+margin)
+        if body_release:
+            # Arrival is measured from NOW, including the approach and startup.
+            # Require the original safety distance plus ego extent on the
+            # approaching vehicle at body-clearance time, not extra ego travel
+            # in its own lane after it has already cleared the borrowed lane.
+            distance=arc_distance
+        else:
+            distance=max(supplied_distance,arc_distance+margin)
     # Clamping a faster initial measurement down to the maneuver speed avoids
     # treating a high approach speed as permission to race through the gap.
     initial=min(speed_xy,cap);acceleration=1.;estimate=None
@@ -241,15 +525,20 @@ def _ep_cautious_gap_time(pilot,distance,target_speed,ego_speed,min_speed,to_ind
             estimate=(cap-initial)/acceleration+(distance-accelerate_distance)/cap
         estimate=max(float(distance)/cap,estimate)
     evidence=dict(schema=DRIVING_POLICY_SCHEMA,source_frame=int(snapshot.frame),
-        source_time=float(snapshot.timestamp.elapsed_seconds),distance_including_original_margins_m=float(distance),
+        source_time=float(snapshot.timestamp.elapsed_seconds),predicted_ego_travel_m=float(distance),
+        distance_including_original_margins_m=None if body_release else float(distance),
         supplied_chord_distance_with_margins_m=supplied_distance,reference_arc_to_return_end_m=arc_distance,
         original_body_and_safety_margin_m=margin,
-        distance_basis='max_original_and_actual_reference_arc_plus_original_margins' if to_index is not None else
+        required_opposing_separation_at_release_m=margin if body_release else None,
+        physical_body_release_index=int(to_index) if body_release else None,
+        distance_basis='current_arc_to_full_body_release_with_opposing_separation_margin' if body_release else
+                       'max_original_and_actual_reference_arc_plus_original_margins' if to_index is not None else
                        'explicit_distance_without_reference_endpoint',
         cautious_gap_speed_mps=cap,map_vehicle_limit_mps=map_limit,observed_speed_xy_mps=speed_xy,
         startup_speed_mps=initial,startup_acceleration_mps2=acceleration,occupancy_estimate_s=estimate,
         current_policy_binding_reasons=_container_copy(policy_evidence.get('binding_reasons',[])),
-        method='cautious_startup_then_speed_limited_full_borrow_and_return',
+        method=('cautious_startup_to_full_body_clearance' if body_release else
+                'cautious_startup_then_speed_limited_full_borrow_and_return'),
         upstream_minimum_time_model_used=False,original_gap_safety_margins_unchanged=True,
         future_waits_bounded=False,collision_free_proof=False)
     pilot._ep_gap_time_estimates.append(evidence)
@@ -279,12 +568,15 @@ def _maneuver_record(pilot, provider):
             reference_shift_started=bool(route_index>start),maneuver_committed=committed,
             physical_entry_evidence=_container_copy(getattr(pilot,'_ep_entry_commit_evidence',{}).get(key)),
             last_preentry_vehicle_gap_clear=bool(gap),
+            home_lane_reference_while_waiting=bool(not gap and not committed),
             current_preentry_vehicle_gap_clear=bool(gap) if evaluated else None,
             clearance_semantics=('cached_entry_decision_not_current_safety' if committed else
                                  'current_vehicle_gap_only' if evaluated else 'not_evaluated_this_frame'),
             actor_hazard_and_traffic_checks='executed_every_frame',
             gap_rule_forces_stop_in_committed_opposite_lane=False))
     return dict(schema=DRIVING_POLICY_SCHEMA,maneuvers=rows,
+        return_update=_container_copy(getattr(pilot,'_ep_return_update',None)),
+        entry_gap_blocker=_container_copy(getattr(pilot,'_ep_gap_blocker',None)),
         preentry_gap_rechecks=getattr(pilot,'_ep_preentry_gap_rechecks',0),
         gap_time_estimates=_container_copy(getattr(pilot,'_ep_gap_time_estimates',[])),
         keep_driving_is_safety_override=False)
@@ -400,6 +692,7 @@ def _expert_tree(text, filename):
     gap_patches = 0
     gap_result_patches = 0
     gap_time_patches = 0
+    missing_lane_patches = 0
     for method in classes[0].body:
         if not isinstance(method, ast.FunctionDef):
             continue
@@ -433,6 +726,8 @@ def _expert_tree(text, filename):
                             raise ValueError('Unexpected overtaking hazard bypass in pinned expert')
                         hazard_patches += 1
                         before = ast.parse(
+                            'self._ep_return_update = _update_return_reference(self, CarlaDataProvider, vehicles)\n'
+                            'route_np = _control_reference(self, CarlaDataProvider, route_np)\n'
                             'target_speed = min(target_speed, target_speed_route_obstacle)\n'
                             'self._ep_maneuver_decision = _maneuver_record(self, CarlaDataProvider)\n'
                             'target_speed = _ep_cautious_target(self, route_np, target_speed, ego_speed)\n').body
@@ -463,13 +758,25 @@ def _expert_tree(text, filename):
                 def visit_Assign(self,node):
                     nonlocal gap_result_patches,gap_time_patches
                     node=self.generic_visit(node)
+                    name = node.targets[0].id if len(node.targets)==1 and isinstance(node.targets[0],ast.Name) else None
+                    if name=='to_location' and isinstance(node.value,ast.Subscript):
+                        before=ast.parse('release = _borrow_release(self, from_index, to_index) if '
+                            'scenario_type in _TWO_WAY else None\n'
+                            'if release is not None:\n    to_index = release').body
+                        return [*[ast.copy_location(item,node) for item in before],node]
+                    if name=='other_vehicle_distance':
+                        after=ast.parse('if release is not None:\n'
+                            '    other_vehicle_distance = min(other_vehicle_distance, dot_product_2 '
+                            '- vehicle.bounding_box.extent.x) - self.config.check_path_free_safety_distance '
+                            '- 2*self._vehicle.bounding_box.extent.x').body
+                        return [node,*[ast.copy_location(item,node) for item in after]]
                     if (len(node.targets)==1 and isinstance(node.targets[0],ast.Name)
                             and node.targets[0].id=='ego_time' and isinstance(node.value,ast.Call)
                             and isinstance(node.value.func,ast.Name)
                             and node.value.func.id=='compute_min_time_for_distance'):
                         gap_time_patches+=1
                         replacement=ast.parse(
-                            'ego_time = _ep_cautious_gap_time(self, ego_distance, target_speed, ego_speed, min_speed, to_index)\n'
+                            'ego_time = _ep_cautious_gap_time(self, ego_distance, target_speed, ego_speed, min_speed, to_index, release is not None)\n'
                             'if ego_time is None:\n    return False\n').body
                         return [ast.copy_location(item,node) for item in replacement]
                     if (len(node.targets)==1 and isinstance(node.targets[0],ast.Subscript)
@@ -479,13 +786,43 @@ def _expert_tree(text, filename):
                             and node.targets[0].slice.value==6
                             and isinstance(node.value,ast.Name) and node.value.id=='path_clear'):
                         gap_result_patches+=1
+                        permit=ast.parse('path_clear = path_clear and _permitted_borrow(self, scenario_type, direction, from_index, to_index)').body[0]
                         after=ast.parse('self._ep_preentry_gap_rechecks += 1\nself._ep_entry_gap_evaluated = True\n'
-                            'self._ep_entry_gap_key = (scenario_type, int(from_index), int(to_index))').body
-                        return [node,*[ast.copy_location(item,node) for item in after]]
+                            'self._ep_entry_gap_key = (scenario_type, int(from_index), int(to_index))\n'
+                            'if path_clear:\n    self._ep_cleared_entries.add(self._ep_entry_gap_key)\n'
+                            'else:\n    self._ep_cleared_entries.discard(self._ep_entry_gap_key)').body
+                        return [ast.copy_location(permit,node),node,*[ast.copy_location(item,node) for item in after]]
                     return node
                 def visit_If(self,node):
-                    nonlocal gap_patches
+                    nonlocal gap_patches,missing_lane_patches
                     node = self.generic_visit(node)
+                    if (isinstance(node.test,ast.Compare) and isinstance(node.test.left,ast.Name)
+                            and node.test.left.id=='dot_product' and len(node.body)==1
+                            and isinstance(node.body[0],ast.Continue)):
+                        # Centres have passed but the vehicles' bodies can
+                        # still be alongside one another across the divider.
+                        node.body=ast.parse("if _past_ego_body(self, vehicle):\n    continue\n"
+                            "self._ep_gap_blocker=dict(actor_id=int(vehicle.id), reason='passing_body_not_clear')\n"
+                            "path_clear=False\nbreak").body
+                        return node
+                    if (isinstance(node.test,ast.Compare) and isinstance(node.test.left,ast.Name)
+                            and node.test.left.id in ('dot_product_2','other_vehicle_time')
+                            and isinstance(node.body[-1],ast.Break)):
+                        reason = 'vehicle_between_ego_and_return' if node.test.left.id=='dot_product_2' else 'arrival_gap_too_small'
+                        record=ast.parse("self._ep_gap_blocker = dict(actor_id=int(vehicle.id), reason=%r, "
+                            "ego_arrival_estimate_s=float(ego_time), opposing_arrival_estimate_s=%s)"%(
+                            reason, 'float(other_vehicle_time)' if reason=='arrival_gap_too_small' else 'None')).body[0]
+                        node.body.insert(0,ast.copy_location(record,node))
+                    if (isinstance(node.test,ast.Compare) and isinstance(node.test.left,ast.Name)
+                            and node.test.left.id=='target_lane' and len(node.body)==1
+                            and isinstance(node.body[0],ast.Return)):
+                        # The unmodified early return keeps the cruise speed
+                        # even if there is no lane into which the ego can pass.
+                        node.body[0].value=ast.parse('(0., False, speed_reduced_by_obj)',mode='eval').body
+                        node.body[:0]=ast.parse('scenario_data[6] = False\n'
+                            'self._ep_cleared_entries.discard((scenario_type, int(from_index), int(to_index)))').body
+                        missing_lane_patches+=1
+                        return node
                     if not isinstance(node.test,ast.BoolOp):
                         return node
                     matches=[item for item in node.test.values if isinstance(item,ast.UnaryOp)
@@ -508,14 +845,15 @@ def _expert_tree(text, filename):
                     return node
             RecheckEntryGap().visit(method)
             reset=ast.parse('self._ep_entry_gap_evaluated = False\nself._ep_entry_gap_key = None\n'
-                            'self._ep_gap_time_estimates = []').body
+                            'self._ep_gap_time_estimates = []\nself._ep_gap_blocker = None').body
             # Preserve the method's public docstring.
             method.body[1:1]=[ast.copy_location(item,method.body[0]) for item in reset]
     if patched != 1:
         raise ValueError('Unexpected NPC cleanup shape in pinned expert')
     if decision_patches != 1:
         raise ValueError('Unexpected decision recording shape in pinned expert')
-    if hazard_patches != 1 or gap_patches != 1 or gap_result_patches != 1 or gap_time_patches != 1:
+    if (hazard_patches != 1 or gap_patches != 1 or gap_result_patches != 1 or gap_time_patches != 1
+            or missing_lane_patches != 1):
         raise ValueError('Unexpected cautious demonstration control/gap shape in pinned expert')
     effects = _side_effects(tree)
     if effects:
@@ -618,6 +956,10 @@ class OfficialExpert:
             _no_npc_deletion=self._reject_npc_deletion,_disabled_recorder=_disabled_recorder,
             _decision_record=_decision_record,_ep_cautious_target=_ep_cautious_target,
             _maneuver_record=_maneuver_record,_ep_before_opposing_entry=_ep_before_opposing_entry,
+            _update_return_reference=_update_return_reference,_permitted_borrow=_permitted_borrow,
+            _control_reference=_control_reference,
+            _borrow_release=_borrow_release,_TWO_WAY=_TWO_WAY,
+            _past_ego_body=_past_ego_body,
             _ep_cautious_gap_time=_ep_cautious_gap_time)
         exec(compile(_expert_tree(path.read_text(encoding='utf-8'),str(path)),str(path),'exec'),module.__dict__)
         pilot = module.AutoPilot(None)
@@ -630,6 +972,11 @@ class OfficialExpert:
         pilot.config.steer_noise = 0.
         pilot._ep_preentry_gap_rechecks = 0
         pilot._ep_committed_maneuvers = set()
+        pilot._ep_cleared_entries = set()
+        pilot._ep_waiting_reference = None
+        pilot._ep_adjusted_returns = set()
+        pilot._ep_crossing_permissions = {}
+        pilot._ep_release_indices = {}
         pilot._ep_entry_commit_evidence = {}
         pilot._ep_gap_time_estimates = []
         from .demonstration_policy import CautiousDemonstrationPolicy
@@ -651,6 +998,8 @@ class OfficialExpert:
             points_per_meter=pilot.config.points_per_meter,construction_transitions=transitions,
             hazard_bypass_removed=True,preentry_opposing_gap='recheck_every_frame_in_activation_window',
             committed_maneuver='do_not_stop_from_cached_gap_alone;current_actor_and_traffic_checks_remain',
+            crossing_permission='both_crossings_checked_on_their_departing_lane',
+            return_adaptation='current_opposing_vehicle_and_clear_smooth_earlier_reference',
             scope='offline_demonstration_only;private_ego_reference_not_official_route_or_NPC_mutation')
         # The NPY map limit has upstream preprocessing and can differ from the
         # vehicle's live limit. Preserve the original 72% default; changing the
@@ -704,6 +1053,9 @@ class OfficialExpert:
         try:
             control = self._pilot.run_step(input_data,timestamp)
         finally:
+            if self._pilot._ep_waiting_reference is not None:
+                self._pilot._waypoint_planner.route_points = self._pilot._ep_waiting_reference
+                self._pilot._ep_waiting_reference = None
             self._provider.finish()
         if world.get_snapshot().frame != frame:
             raise RuntimeError('World advanced during expert control calculation')

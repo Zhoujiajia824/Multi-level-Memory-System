@@ -574,6 +574,9 @@ evaluator 独占世界推进；采集 Agent 不创建或删除周车、不修改
 车辆、红灯及停牌检查；不因`keep_driving`关闭危险检查。参考横移开始不等于实际已
 进入借道，进入前根据当前车体和原车道边界重查对向窗口。私有施工横移参考至少用
 10米过渡，TwoWays原4米过渡被延长；官方原始导航、地图和周车不改。
+等待间隙时，自车转向和车辆运动预测继续沿原车道。实际借道后，专家根据当前对向车、
+原车道障碍物和剩余空间检查提前归道的候选轨迹。采用候选时记录当帧来车 ID 和
+归道参考终点实际前移距离。最终车身是否顺利并回，以实测执行、恢复段和录像审核为准。
 
 `demonstration_policy.py`仅给采集专家施加当前帧速度上限，不被论文A/B/C控制链调用。
 常规速度同时受当前车辆接口限速约束，不把NPY上取整后的100km/h直接当作城市街道
@@ -609,7 +612,13 @@ evaluator 独占世界推进；采集 Agent 不创建或删除周车、不修改
 留在待整理任务的来源中。冻结库后再测试，不用测试失败记录补充该库。
 当前的相机、地面和驾驶问题仍需分别验证，这一划分不代表20条已实际成功。
 
-快速采集使用`--selected-collection --run`，默认`--capture-mode interaction_segment`；
+正式记忆采集入口为 `scripts/collect_fail2drive_interactions.py`，默认在官方 evaluator 上运行冻结采集集的原始交互片段。
+先用 `--fail2drive-root "$F2D_SOURCE" --list --route-ids 1020` 核对原始路线、地图、事件类型及 XML 中指定的演员。
+正式采集使用 `--fail2drive-root "$F2D_SOURCE" --simulator-root "$F2D_CARLA" --worker-python "$NUM_PY" --route-ids 1020 --run`，由原定制 SDK Python 启动。
+每条完成后立即调用数值环境执行 `finalize`。仅允许官方最低速度扣分时显式加 `--allow-min-speed-only`。通过后结果给出 `review_video`，该条仍待人工看片。
+例如 1020 的十个花园矮人和对向车流由官方场景加载，配对的 0020 使用常规施工障碍。每次补采可省略 `--output-dir`，让程序生成新的官方采集目录。
+
+底层官方入口快速采集使用`--selected-collection --run`，默认`--capture-mode interaction_segment`；
 单条补采使用`--route-ids <采集ID> --capture-mode interaction_segment`。从原官方起点、
 原seed正常运行，记录目标交互出现、应对及恢复5秒后，由采集专用hook在官方tick和
 criteria更新后停止manager；不移动起点、不改NPC或场景触发，不给正式测评增加短时限。
@@ -679,7 +688,7 @@ criteria更新后停止manager；不移动起点、不改NPC或场景触发，�
 Town13 的动物横穿使用动物实体，具体蓝图和独立布置的车辆、物体都随采集保存。
 加 `--interaction-only` 后，自车完成交互、驶过冲突位置并稳定行驶，保存恢复后的3秒观测即结束片段。
 
-十类配对采集使用 `scripts/collect_fail2drive_interactions.py`。传入 `--fail2drive-root <devkit> --output-dir output/teaching_clips` 可离线核对20条设计。用 SDK Python 执行同一命令，加 `--worker-python <数值Python> --allow-map-load --allow-similar-road --run` 开始采集。可用 `--route-ids 1010` 单独试采一条，再去掉该选项续采整组。所有运行请使用相同的选址设置。
+独立开发重建及历史批次续采使用 `scripts/collect_fail2drive_reconstructions.py`。传入 `--fail2drive-root <devkit> --output-dir output/teaching_clips` 可离线核对20条设计。用 SDK Python 执行同一命令，加 `--worker-python <数值Python> --allow-map-load --allow-similar-road --run` 可复现过去的独立教学采集。已有 `teaching20_*` 和 `priority6_*` 目录的来源仍是重建场景。
 
 两个采集编号对应同类的两种教学交互，具体演员、布置、触发和示范速度见离线清单与每轮 `demonstration_design.json`。某些官方 Base 没有对应长尾事件，该编号的重建会加入交互。允许相似道路时，采集器优先尝试原采集锚点，并记录最终事件位置与改选原因。每条视频在 `clips/<编号>_try_<次数>/planning/video.mp4`。机器审核通过的片段列在 `review_paths.txt`，人工审片后再送工作台。
 
