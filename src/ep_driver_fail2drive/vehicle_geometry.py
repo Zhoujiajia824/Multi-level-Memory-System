@@ -11,6 +11,7 @@ import math
 
 
 SCHEMA = "ep-driver-f2d-wheel-geometry-1.0"
+POSE_ROTATION_TOLERANCE_DEG = .02
 
 
 def json_safe(value):
@@ -64,6 +65,26 @@ def _multiply(left, right):
              for j in range(4)] for i in range(4)]
 
 
+def pose_rotation_agreement(left, right):
+    """Compare source-bound rotations without correcting either raw pose.
+
+    For proper rotations, ||R1-R2||F = 2*sqrt(2)*sin(theta/2). This remains
+    stable near zero for the SDK's float32 matrices. The 0.02-degree limit
+    bounds rotation-induced displacement to 1.05mm at a 3m lever arm; matrix
+    rigidity, exact frame/time and wheel/body checks remain independent.
+    """
+    left,right=_rigid_matrix(left),_rigid_matrix(right)
+    differences=[left[i][j]-right[i][j] for i in range(3) for j in range(3)]
+    norm=math.sqrt(math.fsum(value*value for value in differences))
+    angle=2.*math.asin(min(1.,norm/(2.*math.sqrt(2.))))
+    tolerance=math.radians(POSE_ROTATION_TOLERANCE_DEG)
+    return dict(rotation_max_error=max(abs(value) for value in differences),
+        rotation_angle_error_rad=angle,rotation_angle_error_deg=math.degrees(angle),
+        rotation_angle_tolerance_rad=tolerance,rotation_angle_tolerance_deg=POSE_ROTATION_TOLERANCE_DEG,
+        rotation_within_tolerance=angle<=tolerance,
+        rotation_comparison='proper_rotation_frobenius_angular_difference',rotation_matrices_corrected=False)
+
+
 def measure_vehicle_geometry(*, actor_transform_matrix_m, wheels, bbox_center_m, bbox_extent_m,
                              sensor_pose, frame, timestamp, bbox_heading_deg=0.):
     """Return verified, fixed body geometry and auditable source measurements.
@@ -103,10 +124,10 @@ def measure_vehicle_geometry(*, actor_transform_matrix_m, wheels, bbox_center_m,
         camera_mount = _rigid_matrix(sensor_pose["camera_mount_matrix_m"])
         actor_ue = _multiply(camera_world, _inverse(camera_mount))
         evidence["actor_ue_world_matrix_m"] = actor_ue
-        rotation_error = max(abs(actor_ue[i][j]-actor_global[i][j]) for i in range(3) for j in range(3))
-        evidence["rotation_max_error"] = rotation_error
+        agreement = pose_rotation_agreement(actor_ue,actor_global)
+        evidence.update(agreement)
         evidence["global_minus_ue_origin_m"] = [actor_global[i][3]-actor_ue[i][3] for i in range(3)]
-        if rotation_error > 1e-4:
+        if not agreement['rotation_within_tolerance']:
             raise ValueError("raw camera and snapshot vehicle rotations disagree")
         inverse = _inverse(actor_ue)
         local = [[sum(inverse[i][j]*([v*.01 for v in wheel]+[1.])[j] for j in range(4))

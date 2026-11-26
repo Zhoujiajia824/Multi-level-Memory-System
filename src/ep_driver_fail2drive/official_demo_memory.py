@@ -343,25 +343,8 @@ def _matrix(value):
 
 
 def _calibration(root,row):
-    manifest=_json(_contained(root,row['camera_manifest']))
-    cameras=manifest.get('cameras',[])
-    if {c.get('view') for c in cameras}!=CAMERAS:
-        raise ValueError('Official source requires the exact six camera views')
-    corrected=[]
-    for camera in cameras:
-        world_to_camera=camera.get('world_to_camera_ue')
-        offset=camera.get('api_global_minus_ue_origin_m')
-        if (not _matrix(world_to_camera) or not isinstance(offset,list) or len(offset)!=3
-                or not all(map(_number,offset))):
-            raise ValueError('Missing same-frame UE/global camera calibration evidence')
-        global_matrix=deepcopy(world_to_camera)
-        # p_UE = p_API - offset; camera = W2C_UE @ p_UE.
-        for i in range(3):
-            global_matrix[i][3]-=sum(world_to_camera[i][j]*offset[j] for j in range(3))
-        corrected.append(dict(view=camera['view'],frame=_frame(camera),timestamp=camera['timestamp'],
-            world_to_camera_global=global_matrix,world_to_camera_ue=world_to_camera,
-            api_global_minus_ue_origin_m=offset,source_manifest=row['camera_manifest']))
-    return corrected
+    from .camera_calibration import global_camera_calibration
+    return global_camera_calibration(_json(_contained(root,row['camera_manifest'])),row['camera_manifest'])
 
 
 def _execution(root):

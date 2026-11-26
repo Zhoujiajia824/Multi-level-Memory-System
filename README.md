@@ -672,18 +672,22 @@ criteria更新后停止manager；不移动起点、不改NPC或场景触发，�
 未入库路线案例对照，不作未见类别/城市或完整排行榜成绩主张；每类一个案例不能替代
 该类别的重复试验，也不保证检索到一条记忆就一定通行。
 
-# 旧独立长尾示范采集（代理开发数据）
+# 独立长尾驾驶示范采集
 
-`config/fail2drive_demonstrations.json` 为17类机制各定义一项独立设计；配置中的
-`pending_execution` 不是成功经验。使用标准CARLA资产和独立开发地图，不读取正式
-Town13路线或未来事件答案。动物、物体图案等代理的视觉差异保留在每项 `proxy` 中，
-不能据此宣称复现官方异常外观或完全未见机制泛化。
+`config/fail2drive_demonstrations.json` 包含17类交互的设计。用 `--map Town13` 按所需车道几何选择示范地点。
+也可以用 `--collection-route-id` 和 `--fail2drive-root` 选择已划入采集集的原始事件地点。两种方式均由示范脚本布置交通参与者。
+Town13 的动物横穿使用动物实体，具体蓝图和独立布置的车辆、物体都随采集保存。
+加 `--interaction-only` 后，自车完成交互、驶过冲突位置并稳定行驶，保存恢复后的3秒观测即结束片段。
+
+十类配对采集使用 `scripts/collect_fail2drive_interactions.py`。传入 `--fail2drive-root <devkit> --output-dir output/teaching_clips` 可离线核对20条设计。用 SDK Python 执行同一命令，加 `--worker-python <数值Python> --allow-map-load --allow-similar-road --run` 开始采集。可用 `--route-ids 1010` 单独试采一条，再去掉该选项续采整组。所有运行请使用相同的选址设置。
+
+两个采集编号对应同类的两种教学交互，具体演员、布置、触发和示范速度见离线清单与每轮 `demonstration_design.json`。某些官方 Base 没有对应长尾事件，该编号的重建会加入交互。允许相似道路时，采集器优先尝试原采集锚点，并记录最终事件位置与改选原因。每条视频在 `clips/<编号>_try_<次数>/planning/video.mp4`。机器审核通过的片段列在 `review_paths.txt`，人工审片后再送工作台。
 
 `scripts/capture_fail2drive_demo.py list` 列出设计；`check --scenario Wall` 只核查配置，
 不连接CARLA。实际 `capture --scenario Wall --worker-python <现有数值Python>` 由现有
 CARLA SDK环境执行，只接受空闲专用世界；需要换图时显式加 `--allow-map-load`。
 默认录制1920×1080、20Hz示例视角视频，1Hz保存严格同帧六相机与状态、20Hz保存
-实测控制和独立物理审计。所有产物只进入本分支 `output/demonstrations/`，不覆盖旧轮次。
+实测控制和独立物理审计。采集产物保存在本分支 `output/` 下指定的目录，每次重试保留旧轮次。
 全封闭类保留60秒清障等待。教学参考与跟踪器仅用于离线采集，正式Agent/MPC不调用它。
 
 地图条件、蓝图、合法绕行或实测净空不满足时拒绝采集；碰撞、离路、规则违规、

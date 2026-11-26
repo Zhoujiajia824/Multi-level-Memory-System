@@ -90,12 +90,20 @@ class SegmentRuntime:
                 row['active']=_status(trigger)=='SUCCESS' and row['main_status'] in ('RUNNING','SUCCESS')
                 row['ended']=row['active'] and row['main_status']=='SUCCESS'
                 row['timeout']=any(getattr(node,'_scenario_timeout',False) is True for node in _walk(scenario.behavior_tree))
-                actors=list(scenario.other_actors)
+                actors=list(getattr(scenario,'other_actors',()) or ())
+                # CustomObstacle/CustomObstacleTwoWays retain their real props
+                # here without adding them to BasicScenario.other_actors. Read
+                # only actor references; the paired transforms are future spawn
+                # poses, never evidence of a currently observed physical body.
+                actors.extend(item[0] for item in (getattr(scenario,'_construction_transforms',()) or ()) if item)
                 # ConstructionObstaclePedestrian registers the crossing walker
                 # as `adversary`, not in BasicScenario.other_actors.
                 adversary=getattr(scenario,'adversary',None)
-                if adversary is not None and all(a.id!=adversary.id for a in actors):actors.append(adversary)
+                if adversary is not None:actors.append(adversary)
+                seen=set()
                 for actor in actors:
+                    if actor is None or actor.id in seen:continue
+                    seen.add(actor.id)
                     frozen=snapshot.find(actor.id)
                     if frozen is None:continue
                     pose=frozen.get_transform();distance=math.dist([pose.location.x,pose.location.y],[ego_pose.location.x,ego_pose.location.y])

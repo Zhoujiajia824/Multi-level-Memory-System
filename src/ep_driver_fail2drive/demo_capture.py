@@ -13,19 +13,107 @@ import time
 import traceback
 
 from .archive import RouteArchive, _png
+from .demo_catalog import capture_implementation
 from .demo_events import DemoEvents
-from .demo_routes import select_route, teaching_path
+from .demo_routes import select_demonstration_site, teaching_path
 from .demo_teacher import DemoTeacher, SCHEMA as TEACHER_SCHEMA
 from .execution import SignedAccelerationController
 from .public_state import PublicStateExtractor
-from .route import xy, point_in_polygon, project
+from .route import xy, point_in_polygon, project, lane_key
 from .vehicle_geometry import measure_vehicle_geometry
+from .camera_calibration import source_camera_calibration
 from nine_grid.paths import filesystem_path
 
 HZ = 20
 LOG = logging.getLogger(__name__)
 VIEWS = (('front_rgb', 0), ('front_left_rgb', -60), ('front_right_rgb', 60),
          ('back_rgb', 180), ('back_left_rgb', -120), ('back_right_rgb', 120))
+
+
+class InteractionCaptureWindow:
+    """Observed short-recovery tail, independent of benchmark completion.
+
+    Completion does not generate controls: an actual event must finish, the
+    car must pass its position and return from an authored bypass, and four
+    actual 1Hz source observations must cover a continuous recovery interval.
+    """
+    SCHEMA='independent-demo-interaction-segment-1.0'
+
+    def __init__(self,spec,waypoints,actor_rows):
+        self.route=[xy(wp.transform.location) for wp in waypoints]
+        self.lanes=[lane_key(wp) for wp in waypoints]
+        stations=[float(row['interaction_station_m']) for row in actor_rows]
+        if not stations or not all(math.isfinite(s) for s in stations):
+            raise ValueError('Interaction collection requires actual finite hazard stations')
+        self.gate=max(stations)+5.
+        if spec['interaction_kind'] in ('parked_bypass','construction_bypass','construction_crossing'):
+            blockers=[float(row['config']['s_offset_m']) for row in actor_rows
+                      if row['config'].get('lane_offset',0)==0]
+            if not blockers:raise ValueError('Bypass collection lacks its authored return section')
+            # Same return_end used by demo_routes.teaching_path, not an
+            # arbitrary distance at which a still-borrowing car is accepted.
+            self.gate=max(self.gate,max(blockers)+25.)
+        self.start = None
+        self.anchor = None
+        self.sources = []
+        self.complete = False
+        self.last = None
+
+    def update(self,scene,event_complete,*,saved_source,audit):
+        if self.complete:raise ValueError('Interaction collection already has a completed recovery tail')
+        frame=scene['diagnostics']['carla_frame'];stamp=scene['time']
+        if type(frame) is not int or type(stamp) not in (int,float) or not math.isfinite(stamp):
+            raise ValueError('Invalid actual recovery source frame/time')
+        if self.last is not None and (frame!=self.last['frame']+1 or abs(stamp-self.last['time']-1/HZ)>1e-5):
+            raise ValueError('Interaction recovery requires consecutive actual physical sources')
+        observed=scene['ego'];speed=math.hypot(*observed['velocity'])
+        projection=project(observed['position'],self.route,heading=observed['heading'])
+        i=projection['segment_index']
+        lane_match=observed.get('lane_id') in self.lanes[max(0,i-1):min(len(self.lanes),i+3)]
+        valid=(scene['diagnostics']['route_projection'].get('valid') is True and audit.get('projection_valid') is True)
+        progress=scene['diagnostics']['route_projection'].get('trusted_progress_m')
+        finite_progress=type(progress) in (int,float) and math.isfinite(progress)
+        safe=all(audit.get(k) is False for k in ('collision','offroad','rule_violation'))
+        past_gate=finite_progress and progress>=self.gate
+        stable=(event_complete and past_gate and valid and safe and lane_match and speed>=.5
+                and projection['distance_m']<=1. and projection['heading_error_rad']<=.35)
+        evidence=dict(source_frame=frame,source_time=stamp,interaction_complete=bool(event_complete),
+            progress_m=progress,pass_gate_s_m=self.gate,past_gate=bool(past_gate),projection_valid=valid,
+            route_lane_match=lane_match,projection_distance_m=projection['distance_m'],
+            heading_error_rad=projection['heading_error_rad'],speed_mps=speed,stable_recovery=bool(stable))
+        events=[];self.last=dict(frame=frame,time=stamp)
+        if stable:
+            if self.start is None:
+                self.start=dict(frame=frame,time=stamp)
+                events.append(dict(phase='recovery',event='recovery_started',completed=False,
+                    observed_progress_m=progress,pass_gate_s_m=self.gate))
+            if saved_source:
+                if self.sources and frame - self.sources[-1]['frame'] != HZ:
+                    self.sources.clear()
+                if not self.sources:
+                    self.anchor = dict(frame=frame,time=stamp)
+                self.sources.append(dict(frame=frame,time=stamp))
+                if len(self.sources) == 4:
+                    self.complete = True
+                    events.append(dict(phase='recovery',event='recovery_completed',completed=True,
+                        observed_progress_m=progress,pass_gate_s_m=self.gate,
+                        recovery_anchor_frame=self.anchor['frame'],recovery_anchor_time=self.anchor['time'],
+                        future_source_frames=[row['frame'] for row in self.sources],
+                        future_source_times=[row['time'] for row in self.sources]))
+        elif self.start is not None:
+            events.append(dict(phase='recovery',event='recovery_interrupted',completed=False,
+                observed_progress_m=progress,pass_gate_s_m=self.gate))
+            self.start=self.anchor=None;self.sources=[]
+        return evidence,events
+
+    def report(self):
+        def field(row,key):return None if row is None else row[key]
+        return dict(schema=self.SCHEMA,complete=self.complete,pass_gate_s_m=self.gate,
+            recovery_start_frame=field(self.start,'frame'),recovery_start_time=field(self.start,'time'),
+            recovery_anchor_frame=field(self.anchor,'frame'),recovery_anchor_time=field(self.anchor,'time'),
+            future_source_frames=[r['frame'] for r in self.sources],future_source_times=[r['time'] for r in self.sources],
+            end_frame=field(self.last,'frame'),end_time=field(self.last,'time'),
+            official_score=False,scope='independent_interaction_segment')
 
 
 def atomic_json(path, value):
@@ -223,7 +311,10 @@ def _body_audit(scene, previous, collisions, line_events):
             projection_valid=False,audit_input_valid=False,audit_errors=['invalid physical audit input: '+str(exc)])
 
 
-def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=False, video=True):
+def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=False, video=True,
+            interaction_only=False, allow_similar_road=False):
+    if type(interaction_only) is not bool:
+        raise ValueError('Interaction-only collection selection must be explicitly boolean')
     import carla
     import numpy as np
     output = filesystem_path(output_dir)
@@ -234,17 +325,17 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
         scenario=spec['id'], source='carla', source_version=None, split='independent_development',
         reference_driver=TEACHER_SCHEMA, seed=spec['seed'], test_only=False,
         complete=False, official_evaluation=False, record_hz=1, physics_hz=HZ,
+        capture_mode='interaction_segment' if interaction_only else 'full_route',
         frames_path='frames.jsonl', model_calls=0, retrieval_enabled=False,
         read_future_during_current_representation=False, parameters=spec,
         weather_preset='ClearNoon',seed_purpose='independent_site_order;not_an_engine_determinism_claim')
-    run['implementation_sha256'] = {name:hashlib.sha256((Path(__file__).parent/name).read_bytes()).hexdigest()
-        for name in ('demo_capture.py','demo_catalog.py','demo_events.py','demo_routes.py','demo_teacher.py',
-                     'public_state.py','traffic_rules.py','execution.py','vehicle_geometry.py')}
+    run['implementation_sha256'] = capture_implementation()
     archive.json('run.json', run)
     owned, sensors, world, saved, saved_weather, events = [], [], None, None, None, None
     restored, complete, reached = False, False, False
     collisions, line_events, errors = [], [], []
     audit_rows, recovery_complete, geometry = [], False, None
+    interaction_window=None
     try:
         client = carla.Client(host, int(port))
         client.set_timeout(30.)
@@ -268,16 +359,22 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
         settings.substepping = True
         settings.max_substep_delta_time = .01
         settings.max_substeps = 5
+        large_map = spec['map'] == 'Town13'
+        if large_map:
+            settings.tile_stream_distance = 650.
+            settings.actor_active_distance = 650.
         world.apply_settings(settings)
         world.set_weather(carla.WeatherParameters.ClearNoon)
-        waypoints = select_route(world, spec)
+        waypoints, site = select_demonstration_site(world, spec, allow_similar_road=allow_similar_road)
+        run['selected_site'] = site
         authored = teaching_path(waypoints, spec)
         route = [xy(wp.transform.location) for wp in waypoints]
         archive.json('demonstration_design.json', dict(spec=spec, route_xy=route, teaching_path_xy=authored,
-            source='independent_public_map_topology', official_route_used=False,
+            source=site['mode'], selected_site=site, collection_route_reference=spec.get('route_source'),
+            official_route_used=False, official_event_replayed=False,
             formal_evaluation_control=False, runtime_success_not_yet_verified=True))
         bp = world.get_blueprint_library().find('vehicle.tesla.model3')
-        bp.set_attribute('role_name', 'offline_demonstration_ego')
+        bp.set_attribute('role_name', 'hero' if large_map else 'offline_demonstration_ego')
         start = waypoints[0].transform
         pose = carla.Transform(carla.Location(x=start.location.x,y=start.location.y,z=start.location.z+.4),
                                carla.Rotation(pitch=start.rotation.pitch,yaw=start.rotation.yaw,roll=start.rotation.roll))
@@ -286,8 +383,13 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
             raise RuntimeError('Development ego spawn failed')
         owned.append(ego)
         ego.apply_control(carla.VehicleControl(brake=1.))
+        if large_map:
+            # Register the streaming hero before spawning the interaction actors.
+            world.tick(30.)
         events = DemoEvents(world, waypoints, spec, carla)
         archive.json('demonstration_actors.json', events.spawn())
+        if interaction_only:
+            interaction_window=InteractionCaptureWindow(spec,waypoints,events.rows)
         barrier = FrameBarrier([name for name, _ in VIEWS]+['rgb'])
         mounts = {}
         for name, yaw in (*VIEWS, ('rgb', 0)):
@@ -380,14 +482,21 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                 actual_steering_rad=-actual.steer*steering)
             returned = carla.VehicleControl(throttle=control['throttle'],brake=control['brake'],
                                            steer=control['steer_normalized_right'],hand_brake=False)
-            archive.append('execution', dict(frame=frame,time=stamp,applied_control=_control(actual),
+            execution=dict(frame=frame,time=stamp,applied_control=_control(actual),
                 returned_control=_control(returned), observed_ego=scene['ego'],
-                teacher=command,controller=control,audit=audit))
+                teacher=command,controller=control,audit=audit)
             audit_rows.append(audit)
             for event in events.update(scene,1/HZ):
                 archive.append('event_evidence', dict(frame=frame,time=stamp,**event))
             progress = scene['diagnostics']['route_projection'].get('trusted_progress_m')
-            if events.completed and progress is not None:
+            if interaction_window is not None:
+                recovery_evidence,recovery_events=interaction_window.update(scene,events.completed,
+                    saved_source=saved_source,audit=audit)
+                execution['interaction_recovery']=recovery_evidence
+                for event in recovery_events:
+                    archive.append('event_evidence',dict(frame=frame,time=stamp,**event))
+                recovery_complete=interaction_window.complete
+            elif events.completed and progress is not None:
                 completion_s = events.completion_progress_m
                 if completion_s is None:
                     raise RuntimeError('Completed event lacks actual completion progress')
@@ -397,6 +506,7 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                 if not recovery_complete and progress >= completion_s+float(spec['recovery_m']):
                     recovery_complete = True
                     archive.append('event_evidence', dict(frame=frame,time=stamp,phase='recovery',event='recovery_completed',completed=True))
+            archive.append('execution',execution)
             arrival = math.dist(scene['ego']['position'], route[-1]) < 1.5 and speed < .2
             correct_lane = scene['ego']['lane_id'] == '{}|{}|{}'.format(waypoints[-1].road_id,waypoints[-1].section_id,waypoints[-1].lane_id)
             if arrival and correct_lane and events.completed and recovery_complete:
@@ -411,19 +521,28 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                 native = 'native/%010d.png'%frame
                 _png(output/native, mosaic)
                 manifest_path = 'native/%010d.cameras.json'%frame
-                cameras = [dict(view=image['id'],rgb_path=Path(image['path']).relative_to(output).as_posix(),
-                    frame=frame,timestamp=stamp, camera_world_matrix_m=raw_images[image['id']].transform.get_matrix(),
-                    world_to_camera_ue=raw_images[image['id']].transform.get_inverse_matrix(),
-                    camera_mount_matrix_m=mounts[image['id']].get_matrix(),width=image['width'],height=image['height'],fov_deg=100.)
-                    for image in images]
+                origin=scene['diagnostics']['frozen_actor_origin_pose']['matrix_xyz_carla']
+                cameras=[]
+                for image in images:
+                    raw=raw_images[image['id']]
+                    calibration=source_camera_calibration(raw.transform.get_matrix(),mounts[image['id']].get_matrix(),origin)
+                    cameras.append(dict(view=image['id'],rgb_path=Path(image['path']).relative_to(output).as_posix(),
+                        frame=int(raw.frame),timestamp=float(raw.timestamp),width=image['width'],height=image['height'],fov_deg=100.,
+                        calibration_source='same_frame_raw_image_transform_and_frozen_actor_origin',**calibration))
+                residual=max(math.dist(c['api_global_minus_ue_origin_m'],cameras[0]['api_global_minus_ue_origin_m']) for c in cameras)
+                if residual>.02:
+                    raise ValueError('Same-frame rigid cameras disagree on the UE/global origin by %.6fm'%residual)
                 atomic_json(output/manifest_path,dict(frame_id=scene['frame_id'],time=stamp,carla_frame=frame,
-                    carla_timestamp=stamp,cameras=cameras))
+                    carla_timestamp=stamp,cameras=cameras,rigid_origin_residual_max_m=residual,rigid_origin_tolerance_m=.02))
                 archive.append('raw_frames',dict(frame=frame,time=stamp,route_id=output.name,scene=scene,images=images,
                     native_image=native,camera_manifest=manifest_path,audit=audit))
                 LOG.info('%s: sim=%.1fs frame=%d progress=%.2fm speed=%.2fm/s phase=%s interaction_complete=%s',
                     spec['id'],elapsed,frame,progress or 0.,speed,command['phase'],events.completed)
             if any(audit[k] for k in ('collision','offroad','rule_violation')) or not audit['projection_valid']:
                 raise RuntimeError('Demonstration failed actual physical audit: '+json.dumps(audit,ensure_ascii=False))
+            if interaction_window is not None and interaction_window.complete:
+                complete=True
+                break
             if reached and stamp-arrived_time >= 4.:
                 complete = True
                 break
@@ -490,6 +609,7 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
             errors.append('archive close: '+str(exc))
         # Video errors, teardown errors and unknown audits cannot certify data.
         evaluation = dict(protocol='ep-driver-f2d-demo-evaluation-1.0',
+            capture_mode=run['capture_mode'],
             reached=reached, interaction_complete=bool(events and events.completed),
             recovery_complete=recovery_complete, collision_count=len(collisions),
             offroad_count=sum(a['offroad'] for a in audit_rows),
@@ -498,7 +618,10 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
             world_settings_restored=restored,errors=errors,official_score=False,
             evidence='actual_20hz_execution_and_sensors_not_designed_reference',
             visual_proxy=spec['proxy'])
-        evaluation['passed'] = bool(complete and not errors and reached and evaluation['interaction_complete']
+        if interaction_window is not None:
+            evaluation['interaction_segment']=interaction_window.report()
+        goal_complete=(interaction_window.complete if interaction_window is not None else reached)
+        evaluation['passed'] = bool(complete and not errors and goal_complete and evaluation['interaction_complete']
             and recovery_complete and not evaluation['collision_count'] and not evaluation['offroad_count']
             and not evaluation['rule_violation_count'] and evaluation['projection_valid'] and restored)
         atomic_json(output/'demo_evaluation.json',evaluation)

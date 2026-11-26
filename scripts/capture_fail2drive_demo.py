@@ -21,15 +21,22 @@ def main(argv=None):
     parser.add_argument('command',choices=('list','check','capture'))
     parser.add_argument('--catalog')
     parser.add_argument('--scenario',help='One catalog id or family, never a formal route id')
-    parser.add_argument('--map',choices=('Town01','Town02','Town03','Town04','Town05','Town10HD_Opt'),
-                        help='Explicit alternative development map; never a formal test route')
+    parser.add_argument('--map',choices=('Town01','Town02','Town03','Town04','Town05','Town10HD_Opt','Town13'),
+                        help='Map for an independently selected road')
+    parser.add_argument('--collection-route-id', type=int,
+                        help='Recreate the interaction near this collection route on its original map')
+    parser.add_argument('--fail2drive-root', help='Official devkit containing fail2drive_split/')
     parser.add_argument('--seed',type=int,help='Explicit alternative development site seed')
     parser.add_argument('--host',default='127.0.0.1')
     parser.add_argument('--port',type=int,default=39000)
     parser.add_argument('--output-dir',help='New episode directory under branch output/')
     parser.add_argument('--worker-python',help='Existing numerical Python; required for actual capture/export')
     parser.add_argument('--allow-map-load',action='store_true',help='Allow required map load only after idle-world check')
+    parser.add_argument('--allow-similar-road',action='store_true',
+                        help='Allow a same-map site with the required topology if the collection anchor is unsuitable')
     parser.add_argument('--no-video',action='store_true',help='Video is on by default')
+    parser.add_argument('--interaction-only',action='store_true',
+                        help='End after the observed interaction, return to navigation and real three-second recovery images')
     args = parser.parse_args(argv)
     from ep_driver_fail2drive.demo_catalog import load_catalog,get_demonstration,catalog_digest,validate_catalog
     from nine_grid.paths import filesystem_path
@@ -52,8 +59,18 @@ def main(argv=None):
                         item['seed'] = args.seed
             catalog = validate_catalog(catalog)
             spec = get_demonstration(catalog,args.scenario)
+        if (args.collection_route_id is None) != (args.fail2drive_root is None):
+            parser.error('--collection-route-id and --fail2drive-root must be supplied together')
+        if args.allow_similar_road and args.collection_route_id is None:
+            parser.error('--allow-similar-road requires a collection route anchor')
+        if args.collection_route_id is not None:
+            if args.map is not None:
+                parser.error('The collection route supplies the map; omit --map')
+            from ep_driver_fail2drive.demo_catalog import with_collection_route_anchor
+            spec = with_collection_route_anchor(spec, args.fail2drive_root, args.collection_route_id)
         if args.command == 'check':
             print(json.dumps(dict(valid_design=True,spec=spec,catalog_sha256=catalog_digest(catalog),
+                capture_mode='interaction_segment' if args.interaction_only else 'full_route',
                 server_connected=False,executed=False,successful_memory_created=False),ensure_ascii=False,indent=2))
             return 0
         if not args.worker_python:
@@ -71,7 +88,9 @@ def main(argv=None):
         if check.returncode:
             raise ValueError('Selected numerical environment cannot import the capture converter')
         from ep_driver_fail2drive.demo_capture import capture
-        result = capture(spec,output,host=args.host,port=args.port,allow_map_load=args.allow_map_load,video=not args.no_video)
+        result = capture(spec,output,host=args.host,port=args.port,allow_map_load=args.allow_map_load,
+                         video=not args.no_video,interaction_only=args.interaction_only,
+                         allow_similar_road=args.allow_similar_road)
         command = [args.worker_python,'-c',
             'import sys;sys.path.insert(0,sys.argv[1]);from ep_driver_fail2drive.demo_export import export_capture;export_capture(sys.argv[2])',
             str(ROOT/'src'),str(output)]

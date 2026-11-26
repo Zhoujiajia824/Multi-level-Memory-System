@@ -534,6 +534,8 @@
     {
       "id": "demo_custom_obstacles",
       "family": "CustomObstacles",
+      "town13_interaction_asset": "static.prop.gnome",
+      "town13_description": "异常园艺摆件占据本车道，自车减速、观察可用车道、绕过后归道。",
       "map": "Town05",
       "seed": 731007,
       "interaction_kind": "construction_bypass",
@@ -695,7 +697,7 @@
       "supported_visual_proxy": false,
       "proxy": {
         "description": "前方标准车辆行驶后急刹、停车10秒并恢复，自车跟随响应。",
-        "limitations": "不复刻官方触发位置；禁用刹车灯仅作为可用能力，缺失则明确记录标准急刹代理。独立地图位置、全新种子及标准CARLA资产；不复制正式路线、事件参数或长尾测试资产，真实闭环通过后方可入库。",
+        "limitations": "前车制动时记录实测踏板与灯态，确认刹车灯熄灭。周车速度和触发时机按独立示范设计。",
         "official_visual_shift_reproduced": false
       },
       "actor_specs": [
@@ -810,6 +812,8 @@
     {
       "id": "demo_animals",
       "family": "Animals",
+      "town13_interaction_asset": "walker.animal.1009",
+      "town13_description": "动物从路侧横穿，自车让行，动物通过后恢复行驶。",
       "map": "Town05",
       "seed": 731011,
       "interaction_kind": "crossing",
@@ -1174,6 +1178,8 @@
     {
       "id": "demo_passable_obstacles",
       "family": "PassableObstacles",
+      "town13_interaction_asset": "static.prop.vendingmachine",
+      "town13_description": "路侧放置自动售货机，自车确认本车道可用宽度后保持车道通过。",
       "map": "Town05",
       "seed": 731016,
       "interaction_kind": "roadside_clear",

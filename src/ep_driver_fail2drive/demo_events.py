@@ -6,7 +6,7 @@ here describes the observed interaction, not successful/official driving.
 """
 import math
 
-from .demo_routes import station_waypoint, chain, _stop_controls_route
+from .demo_routes import station_waypoint, crossing_drive_path, _stop_controls_route
 from .route import xy, project, point_in_polygon, wrap
 
 
@@ -113,48 +113,10 @@ class DemoEvents:
         self.geometry_audit = None
 
     def _cross_branch(self, desired_station):
-        choices, seen = [], set()
-        for wp in self.waypoints:
-            if not wp.is_junction:
-                continue
-            junction = wp.get_junction()
-            if junction is None or junction.id in seen:
-                continue
-            seen.add(junction.id)
-            for entry, _ in junction.get_waypoints(self.carla.LaneType.Driving):
-                ahead = chain(entry, 35.)
-                if not ahead:
-                    continue
-                prefix, cursor = [], entry
-                for _ in range(10):
-                    options = list(cursor.previous(1.))
-                    if not options:
-                        break
-                    cursor = min(options, key=lambda item: abs(wrap(math.radians(
-                        item.transform.rotation.yaw-cursor.transform.rotation.yaw))))
-                    prefix.append(cursor)
-                path = list(reversed(prefix))+ahead
-                points = [xy(item.transform.location) for item in path]
-                arc = 0.
-                for a, b, left, right in zip(points, points[1:], path, path[1:]):
-                    direction = math.atan2(b[1]-a[1], b[0]-a[0])
-                    for c, d, route_wp in zip(self.route, self.route[1:], self.waypoints):
-                        cross = _intersection(a,b,c,d)
-                        route_heading = math.atan2(d[1]-c[1],d[0]-c[0])
-                        same_level = abs(left.transform.location.z-route_wp.transform.location.z) <= 1.5
-                        if cross is None or not same_level or abs(math.cos(wrap(direction-route_heading))) > .5:
-                            continue
-                        station = project(cross,self.route)['s_m']
-                        branch_station = arc+math.dist(a,cross)
-                        before = branch_station
-                        after = sum(math.dist(x,y) for x,y in zip(points,points[1:]))-branch_station
-                        if before >= 6. and after >= 10.:
-                            choices.append((abs(station-desired_station),station,branch_station,path))
-                    arc += math.dist(a,b)
-        if not choices:
+        result = crossing_drive_path(self.waypoints, desired_station)
+        if result is None:
             raise RuntimeError('No same-level driving branch with a real perpendicular route crossing and exit clearance')
-        _, station, branch_station, path = min(choices,key=lambda value:value[:3])
-        return path, station, branch_station
+        return result
 
     def _crossing_left_limit(self, waypoint):
         origin, yaw = waypoint.transform.location, math.radians(waypoint.transform.rotation.yaw)
@@ -237,6 +199,10 @@ class DemoEvents:
             if actor is None:
                 raise RuntimeError('Required actor spawn failed: '+config['id'])
             self.actors.append(actor)
+            if (self.spec.get('family')=='Animals' and self.spec.get('map')=='Town13'
+                    and role in ('crossing_actor','slow_lead')
+                    and actor.type_id!='walker.animal.1009'):
+                raise RuntimeError('Town13 Animals requires the actual 1075 walker.animal.1009 asset; no pedestrian substitute')
             if config['actor_type'] in ('obstacle','visual_proxy'):
                 actor.set_simulate_physics(False)
             # Make full-wall props' physical long axis road-normal. This is
@@ -258,6 +224,7 @@ class DemoEvents:
             self.rows.append(row)
             if config['actor_type'] == 'vehicle':
                 if role == 'braking_lead':
+                    self._clear_brake_light(actor)
                     self._drive_vehicle(row,self.waypoints,float(config['speed_mps']))
                 else:
                     actor.apply_control(self.carla.VehicleControl(brake=1.))
@@ -267,7 +234,14 @@ class DemoEvents:
                      interaction_station_m=row['interaction_station_m'],
                      branch_crossing_s_m=row['branch_crossing_s_m'],
                      stop_sign_id=row['stop_sign_id'],
-                     crossing_left_limit_m=row['crossing_left_limit_m']) for row in self.rows]
+                     crossing_left_limit_m=row['crossing_left_limit_m'],
+                     control_interface=('CARLA.WalkerControl' if row['config']['role'] in ('crossing_actor','slow_lead')
+                                        else 'CARLA.VehicleControl' if row['config']['actor_type']=='vehicle' else 'static_prop'),
+                     animal_asset_reference=(dict(route_id=1075,type_id='walker.animal.1009',parameter='walker',
+                         scope='asset_only;independent_site_and_events')
+                         if self.spec.get('family')=='Animals' and row['actor'].type_id=='walker.animal.1009' else None),
+                     initial_light_state=(int(row['actor'].get_light_state()) if row['config']['role']=='braking_lead' else None))
+                for row in self.rows]
 
     def validate_bodies(self, teaching_path, ego_width, ego_length=5.):
         """Return measured-footprint prechecks, never a physical safety proof."""
@@ -347,6 +321,32 @@ class DemoEvents:
         target_wp = min(path,key=lambda wp:math.dist(point,xy(wp.transform.location)))
         forward = target_wp.transform.get_forward_vector()
         actor.set_target_velocity(self.carla.Vector3D(x=speed*forward.x,y=speed*forward.y,z=speed*forward.z))
+
+    def _clear_brake_light(self,actor):
+        """Only the owned demonstration leader's Brake bit is suppressed."""
+        current=int(actor.get_light_state())
+        brake=int(self.carla.VehicleLightState.Brake)
+        actor.set_light_state(self.carla.VehicleLightState(current & ~brake))
+
+    def _observe_brake_light(self,row,scene,observed_speed):
+        """Read real actor state before commanding this tick, never infer it."""
+        actor=row['actor'];frame=scene['diagnostics'].get('carla_frame')
+        if type(frame) is not int:
+            raise ValueError('HardBrake light observation requires its actual source frame')
+        bits=int(actor.get_light_state());brake_bit=int(self.carla.VehicleLightState.Brake)
+        control=actor.get_control();applied_brake=float(getattr(control,'brake',0.))
+        if not math.isfinite(applied_brake) or not 0.<=applied_brake<=1.:
+            raise ValueError('Invalid actual leader brake pedal during light observation')
+        lit=bool(bits & brake_bit)
+        if applied_brake>0. and lit:
+            raise RuntimeError('HardBrake leader has an observed lit Brake lamp while actually braking')
+        if applied_brake>0. and not lit:
+            row['brake_without_lights_observed']=True
+        return dict(phase='interact',event='lead_brake_light_observed',actor_id=actor.id,
+            source_frame=frame,source_time=float(scene['time']),observed_light_state=bits,brake_light_bit=brake_bit,
+            brake_light_on=lit,observed_applied_brake=applied_brake,observed_speed_mps=observed_speed,
+            measurement='actual_Actor.get_light_state_and_Vehicle.get_control_in_paused_source_frame',
+            completed=False)
 
     def update(self, scene, dt):
         stamp,projection = float(scene['time']),scene['diagnostics']['route_projection']
@@ -448,8 +448,11 @@ class DemoEvents:
                                        observed_speed_mps=observed_speed,completed=False))
                 hold_complete = (row['brake_stopped_at'] is not None and
                                  stamp-row['brake_stopped_at']+1e-8 >= self.spec['wait_s'])
+                events.append(self._observe_brake_light(row,scene,observed_speed))
                 if not hold_complete:
+                    self._clear_brake_light(a)
                     a.apply_control(self.carla.VehicleControl(brake=1.))
+                    self._clear_brake_light(a)
                     if 'brake' not in row['actions']:
                         events.append(dict(phase='interact',event='lead_brake_commanded',actor_id=a.id,observed_speed_mps=observed_speed,completed=False))
                         row['actions'].add('brake')
@@ -459,7 +462,8 @@ class DemoEvents:
                         events.append(dict(phase='interact',event='lead_resume_commanded',actor_id=a.id,completed=False))
                     self._drive_vehicle(row,self.waypoints,speed)
                     moved = math.dist(xy(a.get_location()),row['resume_origin'])
-                    moving_complete.append(row['brake_observed'] and observed_speed > 1. and moved > 2.)
+                    moving_complete.append(row['brake_observed'] and row.get('brake_without_lights_observed') is True
+                                           and observed_speed > 1. and moved > 2.)
             elif role == 'cross_traffic_vehicle':
                 path = row['cross_path']
                 branch = project(xy(a.get_location()),[xy(wp.transform.location) for wp in path])

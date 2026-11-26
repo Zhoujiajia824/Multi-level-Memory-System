@@ -509,10 +509,21 @@ def run_plan(planned):
         if len(archives)==1 and fatal:
             result['failure_summary'],failure=_failure_summary(archives[0].parent,capture)
         elif fatal:
-            result['failure_summary']=dict(type=fatal,classification='capture_unavailable',
-                message='No unique complete Agent capture; inspect the preserved evaluator logs',
-                stdout_path=str(seed_root/'out'/('%04d_out.log'%route)),
-                stderr_path=str(seed_root/'err'/('%04d_err.log'%route)))
+            partial_failures=sorted(job['agent_output'].glob('agent/*/capture_failure.json'))
+            if not archives and len(partial_failures)==1:
+                # Initialization can create an archive and fail before the
+                # demonstration run header exists. Surface its actual error,
+                # while retaining the failed/uncertified capture disposition.
+                failed_path=partial_failures[0]
+                result['failure_summary'],failure=_failure_summary(failed_path.parent,None)
+                result['failure_summary'].update(failure_evidence_path=str(failed_path),
+                    capture_metadata_missing=True)
+                result['partial_capture_dir']=str(failed_path.parent)
+            else:
+                result['failure_summary']=dict(type=fatal,classification='capture_unavailable',
+                    message='No unique complete Agent capture; inspect the preserved evaluator logs',
+                    stdout_path=str(seed_root/'out'/('%04d_out.log'%route)),
+                    stderr_path=str(seed_root/'err'/('%04d_err.log'%route)))
         if segment_rejection:
             events=segment.get('events',[])
             last=events[-1] if isinstance(events,list) and events and isinstance(events[-1],dict) else {}

@@ -185,7 +185,13 @@ def _episode(root, requested_anchors=None):
         raise ValueError('Demonstration evidence file declarations are missing')
     required = {'run.json', 'raw_frames.jsonl', 'physical_events.json', *files.values()}
     evaluation = _json(_contained(root, files['demo_evaluation_path']))
-    for name in ('passed', 'reached', 'interaction_complete', 'recovery_complete', 'projection_valid'):
+    mode = run.get('capture_mode', 'full_route')
+    if mode not in ('interaction_segment', 'full_route') or evaluation.get('capture_mode', 'full_route') != mode:
+        raise ValueError('Capture and evaluation disagree on the demonstration mode')
+    short = mode == 'interaction_segment'
+    if type(evaluation.get('reached')) is not bool or (not short and not evaluation['reached']):
+        raise ValueError('Actual demonstration has not passed: reached')
+    for name in ('passed', 'interaction_complete', 'recovery_complete', 'projection_valid'):
         if evaluation.get(name) is not True:
             raise ValueError('Actual demonstration has not passed: '+name)
     for name in ('collision_count', 'offroad_count', 'rule_violation_count'):
@@ -269,6 +275,20 @@ def _episode(root, requested_anchors=None):
     if not all(min(row['time'] for row in phases[a]) < min(row['time'] for row in phases[b])
                for a, b in zip(PHASES, PHASES[1:])):
         raise ValueError('Actual approach/interaction/recovery evidence is out of order')
+    if short:
+        clip = evaluation.get('interaction_segment') or {}
+        anchor = clip.get('recovery_anchor_frame')
+        if type(anchor) is not int or clip.get('complete') is not True:
+            raise ValueError('Missing completed recovery window')
+        tail = [anchor + offset * 20 for offset in range(4)]
+        observed = {_frame(row):row['time'] for row in frames}
+        if (clip.get('future_source_frames') != tail or any(frame not in observed for frame in tail)
+                or clip.get('future_source_times') != [observed[frame] for frame in tail]
+                or clip.get('end_frame') != tail[-1] or _frame(execution[-1]) != tail[-1]):
+            raise ValueError('Recovery window does not match recorded 1Hz images and execution')
+        if not all(by_frame[frame].get('interaction_recovery', {}).get('stable_recovery') is True
+                   for frame in range(anchor, tail[-1]+1)):
+            raise ValueError('Recovery was interrupted during the recorded clip')
     eligible = []
     for row in frames:
         if all(any(_same(other['time'], row['time']+offset) for other in frames) for offset in (0., 1., 2., 3.)):
@@ -280,6 +300,27 @@ def _episode(root, requested_anchors=None):
         if not 1 <= len(anchors) <= 3:
             raise ValueError('Use one to three explicit anchors per demonstration')
         selected = [{'frame_id': row['snapshot']['frame_id'], 'time': row['time'], 'phase': 'explicit'} for row in anchors]
+    elif short:
+        activated = next((row for row in events if row.get('event') == 'activated'), None)
+        if activated is None:
+            raise ValueError('Clip lacks an observed interaction trigger')
+        # Save cues before intervention and the actual response. E.g. the end
+        # of a pedestrian crossing alone does not show why the driver yielded.
+        onset = activated['time']
+        handled = phases['interact'][0]['time']
+        during = [row for row in execution if onset <= row['time'] <= handled]
+        if not during:
+            raise ValueError('No executed controls within the interaction')
+        moving = [row for row in during if math.hypot(*row.get('observed_ego', {}).get('velocity', [])[:2]) > .2]
+        response = max(moving or during, key=lambda row: max(row['applied_control']['brake'],
+                                                             abs(row['applied_control']['steer'])))
+        selected, used = [], set()
+        for phase, target in [('approach', onset-1.), ('interact', response['time']), ('recovery', observed[anchor])]:
+            row = min(eligible, key=lambda item: abs(item['time']-target))
+            identity = row['snapshot']['frame_id']
+            if identity not in used:
+                selected.append(dict(frame_id=identity, time=row['time'], phase=phase))
+                used.add(identity)
     else:
         selected, used = [], set()
         for phase in PHASES:
@@ -302,6 +343,7 @@ def _episode(root, requested_anchors=None):
                 or _hash(_contained(root, name)) != expected):
             raise ValueError('Source evidence hash mismatch: '+name)
     return {'episode': str(root), 'scenario_family': run['scenario_family'], 'seed': run.get('seed'),
+            'capture_mode': mode, 'reached': evaluation['reached'],
             'driver': run['reference_driver'], 'capture_count': len(frames), 'execution_count': len(execution),
             'anchors': selected, 'source_manifest_sha256': _hash(root/'capture_manifest.json'),
             'source_hashes': sums, 'test_only': False, 'actual_success_evidence': True}
