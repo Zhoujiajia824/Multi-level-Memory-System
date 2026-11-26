@@ -18,6 +18,7 @@
     "disable_any_whitespace": true
   },
   "enable_thinking": false,
+  "sampling_backend": "pytorch",
   "dtype": "bfloat16",
   "gpu_memory_utilization": 0.9,
   "gpu_counts": [2, 4],

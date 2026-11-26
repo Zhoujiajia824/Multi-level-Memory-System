@@ -61,6 +61,8 @@ def load_service_profile(name="shared_qwen3_32b"):
         raise ValueError("Owned NAVSIM service requires compact xgrammar JSON output")
     if value.get("enable_thinking") is not False or value.get("dtype") != "bfloat16":
         raise ValueError("Owned 32B profile must use direct Instruct output and BF16")
+    if value.get("sampling_backend") != "pytorch":
+        raise ValueError("Owned 32B profile must use the PyTorch sampling backend")
     utilization = value.get("gpu_memory_utilization")
     if (isinstance(utilization, bool) or not isinstance(utilization, (int, float))
             or not math.isfinite(utilization) or not 0 < utilization < 1):

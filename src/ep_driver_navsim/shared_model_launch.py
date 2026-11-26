@@ -103,6 +103,9 @@ def cache_environment(profile, root, python):
     env.update(PYTHONDONTWRITEBYTECODE="1", PYTHONUNBUFFERED="1", HF_HUB_OFFLINE="1",
         TRANSFORMERS_OFFLINE="1", HF_HUB_DISABLE_TELEMETRY="1", DO_NOT_TRACK="1",
         VLLM_NO_USAGE_STATS="1", VLLM_DO_NOT_TRACK="1", FLASHINFER_DISABLE_VERSION_CHECK="1",
+        VLLM_USE_FLASHINFER_SAMPLER="0",
+        CC=str(python.parent / "x86_64-conda-linux-gnu-gcc"),
+        CXX=str(python.parent / "x86_64-conda-linux-gnu-g++"),
         CUDA_DEVICE_ORDER="PCI_BUS_ID", PATH=str(python.parent)+os.pathsep+"/usr/local/bin:/usr/bin:/bin")
     return env, sorted(set(folders.values()) | {"work", "logs", "toolchain"})
 
@@ -177,33 +180,69 @@ def _bind_gpus(plan, inventory):
     plan["environment"]["CUDA_VISIBLE_DEVICES"] = ",".join(inventory[str(i)]["uuid"] for i in plan["gpus"])
 
 
+def _python_layout(plan, env):
+    """Read only the selected interpreter's layout inside our read-only sandbox."""
+    prefix = plan["command"][:plan["command"].index("--")+1]
+    probe = ("import json,sys,sysconfig; "
+        "print(json.dumps(dict(executable=sys.executable, version=list(sys.version_info[:2]), "
+        "site_packages=sysconfig.get_path('platlib'))))")
+    try:
+        result = subprocess.run(prefix + [plan["python"], "-I", "-B", "-c", probe],
+            cwd=_child(Path(plan["runtime_root"]), "work"), env=env,
+            capture_output=True, text=True, check=True, timeout=20)
+        value = json.loads(result.stdout)
+        executable = Path(value["executable"]).resolve()
+        site = Path(value["site_packages"]).resolve()
+        version = value["version"]
+        if (executable != Path(plan["python"]).resolve() or not site.is_absolute()
+                or not site.is_relative_to(Path(plan["python"]).parent.parent.resolve())
+                or not isinstance(version, list) or len(version) != 2
+                or any(type(part) is not int for part in version)):
+            raise ValueError("unexpected interpreter layout")
+        return dict(site_packages=str(site), python_version=version)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        raise ValueError("Cannot confirm the selected owned interpreter's site-packages via the read-only probe") from None
+
+
 def _toolchain(plan, env):
-    """Expose read-only pip CUDA with link names created only in our runtime."""
-    venv = Path(plan["python"]).parent.parent
-    for cuda in sorted(venv.glob("lib/python*/site-packages/nvidia/cu13")):
-        if not (cuda / "bin/nvcc").is_file() or not (cuda / "include/cuda.h").is_file():
+    """Expose runtime libraries, without adopting an unverified CUDA compiler.
+
+    The installed nvcc and toolkit headers are not a matched compiler bundle.
+    The supported PyTorch sampler avoids the failing FlashInfer sampling JIT;
+    this does not claim to repair that bundle or disable CUDA version checks.
+    """
+    python = Path(plan["python"])
+    for key, filename in (("CC", "x86_64-conda-linux-gnu-gcc"), ("CXX", "x86_64-conda-linux-gnu-g++")):
+        compiler = python.parent / filename
+        if not compiler.is_file() or not os.access(compiler, os.X_OK):
+            raise ValueError("Required owned host compiler is not executable; no fallback: " + str(compiler))
+        env[key] = str(compiler)
+    layout = _python_layout(plan, env)
+    cuda = (Path(layout["site_packages"]) / "nvidia/cu13").resolve()
+    libraries = {path.resolve() for path in (cuda / "lib").glob("libcudart.so.*") if path.is_file()}
+    if len(libraries) != 1:
+        raise ValueError("Selected interpreter must have one identifiable CUDA runtime library; no fallback")
+    root = Path(plan["runtime_root"])
+    links = _child(root, "toolchain")
+    targets = {"libcudart.so": libraries.pop()}
+    driver = Path("/usr/lib/x86_64-linux-gnu/libcuda.so.1")
+    if driver.is_file():
+        targets["libcuda.so"] = driver
+    for name, target in targets.items():
+        link = links / name
+        if link.is_symlink() and link.resolve() == target.resolve():
             continue
-        root = Path(plan["runtime_root"])
-        links = _child(root, "toolchain")
-        targets = {"libcudart.so": next(iter(sorted((cuda / "lib").glob("libcudart.so.*"))), None)}
-        driver = Path("/usr/lib/x86_64-linux-gnu/libcuda.so.1")
-        if driver.is_file():
-            targets["libcuda.so"] = driver
-        for name, target in targets.items():
-            if target is None:
-                continue
-            link = links / name
-            if link.is_symlink() and link.resolve() == target.resolve():
-                continue
-            if link.exists() or link.is_symlink():
-                raise ValueError("Private toolchain link already differs; preserved: " + str(link))
-            link.symlink_to(target.resolve())
-        paths = [str(links), str(cuda / "lib")]
-        env.update(CUDA_HOME=str(cuda), CUDA_PATH=str(cuda),
-            PATH=str(cuda / "bin")+os.pathsep+env["PATH"],
-            LD_LIBRARY_PATH=os.pathsep.join(paths), LIBRARY_PATH=os.pathsep.join(paths),
-            FLASHINFER_EXTRA_LDFLAGS=" ".join("-L"+shlex.quote(path) for path in paths))
-        break
+        if link.exists() or link.is_symlink():
+            raise ValueError("Private toolchain link already differs; preserved: " + str(link))
+        link.symlink_to(target.resolve())
+    paths = [str(links), str(cuda / "lib")]
+    env.pop("CUDA_HOME", None)
+    env.pop("CUDA_PATH", None)
+    env.update(LD_LIBRARY_PATH=os.pathsep.join(paths), LIBRARY_PATH=os.pathsep.join(paths),
+        FLASHINFER_EXTRA_LDFLAGS=" ".join("-L"+shlex.quote(path) for path in paths))
+    plan["runtime_libraries"] = dict(layout, cuda_runtime_root=str(cuda),
+        sampling_backend=plan["profile"]["sampling_backend"], cuda_compiler_injected=False,
+        cuda_compiler_compatibility="not_certified; no CUDA_HOME, CUDA_PATH or nvcc PATH override")
 
 
 def start(plan):
