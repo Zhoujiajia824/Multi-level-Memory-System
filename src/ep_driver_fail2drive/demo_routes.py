@@ -262,7 +262,7 @@ def _bypass_stations(spec):
     return max(1., first-20.), first-8., last+10., last+25.
 
 
-def select_route(world, spec, *, near_xyz=None):
+def select_route(world, spec, *, near_xyz=None, rejected_crossing_xyz=None):
     road_map = world.get_map()
     if road_map.name.replace('\\', '/').split('/')[-1] != spec['map']:
         raise ValueError('actual development map differs from the selected catalog design')
@@ -333,6 +333,11 @@ def select_route(world, spec, *, near_xyz=None):
         waypoints = examined[:end_index+1]
         if event is not None and not _same_anchor_station(waypoints,hazard_station,event):
             continue
+        if rejected_crossing_xyz is not None:
+            location = station_waypoint(waypoints, hazard_station).transform.location
+            # Avoid selecting a slightly offset spawn on the same unwalkable patch.
+            if math.hypot(location.x-rejected_crossing_xyz[0], location.y-rejected_crossing_xyz[1]) < 30.:
+                continue
         stations = _stations(waypoints)
         if end_station > stations[-1]-2.:
             continue
@@ -371,20 +376,29 @@ def select_route(world, spec, *, near_xyz=None):
     raise NoSuitableSite('No legal development site satisfies '+spec['id']+'; try another explicit map/seed')
 
 
-def select_demonstration_site(world, spec, *, allow_similar_road=False):
+def select_demonstration_site(world, spec, *, allow_similar_road=False, unusable_site=None):
     if type(allow_similar_road) is not bool:
         raise ValueError('allow_similar_road must be boolean')
     source = spec.get('route_source')
     mode, reason = spec['route_policy'], None
-    try:
-        waypoints = select_route(world, spec)
-    except NoSuitableSite as original_error:
-        if not allow_similar_road or source is None:
-            raise
-        reason = str(original_error)
+    rejected_xyz = None
+    if unusable_site is not None:
+        if not allow_similar_road or source is None or spec['family'] != 'PedestrianOtherBlocker':
+            raise ValueError('A replacement crossing site requires an anchored pedestrian-blocker collection and an allowed similar road')
+        rejected_xyz = unusable_site['site_lane_center_xyz_carla_m']
+        reason = unusable_site.get('anchor_rejection') or 'No measured walkable crossing start on the collection anchor'
+    else:
+        try:
+            waypoints = select_route(world, spec)
+        except NoSuitableSite as original_error:
+            if not allow_similar_road or source is None:
+                raise
+            reason = str(original_error)
+    if reason is not None:
         local_spec = dict(spec, route_policy='independent_topology_selection')
         local_spec.pop('route_source')
-        waypoints = select_route(world, local_spec, near_xyz=source['trigger_xyz_carla_m'])
+        waypoints = select_route(world, local_spec, near_xyz=source['trigger_xyz_carla_m'],
+                                 rejected_crossing_xyz=rejected_xyz)
         mode = 'same_map_similar_road'
     station = min(float(actor['s_offset_m']) for actor in spec['actor_specs'])
     event = station_waypoint(waypoints, station)

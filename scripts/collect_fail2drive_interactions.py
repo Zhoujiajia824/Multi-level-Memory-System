@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import signal
 import shutil
 import subprocess
 import sys
@@ -143,15 +142,37 @@ def failure_reason(episode, evidence, stage):
     return '子进程未提供错误文本'
 
 
+def last_startup_step(episode):
+    try:
+        if (episode / 'execution.jsonl').is_file():
+            return None
+        stage = read_json(episode / 'startup_stage.json')
+    except (OSError, ValueError):
+        return None
+    if not isinstance(stage, dict) or stage.get('status') != 'entered':
+        return None
+    operation = stage.get('operation')
+    if not isinstance(operation, str) or not operation:
+        return None
+    step = dict(operation=operation)
+    if isinstance(stage.get('timeout_s'), (int, float)) and stage['timeout_s'] > 0:
+        step['timeout_s'] = stage['timeout_s']
+    return step
+
+
 def collect_one(tag, record, plan, root, args):
-    previous = sorted((root / 'clips').glob(tag + '_try_*'), reverse=True)
+    prefix = tag + '_try_'
+    previous = sorted((p for p in (root / 'clips').glob(prefix + '*')
+                       if p.is_dir() and p.name[len(prefix):].isdecimal()), reverse=True)
     def check(episode):
         return check_capture(episode, record, args.worker_python, root / 'logs' / (episode.name + '.check.json'))
     for path in previous:
         if check(path):
             return dict(status='ready_for_video_review', path='clips/' + path.name)
-    attempted = previous + list((root / 'logs').glob(tag + '_try_*.log'))
-    index = 1 + max((int(p.stem.rsplit('_', 1)[1]) for p in attempted), default=0)
+    attempted = previous + list((root / 'logs').glob(prefix + '*'))
+    # Audit artifacts share the attempt prefix (e.g. 0070_try_002.check.stderr.log).
+    numbers = [p.name[len(prefix):].partition('.')[0] for p in attempted]
+    index = 1 + max((int(n) for n in numbers if n.isdecimal()), default=0)
     episode = root / 'clips' / f'{tag}_try_{index:03d}'
     command = [sys.executable, str(ROOT / 'scripts/capture_fail2drive_demo.py'), 'capture',
                '--scenario', record['family'], '--collection-route-id', str(int(tag)),
@@ -165,15 +186,31 @@ def collect_one(tag, record, plan, root, args):
     log = root / 'logs' / (episode.name + '.log')
     with log.open('w', encoding='utf-8') as handle:
         result = subprocess.run(command, stdout=handle, stderr=subprocess.STDOUT, cwd=ROOT)
-    if result.returncode in (-signal.SIGINT, -signal.SIGTERM):
-        raise RuntimeError('Capture process terminated by signal: ' + str(-result.returncode))
     item = dict(path='clips/' + episode.name, capture_exit=result.returncode, log='logs/' + log.name)
     if result.returncode == 0 and check(episode):
         return dict(item, status='ready_for_video_review')
     stage = 'capture' if result.returncode else 'check'
     evidence = log if result.returncode else log.with_suffix('.check.json')
-    return dict(item, status='failed', failure_stage=stage, reason=failure_reason(episode, evidence, stage),
-                failure_log='logs/' + evidence.name)
+    reason = failure_reason(episode, evidence, stage)
+    item.update(status='failed', failure_stage=stage, reason=reason, failure_log='logs/' + evidence.name)
+    if result.returncode < 0 or (os.name == 'nt' and result.returncode >= 0xC0000000):
+        item['batch_stop_reason'] = 'capture_process_terminated'
+        step = last_startup_step(episode)
+        if step:
+            item['last_startup_step'] = step
+            detail = step['operation']
+            if 'timeout_s' in step:
+                detail += f"（RPC 时限 {step['timeout_s']:g} 秒）"
+            item['reason'] += '。最后记录的初始化步骤为 ' + detail
+    elif stage == 'capture':
+        try:
+            failure = read_json(episode / 'capture_failure.json')
+        except (OSError, ValueError):
+            failure = {}
+        if ((isinstance(failure, dict) and failure.get('failure_code') == 'world_not_idle')
+                or 'Demonstration collection requires an idle dedicated world' in reason):
+            item['batch_stop_reason'] = 'world_not_idle'
+    return item
 
 
 def main(argv=None):
@@ -237,6 +274,10 @@ def main(argv=None):
             else:
                 detail = item['path']
             print(f"[{tag}] {item['status']} ({len(ready)}/{len(routes)})  {detail}", flush=True)
+            if item.get('batch_stop_reason'):
+                print(f"本批次已停止（{item['batch_stop_reason']}，采集退出码 {item['capture_exit']}）。"
+                      f"请确认 {args.host}:{args.port} 专用世界空闲后再续跑。", flush=True)
+                return 2
         return 0 if all(results[t]['status'] == 'ready_for_video_review' for t in selected) else 2
 
 

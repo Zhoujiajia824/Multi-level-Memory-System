@@ -404,6 +404,7 @@ class RouteAdapter:
                                           position_xy=xy(wp.transform.location)))
         lanes = []
         self.lane_elevations = {}
+        self.lane_junctions = {}
         shared_edges,shared_audit=_shared_lane_edges(self.map,groups,lambda wp:
             abs(wp.transform.location.z-self.height_at(xy(wp.transform.location)))<=
             float(self.config.get('same_level_tolerance_m',1.5)))
@@ -441,6 +442,8 @@ class RouteAdapter:
                         line_type=name, **semantics, source='public_waypoint_marking_and_lane_change',
                         is_junction=bool(wp.is_junction)))
             middle = waypoints[len(waypoints)//2]
+            if self.config.get('teaching_junction_overlap', False) and middle.is_junction:
+                self.lane_junctions[key] = getattr(middle, 'junction_id', None)
             adjacent = {}
             for side in ('left','right'):
                 other = getattr(middle,'get_'+side+'_lane')()
@@ -465,6 +468,62 @@ class RouteAdapter:
             raise ValueError('Public map conversion is missing official route lanes: '+','.join(sorted(missing)))
         return lanes
 
+    def _junction_overlap(self, point, projection, observed):
+        """Resolve a local connector label ambiguity using the already observed trajectory."""
+        last = self.last_projection or {}
+        junction = getattr(self, 'lane_junctions', {}).get(observed)
+        if junction is None or junction < 0 or not last.get('valid') or projection['heading_error_rad'] > math.radians(10):
+            return None
+        lanes = {lane['id']: lane for lane in self.lanes}
+        reported = lanes[observed]
+        i = projection['segment_index']
+        for index in (i, i+1):
+            intended = lane_key(self.waypoints[index])
+            if self.lane_junctions.get(intended) != junction:
+                continue
+            planned = lanes[intended]
+            width = min(planned['width'], reported['width'])
+            tracking_tolerance = min(.3, width / 10.)
+            if (math.dist(point, self.previous_position) > width or projection['distance_m'] > tracking_tolerance
+                    or not all(point_in_polygon(point, lane['polygon']) for lane in (planned, reported))):
+                continue
+            p = project(point, planned['center'])
+            r = project(point, reported['center'])
+            if (p['distance_m'] > tracking_tolerance
+                    or abs(self.lane_height_at(intended, point)-self.lane_height_at(observed, point)) > .25):
+                continue
+            # Check the route occurrence here, not a lane elsewhere along a loop.
+            first = end = index
+            while first > 0 and lane_key(self.waypoints[first-1]) == intended:
+                first -= 1
+            while end+1 < len(self.waypoints) and lane_key(self.waypoints[end+1]) == intended:
+                end += 1
+            incoming = lane_key(self.waypoints[first-1]) if first else None
+            outgoing = lane_key(self.waypoints[end+1]) if end+1 < len(self.waypoints) else None
+            previous_lane = (last.get('junction_overlap') or {}).get('route_lane_id', last.get('observed_lane_id'))
+            turn = abs(wrap(p['heading_rad']-r['heading_rad']))
+            incoming_successors = lanes.get(incoming, {}).get('successors', ())
+            if (previous_lane in (incoming, intended) and intended in incoming_successors
+                    and observed in incoming_successors and turn <= math.radians(20)
+                    and max(p['s_m'],r['s_m']) <= width and math.dist(planned['center'][0],reported['center'][0]) <= .1):
+                kind = 'common_entry'
+            elif previous_lane != intended:
+                continue
+            elif (outgoing in planned['successors'] and outgoing in reported['successors'] and turn <= math.radians(20)
+                    and max(math.dist(point,lane['center'][-1]) for lane in (planned,reported)) <= width
+                    and math.dist(planned['center'][-1],reported['center'][-1]) <= .1):
+                kind = 'common_exit'
+            elif math.radians(45) <= turn <= math.radians(135):
+                # Across the crossing connector, physical heading follows the
+                # intended path. A vehicle taking the other path fails the
+                # heading/center checks, even inside the overlapping polygons.
+                kind = 'transverse_crossing'
+            else:
+                continue
+            return dict(kind=kind,junction_id=junction,route_lane_id=intended,observed_lane_id=observed,
+                        route_center_distance_m=p['distance_m'],connector_heading_difference_rad=turn)
+        return None
+
     def update(self, ego_position, ego_heading, frame, timestamp, speed, current_lane_id=None):
         if self.previous_frame == frame:
             return dict(self.last_projection)
@@ -476,6 +535,9 @@ class RouteAdapter:
         window = 25. if self.previous_s is None else max(6.,2.*min(travel,reachable)+2.)
         result = project(ego_position,self.points,0. if self.previous_s is None else self.previous_s,window,ego_heading)
         result.update(valid=True,reason='accepted',version=self.VERSION)
+        teaching_overlap = self.config.get('teaching_junction_overlap', False)
+        if teaching_overlap:
+            result['observed_lane_id'] = current_lane_id
         maximum = float(self.config.get('route_projection_maximum_distance_m', 6.))
         if result['distance_m'] > maximum:
             result.update(valid=False,reason='distance_exceeded')
@@ -498,7 +560,11 @@ class RouteAdapter:
                     nearest=min(edges,key=lambda edge:project(ego_position,edge['points'])['distance_m'])
                     legal_adjacent |= nearest['crossable']
             if not legal_adjacent:
-                result.update(valid=False,reason='current_lane_not_navigation_or_legal_adjacent')
+                overlap = self._junction_overlap(ego_position, result, current_lane_id) if teaching_overlap and result['valid'] else None
+                if overlap:
+                    result.update(reason='overlapping_junction_connectors', junction_overlap=overlap)
+                elif not teaching_overlap or result['valid']:
+                    result.update(valid=False,reason='current_lane_not_navigation_or_legal_adjacent')
         if result['valid']:
             self.previous_s = result['s_m']
         result['trusted_progress_m'] = self.previous_s

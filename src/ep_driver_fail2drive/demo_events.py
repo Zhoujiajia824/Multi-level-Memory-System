@@ -9,6 +9,8 @@ import math
 from .demo_routes import station_waypoint, crossing_drive_path, _stop_controls_route
 from .route import xy, project, point_in_polygon, wrap
 
+WALKABLE_SURFACES = frozenset(('Roads','RoadLines','Sidewalks','Ground','Terrain'))
+
 
 def _hull(points):
     """CARLA boxes return eight 3D vertices, not an ordered 2D polygon."""
@@ -113,7 +115,11 @@ def _adjacent_lanes(wp, *, right):
         yield cursor
 
 
-def _walker_starts(wp, lateral, crossing):
+class NoWalkableCrossingSurface(RuntimeError):
+    """Terrain ruled out the roadside starts for this occluded crossing."""
+
+
+def _walker_starts(wp, lateral, crossing, *, probe_edges=False):
     """Same route station. Keep crossing starts on the right and road walkers in their lane."""
     origin = wp.transform.location
     if not crossing:
@@ -135,7 +141,10 @@ def _walker_starts(wp, lateral, crossing):
             # A centre on a kerb/outer edge can pass a point-on-lane check while
             # the pedestrian capsule is already inside adjacent static geometry.
             inside = min(center+half-.4, max(center-half+.4, lateral))
-            for offset in (inside, center):
+            offsets = [inside, center]
+            if probe_edges:
+                offsets.extend((center+half-.4, center-half+.4))
+            for offset in offsets:
                 if abs(offset-lateral) <= max_side_shift and offset < -wp.lane_width/2.:
                     bands.append((offset, p.z, kind))
     bands.sort(key=lambda item: abs(item[0]-lateral))
@@ -188,14 +197,14 @@ class DemoEvents:
             limit = max(limit,left+cursor.lane_width/2.)
         return limit
 
-    def _spawn_walker(self, blueprint, wp, lateral, rotation, config):
+    def _try_walker_station(self, blueprint, wp, lateral, rotation, config, station, occluded):
         origin = wp.transform.location
         yaw = math.radians(wp.transform.rotation.yaw)
         crossing = config['role'] == 'crossing_actor'
         attempts = []
         self.walker_placements.append(dict(id=config['id'], blueprint=blueprint.id,
-            station_m=config['s_offset_m'], requested_lateral_m=lateral, attempts=attempts))
-        for offset, road_z, mapped in _walker_starts(wp, lateral, crossing):
+            station_m=station, designed_station_m=config['s_offset_m'], requested_lateral_m=lateral, attempts=attempts))
+        for offset, road_z, mapped in _walker_starts(wp, lateral, crossing, probe_edges=occluded):
             x, y = origin.x+offset*math.sin(yaw), origin.y-offset*math.cos(yaw)
             location = self.carla.Location(x=x, y=y, z=road_z+1.8)
             row = dict(lateral_m=offset, mapped_surface=mapped, xy_carla_m=[x,y], spawns=[])
@@ -207,15 +216,31 @@ class DemoEvents:
                 label = str(hit.label).split('.')[-1]
                 row['ray_label'] = label
                 row['ray_z_m'] = hit.location.z
+                # In Town13 the upper ray can start inside a vegetation mesh.
+                # Resolve the walking surface independently beneath that point.
+                if (occluded and mapped in ('Shoulder','Sidewalk') and label == 'Vegetation'
+                        and abs(hit.location.z-location.z) <= .1):
+                    low = self.carla.Location(x=x, y=y, z=road_z+.45)
+                    lower = self.world.ground_projection(low, .9)
+                    if (lower is None or not math.hypot(lower.location.x-x,lower.location.y-y) <= .15
+                            or not -.45 <= lower.location.z-road_z <= .46):
+                        row['rejected'] = 'near-ground sidewalk probe unresolved'
+                        continue
+                    label = str(lower.label).split('.')[-1]
+                    hit = lower
+                    row.update(lower_ray_label=label, lower_ray_z_m=hit.location.z)
+                    if label in WALKABLE_SURFACES and hit.location.z >= low.z-.02:
+                        row['rejected'] = 'near-ground hit is at the ray origin'
+                        continue
                 if not math.isfinite(hit.location.z) or abs(hit.location.z-road_z) > 1.8:
                     row['rejected'] = 'surface at different elevation'
                     continue
-                if label not in ('Roads','RoadLines','Sidewalks','Ground','Terrain'):
+                if label not in WALKABLE_SURFACES:
                     row['rejected'] = 'surface is not walkable'
                     continue
                 ground_z = hit.location.z
                 row['height_source'] = 'ground_projection'
-            elif mapped is not None:
+            elif mapped is not None and not occluded:
                 ground_z = road_z
                 row['height_source'] = 'mapped_surface'
             else:
@@ -237,12 +262,19 @@ class DemoEvents:
                     continue
                 attempt['actor_id'] = actor.id
                 return actor
-        raise RuntimeError('Required walker spawn failed: %s (%s); see capture_failure.json walker_placements'
-                           % (config['id'], blueprint.id))
+        return None
 
     def spawn(self):
         library = self.world.get_blueprint_library()
-        for config in self.spec['actor_specs']:
+        actors = self.spec['actor_specs']
+        occluded = self.spec.get('family') == 'PedestrianOtherBlocker'
+        shift = 0.
+        walker = None
+        if occluded:
+            # Find the actual walker start first, then place its paired occluder
+            # at the corresponding station on this same short route.
+            actors = sorted(actors, key=lambda a: a['role'] != 'crossing_actor')
+        for config in actors:
             blueprint = None
             for name in config['blueprint_candidates']:
                 values = sorted(library.filter(name), key=lambda item:item.id)
@@ -253,13 +285,14 @@ class DemoEvents:
                 raise RuntimeError('Missing required standard asset for '+config['id'])
             if blueprint.has_attribute('is_invincible'):
                 blueprint.set_attribute('is_invincible','false')
-            wp = original = station_waypoint(self.waypoints,config['s_offset_m'])
+            station = float(config['s_offset_m'])+shift
+            wp = original = station_waypoint(self.waypoints,station)
             for _ in range(abs(config['lane_offset'])):
                 wp = wp.get_left_lane() if config['lane_offset'] > 0 else wp.get_right_lane()
                 if wp is None or str(wp.lane_type).split('.')[-1] != 'Driving':
                     raise RuntimeError('Required physical actor driving lane does not exist: '+config['id'])
             pose, lateral, role = wp.transform,float(config['lateral_offset_m']),config['role']
-            cross_path, branch_station, interaction_station = None,None,float(config['s_offset_m'])
+            cross_path, branch_station, interaction_station = None,None,station
             stop_sign_id = None
             if role == 'roadside_crowd':
                 sidewalk, visited = original.get_right_lane(),set()
@@ -296,15 +329,51 @@ class DemoEvents:
                 cross_path,interaction_station,branch_station = self._cross_branch(config['s_offset_m'])
                 pose,lateral = cross_path[0].transform,0.
             yaw = math.radians(pose.rotation.yaw)
+            if occluded and role == 'roadside_occluder':
+                # Put the static prop between the approaching vehicle and the
+                # measured pedestrian start, even for a kerb-side alternative.
+                trigger = next(t['distance_m'] for t in self.spec['trigger_specs'] if 'distance_m' in t)
+                observer,_ = _at(self.route, interaction_station-trigger)
+                center = xy(pose.location)
+                target = xy(walker.get_location())
+                tangent = (math.cos(yaw), -math.sin(yaw))
+                ray = (target[0]-observer[0],target[1]-observer[1])
+                along = ray[0]*tangent[0]+ray[1]*tangent[1]
+                along_center = (center[0]-observer[0])*tangent[0]+(center[1]-observer[1])*tangent[1]
+                if not 0. < along_center < along:
+                    raise RuntimeError('Roadside blocker must be ahead of the viewpoint and before the pedestrian')
+                t = along_center/along
+                lateral = (observer[0]+t*ray[0]-center[0])*math.sin(yaw)+(observer[1]+t*ray[1]-center[1])*math.cos(yaw)
             location = self.carla.Location(x=pose.location.x+lateral*math.sin(yaw),
                 y=pose.location.y-lateral*math.cos(yaw),z=pose.location.z+.35)
             # A public cross branch supplies the actual actor heading. Applying
             # the catalog's generic +90 offset again would point it off-road.
             rotation = self.carla.Rotation(yaw=pose.rotation.yaw+(0. if cross_path else config['yaw_offset_deg']))
             if config['actor_type'] == 'walker':
-                if role == 'crossing_actor':
-                    rotation = self.carla.Rotation(yaw=wp.transform.rotation.yaw-90.)
-                actor = self._spawn_walker(blueprint, wp, lateral, rotation, config)
+                actor = None
+                for delta in ((0., 2., -2., 4., -4., 6., -6., 8., -8.) if occluded else (0.,)):
+                    if occluded:
+                        shift = delta
+                        interaction_station = float(config['s_offset_m'])+shift
+                        wp = original = station_waypoint(self.waypoints,interaction_station)
+                    if role == 'crossing_actor':
+                        rotation = self.carla.Rotation(yaw=wp.transform.rotation.yaw-90.)
+                    actor = self._try_walker_station(blueprint, wp, lateral, rotation, config, interaction_station, occluded)
+                    if actor is not None:
+                        walker = actor
+                        break
+                if actor is None:
+                    message = 'Required walker spawn failed: %s (%s); see capture_failure.json walker_placements' % (
+                        config['id'], blueprint.id)
+                    attempted = [a for record in self.walker_placements for a in record['attempts']]
+                    mapped = [a for a in attempted if a['mapped_surface'] in ('Sidewalk','Shoulder')]
+                    if (occluded and mapped and not any(a['spawns'] for a in attempted)
+                            and all(a.get('rejected') == 'surface is not walkable' or
+                                    (a.get('ray_label') == 'Vegetation' and a.get('rejected') in
+                                     ('near-ground sidewalk probe unresolved','near-ground hit is at the ray origin'))
+                                    for a in mapped)):
+                        raise NoWalkableCrossingSurface(message)
+                    raise RuntimeError(message)
             else:
                 actor = self.world.try_spawn_actor(blueprint,self.carla.Transform(location,rotation))
             if actor is None:
@@ -326,6 +395,8 @@ class DemoEvents:
                 if max(tangent)-min(tangent) > max(normal)-min(normal):
                     rotated = self.carla.Rotation(yaw=rotation.yaw+90.)
                     actor.set_transform(self.carla.Transform(location,rotated))
+            if occluded:
+                interaction_station = project(xy(actor.get_location()),self.route)['s_m']
             row = dict(config=config,actor=actor,original_waypoint=original,cross_path=cross_path,
                        start=actor.get_location(),interaction_station_m=interaction_station,
                        branch_crossing_s_m=branch_station,finished=False,actions=set(),
@@ -339,6 +410,9 @@ class DemoEvents:
                     self._drive_vehicle(row,self.waypoints,float(config['speed_mps']))
                 else:
                     actor.apply_control(self.carla.VehicleControl(brake=1.))
+        if occluded:
+            order = {config['id']: i for i,config in enumerate(self.spec['actor_specs'])}
+            self.rows.sort(key=lambda row:order[row['config']['id']])
         return [dict(id=row['config']['id'],actor_id=row['actor'].id,type_id=row['actor'].type_id,
                      config=row['config'],actual_position_xy=xy(row['actor'].get_location()),
                      actual_yaw_deg=row['actor'].get_transform().rotation.yaw,
@@ -409,6 +483,20 @@ class DemoEvents:
             if minimum < .2-1e-6:
                 raise RuntimeError('Authored teaching path lacks measured body clearance: '+row['config']['id'])
         audit['passing_clearance'] = measured
+        if self.spec.get('family') == 'PedestrianOtherBlocker':
+            blocker = next(r for r in self.rows if r['config']['role'] == 'roadside_occluder')
+            walker = next(r for r in self.rows if r['config']['role'] == 'crossing_actor')
+            trigger = next(t['distance_m'] for t in self.spec['trigger_specs'] if 'distance_m' in t)
+            viewpoint,_ = _at(self.route, blocker['interaction_station_m']-trigger)
+            target = xy(walker['actor'].get_location())
+            body = _body(blocker['actor'])
+            sight = _path_body_distance([viewpoint,target],body)
+            separation = _polygon_distance(_body(walker['actor']),body)
+            audit['roadside_occlusion'] = dict(approach_viewpoint_xy=viewpoint, pedestrian_xy=target,
+                sightline_body_gap_m=sight, initial_body_separation_m=separation,
+                evidence='planar_approach_sightline_intersects_measured_blocker_footprint')
+            if sight > 1e-5 or separation <= 0.:
+                raise RuntimeError('Measured blocker must occlude the crossing pedestrian with separate physical bodies')
         self.geometry_audit = audit
         return audit
 

@@ -106,6 +106,7 @@ class PublicStateExtractor:
                            min(p[1] for p in lane['polygon']),max(p[1] for p in lane['polygon']))
                           for lane in self.route.lanes]
         self._light_stops,self._light_stop_errors={},{}
+        self._audited_green_passages={}
         self.crosswalks = self._crosswalks()
 
     def _crosswalks(self):
@@ -258,10 +259,58 @@ class PublicStateExtractor:
             evidence['reason']=str(exc) if isinstance(exc,ValueError) else 'scope_geometry_unavailable:'+type(exc).__name__
         return evidence
 
+    def remember_audited_green_crossings(self, scene, audit):
+        """Only the teaching collector supplies measured, consecutive-frame crossing evidence."""
+        frame=scene['diagnostics']['carla_frame']
+        if (audit.get('source_frame') != frame or not audit.get('projection_valid')
+                or audit.get('rule_violation') or audit.get('offroad') or audit.get('collision')):
+            return
+        for event in audit.get('rule_evidence', []):
+            if (event.get('kind') != 'traffic_light_crossing' or event.get('current_state') != 'green'
+                    or event.get('source_frame') != frame or not event.get('mapped_stop')
+                    or not event.get('position_xyz_carla') or event.get('lane_id') != scene['ego']['lane_id']
+                    or event.get('stop_heading_rad') is None):
+                continue
+            lane=next(row for row in self.route.lanes if row['id']==event['lane_id'])
+            key=(event['id'], event['lane_id'], tuple(event['position_xyz_carla']))
+            self._audited_green_passages[key]=dict(crossing_frame=frame, last_frame=frame,
+                last_progress=scene['diagnostics']['route_s'], stop_s=event['stop_s'],
+                last_lane=lane['id'], successors=lane['successors'], direction=event['stop_heading_rad'])
+
+    def _advance_green_passages(self, ego, frame, current_light):
+        """Forget stale evidence on discontinuities, reverse travel or leaving the exit connector."""
+        passages=getattr(self, '_audited_green_passages', {})
+        for key, visit in list(passages.items()):
+            current_lane=ego['lane_id']
+            projection = self.route.last_projection
+            overlap = projection.get('junction_overlap')
+            # Only the verified connector identity carries a previous crossing through
+            # an overlap. Signal and controlled-lane lookup still use raw observations.
+            if (projection['valid'] and overlap and self.route.previous_frame == frame
+                    and overlap['observed_lane_id'] == current_lane):
+                current_lane = overlap['route_lane_id']
+            progress=self.route.previous_s
+            light_id, approach_lane, (stop_x, carla_y, _) = key
+            stop_y = -carla_y
+            front = _rectangle(ego['position'], ego['heading'], ego['length'], ego['width'])[:2]
+            cosine, sine = math.cos(visit['direction']), math.sin(visit['direction'])
+            past_line = max((x-stop_x)*cosine + (y-stop_y)*sine for x,y in front) > 0.
+            affected = current_light is not None and current_light.id == light_id
+            connected_exit = visit['last_lane'] == approach_lane and current_lane in visit['successors']
+            if (frame != visit['last_frame']+1 or not projection['valid']
+                    or not past_line or progress is None or progress < visit['last_progress']
+                    or (not affected and progress > visit['stop_s']+ego['length'])
+                    or (current_lane != visit['last_lane'] and not connected_exit)):
+                del passages[key]
+            else:
+                visit.update(last_frame=frame, last_progress=progress, last_lane=current_lane)
+        return passages
+
     def _lights(self, actors, ego, frame):
         records, stop_s, unmapped = [],None,False
         self._last_light_association_audit=[]
         current_light = self.ego.get_traffic_light() if self.ego.is_at_traffic_light() else None
+        passages=self._advance_green_passages(ego, frame, current_light)
         for actor in actors:
             if not actor.type_id.startswith('traffic.traffic_light'):
                 continue
@@ -296,6 +345,12 @@ class PublicStateExtractor:
                 considered.append(detail)
                 s = self.route.stop_projection(position,identity,ego['lane_id'],stop['elevation_m'])
                 detail['task_stop_s']=s
+                visit=passages.get((actor.id,identity,tuple(detail['position_xyz_carla'])))
+                if visit and (s is None or abs(s-visit['stop_s']) < 1e-5):
+                    # The independent audit witnessed this exact front crossing on green.
+                    # Keep the stop and current colour in the record for subsequent audits.
+                    detail.update(association_reason='passed_on_observed_green',crossing_frame=visit['crossing_frame'])
+                    continue
                 if s is not None:
                     detail['association_reason']='upcoming_stop_on_official_route'
                     relevant.append(s)
@@ -315,9 +370,14 @@ class PublicStateExtractor:
                         light_unmapped |= detail['unmapped_affected']
             if current_light is not None and current_light.id == actor.id and state in ('red','yellow') and not relevant:
                 current_stops=[row for row in considered if row['lane_id']==ego['lane_id']]
+                affected_stops=current_stops or considered
+                already_passed=bool(affected_stops) and all(
+                    row.get('association_reason')=='passed_on_observed_green' for row in affected_stops)
                 # Unknown rule coordinates are an input error, not permission
                 # to replace the paper planner with an external brake command.
-                if not current_stops or not all(row.get('continuation_association',{}).get('resolved',False) for row in current_stops):
+                if already_passed:
+                    current_reason='passed_on_observed_green'
+                elif not current_stops or not all(row.get('continuation_association',{}).get('resolved',False) for row in current_stops):
                     light_unmapped=True
                     current_reason=('current_affected_light_without_stop_waypoints' if not stops else
                                     'current_affected_light_without_proven_stop_scope')

@@ -14,7 +14,7 @@ import traceback
 
 from .archive import RouteArchive, _png
 from .demo_catalog import capture_implementation
-from .demo_events import DemoEvents
+from .demo_events import DemoEvents, NoWalkableCrossingSurface
 from .demo_routes import select_demonstration_site, teaching_path, validate_teaching_road_path
 from .demo_teacher import DemoTeacher, SCHEMA as TEACHER_SCHEMA
 from .execution import SignedAccelerationController
@@ -293,7 +293,9 @@ def _body_audit(scene, previous, collisions, line_events):
                     state = light.get('state') if light else None
                     source = light.get('source_frame') if light else None
                     rule_evidence.append(dict(kind='traffic_light_crossing',id=identity,
-                        lane_id=stop.get('lane_id'),stop_s=station,current_state=state,source_frame=source))
+                        lane_id=stop.get('lane_id'),stop_s=station,current_state=state,source_frame=source,
+                        mapped_stop=number(stop.get('task_stop_s')),position_xyz_carla=stop.get('position_xyz_carla'),
+                        stop_heading_rad=stop.get('heading_rad')))
                     if source != frame or state not in ('red','yellow','green','off'):
                         errors.append('crossed light lacks resolved current-frame state')
                     elif state in ('red','yellow'):
@@ -346,6 +348,24 @@ def _archive_failure_scene(archive,scene,audit):
         evidence='last_frozen_public_state;not_a_new_observation',memory_published=False))
 
 
+def _world_preflight(world):
+    """Same exclusivity predicate as capture; all listed actors predate this attempt."""
+    synchronous = bool(world.get_settings().synchronous_mode)
+    counts = {'vehicle': 0, 'walker': 0, 'sensor': 0}
+    examples = []
+    for actor in world.get_actors():
+        kind, sep, _ = actor.type_id.partition('.')
+        if not sep or kind not in counts:
+            continue
+        counts[kind] += 1
+        if len(examples) < 8:
+            examples.append(dict(id=getattr(actor, 'id', None), type_id=actor.type_id,
+                role_name=getattr(actor, 'attributes', {}).get('role_name', '')))
+    count = sum(counts.values())
+    return dict(idle=not synchronous and count == 0, synchronous_mode=synchronous,
+        blocking_actor_count=count, blocking_actor_counts=counts, blocking_actor_examples=examples)
+
+
 def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=False, video=True,
             interaction_only=False, allow_similar_road=False):
     if type(interaction_only) is not bool:
@@ -371,16 +391,26 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
     collisions, line_events, errors = [], [], []
     audit_rows, recovery_complete, geometry = [], False, None
     interaction_window=None
+    preflight = None
+    def startup(operation, timeout_s=30., status='entered', **details):
+        # Survives a native SDK abort, which bypasses Python exception handling.
+        atomic_json(output/'startup_stage.json', dict(operation=operation, timeout_s=timeout_s,
+            status=status, host=host, port=int(port), **details))
+
     try:
+        startup('connect_and_check_world')
         client = carla.Client(host, int(port))
         client.set_timeout(30.)
         if client.get_client_version() != client.get_server_version():
             raise RuntimeError('CARLA client and server versions differ')
         run['source_version'] = client.get_server_version()
         world = client.get_world()
-        busy = [actor for actor in world.get_actors() if actor.type_id.startswith(('vehicle.', 'walker.', 'sensor.'))]
-        if world.get_settings().synchronous_mode or busy:
-            raise RuntimeError('Demonstration collection requires an idle dedicated world, no existing experiment actors')
+        preflight = _world_preflight(world)
+        if not preflight['idle']:
+            raise RuntimeError('Demonstration collection requires an idle dedicated world: '
+                'synchronous_mode={synchronous_mode}, pre-existing actors={blocking_actor_count} '
+                '(vehicles={vehicle}, walkers={walker}, sensors={sensor}).'.format(
+                    **preflight, **preflight['blocking_actor_counts']))
         if world.get_map().name.split('/')[-1] != spec['map']:
             if not allow_map_load:
                 raise RuntimeError('Required map '+spec['map']+'; explicitly allow an idle-world map load')
@@ -389,6 +419,7 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
             load_started = time.monotonic()
             run['map_load'] = dict(map=spec['map'], timeout_s=300., status='loading')
             archive.json('map_load.json', run['map_load'])
+            startup('load_world', 300.)
             LOG.info('加载地图 %s，最多等待300秒', spec['map'])
             client.set_timeout(300.)
             try:
@@ -405,6 +436,7 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                 run['map_load']['wall_seconds'] = time.monotonic()-load_started
                 archive.json('map_load.json', run['map_load'])
             LOG.info('地图 %s 已就绪，加载耗时 %.1f 秒', spec['map'], run['map_load']['wall_seconds'])
+        startup('configure_world')
         saved = world.get_settings()
         saved_weather = world.get_weather()
         settings = world.get_settings()
@@ -420,29 +452,60 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
             settings.actor_active_distance = 650.
         world.apply_settings(settings)
         world.set_weather(carla.WeatherParameters.ClearNoon)
-        waypoints, site = select_demonstration_site(world, spec, allow_similar_road=allow_similar_road)
-        run['selected_site'] = site
-        authored = teaching_path(waypoints, spec)
-        route = [xy(wp.transform.location) for wp in waypoints]
-        archive.json('demonstration_design.json', dict(spec=spec, route_xy=route, teaching_path_xy=authored,
-            source=site['mode'], selected_site=site, collection_route_reference=spec.get('route_source'),
-            official_route_used=False, official_event_replayed=False,
-            formal_evaluation_control=False, runtime_success_not_yet_verified=True))
-        bp = world.get_blueprint_library().find('vehicle.tesla.model3')
-        bp.set_attribute('role_name', 'hero' if large_map else 'offline_demonstration_ego')
-        start = waypoints[0].transform
-        pose = carla.Transform(carla.Location(x=start.location.x,y=start.location.y,z=start.location.z+.4),
-                               carla.Rotation(pitch=start.rotation.pitch,yaw=start.rotation.yaw,roll=start.rotation.roll))
-        ego = world.try_spawn_actor(bp, pose)
-        if ego is None:
-            raise RuntimeError('Development ego spawn failed')
-        owned.append(ego)
-        ego.apply_control(carla.VehicleControl(brake=1.))
-        if large_map:
-            # Register the streaming hero before spawning the interaction actors.
-            world.tick(30.)
-        events = DemoEvents(world, waypoints, spec, carla)
-        archive.json('demonstration_actors.json', events.spawn())
+        unusable_site = None
+        while True:
+            startup('select_site')
+            waypoints, site = select_demonstration_site(world, spec, allow_similar_road=allow_similar_road,
+                                                       unusable_site=unusable_site)
+            run['selected_site'] = site
+            authored = teaching_path(waypoints, spec)
+            route = [xy(wp.transform.location) for wp in waypoints]
+            archive.json('demonstration_design.json', dict(spec=spec, route_xy=route, teaching_path_xy=authored,
+                source=site['mode'], selected_site=site, collection_route_reference=spec.get('route_source'),
+                official_route_used=False, official_event_replayed=False,
+                formal_evaluation_control=False, runtime_success_not_yet_verified=True))
+            spawn_timeout = 120. if large_map else 30.
+            if large_map:
+                client.set_timeout(spawn_timeout)
+            try:
+                startup('prepare_ego_spawn', spawn_timeout)
+                bp = world.get_blueprint_library().find('vehicle.tesla.model3')
+                bp.set_attribute('role_name', 'hero' if large_map else 'offline_demonstration_ego')
+                start = waypoints[0].transform
+                pose = carla.Transform(carla.Location(x=start.location.x,y=start.location.y,z=start.location.z+.4),
+                                       carla.Rotation(pitch=start.rotation.pitch,yaw=start.rotation.yaw,roll=start.rotation.roll))
+                startup('try_spawn_ego', spawn_timeout)
+                ego = world.try_spawn_actor(bp, pose)
+                if ego is None:
+                    raise RuntimeError('Development ego spawn failed')
+                owned.append(ego)
+                startup('apply_initial_brake', spawn_timeout, ego_actor_id=ego.id)
+                ego.apply_control(carla.VehicleControl(brake=1.))
+                if large_map:
+                    startup('register_streaming_hero', spawn_timeout, ego_actor_id=ego.id)
+                    world.tick(spawn_timeout)
+                startup('spawn_interaction_actors', spawn_timeout, ego_actor_id=ego.id)
+                events = DemoEvents(world, waypoints, spec, carla)
+                archive.json('demonstration_actors.json', events.spawn())
+                break
+            except NoWalkableCrossingSurface as exc:
+                if (unusable_site is not None or not allow_similar_road or not spec.get('route_source')
+                        or spec['family'] != 'PedestrianOtherBlocker'):
+                    raise
+                # No cameras or driving frames exist yet. Release only this attempt's actors.
+                archive.json('walker_site_rejection.json', dict(selected_site=site, reason=str(exc),
+                    walker_placements=events.walker_placements))
+                events.close()
+                events = None
+                if ego.is_alive and not ego.destroy():
+                    raise RuntimeError('Failed to release the previous site hero before selecting a replacement')
+                owned.remove(ego)
+                unusable_site = site
+                LOG.info('行人横穿起点没有可验证地面，保留现场并尝试另一处已允许的同图路段')
+            finally:
+                if large_map:
+                    client.set_timeout(30.)
+        startup('register_sensors', ego_actor_id=ego.id)
         if interaction_only:
             interaction_window=InteractionCaptureWindow(spec,waypoints,events.rows)
         barrier = FrameBarrier([name for name, _ in VIEWS]+['rgb'])
@@ -472,6 +535,7 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                 target.append(row)
             sensor.listen(receive)
         last_frame = int(world.get_snapshot().frame)
+        startup('await_first_observation', ego_actor_id=ego.id)
         first_time, previous, extractor, teacher, controller = None, None, None, None, None
         arrived_time, recovery_start = None, None
         while True:
@@ -482,6 +546,8 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
             last_frame = frame
             stamp = float(snapshot.timestamp.elapsed_seconds)
             raw_images = barrier.get(frame, stamp)
+            if first_time is None:
+                startup('first_observation_received', status='complete', frame=frame)
             first_time = stamp if first_time is None else first_time
             elapsed = stamp-first_time
             # Integer physical-frame schedule; never infer camera identity from time.
@@ -502,7 +568,8 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                         camera_mount_matrix_m=mounts['front_rgb'].get_matrix()), frame=frame, timestamp=stamp)
                 archive.json('ego_geometry.json', geometry)
                 extractor = PublicStateExtractor(world, ego, [wp.transform for wp in waypoints],
-                    config=dict(desired_speed_mps=spec['cruise_speed_mps']), route_id=output.name, ego_geometry=geometry)
+                    config=dict(desired_speed_mps=spec['cruise_speed_mps'], teaching_junction_overlap=True),
+                    route_id=output.name, ego_geometry=geometry)
                 if spec['interaction_kind'] == 'stop_sign':
                     # A real public trigger is still required. This stricter
                     # teaching dwell applies only to this independent collector.
@@ -525,6 +592,7 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                 archive.append('event_evidence', dict(frame=frame,time=stamp,phase='approach',event='collection_started',completed=True))
             scene = extractor.capture(frame, camera_images=images, world_snapshot=snapshot)
             audit = _body_audit(scene, previous, collisions, line_events)
+            extractor.remember_audited_green_crossings(scene, audit)
             audit_rows.append(audit)
             if previous is None:
                 # Check the same measured footprint used by the execution audit,
@@ -620,9 +688,12 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
     except BaseException as exc:
         errors.append(type(exc).__name__+': '+str(exc))
         try:
+            busy_evidence = (dict(failure_code='world_not_idle', world_preflight=preflight)
+                             if preflight is not None and not preflight['idle'] else {})
             archive.json('capture_failure.json',dict(error=errors[-1],traceback=traceback.format_exc(),
                 walker_placements=events.walker_placements if events is not None else [],
-                frame=locals().get('frame'),time=locals().get('stamp'),successful_memory_created=False))
+                frame=locals().get('frame'),time=locals().get('stamp'),successful_memory_created=False,
+                **busy_evidence))
         except Exception as write_error:
             errors.append('failure evidence write: '+str(write_error))
         try:
