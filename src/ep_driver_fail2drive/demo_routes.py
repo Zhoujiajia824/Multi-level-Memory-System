@@ -6,7 +6,7 @@ an error, never a reason to relax crossing permissions or move a test finish.
 import math
 import random
 
-from .route import lane_key, xy, wrap, project
+from .route import lane_key, xy, wrap, project, point_in_polygon
 
 
 class NoSuitableSite(RuntimeError):
@@ -255,6 +255,13 @@ def _spawn_candidates(road_map, poses):
                     wp.transform.rotation.yaw-origin.transform.rotation.yaw))), lane_key(wp)))
 
 
+def _bypass_stations(spec):
+    stations = [float(actor['s_offset_m']) for actor in spec['actor_specs']
+                if actor.get('lane_offset', 0) == 0]
+    first, last = min(stations), max(stations)
+    return max(1., first-20.), first-8., last+10., last+25.
+
+
 def select_route(world, spec, *, near_xyz=None):
     road_map = world.get_map()
     if road_map.name.replace('\\', '/').split('/')[-1] != spec['map']:
@@ -290,8 +297,7 @@ def select_route(world, spec, *, near_xyz=None):
     actor_stations = [float(actor['s_offset_m']) for actor in spec['actor_specs']]
     hazard_station = min(actor_stations)
     if bypass:
-        return_start = max(float(actor['s_offset_m']) for actor in spec['actor_specs']
-                           if actor.get('lane_offset', 0) == 0) + 10.
+        change_start, _, return_start, return_end = _bypass_stations(spec)
     # The complete return ends at last actor +25m in teaching_path. Screening
     # only the approach would return an unusable first candidate and prevent
     # searching later sites that really support the whole maneuver.
@@ -310,24 +316,37 @@ def select_route(world, spec, *, near_xyz=None):
         if event is None and not allow_junction:
             # A unique sample well inside the examined section can reject a
             # clearly unsuitable road before tracing its entire recovery tail.
-            ahead = list(start.next(12.))
+            probe_station = change_start+1. if bypass else 12.
+            ahead = list(start.next(probe_station))
             if len(ahead) == 1 and not usable_section(ahead[0]):
                 continue
-        waypoints = chain(start, length)
-        if not waypoints:
+        # Recovery captures continue beyond the lane-change return. Verify the
+        # entire retained route and a forward body overhang before choosing a
+        # site; an unexamined junction at the tail is not a suitable recovery.
+        examined = chain(start, length+4.)
+        if not examined:
             continue
+        examined_stations = _stations(examined)
+        end_index = next((i for i, s in enumerate(examined_stations) if s >= length), None)
+        if end_index is None:
+            continue
+        waypoints = examined[:end_index+1]
         if event is not None and not _same_anchor_station(waypoints,hazard_station,event):
             continue
         stations = _stations(waypoints)
         if end_station > stations[-1]-2.:
             continue
-        active = [wp for wp, station in zip(waypoints, stations) if 8. <= station <= end_station+1.]
+        if any(str(wp.lane_type).split('.')[-1] != 'Driving'
+               or (wp.is_junction and not allow_junction) for wp in examined):
+            continue
+        active = [wp for wp, station in zip(waypoints, stations)
+                  if (change_start <= station < return_end if bypass else 8. <= station <= end_station+1.)]
         if any(abs(wrap(math.radians(b.transform.rotation.yaw-a.transform.rotation.yaw))) > .12
-               for a, b in zip(waypoints, waypoints[1:])):
+               for a, b in zip(examined, examined[1:])):
             continue
         if 'straight_route' in capabilities and any(abs(wrap(math.radians(
                 wp.transform.rotation.yaw-waypoints[0].transform.rotation.yaw))) > .12
-                for wp in active):
+                for wp in examined):
             continue
         if not all(usable_section(wp) for wp in active):
             continue
@@ -382,15 +401,11 @@ def teaching_path(waypoints, spec):
     route = [xy(wp.transform.location) for wp in waypoints]
     if spec['interaction_kind'] not in ('parked_bypass', 'construction_bypass', 'construction_crossing'):
         return route
-    stations = [float(actor['s_offset_m']) for actor in spec['actor_specs']
-                if actor.get('lane_offset', 0) == 0]
-    first, last = min(stations), max(stations)
+    change_start, change_end, return_start, return_end = _bypass_stations(spec)
     result, arc = [], 0.
     for i, wp in enumerate(waypoints):
         if i:
             arc += math.dist(route[i], route[i-1])
-        change_start, change_end = max(1., first-20.), first-8.
-        return_start, return_end = last+10., last+25.
         def smooth(t):
             t = max(0., min(1., t))
             return 10*t**3-15*t**4+6*t**5
@@ -404,6 +419,76 @@ def teaching_path(waypoints, spec):
         else:
             result.append(route[i])
     return result
+
+
+def validate_teaching_road_path(path_xy, drivable_polygons, ego_length_m, ego_width_m,
+                                *, path_step_m=.5, body_step_m=.25):
+    """Check the measured body on the complete authored path before driving.
+
+    This is a finite, sampled geometry check, not a tracking or continuous-time
+    certificate. Include the front and rear beyond the path endpoints. The
+    caller persists the returned evidence before rejecting an unsuitable site.
+    """
+    report = dict(schema='independent-demo-road-coverage-1.0', valid=False,
+                  path_sample_count=0, body_sample_count=0, first_failure=None,
+                  path_sample_spacing_max_m=0., body_sample_spacing_max_m=0.,
+                  scope='sampled_authored_body_coverage_not_actual_driving')
+    finite = lambda value: type(value) in (int, float) and math.isfinite(value)
+    if (not isinstance(path_xy, (list, tuple)) or len(path_xy) < 2
+            or not all(isinstance(p, (list, tuple)) and len(p) == 2
+                       and all(finite(v) for v in p) for p in path_xy)
+            or not all(finite(v) and v > 0. for v in
+                       (ego_length_m, ego_width_m, path_step_m, body_step_m))):
+        report['first_failure'] = dict(reason='invalid_path_or_measured_body')
+        return report
+    if (not isinstance(drivable_polygons, (list, tuple)) or not drivable_polygons
+            or not all(isinstance(poly, (list, tuple)) and len(poly) >= 3
+                and all(isinstance(p, (list, tuple)) and len(p) == 2
+                        and all(finite(v) for v in p) for p in poly)
+                for poly in drivable_polygons)):
+        report['first_failure'] = dict(reason='invalid_driving_domain')
+        return report
+    domains = [(min(p[0] for p in poly), max(p[0] for p in poly),
+                min(p[1] for p in poly), max(p[1] for p in poly), poly)
+               for poly in drivable_polygons]
+    nx, ny = max(2, math.ceil(ego_length_m/body_step_m)), max(2, math.ceil(ego_width_m/body_step_m))
+    body = [(ego_length_m*(i/nx-.5), ego_width_m*(j/ny-.5))
+            for i in range(nx+1) for j in range(ny+1)]
+    body.append((0., 0.))
+    report['samples_per_body'] = len(body)
+    report['body_sample_spacing_max_m'] = max(ego_length_m/nx, ego_width_m/ny)
+    arc = 0.
+    for segment, (a, b) in enumerate(zip(path_xy, path_xy[1:])):
+        length = math.dist(a, b)
+        if length <= 1e-8:
+            continue
+        count = max(1, math.ceil(length/path_step_m))
+        report['path_sample_spacing_max_m'] = max(report['path_sample_spacing_max_m'], length/count)
+        c, s = (b[0]-a[0])/length, (b[1]-a[1])/length
+        for i in range(count+1):
+            fraction = i/count
+            center = [a[0]+fraction*(b[0]-a[0]), a[1]+fraction*(b[1]-a[1])]
+            footprint = [(center[0]+u*c-v*s, center[1]+u*s+v*c) for u, v in body]
+            xmin, xmax = min(p[0] for p in footprint), max(p[0] for p in footprint)
+            ymin, ymax = min(p[1] for p in footprint), max(p[1] for p in footprint)
+            nearby = [row for row in domains if row[0] <= xmax and row[1] >= xmin
+                      and row[2] <= ymax and row[3] >= ymin]
+            outside = [p for p in footprint if not any(
+                lo_x-1e-8 <= p[0] <= hi_x+1e-8 and lo_y-1e-8 <= p[1] <= hi_y+1e-8
+                and point_in_polygon(p, poly) for lo_x, hi_x, lo_y, hi_y, poly in nearby)]
+            report['path_sample_count'] += 1
+            report['body_sample_count'] += len(body)
+            if outside:
+                report['first_failure'] = dict(reason='authored_body_outside_driving_domain',
+                    segment_index=segment, station_m=arc+fraction*length, center_xy=center,
+                    outside_sample_count=len(outside), first_outside_points_xy=outside[:4])
+                return report
+        arc += length
+    if report['path_sample_count'] == 0:
+        report['first_failure'] = dict(reason='path_has_no_spatial_segment')
+        return report
+    report['valid'] = True
+    return report
 
 
 def station_waypoint(waypoints, station):

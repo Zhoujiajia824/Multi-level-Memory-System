@@ -5,6 +5,9 @@ This module never generates a replacement task, advances the world or decides
 official success. Projection failure remains visible instead of jumping a lap.
 """
 import math
+import io
+import struct
+import xml.etree.ElementTree as ET
 
 FINISH_GATE_SCHEMA = 'ep-driver-f2d-finish-gate-1.0'
 
@@ -196,6 +199,110 @@ def _distinct_lane_samples(waypoints):
     return result,removed
 
 
+def _shared_lane_edges(road_map, groups, same_level):
+    """Use one public cross-section boundary for directly adjacent lanes.
+
+    Independent float32 lane centres and differing longitudinal sample grids
+    otherwise create microscopic cracks inside one continuous driving road.
+    Outer edges, shoulders and separate roads are never modified here.
+    """
+    query=getattr(road_map,'get_waypoint_xodr',None)
+    edges,audit={},[]
+    if query is None:
+        return edges,audit
+    seen=set()
+    for key,samples in groups.items():
+        middle=sorted(samples.values(),key=lambda wp:wp.s)[len(samples)//2]
+        for side,opposite in (('left','right'),('right','left')):
+            other=getattr(middle,'get_'+side+'_lane')()
+            other_key=lane_key(other)
+            if (not _driving(other) or other_key not in groups or
+                    (other.road_id,other.section_id)!=(middle.road_id,middle.section_id) or
+                    math.cos(math.radians(other.transform.rotation.yaw-middle.transform.rotation.yaw))<.9 or
+                    lane_key(getattr(other,'get_'+opposite+'_lane')())!=key):
+                continue
+            identity=tuple(sorted((key,other_key)))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            peer=groups[other_key]
+            low=max(min(wp.s for wp in samples.values()),min(wp.s for wp in peer.values()))
+            high=min(max(wp.s for wp in samples.values()),max(wp.s for wp in peer.values()))
+            # Rounded dictionary keys deduplicate samples; they are not valid
+            # public s queries when rounding would step beyond a road exit.
+            stations={}
+            for wp in list(samples.values())+list(peer.values()):
+                if low<=wp.s<=high:
+                    stations.setdefault(round(wp.s,6),float(wp.s))
+            stations=sorted(stations.values())
+            shared=[]; separation=0.
+            for station in stations:
+                a=query(middle.road_id,middle.lane_id,station)
+                b=query(other.road_id,other.lane_id,station)
+                if (lane_key(a)!=key or lane_key(b)!=other_key or
+                        not same_level(a) or not same_level(b) or
+                        lane_key(getattr(a,'get_'+side+'_lane')())!=other_key or
+                        lane_key(getattr(b,'get_'+opposite+'_lane')())!=key or
+                        min(a.lane_width,b.lane_width)<=0):
+                    shared=[];break
+                pa,pb=xy(a.transform.location),xy(b.transform.location)
+                def raw_edge(wp,edge):
+                    p=xy(wp.transform.location);yaw=math.radians(wp.transform.rotation.yaw)
+                    sign=1. if edge=='left' else -1.
+                    return [p[0]+sign*math.sin(yaw)*wp.lane_width/2.,p[1]+sign*math.cos(yaw)*wp.lane_width/2.]
+                gap=math.dist(raw_edge(a,side),raw_edge(b,opposite))
+                def ulp32(value):
+                    value=abs(float(value))
+                    return math.ldexp(1.,-149 if value==0. else max(-149,math.frexp(value)[1]-24))
+                # This bound identifies float32 cross-section disagreement;
+                # it is not a point-in-road tolerance or a polygon buffer.
+                precision=4.*(sum(math.hypot(ulp32(p[0]),ulp32(p[1])) for p in (pa,pb))+
+                    sum(ulp32(wp.lane_width)+wp.lane_width*math.radians(ulp32(wp.transform.rotation.yaw)) for wp in (a,b)))
+                if gap>precision:
+                    shared=[];break
+                fraction=a.lane_width/(a.lane_width+b.lane_width)
+                point=[pa[i]+fraction*(pb[i]-pa[i]) for i in (0,1)]
+                shared.append((station,point,a,b));separation=max(separation,gap)
+            if len(shared)<2:
+                continue
+            edges[(key,side)]=[(s,p,a) for s,p,a,b in shared]
+            edges[(other_key,opposite)]=[(s,p,b) for s,p,a,b in shared]
+            audit.append(dict(lane_ids=list(identity),sample_count=len(shared),
+                maximum_original_boundary_gap_m=separation,
+                source='same_road_section_direct_adjacent_public_s_half_width_interpolation'))
+    return edges,audit
+
+
+def _public_section_bounds(road_map, required_roads):
+    """Public OpenDRIVE section limits; no native lane traversal is needed."""
+    export=getattr(road_map,'to_opendrive',None)
+    if export is None:
+        return {}
+    result={}
+    for _,road in ET.iterparse(io.StringIO(export()),events=('end',)):
+        if road.tag!='road':
+            continue
+        identity=int(road.attrib['id']);end=float(road.attrib['length'])
+        if identity in required_roads:
+            sections=road.findall('lanes/laneSection')
+            for index,section in enumerate(sections):
+                start=float(section.attrib['s'])
+                stop=float(sections[index+1].attrib['s']) if index+1<len(sections) else end
+                result[(identity,index)]=(start,stop)
+        road.clear()
+    return result
+
+
+def _interior_public_station(boundary, increasing):
+    """An inward float32 s remains inside after the SDK's argument narrowing."""
+    packed=struct.pack('>f',boundary)
+    value=struct.unpack('>f',packed)[0]
+    bits=struct.unpack('>I',packed)[0]
+    if (increasing and value<=boundary) or (not increasing and value>=boundary):
+        bits+=1 if increasing else -1
+    return float(struct.unpack('>f',struct.pack('>I',bits))[0])
+
+
 class RouteAdapter:
     """Frozen official world-coordinate route; public map has no scenario oracle."""
     VERSION = 'official-route-residual-1.0'
@@ -253,24 +360,57 @@ class RouteAdapter:
         lowx, highx = min(p[0] for p in self.points)-margin, max(p[0] for p in self.points)+margin
         lowy, highy = min(p[1] for p in self.points)-margin, max(p[1] for p in self.points)+margin
         groups = {}
-        for wp in points:
+        def retain(wp):
             if not _driving(wp):
-                continue
+                return
             location = wp.transform.location
             p = xy(location)
             if not (lowx <= p[0] <= highx and lowy <= p[1] <= highy):
-                continue
+                return
             # Preserve the existing single-layer 2D driving domain. Retaining
             # both overlapping heights would let the worker union different
             # floors into one traversable surface; that needs a separate 3D
             # map contract, not merely a less selective initialization filter.
             if abs(location.z-self.height_at(p)) > float(self.config.get('same_level_tolerance_m', 1.5)):
-                continue
+                return
             groups.setdefault(lane_key(wp), {})[round(wp.s, 6)] = wp
+        for wp in points:
+            retain(wp)
+        # The SDK topology links a lane entry to its successor's entry. Its
+        # pair need not include the current lane's own exit, and uniform map
+        # samples stop short of that exit. Retain public lane-end geometry so
+        # the resulting road does not acquire a false gap before a junction.
+        # No point is extrapolated, widened, or joined to a different lane.
+        lane_ends = []
+        section_bounds=_public_section_bounds(self.map,{next(iter(r.values())).road_id for r in groups.values()})
+        query=getattr(self.map,'get_waypoint_xodr',None)
+        for key, samples in list(groups.items()):
+            end = sorted(samples.values(), key=lambda wp: wp.s,
+                         reverse=next(iter(samples.values())).lane_id > 0)[-1]
+            bounds=section_bounds.get((end.road_id,end.section_id))
+            if bounds is None or query is None:
+                continue
+            start,stop=bounds
+            # The Python SDK narrows s to float32. A double infinitesimally
+            # inside may round beyond the section and return no waypoint.
+            # Choose the adjacent representable interior s, never extrapolate.
+            station=_interior_public_station(start,True) if end.lane_id>0 else _interior_public_station(stop,False)
+            wp=query(end.road_id,end.lane_id,station)
+            if lane_key(wp)==key:
+                retained = round(wp.s, 6) not in samples
+                retain(wp)
+                if retained and round(wp.s, 6) in samples:
+                    lane_ends.append(dict(lane_id=key, s_m=float(wp.s),
+                                          position_xy=xy(wp.transform.location)))
         lanes = []
         self.lane_elevations = {}
+        shared_edges,shared_audit=_shared_lane_edges(self.map,groups,lambda wp:
+            abs(wp.transform.location.z-self.height_at(xy(wp.transform.location)))<=
+            float(self.config.get('same_level_tolerance_m',1.5)))
         self.map_sample_audit=dict(policy='exact_xy_adjacent_numerical_alias_only;first_sample_retained',
-            no_spatial_merging=True,official_navigation_unchanged=True,removed_samples=[])
+            no_spatial_merging=True,official_navigation_unchanged=True,removed_samples=[],
+            lane_end_samples=lane_ends, lane_end_source='public_opendrive_section_limit_get_waypoint_xodr',
+            shared_internal_boundaries=shared_audit)
         for key in sorted(groups):
             waypoints = sorted(groups[key].values(), key=lambda w:w.s, reverse=next(iter(groups[key].values())).lane_id > 0)
             waypoints,removed=_distinct_lane_samples(waypoints)
@@ -283,13 +423,21 @@ class RouteAdapter:
                 center.append(xy(p))
                 left.append([p.x+math.sin(yaw)*width/2., -p.y+math.cos(yaw)*width/2.])
                 right.append([p.x-math.sin(yaw)*width/2., -p.y-math.cos(yaw)*width/2.])
-            for side, coordinates in (('left',left),('right',right)):
-                for i, wp in enumerate(waypoints[:-1]):
+            edges={}
+            for side,coordinates in (('left',left),('right',right)):
+                records=[(float(wp.s),point,wp) for wp,point in zip(waypoints,coordinates)]
+                shared=shared_edges.get((key,side))
+                if shared:
+                    low,high=shared[0][0],shared[-1][0]
+                    records=[r for r in records if not low<=r[0]<=high]+shared
+                    records.sort(key=lambda row:row[0],reverse=waypoints[0].lane_id>0)
+                edges[side]=[r[1] for r in records]
+                for i,(_,_,wp) in enumerate(records[:-1]):
                     marking = getattr(wp, side+'_lane_marking')
                     name = str(marking.type).split('.')[-1]
                     semantics=boundary_semantics(marking.type,_permission(wp.lane_change,side),
                                                  _permission(marking.lane_change,side),wp.is_junction)
-                    boundaries.append(dict(id='{}:{}:{}'.format(key,side,i), points=coordinates[i:i+2],
+                    boundaries.append(dict(id='{}:{}:{}'.format(key,side,i), points=edges[side][i:i+2],
                         line_type=name, **semantics, source='public_waypoint_marking_and_lane_change',
                         is_junction=bool(wp.is_junction)))
             middle = waypoints[len(waypoints)//2]
@@ -299,7 +447,7 @@ class RouteAdapter:
                 same = _driving(other) and math.cos(math.radians(other.transform.rotation.yaw-middle.transform.rotation.yaw)) > .5
                 adjacent[side] = lane_key(other) if same and lane_key(other) in groups else None
             successors = sorted(set(lane_key(wp) for wp in waypoints[-1].next(max(2.,resolution*2)) if lane_key(wp) in groups and lane_key(wp) != key))
-            lanes.append(dict(id=key,center=center,polygon=left+right[::-1],width=float(middle.lane_width),
+            lanes.append(dict(id=key,center=center,polygon=edges['left']+edges['right'][::-1],width=float(middle.lane_width),
                 speed_limit=float(self.config.get('map_speed_cap_mps',30.)),successors=successors,
                 left=adjacent['left'],right=adjacent['right'],priority=0,boundaries=boundaries))
             self.lane_elevations[key] = [float(wp.transform.location.z) for wp in waypoints]

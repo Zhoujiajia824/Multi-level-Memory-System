@@ -15,7 +15,7 @@ import traceback
 from .archive import RouteArchive, _png
 from .demo_catalog import capture_implementation
 from .demo_events import DemoEvents
-from .demo_routes import select_demonstration_site, teaching_path
+from .demo_routes import select_demonstration_site, teaching_path, validate_teaching_road_path
 from .demo_teacher import DemoTeacher, SCHEMA as TEACHER_SCHEMA
 from .execution import SignedAccelerationController
 from .public_state import PublicStateExtractor
@@ -208,7 +208,30 @@ def _body_audit(scene, previous, collisions, line_events):
         polygons = scene['drivable_polygons']
         if not polygons:
             raise ValueError('missing drivable polygons')
-        offroad = not all(any(point_in_polygon(p, poly) for poly in polygons) for p in samples)
+        outside = [p for p in samples if not any(point_in_polygon(p, poly) for poly in polygons)]
+        offroad = bool(outside)
+        road_coverage = dict(source='same_frame_drivable_polygon_union',source_frame=frame,
+            ego_lane_id=ego.get('lane_id'),outside_sample_count=len(outside),
+            outside_sample_limit=8,outside_samples=[],
+            outside_distance_min_m=None,outside_distance_max_m=None)
+        if outside:
+            # Distance is diagnostic only: the existing exact inclusion test
+            # above decides offroad, with no road enlargement or grace margin.
+            def boundary_distance(point):
+                distances = []
+                for polygon in polygons:
+                    for a,b in zip(polygon,polygon[1:]+polygon[:1]):
+                        dx,dy=b[0]-a[0],b[1]-a[1]
+                        norm=dx*dx+dy*dy
+                        t=max(0.,min(1.,((point[0]-a[0])*dx+(point[1]-a[1])*dy)/norm)) if norm else 0.
+                        distances.append(math.hypot(point[0]-a[0]-t*dx,point[1]-a[1]-t*dy))
+                return min(distances) if distances else None
+            measured=[dict(position_xy_m=point,distance_to_drivable_m=boundary_distance(point)) for point in outside]
+            finite=[row['distance_to_drivable_m'] for row in measured if row['distance_to_drivable_m'] is not None]
+            road_coverage['outside_samples']=sorted(measured,
+                key=lambda row:row['distance_to_drivable_m'] or 0.,reverse=True)[:8]
+            if finite:
+                road_coverage.update(outside_distance_min_m=min(finite),outside_distance_max_m=max(finite))
         current_events = []
         for event in [*collisions,*line_events]:
             if type(event.get('frame')) is not int or event['frame'] > frame or event['frame'] < 0:
@@ -300,15 +323,27 @@ def _body_audit(scene, previous, collisions, line_events):
             # to replay yesterday's red state after the current signal is green.
             if not current_lights and not current_stops and rules.get('stop_s') is not None:
                 errors.append('active aggregate stop has no auditable rule identity')
-        return dict(collision=bool(collision_frames),collision_source_frames=collision_frames,
+        return dict(source_frame=frame,collision=bool(collision_frames),collision_source_frames=collision_frames,
             late_sensor_event_frames=sorted({row['frame'] for row in current_events if row['frame']<frame}),
             offroad=offroad,rule_violation=bool(reasons),rule_reasons=sorted(set(reasons)),
             rule_evidence=rule_evidence,body_sample_count=len(samples),body_sample_spacing_max_m=.25,
+            road_coverage=road_coverage,
             audit_input_valid=not errors,audit_errors=errors,
             projection_valid=bool(diagnostics['route_projection']['valid']) and not errors)
     except (ValueError,TypeError,KeyError,OverflowError) as exc:
-        return dict(collision=bool(collisions),offroad=False,rule_violation=False,rule_reasons=[],
+        return dict(source_frame=frame if 'frame' in locals() and type(frame) is int else None,
+            collision=bool(collisions),offroad=False,rule_violation=False,rule_reasons=[],
             projection_valid=False,audit_input_valid=False,audit_errors=['invalid physical audit input: '+str(exc)])
+
+
+def _archive_failure_scene(archive,scene,audit):
+    """Retain the last frozen state, including failures between 1Hz archives."""
+    if scene is None:
+        return
+    frame=scene['diagnostics']['carla_frame']
+    archive.json('failure_scene.json',dict(source_frame=frame,source_time=scene['time'],scene=scene,
+        audit=audit if isinstance(audit,dict) and audit.get('source_frame')==frame else None,
+        evidence='last_frozen_public_state;not_a_new_observation',memory_published=False))
 
 
 def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=False, video=True,
@@ -474,8 +509,6 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                     extractor.traffic_rules.hold_s = max(.1,float(spec['wait_s']))
                     archive.json('demonstration_stop_policy.json',dict(real_stop_sign_required=True,
                         observed_hold_s=extractor.traffic_rules.hold_s,formal_rules_modified=False))
-                body_evidence = events.validate_bodies(authored, 2*box.extent.y, ego_length=2*box.extent.x)
-                archive.json('development_site_geometry.json', body_evidence)
                 teacher_settings = dict(cruise_speed_mps=spec['cruise_speed_mps'],corridor_margin_m=.2)
                 if spec['interaction_kind'] == 'stop_sign':
                     # The public stop trigger requires an observed stop within
@@ -492,6 +525,18 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                 archive.append('event_evidence', dict(frame=frame,time=stamp,phase='approach',event='collection_started',completed=True))
             scene = extractor.capture(frame, camera_images=images, world_snapshot=snapshot)
             audit = _body_audit(scene, previous, collisions, line_events)
+            audit_rows.append(audit)
+            if previous is None:
+                # Check the same measured footprint used by the execution audit,
+                # including the full return and recovery, before driving starts.
+                measured = scene['ego']
+                body_evidence = events.validate_bodies(authored, measured['width'], ego_length=measured['length'])
+                body_evidence['road_coverage'] = validate_teaching_road_path(
+                    authored, scene['drivable_polygons'], measured['length'], measured['width'])
+                archive.json('development_site_geometry.json', body_evidence)
+                if not body_evidence['road_coverage']['valid']:
+                    raise RuntimeError('Teaching reference failed full-body road preflight: '+
+                        json.dumps(body_evidence['road_coverage']['first_failure'], ensure_ascii=False))
             actual = ego.get_control()
             command = teacher.step(scene, 1/HZ)
             speed = math.hypot(*scene['ego']['velocity'])
@@ -505,7 +550,6 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
             execution=dict(frame=frame,time=stamp,applied_control=_control(actual),
                 returned_control=_control(returned), observed_ego=scene['ego'],
                 teacher=command,controller=control,audit=audit)
-            audit_rows.append(audit)
             for event in events.update(scene,1/HZ):
                 archive.append('event_evidence', dict(frame=frame,time=stamp,**event))
             progress = scene['diagnostics']['route_projection'].get('trusted_progress_m')
@@ -581,6 +625,10 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                 frame=locals().get('frame'),time=locals().get('stamp'),successful_memory_created=False))
         except Exception as write_error:
             errors.append('failure evidence write: '+str(write_error))
+        try:
+            _archive_failure_scene(archive,locals().get('scene'),locals().get('audit'))
+        except Exception as write_error:
+            errors.append('failure scene write: '+str(write_error))
         raise
     finally:
         if events is not None and events.walker_placements:
