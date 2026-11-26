@@ -349,7 +349,27 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
         if world.get_map().name.split('/')[-1] != spec['map']:
             if not allow_map_load:
                 raise RuntimeError('Required map '+spec['map']+'; explicitly allow an idle-world map load')
-            world = client.load_world(spec['map'])
+            # Town13 cold loads use the official evaluator's 300 s allowance.
+            # A timed-out load can still finish server-side; issue it only once.
+            load_started = time.monotonic()
+            run['map_load'] = dict(map=spec['map'], timeout_s=300., status='loading')
+            archive.json('map_load.json', run['map_load'])
+            LOG.info('加载地图 %s，最多等待300秒', spec['map'])
+            client.set_timeout(300.)
+            try:
+                world = client.load_world(spec['map'])
+                actual_map = world.get_map().name.split('/')[-1]
+                if actual_map != spec['map']:
+                    raise RuntimeError('Loaded map differs from requested map: '+actual_map)
+                run['map_load']['status'] = 'ready'
+            except Exception as exc:
+                run['map_load'].update(status='failed', error=str(exc))
+                raise RuntimeError('Map load '+spec['map']+' failed: '+str(exc)) from exc
+            finally:
+                client.set_timeout(30.)
+                run['map_load']['wall_seconds'] = time.monotonic()-load_started
+                archive.json('map_load.json', run['map_load'])
+            LOG.info('地图 %s 已就绪，加载耗时 %.1f 秒', spec['map'], run['map_load']['wall_seconds'])
         saved = world.get_settings()
         saved_weather = world.get_weather()
         settings = world.get_settings()
