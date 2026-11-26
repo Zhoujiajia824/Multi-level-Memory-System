@@ -9,18 +9,22 @@ import yaml
 
 from .protocol import write_json
 from .progress import progress_interval
+from .profiles import get_profile, normalize_profile, DEFAULT_PROFILE, PROFILES
 
 
-def generate(base, destination, profile, revision, base_url, model, split="warmup_two_stage",
+def generate(base, destination, profile, revision, base_url, model, split=None,
              overwrite=False, *, groups=None, run_name=None, max_tokens=4096,
              max_model_len=16384, model_goal_retry_limit=1, request_timeout_s=120.,
              model_deadline_s=300., transport_retry_limit=1, model_concurrency=None,
              evaluation_workers=None, vllm_version=None, structured_backend="xgrammar",
-             allow_any_whitespace=False, progress_interval_s=15.):
+             allow_any_whitespace=False, progress_interval_s=15., benchmark=DEFAULT_PROFILE,
+             sdk_root=None, sdk_python=None):
     if not isinstance(revision, str) or not revision.strip():
         raise ValueError("An explicit model weights/config revision is required")
-    if split not in ("warmup_two_stage", "navhard_two_stage"):
-        raise ValueError("Unknown pinned official split")
+    protocol = get_profile(benchmark)
+    split = split or protocol["splits"][0]
+    if split not in protocol["splits"]:
+        raise ValueError("Split is incompatible with benchmark " + protocol["id"])
     groups = tuple(groups) if groups is not None else ("A_base", "B_model", "C_model_memory")
     allowed = {"A_base", "B_model", "C_model_memory"}
     if not groups or len(set(groups)) != len(groups) or not set(groups).issubset(allowed):
@@ -62,7 +66,7 @@ def generate(base, destination, profile, revision, base_url, model, split="warmu
         raise ValueError("An explicit served model name is required")
     destination = Path(destination).resolve()
     template = json.loads(Path(base).read_text(encoding="utf-8"))
-    suffix = profile + ("." + run_name if run_name else "")
+    suffix = profile + ("." + benchmark if benchmark != DEFAULT_PROFILE else "") + ("." + run_name if run_name else "")
     prefix = "navsim." + suffix
     model_path = destination / ("models.navsim." + suffix + ".local.yaml")
     files = [model_path] + [destination / (prefix + "." + name + ".local.json")
@@ -79,17 +83,34 @@ def generate(base, destination, profile, revision, base_url, model, split="warmu
             maps_runtime_root=root + "/experiments/navsim/maps_runtime",
             metric_cache_path=root + "/experiments/navsim/cache/" + split)
         output = root + "/experiments/navsim/" + split
+        if not protocol["two_stage"]:
+            version = "v1" if protocol["is_v1"] else "v2"
+            if protocol["is_v1"]:
+                template.update(sdk_root=root + "/navsim-devkit-v1.1",
+                    sdk_python="/home/zjj/miniconda3/envs/ep-navsim-v1/bin/python")
+            template["metric_cache_path"] = root + "/experiments/navsim/cache/" + version + "/navtest"
+            output = root + "/experiments/navsim/" + version + "/navtest"
         memory = root + "/driving_experience"
         # The generated files will be copied/published under the branch's config directory.
         model_reference = "config/" + model_path.name
     elif profile == "local":
         output = "test/artifacts/navsim/local/" + split
+        if not protocol["two_stage"]:
+            version = "v1" if protocol["is_v1"] else "v2"
+            output = "test/artifacts/navsim/local/" + version + "/navtest"
+            template["metric_cache_path"] = "test/artifacts/navsim/cache/" + version + "/navtest"
+            if protocol["is_v1"] and not sdk_root:
+                raise ValueError("Local v1 evaluation requires --sdk-root pointing to pinned official v1.1 source")
         memory = "E:/driving_memory_workspace/libraries/driving_experience"
         model_reference = str(model_path)
     else:
         raise ValueError("profile must be local or server")
     if run_name:
         output += "/" + run_name
+    if sdk_root:
+        template["sdk_root"] = str(sdk_root)
+    if sdk_python:
+        template["sdk_python"] = str(sdk_python)
     settings = dict(template, split=split, resume=True, model_revision=revision,
         timeout_s=3600.0, bev_video=True,
         navigation_preflight_workers=8 if profile == "server" else 1,
@@ -98,7 +119,8 @@ def generate(base, destination, profile, revision, base_url, model, split="warmu
         model_service=dict(image_limit=9, max_pixels_per_image=602112, max_model_len=max_model_len,
             max_num_seqs=model_concurrency, vllm_version=vllm_version,
             structured_outputs=dict(backend=structured_backend, disable_any_whitespace=not allow_any_whitespace)),
-        models_config=model_reference)
+        models_config=model_reference, benchmark_profile=benchmark)
+    settings = normalize_profile(settings)
     destination.mkdir(parents=True, exist_ok=True)
     models = dict(fast=dict(backend="server", base_url=base_url, model=model,
                            api_key_env="FAST_VLM_API_KEY", timeout_s=float(request_timeout_s), max_tokens=max_tokens),
@@ -115,13 +137,16 @@ def generate(base, destination, profile, revision, base_url, model, split="warmu
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-config", default="config/navsim.local.json")
+    parser.add_argument("--base-config", default="config/navsim.example.json")
     parser.add_argument("--destination", help="Defaults to test/config for local bringup, config for server")
     parser.add_argument("--profile", choices=("local", "server"), required=True)
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     parser.add_argument("--model", default="Qwen2.5-VL-3B-Instruct")
-    parser.add_argument("--split", choices=("warmup_two_stage", "navhard_two_stage"), default="warmup_two_stage")
+    parser.add_argument("--benchmark", choices=tuple(PROFILES), default=DEFAULT_PROFILE)
+    parser.add_argument("--split", choices=("navtest", "warmup_two_stage", "navhard_two_stage"))
+    parser.add_argument("--sdk-root", help="Explicit pinned SDK directory; v1 and v2 must be separate")
+    parser.add_argument("--sdk-python", help="Python 3.9 interpreter for the selected SDK")
     parser.add_argument("--groups", nargs="+", choices=("A_base", "B_model", "C_model_memory"),
                         help="Select A_base B_model for the paired no-retrieval comparison")
     parser.add_argument("--run-name", help="New shared run label; keeps old results and configs separate")
@@ -153,7 +178,8 @@ def main():
                          transport_retry_limit=args.transport_retry_limit, model_concurrency=args.model_concurrency,
                          evaluation_workers=args.evaluation_workers, vllm_version=args.vllm_version,
                          structured_backend=args.structured_backend, allow_any_whitespace=args.allow_any_whitespace,
-                         progress_interval_s=args.progress_interval_s):
+                         progress_interval_s=args.progress_interval_s, benchmark=args.benchmark,
+                         sdk_root=args.sdk_root, sdk_python=args.sdk_python):
         print(path)
 
 

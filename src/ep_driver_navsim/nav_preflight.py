@@ -20,6 +20,7 @@ import traceback
 
 from nine_grid.paths import filesystem_path
 from .protocol import digest, write_json
+from .profiles import get_profile, is_two_stage
 
 SCHEMA = "ep-navsim-navigation-preflight-4"
 MAP_VERSION = "nuplan-maps-v1.0"
@@ -79,10 +80,14 @@ def cache_contract(settings, tokens):
         adapter['nine_grid/'+name] = hashlib.sha256(
             (source.parent/'nine_grid'/name).read_bytes().replace(b'\r\n',b'\n')).hexdigest()
     required = ("official_commit", "official_source_sha256", "map_source_sha256",
-                "scene_filter_sha256", "mapping_sha256", "numerical_source_sha256")
+                "scene_filter_sha256", "numerical_source_sha256")
+    if is_two_stage(settings):
+        required += ("mapping_sha256",)
     if any(not settings.get(key) for key in required):
         raise ValueError("Navigation preflight requires verified SDK/map/source fingerprints")
     return dict(schema=SCHEMA, adapter_source_sha256=adapter,
+        benchmark_profile=get_profile(settings)["id"],
+        official_metric=settings.get("official_metric"),
         verified_sources={key: settings[key] for key in required},
         selected_tokens_sha256=digest(tokens), selected_token_count=len(tokens),
         split=settings["split"], data_root=str(Path(settings["data_root"]).resolve()),
@@ -101,8 +106,9 @@ def extract_task(loader, token):
     unavoidable, but no future row/trajectory/annotation is inspected or sent.
     Original yaw uses precisely the quaternion convention in Scene's builder.
     """
-    if token in loader.synthetic_scenes:
-        with filesystem_path(loader.synthetic_scenes[token][0]).open("rb") as stream:
+    synthetic_scenes = getattr(loader, "synthetic_scenes", {})
+    if token in synthetic_scenes:
+        with filesystem_path(synthetic_scenes[token][0]).open("rb") as stream:
             value = pickle.load(stream)
         metadata = value["scene_metadata"]
         if metadata["num_history_frames"] != 4:

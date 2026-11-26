@@ -81,6 +81,9 @@ class ProgressMonitor:
         self.root = Path(settings["output_dir"]) / "samples"
         self.video = settings.get("bev_video", True)
         self.model_requested = settings.get("fast", "off") != "off"
+        self.benchmark_profile = settings.get("benchmark_profile", "v2_two_stage")
+        self.benchmark_label = {"v1_navtest": "v1.1/navtest/单阶段", "v2_navtest": "v2.2/navtest/单阶段",
+                                "v2_two_stage": "v2.2/两阶段"}.get(self.benchmark_profile, self.benchmark_profile)
         self.expected = {hashlib.sha256(json.dumps(str(token), ensure_ascii=False).encode()).hexdigest()[:24]: str(token)
                          for token in settings.get("evaluation_tokens", [])}
         self._cache = {}
@@ -189,14 +192,15 @@ class ProgressMonitor:
         longest = max(active, key=lambda row: row["elapsed_s"] if row["elapsed_s"] is not None else -1, default=None)
         keys = ("expected", "attempted", "planned", "scored", "videos", "model_applied", "base_fallback",
                 "model_unknown", "failed", "processing", "unbound", "not_attempted")
-        return dict(**{key: counts[key] for key in keys}, stages=dict(stages), longest_active=longest)
+        return dict(**{key: counts[key] for key in keys}, stages=dict(stages), longest_active=longest,
+                    benchmark_profile=self.benchmark_profile)
 
     def emit(self, phase="official_scoring"):
         try:
             row = self.snapshot()
             total = row["expected"]
             percent = 100*row["scored"]/total if total else 0.
-            message = ("[NAVSIM进度] 阶段="+str(phase)+"；官方评分="+str(row["scored"])+"/"+str(total)
+            message = ("[NAVSIM进度] 协议="+self.benchmark_label+"；阶段="+str(phase)+"；官方评分="+str(row["scored"])+"/"+str(total)
                        +" (%.2f%%)" % percent+"；规划完成="+str(row["planned"])+"；视频="+str(row["videos"])
                        +"；处理中="+str(row["processing"])+"；失败="+str(row["failed"]))
             if self.model_requested:

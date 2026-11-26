@@ -75,6 +75,11 @@ def build_run_identity(settings, effective_config, model_settings, system_prompt
         except PackageNotFoundError:
             dependencies[package] = None
     return dict(schema=SCHEMA, input_protocol=INPUT_PROTOCOL,
+                benchmark=dict(profile=settings.get("benchmark_profile", "v2_two_stage"),
+                    navsim_version=settings.get("navsim_version", "v2.2"),
+                    official_commit=settings.get("official_commit"),
+                    official_source_sha256=settings.get("official_source_sha256"),
+                    traffic_policy=settings.get("traffic_policy", settings.get("traffic_agents", "reactive"))),
                 runtime=dict(python=sys.version, platform=platform.platform(), dependencies=dependencies),
                 numerical_source_sha256=settings["numerical_source_sha256"],
                 effective_parameters_sha256=digest(effective_config),

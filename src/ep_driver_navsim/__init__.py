@@ -1,9 +1,10 @@
-"""NAVSIM v2.2 integration. SDK modules stay importable under Python 3.9.
+"""Versioned NAVSIM v1/v2 integration; SDK modules run under Python 3.9.
 
 The numerical planner runs in a separate Python 3.12 process; importing this
 package must not import nine_grid or alter the official evaluator.
 """
 
+# Legacy defaults stay v2.2; explicit versioned contracts live in profiles.py.
 OFFICIAL_TAG = "v2.2"
 OFFICIAL_COMMIT = "359c7f72304bfa8273e754224a213d3751bd2340"
 INPUT_PROTOCOL = "ep-driver-navsim-privileged-history-1.1"

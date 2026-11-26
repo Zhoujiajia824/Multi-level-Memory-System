@@ -434,12 +434,19 @@ def _history_actors(frames, origin):
     return actors, ignored
 
 
-def build_packet(agent_input, scene, camera_dir, desired_speed_mps=10.0, map_radius_m=160.0):
+def build_packet(agent_input, scene, camera_dir, desired_speed_mps=10.0, map_radius_m=160.0,
+                 benchmark_profile="v2_two_stage"):
     from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters
+    from .profiles import is_v1
 
     metadata = scene.scene_metadata
     if metadata.num_history_frames != 4 or len(agent_input.ego_statuses) != 4:
-        raise ValueError("The official v2.2 evaluation input must have four history/current frames")
+        raise ValueError("The official NAVSIM evaluation input must have four history/current frames")
+    legacy_scene = is_v1({"benchmark_profile": benchmark_profile})
+    # v1.1 has no synthetic-scene provenance fields. Null explicitly means
+    # inapplicable there; a v2 Scene must still provide its official fields.
+    corresponding_scene = None if legacy_scene else metadata.corresponding_original_scene
+    corresponding_token = None if legacy_scene else metadata.corresponding_original_initial_token
     # This is the only access to scene.frames. Never index a future frame.
     frames = [scene.frames[i] for i in range(4)]
     now = frames[-1]
@@ -539,8 +546,8 @@ def build_packet(agent_input, scene, camera_dir, desired_speed_mps=10.0, map_rad
         identity=dict(token=str(now.token), log_name=metadata.log_name, scene_token=metadata.scene_token,
                       map_name=metadata.map_name, timestamp_us=int(now.timestamp), history_frames=4,
                       history_timestamps_us=ts.tolist(),
-                      corresponding_original_scene=metadata.corresponding_original_scene,
-                      corresponding_original_initial_token=metadata.corresponding_original_initial_token),
+                      corresponding_original_scene=corresponding_scene,
+                      corresponding_original_initial_token=corresponding_token),
         vehicle=dict(length_m=float(vehicle.length), width_m=float(vehicle.width),
                      wheelbase_m=float(vehicle.wheel_base), rear_axle_to_center_m=rear),
         ego=ego, actors=actors, lanes=lanes, route=route.tolist(), route_lane_ids=ids, drivable_geometry=drivable_geometry,

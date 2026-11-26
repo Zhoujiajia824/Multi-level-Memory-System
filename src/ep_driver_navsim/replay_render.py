@@ -21,6 +21,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from shapely import wkt
 from nine_grid.paths import filesystem_path
+from .profiles import get_profile
 
 
 VERSION = "navsim-official-replay-1.0"
@@ -38,6 +39,15 @@ METRICS = (
     ("EP", "ego_progress"), ("TTC", "time_to_collision_within_bound"),
     ("LK", "lane_keeping"), ("HC", "history_comfort"),
 )
+
+
+def replay_metrics(replay):
+    """Display only metrics actually defined by the selected official version."""
+    if get_profile(replay)["is_v1"]:
+        return (("NC", "no_at_fault_collisions"), ("DAC", "drivable_area_compliance"),
+                ("DDC", "driving_direction_compliance"), ("EP", "ego_progress"),
+                ("TTC", "time_to_collision_within_bound"), ("C", "comfort"), ("PDMS", "score"))
+    return METRICS
 
 
 def _array(value, label, minimum_columns):
@@ -69,6 +79,7 @@ def load_replay(path):
         value = json.load(stream)
     if value.get("version") != VERSION:
         raise ValueError("Unsupported official replay version")
+    get_profile(value)  # Reject a mislabeled future profile; legacy defaults stay supported.
     dt = float(value["dt_s"])
     if not math.isfinite(dt) or not math.isclose(dt, 0.1, abs_tol=1e-9):
         raise ValueError("Official replay requires actual 0.1s samples")
@@ -294,7 +305,8 @@ class _Canvas:
         self.text(drawing, (22, 75), "t = %.1f / 4.0 s    speed = %.2f m/s    actors = %d" %
                   (index * self.replay["dt_s"], np.linalg.norm(self.states[index, 3:5]),
                    len(self.replay["actors"][index])))
-        self.text(drawing, (22, 100), "Official LQR / dynamics + captured traffic-policy response; no replanning within this clip.", "small")
+        traffic = "scored non-reactive GT occupancy" if get_profile(self.replay)["is_v1"] else "captured traffic-policy response"
+        self.text(drawing, (22, 100), "Official LQR / dynamics + " + traffic + "; no replanning.", "small")
         drawing.rectangle(self.rect, outline=COLORS["border"], width=1)
         # Compass stays fixed as the vehicle turns; this is not an ego-up view.
         nx, ny = self.u(847), self.u(164)
@@ -311,9 +323,11 @@ class _Canvas:
             x, y = 24 + (number % 4) * 215, 694 + (number // 4) * 24
             drawing.rectangle((self.u(x), self.u(y + 3), self.u(x + 13), self.u(y + 13)), fill=COLORS[key])
             self.text(drawing, (x + 20, y), label, "small")
-        self.text(drawing, (22, 749), "OFFICIAL FINAL COMPONENTS (whole clip, after official filtering)", "normal")
+        metric_label = ("OFFICIAL V1 PDMS COMPONENTS (whole clip; no human filter)"
+                        if get_profile(self.replay)["is_v1"] else "OFFICIAL FINAL COMPONENTS (whole clip, after official filtering)")
+        self.text(drawing, (22, 749), metric_label, "normal")
         values = self.replay["metrics"]["official_final"]
-        for number, (short, key) in enumerate(METRICS):
+        for number, (short, key) in enumerate(replay_metrics(self.replay)):
             value = values.get(key)
             valid = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
             label = "--" if not valid else "%.2f" % value
@@ -324,7 +338,7 @@ class _Canvas:
                   for event in self.replay.get("events", []) if event["frame_index"] == index]
         message = "; ".join(events) if events else "No timed raw diagnostic at this sample."
         self.text(drawing, (22, 830), message[:105], "normal", COLORS["red"] if events else COLORS["muted"])
-        self.text(drawing, (22, 866), "0.0-4.0 s state horizon; 41 endpoint-inclusive frames / 10 fps = 4.1 s video. EPDMS aggregates separately.", "small")
+        self.text(drawing, (22, 866), "0.0-4.0 s horizon; 41 samples / 10 fps = 4.1 s video. Dataset scores are in the official CSV.", "small")
         return image
 
 
@@ -412,6 +426,7 @@ def _render_captured(replay_path, destination, replay, canvas, size, metadata, *
         raise RuntimeError("Encoded official replay failed frame-count/fps validation")
     os.replace(temporary, video)
     status = dict(status="complete", token=replay["token"], replay_version=VERSION,
+                  benchmark_profile=get_profile(replay)["id"],
                   sample_attempt_id=(replay.get("provenance") or {}).get("sample_attempt_id"),
                   stage=replay.get("stage"), replay_path=str(replay_path),
                   video=str(video), preview=str(destination / "official_bev_first.png"),
@@ -462,6 +477,8 @@ def render_replay(replay_path, output_dir=None, *, size=900, settings=None,
         raise ValueError("Unknown replay renderer: " + str(renderer))
     settings_path = _find_settings(replay_path, settings)
     frozen = json.loads(settings_path.read_text(encoding="utf-8"))
+    if get_profile(frozen)["id"] != get_profile(replay)["id"]:
+        raise ValueError("Replay benchmark profile differs from its rendering settings")
     executable = sdk_python or os.environ.get("EP_NAVSIM_SDK_PYTHON") or frozen.get("sdk_python")
     sdk_root = sdk_root or os.environ.get("EP_NAVSIM_SDK_ROOT") or frozen.get("sdk_root")
     if not executable or not sdk_root:

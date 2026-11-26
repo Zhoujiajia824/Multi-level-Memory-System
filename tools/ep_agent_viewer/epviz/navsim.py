@@ -32,11 +32,18 @@ _RUN_METRICS = (
     ("HC", "history_comfort", "历史运动衔接舒适性"),
     ("EC", "two_frame_extended_comfort", "相邻规划扩展舒适性"),
 )
+_V1_RUN_METRICS = (
+    ("NC", "no_at_fault_collisions", "无责任碰撞"),
+    ("DAC", "drivable_area_compliance", "可行驶区域遵守"),
+    ("TTC", "time_to_collision_within_bound", "碰撞时间安全性"),
+    ("EP", "ego_progress", "自车行驶进度"),
+    ("C", "comfort", "舒适性"),
+)
 
 
 def _stage(value):
     return {"original": "stage_one", "synthetic": "stage_two",
-            "stage_one": "stage_one", "stage_two": "stage_two"}.get(str(value).lower())
+            "stage_one": "stage_one", "stage_two": "stage_two", "single_stage": "single_stage"}.get(str(value).lower())
 
 
 @lru_cache(maxsize=1)
@@ -107,15 +114,29 @@ class NavsimRun(_Episode):
         self._csv_signature = None
         self._csv_rows = {}
         self._csv_error = None
+        self._single_summary_cache = None
 
     def benchmark(self):
         value = self.json(self.path / "benchmark_result.json")
         return value if isinstance(value, dict) else {}
 
+    def profile(self):
+        settings = self.json(self.path / "run_settings.json") or {}
+        settings = settings if isinstance(settings, dict) else {}
+        benchmark = self.benchmark()
+        profile = benchmark.get("benchmark_profile", settings.get("benchmark_profile", "v2_two_stage"))
+        single = profile in ("v1_navtest", "v2_navtest")
+        return dict(id=profile, recognized=profile in ("v1_navtest", "v2_navtest", "v2_two_stage"),
+            single_stage=single, navsim_version=settings.get("navsim_version") or ("v1.1" if profile == "v1_navtest" else "v2.2"),
+            score_name="PDMS" if profile == "v1_navtest" else "EPDMS",
+            stage_columns=["single_stage"] if single else ["stage_one", "stage_two"],
+            traffic_policy=settings.get("traffic_policy", settings.get("traffic_agents")))
+
     def metadata(self):
         settings = self.json(self.path / "run_settings.json") or {}
         settings = settings if isinstance(settings, dict) else {}
         benchmark = self.benchmark()
+        profile = self.profile()
         fast = settings.get("fast")
         condition = "基础规划" if fast == "off" else "基础规划＋模型" if fast in ("api", "server") else "输入条件未归档"
         if settings.get("retrieve") is True:
@@ -123,11 +144,14 @@ class NavsimRun(_Episode):
         expected = settings.get("evaluation_tokens")
         expected = len(expected) if isinstance(expected, list) else benchmark.get("expected_tokens", benchmark.get("evaluated_tokens"))
         return dict(id=self.id, name=self.path.name, path=self.path.relative_to(self.authorized_root).as_posix(),
-            label=condition + " · " + self.path.name, condition_label=condition,
+            label="NAVSIM " + profile["navsim_version"] + " · " + condition + " · " + self.path.name, condition_label=condition,
+            benchmark_profile=profile["id"], navsim_version=profile["navsim_version"],
+            score_name=profile["score_name"], stage_columns=profile["stage_columns"], traffic_policy=profile["traffic_policy"],
             split=benchmark.get("split", settings.get("split")),
             status=benchmark.get("status", "pending"), run_phase=benchmark.get("phase"), sample_count=self.sample_count,
             completed_samples=self.completed_samples, expected_samples=expected,
-            stages=dict(self.stages), model_backend=fast, retrieval_enabled=settings.get("retrieve"),
+            stages=dict(single_stage=self.sample_count) if profile["single_stage"] else dict(self.stages),
+            model_backend=fast, retrieval_enabled=settings.get("retrieve"),
             standard_sensor_only_comparable=benchmark.get("standard_sensor_only_comparable"))
 
     def _official_rows(self):
@@ -145,7 +169,7 @@ class NavsimRun(_Episode):
                         for row in csv.DictReader(stream):
                             token = row.get("token")
                             if not token:
-                                continue
+                                raise ValueError("Missing token in official CSV")
                             if token in self._csv_rows:
                                 raise ValueError("Duplicate token in official CSV")
                             self._csv_rows[token] = row
@@ -158,6 +182,8 @@ class NavsimRun(_Episode):
         return self._official_rows()[1].get(token)
 
     def details(self):
+        if self.profile()["id"] != "v2_two_stage":
+            return self._single_stage_details()
         result = self.metadata()
         path, rows = self._official_rows()
         first = rows.get("extended_pdm_score_stage_one", {})
@@ -200,6 +226,71 @@ class NavsimRun(_Episode):
             failed_samples=self.benchmark().get("failed_tokens"),
             error=failure if isinstance(failure, dict) else None,
             condition_audit=self.benchmark().get("condition_audit"))
+        return result
+
+    def _single_stage_details(self):
+        result, profile = self.metadata(), self.profile()
+        path, rows = self._official_rows()
+        metadata_signature = []
+        for name in ("run_settings.json", "benchmark_result.json"):
+            info = _stat(self.path / name)
+            metadata_signature.append((info.st_size, info.st_mtime_ns) if info else None)
+        signature = (self._csv_signature, tuple(metadata_signature))
+        if self._single_summary_cache is not None and self._single_summary_cache[0] == signature:
+            # A 12k-anchor CSV is validated once per file revision, not for
+            # every 10Hz replay frame. Discovery counts remain live metadata.
+            result.update(copy.deepcopy(self._single_summary_cache[1]))
+            return result
+        is_v1 = profile["id"] == "v1_navtest"
+        summary = rows.get("average" if is_v1 else "average_all_frames", {})
+        fields = _V1_RUN_METRICS if is_v1 else _RUN_METRICS
+        if is_v1 and "driving_direction_compliance" in summary:
+            fields = (*fields, ("DDC", "driving_direction_compliance", "行驶方向遵守"))
+        metrics = [dict(key=key, label=label, single_stage=_finite(summary.get(field))) for key, field, label in fields]
+        score = _finite(summary.get("score"))
+        warnings, unavailable = [], {}
+        required = []
+        for row in metrics:
+            if (row["key"] == "EC" and not is_v1
+                    and str(summary.get("two_frame_extended_comfort")).lower() in ("", "none", "nan")):
+                unavailable["EC"] = "官方单阶段无相邻终点配对，EC未定义且权重为0；不补分。"
+                row["unavailable_reason"] = unavailable["EC"]
+            else:
+                required.append(row["single_stage"])
+        settings = self.json(self.path / "run_settings.json") or {}
+        expected = settings.get("evaluation_tokens")
+        summary_token = "average" if is_v1 else "average_all_frames"
+        valid = (profile["recognized"] and isinstance(expected, list) and bool(expected)
+            and len(expected) == len(set(expected)) and set(rows) == set(expected) | {summary_token}
+            and all(field in summary for _, field, _ in fields)
+            and all(str(row.get("valid", "")).lower() == "true" for row in rows.values())
+            and all(value is not None and 0 <= value <= 1 for value in [score, *required])
+            and all(_finite(rows[token].get("score")) is not None
+                    and 0 <= _finite(rows[token].get("score")) <= 1 for token in expected))
+        failure = self.benchmark().get("error")
+        status = "failed" if result["status"] == "failed" else "pending"
+        if result["status"] == "complete":
+            archived = _finite(self.benchmark().get("official_score"))
+            valid = valid and (archived is None or score is not None and abs(archived-score) <= 1e-9)
+            status = "complete" if valid else "unavailable"
+            if not valid:
+                warnings.append("完整有效的官方单阶段CSV与整轮结果尚不一致，未展示为有效汇总。")
+        if isinstance(failure, dict):
+            warnings.append(str(failure.get("type", "Error")) + ": " + str(failure.get("message", "")))
+        if self._csv_error:
+            warnings.append("官方CSV读取失败：" + self._csv_error)
+        if status != "complete":
+            score = None
+            metrics = [{**row, "single_stage": None} for row in metrics]
+        payload = dict(scores=dict(single_stage=score), metrics=metrics, scores_status=status,
+            unavailable_metrics=unavailable, official_csv=path, score_source="official_csv_named_summary_rows",
+            metric_scale="0_to_1", warnings=warnings,
+            score_semantics="Original SDK single-stage average row; no paired-stage aggregation",
+            input_condition=self.benchmark().get("input_condition"),
+            failed_samples=self.benchmark().get("failed_tokens"), error=failure if isinstance(failure, dict) else None,
+            condition_audit=self.benchmark().get("condition_audit"))
+        self._single_summary_cache = signature, copy.deepcopy(payload)
+        result.update(payload)
         return result
 
 
@@ -397,6 +488,8 @@ class NavsimEpisode(_Episode):
     def stage(self):
         # The scorer explicitly records original/synthetic. Missing future GT
         # or a suggestive directory name is not evidence of a stage.
+        if self.run and self.run.profile()["single_stage"]:
+            return "single_stage", "run_settings.benchmark_profile"
         primary = (self._listing_state or {}).get("primary_stage", (None, None))
         if primary[0]:
             return primary
@@ -490,14 +583,20 @@ class NavsimEpisode(_Episode):
         ready = summary.get("scores_status") == "complete"
         csv_row = self.run.csv_record(self.token) if self.run and ready else None
         final = ((self.trace or {}).get("metrics") or {}).get("official_final")
-        return dict(internal_quality=_compact(self.planning.get("internal_quality")),
+        profile = self.run.profile() if self.run else dict(single_stage=False, score_name="EPDMS")
+        aggregate = dict(score=(summary.get("scores") or {}).get("single_stage" if profile["single_stage"] else "combined") if ready else None,
+            score_name=profile["score_name"], status=summary.get("scores_status", "pending"),
+            evaluated_tokens=benchmark.get("evaluated_tokens"), failed_tokens=benchmark.get("failed_tokens"),
+            split=benchmark.get("split"), benchmark_profile=summary.get("benchmark_profile"),
+            standard_sensor_only_comparable=benchmark.get("standard_sensor_only_comparable"))
+        result = dict(internal_quality=_compact(self.planning.get("internal_quality")),
             internal_quality_is_official_metric=False,
             official_anchor=_compact(final), official_csv_anchor=csv_row,
-            official_two_stage_aggregate=dict(score=(summary.get("scores") or {}).get("combined") if ready else None,
-                status=summary.get("scores_status", "pending"),
-                evaluated_tokens=benchmark.get("evaluated_tokens"), failed_tokens=benchmark.get("failed_tokens"),
-                split=benchmark.get("split"), standard_sensor_only_comparable=benchmark.get("standard_sensor_only_comparable")),
-            semantics="Internal quality, pre-aggregation official anchor metrics, CSV anchor row and official two-stage run aggregate are distinct; none are instantaneous replay metrics")
+            official_run_aggregate=aggregate,
+            semantics="Internal quality, official anchor metrics, CSV anchor row and complete run summary are distinct; none are instantaneous replay metrics")
+        if not profile["single_stage"]:
+            result["official_two_stage_aggregate"] = aggregate
+        return result
 
     def _model(self, store):
         prompt_path = self._file("model_prompt.txt")

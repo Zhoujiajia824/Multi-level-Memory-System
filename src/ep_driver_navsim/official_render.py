@@ -16,7 +16,8 @@ import numpy as np
 from PIL import Image
 from nine_grid.paths import filesystem_path
 
-from .replay_render import METRICS, RENDERER_VERSION, _render_captured, load_replay
+from .replay_render import RENDERER_VERSION, _render_captured, load_replay, replay_metrics
+from .profiles import get_profile
 
 
 VIEWS = (("cam_l0", "cam_f0", "cam_r0"),
@@ -113,6 +114,7 @@ class OfficialCanvas:
         from nuplan.common.actor_state.state_representation import StateSE2
 
         self.bev, self.plots, self.replay, self.size = bev, plots, replay, size
+        profile = get_profile(replay)
         self.agent_config, self.trajectory_config = AGENT_CONFIG, TRAJECTORY_CONFIG
         self.states = np.asarray(replay["ego"]["states"], float)
         self.origin = self.states[0, :3].copy()
@@ -143,10 +145,14 @@ class OfficialCanvas:
                   ("Executed history", TAB_10[0]), ("Recorded human reference" if human else "Human: unavailable", TRAJECTORY_CONFIG["human"]["line_color"])]
         for index, (label, color) in enumerate(legend):
             self.fig.text(.06 + index * .30, .218, label, color=color, fontsize=10 * size / 900)
-        self.fig.text(.055, .189, "Bodies: actual scorer ego / first traffic-policy response. Cameras: static source anchor only.", fontsize=9 * size / 900)
-        self.fig.text(.055, .158, "OFFICIAL FINAL COMPONENTS (whole anchor, after official filtering)", fontsize=9 * size / 900)
+        traffic = "exact scored non-reactive GT occupancy" if profile["is_v1"] else "first traffic-policy response"
+        self.fig.text(.055, .189, "Bodies: actual scorer ego / " + traffic + ". Cameras: source anchor only.", fontsize=9 * size / 900)
+        metric_label = ("OFFICIAL V1 PDMS COMPONENTS (whole anchor; no human filter)" if profile["is_v1"]
+                        else "OFFICIAL FINAL COMPONENTS (whole anchor, after official filtering)")
+        self.fig.text(.055, .158, metric_label, fontsize=9 * size / 900)
         values = replay["metrics"]["official_final"]
-        labels = [short + " " + ("%.2f" % values[key] if isinstance(values.get(key), (float, int)) else "--") for short, key in METRICS]
+        labels = [short + " " + ("%.2f" % values[key] if isinstance(values.get(key), (float, int)) else "--")
+                  for short, key in replay_metrics(replay)]
         self.fig.text(.055, .130, "    ".join(labels), fontsize=10 * size / 900)
         self.fig.text(.055, .098, "RAW TIMED DIAGNOSTICS (before filtering; not per-frame scores)", fontsize=9 * size / 900)
         self.events = self.fig.text(.055, .071, "", fontsize=10 * size / 900)
@@ -245,6 +251,8 @@ def render_official(replay_path, output_dir, settings, size=900, packet=None):
 
     replay_path, destination = filesystem_path(replay_path), filesystem_path(output_dir)
     replay = load_replay(replay_path)
+    if get_profile(replay)["id"] != get_profile(settings)["id"]:
+        raise ValueError("Official renderer SDK profile differs from the captured score")
     source_hash = hashlib.sha256(replay_path.read_bytes()).hexdigest()
     files = [filesystem_path(inspect.getfile(module)) for module in (bev, camera, config, plots)]
     hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
@@ -260,6 +268,7 @@ def render_official(replay_path, output_dir, settings, size=900, packet=None):
         if hashlib.sha256(replay_path.read_bytes()).hexdigest() != source_hash:
             raise RuntimeError("Captured scoring trace changed during export")
         status.update(official_functions_called=canvas.calls, official_visualization_source_sha256=hashes,
+            benchmark_profile=get_profile(replay)["id"], official_commit=settings.get("official_commit"),
             official_sdk_sources_unchanged=True, trace_sha256=source_hash,
             renderer_python=sys.version, source_anchor=source, camera_panel=str(panel),
             filesystem_path_policy="absolute_windows_extended_or_native_posix",

@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/autonomousvision/navsim",
+  "branch": "v1.1",
+  "commit": "3e8291bfa89ff247231e0227778840cd0a036896",
+  "source_files": 128,
+  "source_sha256": "329f3716b9c41e7a6f55fe90a1861e51a32866023b920f645586f24b59efad4a",
+  "source_hash_definition": "sort relative POSIX paths for navsim/**/*.py and navsim/**/*.yaml; path:sha256(bytes with CRLF normalized to LF), joined by newline",
+  "nuplan_tag": "nuplan-devkit-v1.2",
+  "trajectory": {"reference_point": "rear_axle", "horizon_s": 4.0, "interval_s": 0.5, "poses": 8},
+  "metric": "NAVSIM_v1.1_official_navtest_PDMS",
+  "supported_splits": ["navtest"],
+  "input_condition": "privileged_current_history_tracks_hd_map_route_traffic_lights",
+  "standard_sensor_only_comparable": false
+}

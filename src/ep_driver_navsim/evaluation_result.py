@@ -27,6 +27,15 @@ METRICS = (
 )
 STAGES = ("stage_one", "stage_two")
 SUMMARY_TOKENS = {"extended_pdm_score_" + name for name in (*STAGES, "combined")}
+V1_METRICS = (("NC", "no_at_fault_collisions"), ("DAC", "drivable_area_compliance"),
+              ("TTC", "time_to_collision_within_bound"), ("EP", "ego_progress"), ("C", "comfort"))
+
+
+def _profile(settings):
+    value = settings.get("benchmark_profile", "v2_two_stage")
+    if value not in ("v1_navtest", "v2_navtest", "v2_two_stage"):
+        raise ValueError("Unknown NAVSIM benchmark_profile")
+    return value
 
 
 def utc_now():
@@ -78,6 +87,8 @@ def _number(value, context):
 
 def validate_csv(settings, csv_path):
     """Check all samples, all three SDK summaries and all nine scalar metrics."""
+    if _profile(settings) != "v2_two_stage":
+        return _validate_single_stage_csv(settings, csv_path)
     with filesystem_path(csv_path).open(encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
         columns = set(reader.fieldnames or ())
@@ -136,6 +147,53 @@ def validate_csv(settings, csv_path):
     return dict(scores=scores, metrics=metrics, stage_counts={stage: len(tokens) for stage, tokens in membership.items()})
 
 
+def _validate_single_stage_csv(settings, csv_path):
+    """Read the original SDK average row without inventing a paired stage.
+
+    Per-anchor columns may contain official undefined quantities. Only v2's
+    EC summary may remain undefined: its one-stage evaluator has no adjacent
+    endpoint pair and gives that term zero weight. It stays None in JSON.
+    """
+    profile = _profile(settings)
+    is_v1 = profile == "v1_navtest"
+    summary_token = "average" if is_v1 else "average_all_frames"
+    metrics = V1_METRICS if is_v1 else METRICS
+    with filesystem_path(csv_path).open(encoding="utf-8-sig", newline="") as stream:
+        reader = csv.DictReader(stream)
+        names = reader.fieldnames or []
+        columns = set(names)
+        required = {"token", "valid", "score"} | {field for _, field in metrics}
+        if len(columns) != len(names) or not required.issubset(columns):
+            raise RuntimeError("Official single-stage CSV is missing required columns or has duplicate headers")
+        rows = list(reader)
+    expected = set(settings["evaluation_tokens"])
+    by_token = {row.get("token"): row for row in rows}
+    if (len(expected) != len(settings["evaluation_tokens"]) or not expected
+            or len(by_token) != len(rows) or set(by_token) != expected | {summary_token}):
+        raise RuntimeError("Official single-stage CSV is incomplete or has duplicate/unexpected tokens")
+    if any(str(row.get("valid", "")).lower() != "true" for row in rows):
+        raise RuntimeError("Official single-stage CSV contains invalid samples or summary")
+    for token in expected:
+        _number(by_token[token].get("score"), token + ".score")
+    summary = by_token[summary_token]
+    score = _number(summary.get("score"), summary_token + ".score")
+    if is_v1 and "driving_direction_compliance" in columns:
+        metrics = (*metrics, ("DDC", "driving_direction_compliance"))
+    values, unavailable = [], {}
+    for key, field in metrics:
+        raw = summary.get(field)
+        if not is_v1 and key == "EC" and str(raw).lower() in ("", "none", "nan"):
+            value = None
+            unavailable[key] = "official_one_stage_no_adjacent_endpoint_pair; official_EC_weight_zero"
+        else:
+            value = _number(raw, summary_token + "." + field)
+        values.append(dict(key=key, single_stage=value))
+    return dict(benchmark_profile=profile, score_name="PDMS" if is_v1 else "EPDMS",
+        scores=dict(single_stage=score), metrics=values,
+        stage_counts=dict(single_stage=len(expected)), unavailable_metrics=unavailable,
+        summary_token=summary_token)
+
+
 def artifact_audit(settings):
     """Count existing per-sample evidence without decoding map/replay payloads."""
     root = filesystem_path(settings["output_dir"])
@@ -170,11 +228,19 @@ def artifact_audit(settings):
 
 def run_state(settings, phase, status="running", started_utc=None, error=None, **extra):
     record = dict(status=status, phase=phase, expected_tokens=len(settings["evaluation_tokens"]),
-                  official_csv=None, official_two_stage_epdms=None,
+                  official_csv=None,
                   split=settings["split"], input_condition=settings.get("input_condition"),
                   standard_sensor_only_comparable=False, official_commit=settings.get("official_commit"),
                   settings_sha256=digest(settings), started_utc=started_utc or utc_now(),
                   updated_utc=utc_now(), **extra)
+    profile = _profile(settings)
+    record.update(benchmark_profile=profile, navsim_version=settings.get("navsim_version"),
+                  traffic_policy=settings.get("traffic_policy", settings.get("traffic_agents")))
+    if profile == "v2_two_stage":
+        record.setdefault("official_two_stage_epdms", None)
+    else:
+        record.setdefault("official_score", None)
+        record.setdefault("score_name", "PDMS" if profile == "v1_navtest" else "EPDMS")
     if status != "running":
         record["finished_utc"] = utc_now()
     if error is not None:

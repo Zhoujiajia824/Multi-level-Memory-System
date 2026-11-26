@@ -15,6 +15,7 @@ from nuplan.planning.simulation.trajectory.trajectory_sampling import Trajectory
 
 from .input_adapter import build_packet, CAMERAS
 from .protocol import digest, write_json
+from .profiles import get_profile, is_v1
 
 
 class CoreProcess:
@@ -27,6 +28,11 @@ class CoreProcess:
                        "retrieve", "memory_read_dir", "memory_snapshot_id", "config_file_sha256", "numerical_source_sha256",
                        "evaluation_logs", "evaluation_tokens", "output_dir")
         worker_settings = {key: settings[key] for key in worker_keys}
+        worker_settings["benchmark_profile"] = get_profile(settings)["id"]
+        for key in ("navsim_version", "traffic_policy", "traffic_agents", "official_commit",
+                    "official_source_sha256", "official_metric", "score_name"):
+            if key in settings:
+                worker_settings[key] = settings[key]
         worker_settings.update(resume=settings.get("resume", True),
                                model_revision=settings.get("model_revision"),
                                model_service=settings.get("model_service", {}),
@@ -120,7 +126,14 @@ class EPDriverPrivilegedAgent(AbstractAgent):
         sampling = trajectory_sampling or TrajectorySampling(time_horizon=4.0, interval_length=0.5)
         if sampling.num_poses != 8 or not np.isclose(sampling.interval_length, 0.5):
             raise ValueError("NAVSIM integration requires four seconds at 2Hz")
-        super().__init__(trajectory_sampling=sampling, requires_scene=True)
+        initial_settings = json.loads(Path(settings_path).read_text(encoding="utf-8"))
+        if is_v1(initial_settings):
+            # v1.1's official base constructor only accepts requires_scene.
+            super().__init__(requires_scene=True)
+            self._trajectory_sampling = sampling
+        else:
+            super().__init__(trajectory_sampling=sampling, requires_scene=True)
+        self.benchmark_profile = get_profile(initial_settings)["id"]
         self.settings_path = str(settings_path)
         self.core_python = str(core_python)
         self.timeout_s = float(timeout_s)
@@ -128,7 +141,7 @@ class EPDriverPrivilegedAgent(AbstractAgent):
         atexit.register(self.close)
 
     def name(self):
-        return "EP-Driver-privileged-current-history-v2.2"
+        return "EP-Driver-privileged-current-history-" + self.benchmark_profile
 
     def get_sensor_config(self):
         return SensorConfig(**dict({name: [3] for name in CAMERAS}, lidar_pc=False))
@@ -137,6 +150,8 @@ class EPDriverPrivilegedAgent(AbstractAgent):
         if self.core is not None:
             return
         self.settings = json.loads(Path(self.settings_path).read_text(encoding="utf-8"))
+        if get_profile(self.settings)["id"] != self.benchmark_profile:
+            raise ValueError("Benchmark profile changed after the SDK agent was constructed")
         if self.settings["input_condition"] != "privileged_current_history_tracks_hd_map_route_traffic_lights":
             raise ValueError("Privileged-input condition must be explicit")
         self.core = CoreProcess(self.core_python, self.settings, self.timeout_s)
@@ -151,7 +166,8 @@ class EPDriverPrivilegedAgent(AbstractAgent):
         # Avoid interpreting external tokens as filesystem paths.
         output = Path(self.settings["output_dir"]) / "samples" / digest(token)[:24]
         packet = build_packet(agent_input, scene, output / "cameras",
-            desired_speed_mps=self.settings["desired_speed_mps"], map_radius_m=self.settings["map_radius_m"])
+            desired_speed_mps=self.settings["desired_speed_mps"], map_radius_m=self.settings["map_radius_m"],
+            benchmark_profile=self.benchmark_profile)
         result = self.core.compute(packet, output)
         if result["frame_id"] != token:
             raise RuntimeError("Output trajectory has the wrong source frame")

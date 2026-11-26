@@ -18,6 +18,7 @@ import yaml
 from . import INPUT_CONDITION, OFFICIAL_COMMIT
 from .protocol import digest, write_json
 from .progress import ProgressMonitor, progress_interval
+from .profiles import get_profile, is_v1, is_two_stage, normalize_profile
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -52,19 +53,31 @@ def source_fingerprint(root, subdir="navsim"):
     return len(files), hashlib.sha256("\n".join(entries).encode()).hexdigest()
 
 
-def verify_sdk(sdk_root):
-    lock = json.loads((ROOT / "config/navsim/official_v2_2.json").read_text(encoding="utf-8"))
+def verify_sdk(sdk_root, settings=None):
+    profile = get_profile(settings)
+    lock = json.loads((ROOT / "config/navsim" / profile["lock_file"]).read_text(encoding="utf-8"))
     count, fingerprint = source_fingerprint(sdk_root)
     if count != lock["source_files"] or fingerprint != lock["source_sha256"]:
-        raise ValueError("NAVSIM SDK source/config does not match pinned official v2.2; do not patch scoring code")
+        raise ValueError("NAVSIM SDK source/config does not match pinned official " + profile["navsim_version"] + "; do not patch scoring code")
     return lock
 
 
-def split_contract(sdk_root, split):
+def split_contract(sdk_root, split, settings=None):
     root = Path(sdk_root).resolve() / "navsim/planning/script/config/common/train_test_split"
     filter_path = root / "scene_filter" / (split + ".yaml")
     mapping_path = root / (split + ".yaml")
     scene_filter = yaml.safe_load(filter_path.read_text(encoding="utf-8"))
+    if split == "navtest":
+        profile = get_profile(settings or {"benchmark_profile": "v2_navtest"})
+        if profile["two_stage"]:
+            raise ValueError("navtest requires an explicit single-stage benchmark profile")
+        tokens, logs = scene_filter["tokens"], scene_filter["log_names"]
+        if not tokens or len(tokens) != len(set(tokens)) or len(logs) != len(set(logs)):
+            raise ValueError("Official navtest filter has empty or duplicate membership")
+        return dict(evaluation_tokens=sorted(tokens), evaluation_logs=sorted(logs),
+            original_tokens=sorted(tokens), reactive_synthetic_tokens=[], original_count=len(tokens),
+            reactive_synthetic_count=0, scene_filter_sha256=hashlib.sha256(filter_path.read_bytes()).hexdigest(),
+            mapping_sha256=None)
     mapping = yaml.safe_load(mapping_path.read_text(encoding="utf-8"))["reactive_all_mapping"]
     originals = set(scene_filter["tokens"])
     synthetic = set(scene_filter["reactive_synthetic_initial_tokens"])
@@ -140,6 +153,7 @@ def prepare_settings(config_path, split_override=None, output_override=None, bev
                     dino_device="cpu", timeout_s=600.0, bev_video=True, resume=True,
                     model_revision=None, model_service={}, structured_model_output=False,
                     evaluation_workers=1, progress_interval_s=15.)
+    defaults["split"] = get_profile(settings)["splits"][0]
     settings = dict(defaults, **settings)
     settings.setdefault("model_goal_retry_limit", 1 if settings["fast"] == "server" else 0)
     if (type(settings["model_goal_retry_limit"]) is not int or settings["model_goal_retry_limit"] not in (0, 1)
@@ -149,6 +163,8 @@ def prepare_settings(config_path, split_override=None, output_override=None, bev
     settings["progress_interval_s"] = progress_interval(settings["progress_interval_s"])
     if split_override:
         settings["split"] = split_override
+    settings = normalize_profile(settings)
+    profile = get_profile(settings)
     if output_override:
         settings["output_dir"] = output_override
     if bev_video_override is not None:
@@ -161,8 +177,6 @@ def prepare_settings(config_path, split_override=None, output_override=None, bev
         raise ValueError("structured_model_output must be true or false")
     if not isinstance(settings["model_service"], dict):
         raise ValueError("model_service must describe the declared server preprocessing")
-    if settings["split"] not in ("warmup_two_stage", "navhard_two_stage"):
-        raise ValueError("Only pinned v2.2 warmup_two_stage/navhard_two_stage are supported")
     if settings["fast"] not in ("off", "api", "server") or type(settings["retrieve"]) is not bool:
         raise ValueError("Invalid model/retrieval mode")
     if settings["structured_model_output"] and settings["fast"] != "server":
@@ -174,8 +188,9 @@ def prepare_settings(config_path, split_override=None, output_override=None, bev
         settings[key] = path(settings[key])
     if settings["memory_read_dir"]:
         settings["memory_read_dir"] = path(settings["memory_read_dir"])
-    settings["metric_cache_path"] = path(settings.get("metric_cache_path",
-        "outputs/navsim/metric_cache_v2_2/" + settings["split"]))
+    cache_default = ("outputs/navsim/metric_cache_v2_2/" + settings["split"] if profile["two_stage"]
+                     else "outputs/navsim/cache/" + profile["id"])
+    settings["metric_cache_path"] = path(settings.get("metric_cache_path", cache_default))
     settings["maps_runtime_root"] = path(settings.get("maps_runtime_root", "outputs/navsim/maps_runtime"))
     for key in ("sdk_python", "core_python", "parameters", "models_config", "prompts_config"):
         if not Path(settings[key]).is_file():
@@ -203,12 +218,14 @@ def prepare_settings(config_path, split_override=None, output_override=None, bev
         print("Model service validation: " + ("verified" if service_validation["verified"] else "MANUAL_UNVERIFIED")
               + " (" + service_validation["verification_method"] + ")", flush=True)
     data = Path(settings["data_root"])
-    for name in ("maps", "navsim_logs/test", "sensor_blobs/test", settings["split"] + "/sensor_blobs",
-                 settings["split"] + "/synthetic_scene_pickles"):
+    data_directories = ["maps", "navsim_logs/test", "sensor_blobs/test"]
+    if profile["two_stage"]:
+        data_directories += [settings["split"] + "/sensor_blobs", settings["split"] + "/synthetic_scene_pickles"]
+    for name in data_directories:
         if not (data / name).is_dir():
             raise FileNotFoundError("Missing data directory: " + str(data / name))
-    lock = verify_sdk(settings["sdk_root"])
-    settings.update(split_contract(settings["sdk_root"], settings["split"]))
+    lock = verify_sdk(settings["sdk_root"], settings)
+    settings.update(split_contract(settings["sdk_root"], settings["split"], settings))
     settings.update(memory_snapshot_id=hashlib.sha256(b"[]").hexdigest(), memory_record_count=0)
     if settings["retrieve"]:
         from .memory import load_memory_snapshot
@@ -225,7 +242,7 @@ def prepare_settings(config_path, split_override=None, output_override=None, bev
     check_weight_file(settings["dino_model"])
     settings["map_source_sha256"] = stage_maps(data, settings["maps_runtime_root"])
     settings.update(input_condition=INPUT_CONDITION, standard_sensor_only_comparable=False,
-                    official_metric=lock["metric"], official_commit=OFFICIAL_COMMIT,
+                    official_metric=profile["metric"], official_commit=profile["sdk_commit"],
                     official_source_sha256=lock["source_sha256"], online_memory_write=False,
                     reflection_enabled=False, root=str(ROOT),
                     numerical_source_sha256=source_fingerprint(ROOT, "src")[1])
@@ -297,8 +314,11 @@ def run_sdk(settings, action):
 
 
 def cache_contract(settings):
-    return {key: settings[key] for key in ("official_commit", "official_source_sha256", "split",
+    value = {key: settings[key] for key in ("official_commit", "official_source_sha256", "split",
             "scene_filter_sha256", "mapping_sha256", "data_root", "map_source_sha256")}
+    if not is_two_stage(settings):
+        value.update(benchmark_profile=get_profile(settings)["id"], traffic_policy=get_profile(settings)["traffic_agents"])
+    return value
 
 
 def verify_cache_contract(settings, creating=False):
@@ -308,7 +328,7 @@ def verify_cache_contract(settings, creating=False):
         if json.loads(lock.read_text(encoding="utf-8")) != cache_contract(settings):
             raise ValueError("Metric cache belongs to another SDK/split/dataset")
     elif path.exists() and any(path.iterdir()):
-        raise ValueError("Existing cache has no v2.2 provenance; use a new empty metric_cache_path")
+        raise ValueError("Existing cache has no compatible NAVSIM provenance; use a new empty metric_cache_path")
     elif not creating:
         raise FileNotFoundError("Generate the official metric cache first")
     return lock
@@ -334,7 +354,8 @@ def normalize_cache_metadata(settings):
 
 
 def official_command(settings, cache=False):
-    script = "run_metric_caching.py" if cache else "run_pdm_score.py"
+    profile = get_profile(settings)
+    script = "run_metric_caching.py" if cache else profile["scoring_script"]
     sdk = Path(settings["sdk_root"])
     # These are direct Hydra overrides of the official entry point; no local
     # scoring formula, custom aggregation or changed traffic policy is used.
@@ -344,13 +365,19 @@ def official_command(settings, cache=False):
         str(sdk / "navsim/planning/script" / script),
         "train_test_split=" + settings["split"],
         "worker=" + ("single_machine_thread_pool" if workers > 1 else "sequential"), "gpu=false",
-        "navsim_log_path=" + quote(Path(settings["data_root"]) / "navsim_logs/test"),
-        "original_sensor_path=" + quote(Path(settings["data_root"]) / "sensor_blobs/test"),
-        "synthetic_sensor_path=" + quote(Path(settings["data_root"]) / settings["split"] / "sensor_blobs"),
-        "synthetic_scenes_path=" + quote(Path(settings["data_root"]) / settings["split"] / "synthetic_scene_pickles"),
-        "metric_cache_path=" + quote(settings["metric_cache_path"])]
+        "navsim_log_path=" + quote(Path(settings["data_root"]) / "navsim_logs/test")]
+    cache_key = "cache.cache_path" if cache and profile["is_v1"] else "metric_cache_path"
+    command += [cache_key + "=" + quote(settings["metric_cache_path"])]
+    camera_key = "sensor_blobs_path" if profile["is_v1"] else "original_sensor_path"
+    if not (cache and profile["is_v1"]):
+        command += [camera_key + "=" + quote(Path(settings["data_root"]) / "sensor_blobs/test")]
+    if profile["two_stage"]:
+        command += ["synthetic_sensor_path=" + quote(Path(settings["data_root"]) / settings["split"] / "sensor_blobs"),
+                    "synthetic_scenes_path=" + quote(Path(settings["data_root"]) / settings["split"] / "synthetic_scene_pickles")]
+    if not profile["is_v1"] and not profile["two_stage"]:
+        command += ["traffic_agents=" + profile["traffic_agents"]]
     if cache:
-        command += ["force_feature_computation=false"]
+        command += [("cache.force_feature_computation" if profile["is_v1"] else "force_feature_computation") + "=false"]
     else:
         if workers > 1:
             command += ["worker.use_process_pool=true", "worker.max_workers=" + str(workers)]
@@ -368,13 +395,23 @@ def verify_scores(settings, csv_path):
     from nine_grid.paths import filesystem_path
     checked = validate_csv(settings, csv_path)
     expected = set(settings["evaluation_tokens"])
+    profile = get_profile(settings)
     result = dict(status="complete", phase="complete", official_csv=str(csv_path),
-                official_two_stage_epdms=checked["scores"]["combined"],
-                official_stage_scores={stage: checked["scores"][stage] for stage in ("stage_one", "stage_two")},
                 official_metrics=checked["metrics"], official_stage_counts=checked["stage_counts"],
                 evaluated_tokens=len(expected), failed_tokens=0, input_condition=INPUT_CONDITION,
-                standard_sensor_only_comparable=False, official_commit=OFFICIAL_COMMIT,
+                standard_sensor_only_comparable=False, official_commit=profile["sdk_commit"],
+                benchmark_profile=profile["id"], navsim_version=profile["navsim_version"],
+                official_metric=profile["metric"], score_name=profile["score_name"], traffic_policy=profile["traffic_agents"],
                 split=settings["split"], settings_sha256=digest(settings))
+    if profile["two_stage"]:
+        result.update(official_two_stage_epdms=checked["scores"]["combined"],
+            official_score=checked["scores"]["combined"],
+            official_stage_scores={stage: checked["scores"][stage] for stage in ("stage_one", "stage_two")})
+    else:
+        result.update(official_score=checked["scores"]["single_stage"],
+            official_stage_scores={"single_stage": checked["scores"]["single_stage"]})
+        if checked.get("unavailable_metrics"):
+            result["unavailable_metrics"] = checked["unavailable_metrics"]
     result["trajectory_sampling"] = dict(horizon_s=4.0, interval_s=0.5, poses=8,
                                          short_plan_padding_allowed=False)
     if settings.get("model_service_validation") is not None:
@@ -579,10 +616,10 @@ def _evaluate_locked(settings, lease):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="EP-Driver privileged NAVSIM v2.2 official evaluation")
+    parser = argparse.ArgumentParser(description="EP-Driver privileged NAVSIM v1/v2 official evaluation")
     parser.add_argument("action", choices=("check", "smoke", "cache", "evaluate", "render", "gallery"))
     parser.add_argument("--config", default="config/navsim.local.json")
-    parser.add_argument("--split", choices=("warmup_two_stage", "navhard_two_stage"))
+    parser.add_argument("--split", choices=("navtest", "warmup_two_stage", "navhard_two_stage"))
     parser.add_argument("--output-dir")
     video = parser.add_mutually_exclusive_group()
     video.add_argument("--bev-video", dest="bev_video", action="store_true", default=None,

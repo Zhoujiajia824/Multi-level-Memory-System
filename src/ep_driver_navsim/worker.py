@@ -386,6 +386,8 @@ class NumericalPipeline:
                 Path(reps.bev_path).name.replace("_bev.png", "_occupancy.npz")))
         render_goal_overlay(scene, plan).save(root / "trajectory_bev.png")
         evidence = dict(identity=packet["identity"], input_condition=packet["input_condition"],
+            benchmark_profile=self.settings.get("benchmark_profile", "v2_two_stage"),
+            official_metric=self.settings.get("official_metric"), official_commit=self.settings.get("official_commit"),
             parameters_sha256=config_hash, parameters=self.config, timing_s=timing,
             model_answer=plain(answer), model_error=model_error, model_error_detail=model_error_detail, model_raw=raw,
             model_preparation_fallback=model_preparation_fallback,
@@ -419,6 +421,7 @@ class NumericalPipeline:
                       execution_mode=plan.diagnostics.get("execution_mode"), timing_s=timing,
                       safety_feasible=plan.diagnostics.get("safety_feasible"), evidence=str(root / "planning_evidence.json"))
         result["condition_audit"] = dict(model_requested=self.fast.enabled, model_answer_valid=model_semantics_applied,
+            benchmark_profile=self.settings.get("benchmark_profile", "v2_two_stage"),
             model_answer_parsed_valid=answer is not None, model_semantics_applied=model_semantics_applied,
             model_planning_fallback=plain(semantic_fallback),
             model_preparation_fallback=model_preparation_fallback,

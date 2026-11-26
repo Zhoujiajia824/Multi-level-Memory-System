@@ -5,12 +5,16 @@ from pathlib import Path
 
 from .protocol import write_bytes, write_json
 from .replay_render import RENDERER_VERSION
+from .profiles import get_profile
 
 
 def update_gallery(output_dir):
     root = Path(output_dir).resolve()
     folder = root / "visualizations"
     folder.mkdir(parents=True, exist_ok=True)
+    settings_file = root / "run_settings.json"
+    settings = json.loads(settings_file.read_text(encoding="utf-8")) if settings_file.is_file() else {}
+    profile = get_profile(settings)
     rows, complete, failed, legacy = [], 0, 0, 0
     for replay in sorted((root / "samples").glob("*/official_replay")):
         status_file = replay / "render_status.json"
@@ -29,6 +33,8 @@ def update_gallery(output_dir):
         preview = "../" + (replay / "official_bev_first.png").relative_to(root).as_posix()
         trace = "../" + (replay / "trace.json.gz").relative_to(root).as_posix()
         label = str(status.get("stage", ""))
+        if status.get("benchmark_profile"):
+            label = str(status["benchmark_profile"]) + " / " + label
         panel_path = replay / "official_cameras_anchor.png"
         camera_panel = "../" + panel_path.relative_to(root).as_posix() if official and panel_path.is_file() else ""
         cameras = [{"view": path.stem, "url": "../" + path.relative_to(root).as_posix()}
@@ -41,6 +47,7 @@ def update_gallery(output_dir):
                     (html.escape(token), html.escape(label), "official SDK plots" if official else ("legacy renderer; re-export for SDK style" if ok else "failed / pending"),
                      control, html.escape(trace, quote=True)))
     summary = dict(complete_videos=complete, legacy_style_videos=legacy, renderer_version=RENDERER_VERSION,
+                   benchmark_profile=profile["id"], score_name=profile["score_name"],
                    failed_or_pending_videos=failed, total_replays=len(rows),
                    scoring_results_modified=False,
                    note="Only saved official simulation outputs; independent 4s anchors, not a continuous drive")
@@ -58,7 +65,7 @@ input{padding:8px;width:min(440px,90%)}code{background:#edf1f5}</style>
 figure{margin:0}figure img{width:100%;display:block}figcaption{padding:5px}summary{cursor:pointer}</style>
 <h1>NAVSIM 官方评分：BEV 执行回放</h1>
 <p>Privileged-input baseline. Each video is an independent 0–4 s evaluation anchor.
-It shows the official simulated ego and the traffic returned by the official policy;
+It shows the official simulated ego and the traffic actually used by its version's official scorer;
 it is not CARLA rendering or a continuous replanning drive.</p>
 <div class="panel"><p>%(complete)d verified official SDK visualizations; %(legacy)d legacy-style videos; %(failed)d failed/pending exports.
 Visualization failures do not change official scores. Reload this page after more samples finish.
@@ -72,8 +79,8 @@ For a running evaluation, regenerate the gallery with <code>run_navsim.py galler
 <img id="camera-panel" alt="Eight static source-anchor cameras with official BEV" style="display:none;width:100%">
 <details><summary>查看单独相机图片</summary><div id="camera-grid"></div></details>
 <p>Official style: red dashed submitted plan, blue growing executed history, green recorded human reference.
-Raw diagnostic events precede human-penalty filtering; official final components apply to the whole anchor,
-not the current frame. Two-stage aggregate EPDMS is available in the official result CSV.</p></div>
+Raw diagnostic events are scorer diagnostics; official components apply to the whole anchor,
+not the current frame. %(score_note)s</p></div>
 <div class="panel"><input id="filter" placeholder="Filter token or stage"><table>
 <thead><tr><th>Token</th><th>Stage</th><th>Video status</th><th>Animation</th><th>Scoring trace</th></tr></thead>
 <tbody id="rows">%(rows)s</tbody></table></div>
@@ -97,6 +104,9 @@ const first=document.querySelector('.play[data-official="true"]')||document.quer
 document.getElementById('filter').addEventListener('input',e=>{const q=e.target.value.toLowerCase();
 document.querySelectorAll('#rows tr').forEach(r=>r.hidden=!r.textContent.toLowerCase().includes(q));});</script></html>"""
     document = (document.replace("%(complete)d", str(complete)).replace("%(legacy)d", str(legacy)).replace("%(failed)d", str(failed))
+                .replace("%(score_note)s", ("NAVSIM v1 uses non-reactive scored GT occupancy, PDMS and comfort C; no human filtering."
+                    if profile["is_v1"] else "Two-stage aggregate EPDMS is available in the official result CSV."
+                    if profile["two_stage"] else "Single-stage EPDMS is available in the official result CSV."))
                 .replace("%(rows)s", "\n".join(rows)))
     target = folder / "index.html"
     # Official process workers can refresh together; every publisher needs its

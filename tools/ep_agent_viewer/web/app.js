@@ -8,7 +8,7 @@ const finite=value=>typeof value==='number'&&Number.isFinite(value);
 const el=(tag,cls,text)=>{const node=document.createElement(tag);if(cls)node.className=cls;if(text!==undefined)node.textContent=text;return node;};
 const clock=t=>{if(!finite(t))return'—';return `${String(Math.floor(Math.max(0,t)/60)).padStart(2,'0')}:${(Math.max(0,t)%60).toFixed(2).padStart(5,'0')}`;};
 const initialParams=new URLSearchParams(location.search);
-const state={episodes:[],runs:[],run:initialParams.get('run'),stage:['stage_one','stage_two','unknown'].includes(initialParams.get('stage'))?initialParams.get('stage'):'all',runSummary:null,runController:null,runRequest:0,listingRequest:0,episode:initialParams.get('episode'),manifest:null,frame:null,index:0,requested:-1,playing:false,rate:1,follow:initialParams.get('follow')==='1',epoch:0,manifestEpoch:0,manifestRequest:0,frameController:null,potentialController:null,view:'scene',isNavsim:false,nonNavsimView:'scene',pendingVideoSeek:null,playTime:0,lastWall:0,fetching:false};
+const state={episodes:[],runs:[],run:initialParams.get('run'),stage:['single_stage','stage_one','stage_two','unknown'].includes(initialParams.get('stage'))?initialParams.get('stage'):'all',runSummary:null,runController:null,runRequest:0,listingRequest:0,episode:initialParams.get('episode'),manifest:null,frame:null,index:0,requested:-1,playing:false,rate:1,follow:initialParams.get('follow')==='1',epoch:0,manifestEpoch:0,manifestRequest:0,frameController:null,potentialController:null,view:'scene',isNavsim:false,nonNavsimView:'scene',pendingVideoSeek:null,playTime:0,lastWall:0,fetching:false};
 const sceneLayers={roads:true,sidewalk:true,junction:true,crosswalk:true,topology:false,regions:true,objects:true,grid_matches:true,sources:true,attention:true,trajectory:true,corridor:true,goal:true};
 let scene=null,scenePromise=null,plotlyPromise=null,navsimPlotLoading=false;
 const assetUrl=path=>!path?'':typeof path==='object'?(path.url||assetUrl(path.path)):path.startsWith('/api/')||path.startsWith('/assets/')?path:`/api/asset?episode=${encodeURIComponent(state.episode||'')}&path=${encodeURIComponent(path)}`;
@@ -26,8 +26,9 @@ function metricValue(value){if(value===true)return'是';if(value===false)return'
 function emptyPanel(container,title,message,icon='⌁'){container.replaceChildren();const block=el('div','empty-state small');block.append(el('span','empty-icon',icon),el('strong',null,title),el('p',null,message));container.append(block);}
 function metricList(container,title,values){container.append(el('div','metric-title',title));const dl=el('dl','metric-list');for(const [label,value]of values){const row=el('div');row.append(el('dt',null,label),el('dd',typeof value==='boolean'?(value?'good':'bad'):null,metricValue(value)));dl.append(row);}container.append(dl);}
 function rawDetails(container,title,value){if(value==null)return;const d=el('details');d.append(el('summary',null,title),el('pre',null,json(value)));container.append(d);}
-const stageName=stage=>({stage_one:'第一阶段',stage_two:'第二阶段',unknown:'阶段未归档'})[stage]||'阶段未归档';
+const stageName=stage=>({single_stage:'单阶段',stage_one:'第一阶段',stage_two:'第二阶段',unknown:'阶段未归档'})[stage]||'阶段未归档';
 const scoreColumns=[['NC','无责任碰撞'],['DAC','可行驶区域遵守'],['DDC','行驶方向遵守'],['TLC','交通灯遵守'],['EP','自车行驶进度'],['TTC','碰撞时间安全指标'],['LK','车道保持'],['HC','历史衔接舒适性'],['EC','相邻规划扩展舒适性']];
+const v1ScoreColumns=[['NC','无责任碰撞'],['DAC','可行驶区域遵守'],['TTC','碰撞时间安全指标'],['EP','自车行驶进度'],['C','舒适性']];
 const otherRun='__other_experiments__';
 const selectedRun=()=>state.runs.find(run=>run.id===state.run);
 function rememberSelection(){
@@ -40,19 +41,24 @@ function renderRunResults(){
   const run=selectedRun(),panel=$('run-results');panel.hidden=!run;if(!run)return;
   const summary=state.runSummary,ready=summary?.scores_status==='complete',scores=ready?summary.scores||{}:{},failed=(summary||run).status==='failed';
   const status=$('run-results-status');status.className=`badge ${ready?'good':failed?'bad':'subtle'}`;status.textContent=ready?'已完成':failed?'测评失败':summary?.scores_status==='unavailable'?'汇总不可用':summary?.status==='running'?'测评进行中':summary?'汇总未生成':'读取中';
-  $('run-results-name').textContent=`${run.condition_label||run.label||run.name} · ${run.name||run.id}`;
+  $('run-results-name').textContent=run.label||`${run.condition_label||run.name} · ${run.name||run.id}`;
   $('run-results-name').title=run.path||'';
   const detail=summary||run,split=detail.split||run.split||'';
-  $('run-results-progress').textContent=[split,`${detail.completed_samples??0}${detail.expected_samples!=null?' / '+detail.expected_samples:''} 个场景已评分`].filter(Boolean).join(' · ');
-  $('run-score-total').textContent=finite(scores.combined)?fmt(scores.combined*100):'—';
+  const stages=detail.stage_columns||['stage_one','stage_two'],single=stages.includes('single_stage'),scoreName=detail.score_name||'EPDMS';
+  const columns=summary?.metrics?.length?summary.metrics.map(row=>[row.key,row.label||row.key]):detail.benchmark_profile==='v1_navtest'?v1ScoreColumns:scoreColumns;
+  $('run-results-progress').textContent=[detail.navsim_version?`NAVSIM ${detail.navsim_version}`:'',split,`${detail.completed_samples??0}${detail.expected_samples!=null?' / '+detail.expected_samples:''} 个场景已评分`].filter(Boolean).join(' · ');
+  const total=single?scores.single_stage:scores.combined;
+  $('run-score-total').textContent=finite(total)?fmt(total*100):'—';
+  $('run-score-total').previousElementSibling.textContent=`${single?'官方':'综合'} ${scoreName}`;
   const table=$('run-score-table'),head=el('tr');head.append(el('th',null,'阶段'));head.firstChild.scope='col';
-  for(const [key,label]of [...scoreColumns,['EPDMS','阶段综合分']]){const th=el('th',null,key);th.scope='col';th.title=label;head.append(th);}
+  table.caption.textContent=`官方${single?'单阶段':'两阶段'}各项指标，0到100分；不随场景筛选重新计算。`;
+  for(const [key,label]of [...columns,[scoreName,'官方综合分']]){const th=el('th',null,key);th.scope='col';th.title=label;head.append(th);}
   table.tHead.replaceChildren(head);const body=table.tBodies[0];body.replaceChildren();
-  for(const stage of ['stage_one','stage_two']){
+  for(const stage of stages){
     const row=el('tr',state.stage===stage?'selected':'');row.dataset.stage=stage;
     const label=el('th',null,stageName(stage));label.scope='row';row.append(label);
-    for(const [key]of scoreColumns){const value=ready?summary.metrics?.find(metric=>metric.key===key)?.[stage]:null;const cell=el('td',null,finite(value)?fmt(value*100):'—');cell.dataset.metric=key;row.append(cell);}
-    const score=el('td','stage-score',finite(scores[stage])?fmt(scores[stage]*100):'—');score.dataset.metric='EPDMS';row.append(score);body.append(row);
+    for(const [key]of columns){const value=ready?summary.metrics?.find(metric=>metric.key===key)?.[stage]:null,reason=ready?summary.unavailable_metrics?.[key]:null;const cell=el('td',null,finite(value)?fmt(value*100):reason?'未定义':'—');cell.dataset.metric=key;if(reason)cell.title=reason;row.append(cell);}
+    const score=el('td','stage-score',finite(scores[stage])?fmt(scores[stage]*100):'—');score.dataset.metric=scoreName;row.append(score);body.append(row);
   }
   const phases={data_inspection:'数据与导航预检',cache_verification:'评分缓存核验',official_scoring:'官方评分',official_result_validation:'官方结果核验'};
   let note=ready?'官方 CSV 汇总 · 0–100 分，越高越好':failed?`${phases[detail.run_phase]||detail.run_phase||'测评'}失败；已有场景仍可查看。`:
@@ -60,6 +66,7 @@ function renderRunResults(){
   if(failed&&summary?.error?.message)note+=` ${String(summary.error.message).slice(0,300)}`;
   const condition=summary?.condition_audit;
   if(ready&&condition?.model_requested>0)note+=` · 模型实际应用 ${condition.model_semantics_applied??condition.valid_model_answers??0}/${condition.model_requested}，回退 ${condition.base_fallback_samples??0}`;
+  if(ready&&summary?.unavailable_metrics?.EC)note+=' · EC 官方未定义（权重0），未补分';
   $('run-results-note').textContent=note;
   $('run-results-note').title=summary?.official_csv||summary?.warnings?.join('\n')||'';
 }
@@ -105,7 +112,7 @@ async function loadEpisodes(){
     const data=await request('/api/episodes');if(requestId!==state.listingRequest)return;
     state.episodes=Array.isArray(data)?data:data.episodes||[];state.runs=Array.isArray(data.runs)?data.runs:[];
     const runSelect=$('run-select');runSelect.replaceChildren();$('run-filters').hidden=!state.runs.length;
-    for(const run of state.runs){const option=new Option(`${run.condition_label||run.label||run.name} · ${run.name||run.id}`,run.id);option.title=run.path||'';runSelect.append(option);}
+    for(const run of state.runs){const option=new Option(run.label||`${run.condition_label||run.name} · ${run.name||run.id}`,run.id);option.title=run.path||'';runSelect.append(option);}
     const hasOther=state.episodes.some(item=>!item.run_id);if(state.runs.length&&hasOther)runSelect.append(new Option('其他实验',otherRun));
     if(!state.runs.length){state.run=null;state.stage='all';}
     else if(!state.runs.some(run=>run.id===state.run)&&!(state.run===otherRun&&hasOther)){state.run=state.episodes.find(item=>(item.id||item.episode_id)===state.episode)?.run_id||state.runs[0].id;}
@@ -115,6 +122,10 @@ async function loadEpisodes(){
 }
 function configureStageFilter(){
   const select=$('stage-select'),run=selectedRun();if(!run)state.stage='all';
+  if(!select.querySelector('[value="single_stage"]'))select.append(new Option('单阶段 · navtest','single_stage'));
+  const stages=run?.stage_columns||['stage_one','stage_two'];
+  for(const option of select.options){if(!['all','unknown'].includes(option.value))option.hidden=!stages.includes(option.value);}
+  if(state.stage!=='all'&&state.stage!=='unknown'&&!stages.includes(state.stage))state.stage='all';
   select.disabled=!run;select.value=state.stage;
   select.querySelector('[value="unknown"]').hidden=!(run?.stages?.unknown>0)&&state.stage!=='unknown';
 }
@@ -332,12 +343,12 @@ function renderMemory(frame){
 function renderMetrics(frame){
   const panel=$('metrics-panel');panel.replaceChildren();const plan=frame.plan||{},d=plan.diagnostics||{},timing=frame.timing||{},audit=frame.execution_audit||{};
   if(frame.navsim){
-    const n=frame.navsim,s=n.scores||{},q=s.internal_quality||{},a=s.official_anchor||{},run=s.official_two_stage_aggregate||{},meta=n.source_plan_metadata||{};
+    const n=frame.navsim,s=n.scores||{},q=s.internal_quality||{},a=s.official_anchor||{},run=s.official_run_aggregate||s.official_two_stage_aggregate||{},meta=n.source_plan_metadata||{},single=['v1_navtest','v2_navtest'].includes(run.benchmark_profile);
     metricList(panel,'ANCHOR · 独立样本',[['源token',n.anchor_token],['回放偏移秒',frame.time],['输入条件',n.input_condition],['源规划可执行',meta.valid],['源规划安全条件满足',meta.diagnostics?.safety_feasible]]);
     metricList(panel,'INTERNAL · 源规划内部质量（非官方分数）',[['内部quality',q.score],['内部有效',q.valid]]);
-    metricList(panel,'OFFICIAL · 单锚点（两阶段聚合前）',[['归档PDM score',a.pdm_score],['CSV单锚点score',s.official_csv_anchor?.score],['CSV有效',s.official_csv_anchor?.valid]]);
-    metricList(panel,'OFFICIAL · 整轮两阶段聚合',[['官方两阶段EPDMS',run.score],['已评估token',run.evaluated_tokens],['失败token',run.failed_tokens],['split',run.split],['可与纯传感器标准条件直接比较',run.standard_sensor_only_comparable]]);
-    panel.append(el('p','context-caption','上述值为源规划或最终评分，回放中不会重算。CSV可包含两帧舒适度等后处理；它与归档单锚点PDM值及整轮两阶段聚合是不同字段。'));
+    metricList(panel,'OFFICIAL · 单锚点',[['归档score',a.score??a.pdm_score],['CSV单锚点score',s.official_csv_anchor?.score],['CSV有效',s.official_csv_anchor?.valid]]);
+    metricList(panel,`OFFICIAL · 整轮${single?'单阶段汇总':'两阶段聚合'}`,[[`官方 ${run.score_name||'EPDMS'}`,run.score],['已评估token',run.evaluated_tokens],['失败token',run.failed_tokens],['split',run.split],['可与纯传感器标准条件直接比较',run.standard_sensor_only_comparable]]);
+    panel.append(el('p','context-caption','上述值为源规划或官方最终评分，回放中不会重算；整轮汇总来自完整官方CSV。'));
     rawDetails(panel,'内部quality原始字段（已省略内部数组）',s.internal_quality);rawDetails(panel,'官方单锚点原始指标',s.official_anchor);rawDetails(panel,'官方CSV本token行',s.official_csv_anchor);rawDetails(panel,'源规划诊断摘要',meta);rawDetails(panel,'归档时域约定（主轨迹与诊断尾段分开）',n.horizon_contract);rawDetails(panel,'坐标与来源',n.coordinates);rawDetails(panel,'评分回放来源',n.provenance);rawDetails(panel,'源模型/规划耗时',timing);rawDetails(panel,'数据来源证据',frame.evidence);return;
   }
   metricList(panel,'PLANNING · 当前源帧',[

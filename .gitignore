@@ -23,6 +23,7 @@
 !/config/navsim/
 /config/navsim/*
 !/config/navsim/official_v2_2.json
+!/config/navsim/official_v1_1.json
 !/config/navsim/sdk-requirements.txt
 /config/navsim.local.json
 /config/models.yaml

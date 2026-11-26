@@ -2,9 +2,17 @@
 
 本分支从 `EP-Driver@f91af2d` 创建，共享算法与模型提示同步至 `EP-Driver@6b4853d`，包含 `development-1.3.0-bev-perception-lane-all-planning` 对象范围与统一候选对象输入更新，复用五次参考、Frenet APF、MPC、BEV/OCC、八向张量、DINO、参照规划与质量诊断。下面的 Highway 指令保留用于原算法回归；NAVSIM 使用 `scripts/run_navsim.py`。
 
-NAVSIM 固定官方 **v2.2 / 359c7f72304bfa8273e754224a213d3751bd2340**，运行未经修改的 `run_metric_caching.py` 和 `run_pdm_score.py`。后者已经包含两阶段响应交通、成对帧舒适性和官方聚合，不能另用单帧均值代替。入口检查 SDK 源码指纹、完整样本及缓存覆盖，出现缺样本、失败轨迹或无效聚合时不输出合格 benchmark 结果。
+NAVSIM 按 `--benchmark` 选择固定的官方协议，运行未经修改的官方缓存和评分代码：
 
-服务器模型同时接收八路当前相机和一张BEV，共九图；输出额度为4096 tokens。服务的上下文还需容纳图像和完整文本输入，不能把4096当作整个上下文大小。本次九图实测输入已超过16K；服务容量应在正式评分前以真实请求验证，`model_service`元数据必须与实际启动参数一致，不能靠删图或静默裁剪输入绕过容量不足。NAVSIM结构化服务使用greedy解码，说明字段最多192字符；vLLM专用服务启用`--structured-outputs-config '{"backend":"xgrammar","disable_any_whitespace":true}'`，限制JSON字段间空白，避免greedy空白退化耗尽输出额度（字符串正文不裁剪）；目标横向范围由同帧合法候选车道几何给出保守外包，不替模型选目标、不夹紧返回值。没有合法语义参考或纵向目标区间时，保存原因并跳过HTTP，继续原基础MPC；按锚点记录实际调用尝试次数，这类回退不能作为成功模型样本复用。
+| benchmark | 官方版本与场景集 | 评分入口与结果 |
+|---|---|---|
+| `v1_navtest` | v1.1分支，`3e8291bfa89ff247231e0227778840cd0a036896`，navtest | `run_pdm_score.py`，PDMS，单阶段 |
+| `v2_navtest` | v2.2，`359c7f72304bfa8273e754224a213d3751bd2340`，navtest | `run_pdm_score_one_stage.py`，EPDMS，单阶段 |
+| `v2_two_stage`（兼容默认） | 同一v2.2，warmup/navhard | `run_pdm_score.py`，两阶段响应交通EPDMS |
+
+v1/v2 navtest均使用官方12,146个锚点、非反应式周车；两版本SDK目录、运行环境、评分缓存及输出分开，同版本A/B共享缓存。`prepare_navsim_runtime.py --profile server --benchmark v1_navtest --groups A_base B_model ...` 生成对应配置，v2用 `v2_navtest`；默认服务器v1 SDK为 `navsim-devkit-v1.1` / `ep-navsim-v1`，v2沿用 `navsim-devkit` / `ep-navsim`。入口检查SDK源码指纹、实际导入路径、完整样本及缓存覆盖。v1结果读取官方 `average` 行，v2单阶段读取 `average_all_frames`；未定义的EC保留为空，禁止补分。两阶段聚合继续由原官方入口完成，不能用单阶段均值代替。结果记录显式版本、交通策略、模型有效参与和回退数量，查看器按协议显示指标与阶段。
+
+服务器模型同时接收八路当前相机和一张BEV，共九图；配置生成器默认输出额度为4096 tokens，本轮navtest正式配置使用16384 tokens、128000上下文。服务的上下文还需容纳图像和完整文本输入，不能把4096当作整个上下文大小。本次九图实测输入已超过16K；服务容量应在正式评分前以真实请求验证，`model_service`元数据必须与实际启动参数一致，不能靠删图或静默裁剪输入绕过容量不足。NAVSIM结构化服务使用greedy解码，说明字段最多192字符；vLLM专用服务启用`--structured-outputs-config '{"backend":"xgrammar","disable_any_whitespace":true}'`，限制JSON字段间空白，避免greedy空白退化耗尽输出额度（字符串正文不裁剪）；目标横向范围由同帧合法候选车道几何给出保守外包，不替模型选目标、不夹紧返回值。没有合法语义参考或纵向目标区间时，保存原因并跳过HTTP，继续原基础MPC；按锚点记录实际调用尝试次数，这类回退不能作为成功模型样本复用。
 
 **输入条件是 privileged baseline，不属于标准 sensor-only 输入条件。** 规划只访问当前及历史四帧（约1.5秒）的对象标注、自车状态、当前地图/roadblock 导航、当前红灯标记与八路当前图片；不访问未来自车轨迹、未来对象标注或评分缓存。模型与预测候选为当前/可跨越邻道沿线前40米、后20米内全部对象，与当前BEV视口内车辆、自行车、行人的并集；优化使用道路范围全部对象与最多3个关注对象，独立审计保留完整候选预测，八向代表主要用于检索。一般家具类 `generic_object` 排除，锥桶、施工标志和隔离障碍作为候选，仍需通过道路范围筛选。NAVSIM 提供相邻拓扑，未提供完整车道线跨越权限；本基线明确记录“同向相邻拓扑视为可跨越”的适配假设，不能把它写成真实标线真值。红灯布尔值的反值记为 `not_red`，不虚构绿/黄灯细分。
 
@@ -18,7 +26,7 @@ NAVSIM 的 `navsim_execution.postsolve_safety_policy=audit_only` 保留 MPC 的�
 
 首次准备两个独立环境：现有 EP-Driver Python3.12 数值环境，以及官方 SDK Python3.9 环境。按 [NAVSIM 官方安装说明](https://github.com/autonomousvision/navsim/blob/v2.2/docs/install.md)取得上述固定版本 NAVSIM 与 nuPlan v1.2；SDK 环境使用 `config/navsim/sdk-requirements.txt` 的推理/评分依赖，并将两份 devkit 以 `pip install --no-deps -e <路径>` 安装。Linux 为官方支持环境；本机 Windows 短测仅增加 Linux pickle 路径兼容和无下载的 `fcntl` 导入保护，评分源码/公式不变，不能据此声称完成 Linux 全量验证。缺少地图而需要 POSIX 文件锁时会明确失败。
 
-复制 `config/navsim.example.json` 为被忽略的 `config/navsim.local.json`，填写 SDK、两个 Python、数据与真实 DINO 权重目录；不得使用 LFS 指针代替权重。原始输入来自 `navsim_logs/test` 和 `sensor_blobs/test`，合成后续输入来自对应 `*_two_stage` 目录。入口将地图矢量文件校验后复制到本地 `outputs/navsim/maps_runtime`，官方临时文件不写入原数据目录。个人配置和运行产物不提交。
+复制 `config/navsim.example.json` 为被忽略的 `config/navsim.local.json`，填写 SDK、两个 Python、数据与真实 DINO 权重目录；不得使用 LFS 指针代替权重。原始输入来自 `navsim_logs/test` 和 `sensor_blobs/test`，仅两阶段协议的合成后续输入来自对应 `*_two_stage` 目录；navtest不需要合成场景数据。入口将地图矢量文件校验后复制到本地 `outputs/navsim/maps_runtime`，官方临时文件不写入原数据目录。个人配置和运行产物不提交。
 
 在本分支根目录、数值环境中逐条运行。`test/` 中的回归脚本仅保留在本地开发工作区，不随分支发布；服务器可跳过该行，正式运行入口保留在 `scripts/`：
 
@@ -36,7 +44,7 @@ python scripts/run_navsim.py evaluate
 
 适配器在每个独立锚点调用固定版本 PDM 的当前位姿/地图拓扑纠正函数，既可补接公开导航首段前驱，也可修复中间连接。重叠路口先按原有航向与投影门槛筛选，再比较覆盖和投影距离。若纠正结果丢失有效的当前关联，仅在公开路线保持顺序、通过有界官方BFS补齐缺链并逐段验证有向连通后保留公开路线；纠正尝试和拒绝原因均归档，不移动实际自车位姿。参考路径的前向长度不包含自车后方弧长。证据写入输入包的 `route_association`，不读取未来轨迹或评分缓存。车道交集中的零面积线/点从势场面域中排除，不缓冲扩大车道。任一样本预检失败会停止，不以删样本或替代分数完成评测。
 
-`smoke/evaluate` 默认开启 `bev_video: true`（命令行 `--bev-video`）；逐样本保存 `samples/<摘要ID>/official_replay/official_bev.mp4`、首帧图、压缩执行记录及独立导出状态，完成后打开输出目录下 `visualizations/index.html` 选择播放。动画使用本次官方控制器实际模拟的自车轨迹和本次响应交通策略返回的对象轨迹，叠加提交规划、记录人类参考和官方红灯区域；不是把数据集未来帧冒充算法执行。原始事件诊断与人类违规过滤后的官方整段指标分开显示，不虚构逐帧 EPDMS 或完整两阶段成绩。0至4秒的41个实际状态按10帧/秒编码，视频编码时长4.1秒；不同锚点不拼成连续驾驶。
+`smoke/evaluate` 默认开启 `bev_video: true`（命令行 `--bev-video`）；逐样本保存 `samples/<摘要ID>/official_replay/official_bev.mp4`、首帧图、压缩执行记录及独立导出状态，完成后打开输出目录下 `visualizations/index.html` 选择播放。动画使用本次官方控制器实际模拟的自车轨迹和本次官方交通策略的对象轨迹（v1取官方评分占用序列，v2取所选策略的模拟返回），叠加提交规划、记录人类参考和官方红灯区域；不是把数据集未来帧冒充算法执行。原始事件诊断与人类违规过滤后的官方整段指标分开显示，不虚构逐帧 EPDMS 或完整两阶段成绩。0至4秒的41个实际状态按10帧/秒编码，视频编码时长4.1秒；不同锚点不拼成连续驾驶。
 
 可视化在评分侧旁路采集，不把未来状态送回规划器，不修改官方SDK、响应策略、评分公式或聚合。人类参照评分前先复制算法对应的执行数据，避免被第二次评分覆盖。视频失败单列状态，不把官方分数改成失败或成功；`--no-bev-video` 可关闭导出。导出时间独立记录，不计作规划耗时。修改代码后使用新的输出目录，正在运行的旧评测不会自动获得动画。
 

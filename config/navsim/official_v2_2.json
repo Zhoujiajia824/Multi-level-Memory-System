@@ -8,7 +8,7 @@
   "nuplan_tag": "nuplan-devkit-v1.2",
   "trajectory": {"reference_point": "rear_axle", "horizon_s": 4.0, "interval_s": 0.5, "poses": 8},
   "metric": "NAVSIM_v2.2_official_two_stage_reactive_EPDMS",
-  "supported_splits": ["warmup_two_stage", "navhard_two_stage"],
+  "supported_splits": ["navtest", "warmup_two_stage", "navhard_two_stage"],
   "input_condition": "privileged_current_history_tracks_hd_map_route_traffic_lights",
   "standard_sensor_only_comparable": false
 }
