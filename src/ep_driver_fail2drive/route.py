@@ -54,6 +54,27 @@ def xy(location):
     return [float(location.x), -float(location.y)]
 
 
+def _nearest_boundary_crossable(point, edges):
+    """Use the local marking, including restrictive transitions at a shared vertex."""
+    nearest = math.inf
+    allowed = False
+    for edge in edges:
+        points = edge['points']
+        if any(math.dist(a,b) > 1e-8 for a,b in zip(points,points[1:])):
+            distance = project(point, points)['distance_m']
+        elif points and not edge['crossable']:
+            # Distinct OpenDRIVE stations can have identical CARLA XY. Keep a
+            # restrictive point, but never grant lane access from a point alone.
+            distance = min(math.dist(point, p) for p in points)
+        else:
+            continue
+        if distance < nearest:
+            nearest, allowed = distance, edge['crossable']
+        elif distance == nearest:
+            allowed = allowed and edge['crossable']
+    return allowed
+
+
 def project(point, points, previous_s=None, window=None, heading=None, minimum_s=None, maximum_s=None,
             segment_indices=None, elevations=None, elevation=None):
     """Return real Euclidean residual, not only signed lateral distance."""
@@ -556,9 +577,7 @@ class RouteAdapter:
                 if side is None:
                     continue
                 edges=[edge for edge in lane['boundaries'] if ':'+side+':' in edge['id']]
-                if edges:
-                    nearest=min(edges,key=lambda edge:project(ego_position,edge['points'])['distance_m'])
-                    legal_adjacent |= nearest['crossable']
+                legal_adjacent |= _nearest_boundary_crossable(ego_position,edges)
             if not legal_adjacent:
                 overlap = self._junction_overlap(ego_position, result, current_lane_id) if teaching_overlap and result['valid'] else None
                 if overlap:

@@ -1,0 +1,522 @@
+{
+  "schema": "fail2drive-memory-transfer-split-1.0",
+  "official_commit": "bceb18afb7d62e06e990739e013e750d92ad7a88",
+  "design": "known_family_heldout_route_pair",
+  "collection_route_count": 34,
+  "evaluation_route_count": 17,
+  "collection_seed": 1,
+  "evaluation_seed": 1,
+  "collection_variants": [
+    "Base",
+    "Generalization"
+  ],
+  "evaluation_variant": "Generalization",
+  "memory_admission": "complete_route_or_independently_audited_interaction_segment;zero_non_min_speed_infractions;human_review_required",
+  "evaluation_methods": [
+    "A_base",
+    "B_model_reflection_no_memory",
+    "C_model_reflection_new_memory"
+  ],
+  "retrieval": "existing_BEV_OCC_eight_direction_features;no_family_or_route_id_matching",
+  "split_rule": "hold_out_whole_Base_Generalization_pair_and_exclude_exact_sparse_route_geometry_across_families",
+  "evaluation_selection": "second_official_pair_per_family_before_A_B_C_results;no_success_based_replacement",
+  "map_generalization_claimed": false,
+  "unseen_family_generalization_claimed": false,
+  "same_map_partial_road_overlap_possible": true,
+  "rows": [
+    {
+      "family": "Animals",
+      "collection": [
+        {
+          "route_id": 75,
+          "variant": "Base",
+          "routes": "fail2drive_split/Base_Animals_0075.xml",
+          "sha256": "335dbac4ba93f0bde282376efd6020775a88ee09a926ef1e1bc4ce73624393f5"
+        },
+        {
+          "route_id": 1075,
+          "variant": "Generalization",
+          "routes": "fail2drive_split/Generalization_Animals_1075.xml",
+          "sha256": "1607b6520ff8b7bad915f4ebbdcaaa3a29f5b5660fc34d57d17cd43c90456c42"
+        }
+      ],
+      "evaluation": {
+        "route_id": 1076,
+        "variant": "Generalization",
+        "routes": "fail2drive_split/Generalization_Animals_1076.xml",
+        "sha256": "dc4121d33e6602f854824c576f1a9d1c93f19ed2d7975b32f4b684a76e382017"
+      },
+      "reserved_counterpart": {
+        "route_id": 76,
+        "variant": "Base",
+        "routes": "fail2drive_split/Base_Animals_0076.xml",
+        "sha256": "2288bf769e7601b9a65d118260087e0408007e132333c9bd1915ab18fd835f4e"
+      }
+    },
+    {
+      "family": "BadParking",
+      "collection": [
+        {
+          "route_id": 0,
+          "variant": "Base",
+          "routes": "fail2drive_split/Base_BadParking_0000.xml",
+          "sha256": "333c1accad65379ee2220c51d26e31b87743e14974d4e25b34b91294f07cf746"
+        },
+        {
+          "route_id": 1000,
+          "variant": "Generalization",
+          "routes": "fail2drive_split/Generalization_BadParking_1000.xml",
+          "sha256": "16804885e88fad4b584a5f40f08fb051903556f48b840aeeb4e69ecf5894875a"
+        }
+      ],
+      "evaluation": {
+        "route_id": 1001,
+        "variant": "Generalization",
+        "routes": "fail2drive_split/Generalization_BadParking_1001.xml",
+        "sha256": "819f98a3b679610e1218fa1949c5b85e9bff6e3cb8ea3d58430b50216d1bf6a1"
+      },
+      "reserved_counterpart": {
+        "route_id": 1,
+        "variant": "Base",
+        "routes": "fail2drive_split/Base_BadParking_0001.xml",
+        "sha256": "c5b5c803893a09e593994c7ec9217a74f7d237819357744bea97db3cb62d603a"
+      }
+    },
+    {
+      "family": "ConstructionPedestrian",
+      "collection": [
+        {
+          "route_id": 10,
+          "variant": "Base",
+          "routes": "fail2drive_split/Base_ConstructionPedestrian_0010.xml",
+          "sha256": "cf0c8db19cc6be3bd8c6e3391ba16adbae6b912015153d2fba7959f9c3bf8251"
+        },
+        {
+          "route_id": 1010,
+          "variant": "Generalization",
+          "routes": "fail2drive_split/Generalization_ConstructionPedestrian_1010.xml",
+          "sha256": "9a6e3443925d9e51ba6e0d4b087c75832a2534c3dc79ef76113dbbe472fc399d"
+        }
+      ],
+      "evaluation": {
+        "route_id": 1011,
+        "variant": "Generalization",
+        "routes": "fail2drive_split/Generalization_ConstructionPedestrian_1011.xml",
+        "sha256": "4ca527704d206bc11a12f18159829d11e14acfb47a7c6e82891e99512d4e5ee0"
+      },
+      "reserved_counterpart": {
+        "route_id": 11,
+        "variant": "Base",
+        "routes": "fail2drive_split/Base_ConstructionPedestrian_0011.xml",
+        "sha256": "961bee39285c914e762127ebeac098c4687686c0bd05105e74ffc7527c9974f3"
+      }
+    },
+    {
+      "family": "ConstructionPermutations",
+      "collection": [
+        {
+          "route_id": 15,
+          "variant": "Base",
+          "routes": "fail2drive_split/Base_ConstructionPermutations_0015.xml",
+          "sha256": "2379ed11ca37d7aeb0dbf5c6bdb213f475ef0183d44b0849d50a4288af25b855"
+        },
+        {
+          "route_id": 1015,
+          "variant": "Generalization",
+          "routes": "fail2drive_split/Generalization_ConstructionPermutations_1015.xml",
+          "sha256": "15d8058449c482bb88726b473ee7dc3eab9dda2178238be0b6388cc120099d22"
+        }
+      ],
+      "evaluation": {
+        "route_id": 1016,
+        "variant": "Generalization",
+        "routes": "fail2drive_split/Generalization_ConstructionPermutations_1016.xml",
+        "sha256": "f528c0e46bf7a6a4120ae102d7e581a03288aab90863b364cd36758d35b23ba2"
+      },
+      "reserved_counterpart": {
+        "route_id": 16,
+        "variant": "Base",
+        "routes": "fail2drive_split/Base_ConstructionPermutations_0016.xml",
+        "sha256": "b0fddf466cd0c498b39cb94461fea10cc0996081dca2ef0f82196a1dc75a325b"
+      }
+    },
+    {
+      "family": "CustomObstacles",
+      "collection": [
+        {
+          "route_id": 20,
+          "variant": "Base",
+          "routes": "fail2drive_split/Base_CustomObstacles_0020.xml",
+          "sha256": "e2b07b96588a91981f6434dddd55f247ab7b8aa290587ec4f59363900ae2cf57"
+        },
+        {
+          "route_id": 1020,
+          "variant": "Generalization",
+          "routes": "fail2drive_split/Generalization_CustomObstacles_1020.xml",
+          "sha256": "ff26a7a336eee748674b7e58515c3206b427fee0cd8783064af7a99fc34f3a76"
+        }
+      ],
+      "evaluation": {
+        "route_id": 1021,
+        "variant": "Generalization",
+        "routes": "fail2drive_split/Generalization_CustomObstacles_1021.xml",
+        "sha256": "c3e3f0824513f4a1f1b9710ed52447c4880b475a081bc4cca5ac5e3ef535a101"
+      },
+      "reserved_counterpart": {
+        "route_id": 21,
+        "variant": "Base",
+        "routes": "fail2drive_split/Base_CustomObstacles_0021.xml",
+        "sha256": "20c79326d9837a67287902d2eb683ecb874b761bc8066fcee397c1719bd38a25"
+      }
+    },
+    {
+      "family": "FullyBlocked",
+      "collection": [
+        {
+          "route_id": 30,
+          "variant": "Base",
+          "routes": "fail2drive_split/Base_FullyBlocked_0030.xml",
+          "sha256": "572c64fee5fec0eed5cc185eb63c7062a717195ecf60f3f3c2584f28cc7ed2cf"
+        },
+        {
+          "route_id": 1030,
+          "variant": "Generalization",
+          "routes": "fail2drive_split/Generalization_FullyBlocked_1030.xml",
+          "sha256": "20052810fe7a2a9a5ccaeb141bba511531f80d12375dc0d647a74a36fa9556f5"
+        }
+      ],
+      "evaluation": {
+        "route_id": 1031,
+        "variant": "Generalization",
+        "routes": "fail2drive_split/Generalization_FullyBlocked_1031.xml",
+        "sha256": "2cfd8d19180f4e762cd4af866f6c220359e060d52068928bd26b8a5d90d9ef0c"
+      },
+      "reserved_counterpart": {
+        "route_id": 31,
+        "variant": "Base",
+        "routes": "fail2drive_split/Base_FullyBlocked_0031.xml",
+        "sha256": "6a3c58b7d9e7a4c0710f0e608cc38d0ef4b2ebcef2c6dc0343a51cfbd6210311"
+      }
+    },
+    {
+      "family": "HardBrake",
+      "collection": [
+        {
+          "route_id": 35,
+          "variant": "Base",
+          "routes": "fail2drive_split/Base_HardBrake_0035.xml",
+          "sha256": "8796c9eb7a9c9fddb859aa9fdce96d79b7b75d27ec40d0eee256fbb2bf10c399"
+        },
+        {
+          "route_id": 1035,
+          "variant": "Generalization",
+          "routes": "fail2drive_split/Generalization_HardBrake_1035.xml",
+          "sha256": "0228d7327effc42657bb9d8631c43aadaaec5424c1c37653181379aab2f083ae"
+        }
+      ],
+      "evaluation": {
+        "route_id": 1036,
+        "variant": "Generalization",
+        "routes": "fail2drive_split/Generalization_HardBrake_1036.xml",
+        "sha256": "e950f10bb83f6e180d7aa8604619aad13052f6a39d410c49c1a6f0a884a2e32a"
+      },
+      "reserved_counterpart": {
+        "route_id": 36,
+        "variant": "Base",
+        "routes": "fail2drive_split/Base_HardBrake_0036.xml",
+        "sha256": "e37c13cab93c9377f726a536f69df19510279cea3fbbcf157d28040d69e82a76"
+      }
+    },
+    {
+      "family": "ImageOnObject",
+      "collection": [
+        {
+          "route_id": 40,
+          "variant": "Base",
+          "routes": "fail2drive_split/Base_ImageOnObject_0040.xml",
+          "sha256": "e8de065c7385cb9b72e65640576f45bb60c077e46c5e51db5fcd1e29ead851e0"
+        },
+        {
+          "route_id": 1040,
+          "variant": "Generalization",
+          "routes": "fail2drive_split/Generalization_ImageOnObject_1040.xml",
+          "sha256": "c4c748e31d64f7ff0cd6b4182016f1f119262fd1ab79616b634666ae8115cc5d"
+        }
+      ],
+      "evaluation": {
+        "route_id": 1041,
+        "variant": "Generalization",
+        "routes": "fail2drive_split/Generalization_ImageOnObject_1041.xml",
+        "sha256": "05899f6dfbccbf548173f7b8a0dfc22ab1823761348a361f181186cdc401298d"
+      },
+      "reserved_counterpart": {
+        "route_id": 41,
+        "variant": "Base",
+        "routes": "fail2drive_split/Base_ImageOnObject_0041.xml",
+        "sha256": "b1ee954c7088e15694f70dbce875a318a1245ba4eefe4b638f0821c93b91dee2"
+      }
+    },
+    {
+      "family": "ObscuredStop",
+      "collection": [
+        {
+          "route_id": 45,
+          "variant": "Base",
+          "routes": "fail2drive_split/Base_ObscuredStop_0045.xml",
+          "sha256": "3f656af37d7d018432f79ae9424973cdd4da872c3b072411cfc69470ec316f02"
+        },
+        {
+          "route_id": 1045,
+          "variant": "Generalization",
+          "routes": "fail2drive_split/Generalization_ObscuredStop_1045.xml",
+          "sha256": "c4a98910c5d41c50bbfe519f2c40a790f5ed66c667316493d007042122fbede5"
+        }
+      ],
+      "evaluation": {
+        "route_id": 1046,
+        "variant": "Generalization",
+        "routes": "fail2drive_split/Generalization_ObscuredStop_1046.xml",
+        "sha256": "eeddb4420df7c794b1fd90e182262022b59ce24728d18d2bccbbc9ab1a3b8abc"
+      },
+      "reserved_counterpart": {
+        "route_id": 46,
+        "variant": "Base",
+        "routes": "fail2drive_split/Base_ObscuredStop_0046.xml",
+        "sha256": "4f49f8596f809563edadd54dd86318f5e52cd443745d0407ca9a7c8d514f3798"
+      }
+    },
+    {
+      "family": "OppositeConstruction",
+      "collection": [
+        {
+          "route_id": 50,
+          "variant": "Base",
+          "routes": "fail2drive_split/Base_OppositeConstruction_0050.xml",
+          "sha256": "d614297152f8b278ba15f551cf223ca193763ef41cf0d34ecb413ed4de14633b"
+        },
+        {
+          "route_id": 1050,
+          "variant": "Generalization",
+          "routes": "fail2drive_split/Generalization_OppositeConstruction_1050.xml",
+          "sha256": "855d44d11feecfb307fb979bb1b960ff40a40ac3132d9a3ceb1a6744f2f917cf"
+        }
+      ],
+      "evaluation": {
+        "route_id": 1051,
+        "variant": "Generalization",
+        "routes": "fail2drive_split/Generalization_OppositeConstruction_1051.xml",
+        "sha256": "d4a77cc7fa45394fa057e44d0f50254778e24b1854410ee065c5564643650517"
+      },
+      "reserved_counterpart": {
+        "route_id": 51,
+        "variant": "Base",
+        "routes": "fail2drive_split/Base_OppositeConstruction_0051.xml",
+        "sha256": "d261496d6fd77390060651db2277a3fefffa49dd2965b64cf277af755dac921f"
+      }
+    },
+    {
+      "family": "PassableObstacles",
+      "collection": [
+        {
+          "route_id": 60,
+          "variant": "Base",
+          "routes": "fail2drive_split/Base_PassableObstacles_0060.xml",
+          "sha256": "2a0b0a191394de9aaaf95889d0e5782e6a388549dd9ad719050ac0324ab8968b"
+        },
+        {
+          "route_id": 1060,
+          "variant": "Generalization",
+          "routes": "fail2drive_split/Generalization_PassableObstacles_1060.xml",
+          "sha256": "eb1dd12b87ddd198d4f03e04419357e9b47530d8c65714a027025d7068693d4b"
+        }
+      ],
+      "evaluation": {
+        "route_id": 1061,
+        "variant": "Generalization",
+        "routes": "fail2drive_split/Generalization_PassableObstacles_1061.xml",
+        "sha256": "3892f7b7ec6c761e0a5a62a091555e3b656902ee2f921089edd179b5ec166dfb"
+      },
+      "reserved_counterpart": {
+        "route_id": 61,
+        "variant": "Base",
+        "routes": "fail2drive_split/Base_PassableObstacles_0061.xml",
+        "sha256": "10bda7c6023ed1c4c79b7c0b01c68c2b466b87e58640511d3736760930855525"
+      }
+    },
+    {
+      "family": "PedestrianCrowd",
+      "collection": [
+        {
+          "route_id": 65,
+          "variant": "Base",
+          "routes": "fail2drive_split/Base_PedestrianCrowd_0065.xml",
+          "sha256": "713cdc4fceeff9b0b62e9e6295ffbc559fbf670e0e612def131139b2a9df8841"
+        },
+        {
+          "route_id": 1065,
+          "variant": "Generalization",
+          "routes": "fail2drive_split/Generalization_PedestrianCrowd_1065.xml",
+          "sha256": "0c4302955a01d8ccec2f2348907dd3ee32fe90b77cfec4f35be6987d2366d7e2"
+        }
+      ],
+      "evaluation": {
+        "route_id": 1066,
+        "variant": "Generalization",
+        "routes": "fail2drive_split/Generalization_PedestrianCrowd_1066.xml",
+        "sha256": "ecced2989e7f3568d36c9b11073c88cf804b9c2301fe4346ec7a38fbafb1fb2e"
+      },
+      "reserved_counterpart": {
+        "route_id": 66,
+        "variant": "Base",
+        "routes": "fail2drive_split/Base_PedestrianCrowd_0066.xml",
+        "sha256": "b1e54c5f2ce9833e180920207353b4eb2ca1fcea5e8c5931de6088863c9be8a5"
+      }
+    },
+    {
+      "family": "PedestrianOtherBlocker",
+      "collection": [
+        {
+          "route_id": 70,
+          "variant": "Base",
+          "routes": "fail2drive_split/Base_PedestrianOtherBlocker_0070.xml",
+          "sha256": "02a296b93c65e8692914b41030860111e3da3a869a3feade6ea9ae7859db447a"
+        },
+        {
+          "route_id": 1070,
+          "variant": "Generalization",
+          "routes": "fail2drive_split/Generalization_PedestrianOtherBlocker_1070.xml",
+          "sha256": "7d37df6e90f3b19076e763172b943935337d294e8c0c6271ab844bddd87c9fb5"
+        }
+      ],
+      "evaluation": {
+        "route_id": 1071,
+        "variant": "Generalization",
+        "routes": "fail2drive_split/Generalization_PedestrianOtherBlocker_1071.xml",
+        "sha256": "f287716f93c5fd80ac14f958c387bb5f955ede713f7d7135238abe911fc5e603"
+      },
+      "reserved_counterpart": {
+        "route_id": 71,
+        "variant": "Base",
+        "routes": "fail2drive_split/Base_PedestrianOtherBlocker_0071.xml",
+        "sha256": "dbe49251f15302431bed5a9a08824963300b1ee432e6142abd2af6153a213c91"
+      }
+    },
+    {
+      "family": "PedestriansOnRoad",
+      "collection": [
+        {
+          "route_id": 85,
+          "variant": "Base",
+          "routes": "fail2drive_split/Base_PedestriansOnRoad_0085.xml",
+          "sha256": "e47dd0f79b615cfaeb5a119317ee60e6cfd85dae390fdc7dcc9702fdd22f3ec4"
+        },
+        {
+          "route_id": 1085,
+          "variant": "Generalization",
+          "routes": "fail2drive_split/Generalization_PedestriansOnRoad_1085.xml",
+          "sha256": "e40b666509efb8b7c583eba3e44b5df7bf5cb74114eab98e25f74b7c4db13331"
+        }
+      ],
+      "evaluation": {
+        "route_id": 1086,
+        "variant": "Generalization",
+        "routes": "fail2drive_split/Generalization_PedestriansOnRoad_1086.xml",
+        "sha256": "f85fcc3eea7a4ecb0588322321c5bb8afcbcadb563e137e8fa7356682cbeea1f"
+      },
+      "reserved_counterpart": {
+        "route_id": 86,
+        "variant": "Base",
+        "routes": "fail2drive_split/Base_PedestriansOnRoad_0086.xml",
+        "sha256": "ee33a79f1f99f5e39f7e2cd877ffacd14c139c10dc258f9cdb4dd5232525edb4"
+      }
+    },
+    {
+      "family": "RightConstruction",
+      "collection": [
+        {
+          "route_id": 90,
+          "variant": "Base",
+          "routes": "fail2drive_split/Base_RightConstruction_0090.xml",
+          "sha256": "b3b15c7d1c2ba15d4c7786f9a8deaa4358a555e79c754f3741d529268f879475"
+        },
+        {
+          "route_id": 1090,
+          "variant": "Generalization",
+          "routes": "fail2drive_split/Generalization_RightConstruction_1090.xml",
+          "sha256": "fea9dce40a56d3dd7600a0abd182f3f13005576ba0f7537d55fa571a92661805"
+        }
+      ],
+      "evaluation": {
+        "route_id": 1091,
+        "variant": "Generalization",
+        "routes": "fail2drive_split/Generalization_RightConstruction_1091.xml",
+        "sha256": "70b5e5d938e24435d865367ba4104dbd848aa17df40c1c9da6311dfce1da6333"
+      },
+      "reserved_counterpart": {
+        "route_id": 91,
+        "variant": "Base",
+        "routes": "fail2drive_split/Base_RightConstruction_0091.xml",
+        "sha256": "f00065952ee0eed4caef3776e78edc2cbba7ac05acc3891aee3ad55e49ddfc3f"
+      }
+    },
+    {
+      "family": "RightOfWay",
+      "collection": [
+        {
+          "route_id": 55,
+          "variant": "Base",
+          "routes": "fail2drive_split/Base_RightOfWay_0055.xml",
+          "sha256": "344528d49a100765afec681796fe241e6dbfa8fb6e1511b694a80a41fddb5612"
+        },
+        {
+          "route_id": 1055,
+          "variant": "Generalization",
+          "routes": "fail2drive_split/Generalization_RightOfWay_1055.xml",
+          "sha256": "bd7fac55f298792b946121bfbbc21ffa96a3aecfc7f455d983ecd252257b6c2c"
+        }
+      ],
+      "evaluation": {
+        "route_id": 1056,
+        "variant": "Generalization",
+        "routes": "fail2drive_split/Generalization_RightOfWay_1056.xml",
+        "sha256": "c9eaf956e2cccda16188a4d5bfc2bfcf589c8daf01e1476fc79ec649cc2546e6"
+      },
+      "reserved_counterpart": {
+        "route_id": 56,
+        "variant": "Base",
+        "routes": "fail2drive_split/Base_RightOfWay_0056.xml",
+        "sha256": "eb433aa29614d73a4b99e30f896c0a297f23b22fd520eaff9dc90181b056513a"
+      }
+    },
+    {
+      "family": "Wall",
+      "collection": [
+        {
+          "route_id": 95,
+          "variant": "Base",
+          "routes": "fail2drive_split/Base_Wall_0095.xml",
+          "sha256": "8f47928f6b9b60134f03d0dafea2cf7b0d4c0ab2bdee97d9504e7ecf0c13de22"
+        },
+        {
+          "route_id": 1095,
+          "variant": "Generalization",
+          "routes": "fail2drive_split/Generalization_Wall_1095.xml",
+          "sha256": "3b54d63dc61488abdc80b08e9dfbe2f3532e8ef679a51f660e60f9d10e16f974"
+        }
+      ],
+      "evaluation": {
+        "route_id": 1096,
+        "variant": "Generalization",
+        "routes": "fail2drive_split/Generalization_Wall_1096.xml",
+        "sha256": "ebb5837021e62e3db703244f1f5692a9fcd67c915c1c5afe63df7785da81772d"
+      },
+      "reserved_counterpart": {
+        "route_id": 96,
+        "variant": "Base",
+        "routes": "fail2drive_split/Base_Wall_0096.xml",
+        "sha256": "61c1c89b7c1877295005b713109cbc29faf3f95e174d2b465cdd888f029a67f3"
+      }
+    }
+  ],
+  "selection_scope": "all_official_families"
+}

@@ -589,15 +589,17 @@ evaluator 独占世界推进；采集 Agent 不创建或删除周车、不修改
 前视距离和横向偏离。官方初始化可能从自车前约5米处返回前向参考，不能把这个距离
 直接判为离路；不修改官方规划游标、不凭空连接路线，也不放宽真实横向偏离资格。
 
-同类型经验迁移实验的完整预设划分使用 `config/fail2drive_memory_transfer_split.json`：
-当前选择10类，每类一组Base/Generalization采集，共20条；每类另一组的Generalization留作测试，共10条。
+同类型经验迁移实验使用 `config/fail2drive_memory_transfer_all17.json`。17类各采集一组
+Base/Generalization，共34条。每类从另一组取一条Generalization留作测试，共17条。
+原10类的采集路线、配对、种子和留出编号沿用旧划分。本轮34条全部重新采集，每个家族单独运行一批，使用新的输出目录。
 测试组对应的Base也禁止进入记忆，原始XML哈希、配对关系及跨类别完全相同的稀疏路线
 均检查。允许同Town13部分道路重叠，不宣称跨地图或跨类别泛化。
 `scripts/check_fail2drive_memory_split.py --fail2drive-root <官方源码目录>` 只读验证划分；
 加 `--ids collection` 或 `--ids evaluation` 输出现有入口可用的 `--route-ids` 参数列表。
-本次20/10划分使用这些ID，`--selected-collection`选取全部20条采集；旧 `--all-families` 仍是17条诊断路线。
+`--selected-collection` 选取全部34条。复现旧20条时显式指定
+`--collection-split config/fail2drive_memory_transfer_split.json`。旧 `--all-families` 仍选择17条诊断路线。
 采集和测试seed均固定1；完整方案下A基础、B模型加失败反思、C同B但反思检索新库
-各测10条，共30轮。也可先采集，再按成功与完整视频质量选取少量示范，冻结选集后
+各测17条，共51轮。也可先采集，再按成功与完整视频质量选取少量示范，冻结选集后
 只评测这些家族原预设的保留路线。实际数量及Base/Generalization覆盖如实记录，不
 把失败采集变成成功，不把仅选中部分场景的结果称为全量成绩。B/C模型、提示词、
 规划器和失败反思条件一致，测试中不写库。
@@ -605,25 +607,30 @@ evaluator 独占世界推进；采集 Agent 不创建或删除周车、不修改
 测试案例在看A/B/C结果前固定，失败照实报告，不按成功率换样本。
 
 新库 `build_fail2drive_official_memory.py check/prepare` 需加
-`--collection-split config/fail2drive_memory_transfer_split.json`，默认要求20条均通过相应的整路线或交互片段验收。选择少量优质示范时显式加`--allow-partial-collection`，并用多个`--captures`
+`--collection-split config/fail2drive_memory_transfer_all17.json`，默认要求34条均通过相应的整路线或交互片段验收。选择少量优质示范时显式加`--allow-partial-collection`，并用多个`--captures`
 指定已finalize且实际选中的成功叶子目录，不要把混有失败记录的整批根目录当作选集。
 该选项只允许缺少未选案例，仍拒绝测试路线、保留配对、错seed、错XML或重复轮次；
 报告保留原完整划分、实际选集指纹、覆盖家族、不完整采集配对及对应保留测试ID，并将来源
 留在待整理任务的来源中。冻结库后再测试，不用测试失败记录补充该库。
-当前的相机、地面和驾驶问题仍需分别验证，这一划分不代表20条已实际成功。
+采集清单记录计划覆盖范围，实际交互覆盖以成功归档和完整视频审核为准。
 
 正式记忆采集入口为 `scripts/collect_fail2drive_interactions.py`，默认在官方 evaluator 上运行冻结采集集的原始交互片段。
+按家族采集时，用同一组环境参数加 `--family BadParking --seed 1 --output-dir <本次新目录> --allow-min-speed-only --run`。一次调用只跑该家族的原始 Base 和 Generalization。启动前可用 `--fail2drive-root "$F2D_SOURCE" --family BadParking --list` 查两个编号。批次目录中的 `BadParking_batch.json` 逐条给出运行状态、原始记录和可供审核的视频路径。两条都达到 `ready_for_video_review` 后分别核对关键交互和恢复行驶，再开始下一批。重采使用新的目录，以保留前一次视频和失败证据。
+两类施工绕行有预先指定的官方备选。若本轮 0015/1015 或 0020/1020 中的一条在对向车流下持续停等至片段时限，可为同一家族添加 `--fallback-after <原家族批次JSON>`，在新目录完整采集另一对。ConstructionPermutations 的备选 0017/1017 是同向邻道的施工绕行。CustomObstacles 的备选 0029/1029 是双向路段，1029 的异常物体是蹦床。原尝试和启用备选的原因保留在记录中。最终每类选一对。采用备选的家族在 `check_fail2drive_memory_split.py` 上各传一次 `--reserve-pair <家族>`，用 `--write-split <新文件>` 保存最终划分，供记忆库 `check/prepare --collection-split` 使用。17条留出测评路线固定。
 先用 `--fail2drive-root "$F2D_SOURCE" --list --route-ids 1020` 核对原始路线、地图、事件类型及 XML 中指定的演员。
 正式采集使用 `--fail2drive-root "$F2D_SOURCE" --simulator-root "$F2D_CARLA" --worker-python "$NUM_PY" --route-ids 1020 --run`，由原定制 SDK Python 启动。
 每条完成后立即调用数值环境执行 `finalize`。仅允许官方最低速度扣分时显式加 `--allow-min-speed-only`。通过后结果给出 `review_video`，该条仍待人工看片。
+该入口一次采集多条时，已分类的交互失败（例如等待至片段时限）单列后继续采下一条；批次仍返回失败状态。
+SDK、归档或未识别的运行错误会中止批次。需要遇到首条已分类失败就停时可指定 `--no-continue-on-route-failure`。
 例如 1020 的十个花园矮人和对向车流由官方场景加载，配对的 0020 使用常规施工障碍。每次补采可省略 `--output-dir`，让程序生成新的官方采集目录。
 
 底层官方入口快速采集使用`--selected-collection --run`，默认`--capture-mode interaction_segment`；
 单条补采使用`--route-ids <采集ID> --capture-mode interaction_segment`。从原官方起点、
 原seed正常运行，记录目标交互出现、应对及恢复5秒后，由采集专用hook在官方tick和
 criteria更新后停止manager；不移动起点、不改NPC或场景触发，不给正式测评增加短时限。
-无附加事件的Base按其Generalization配对的目标路段保留正常通行对照。默认90秒仅为
-采集预算，耗尽但交互未完成仍拒收。每个入库锚点须有真实当前及后1/2/3秒证据。
+无附加事件的Base按其Generalization配对的目标路段保留正常通行对照。普通片段的默认采集预算为90秒。
+含官方 `RoadBlocked` 事件的 FullyBlocked 和 Wall 路线默认给120秒，包含官方60秒清障等待、
+接近与恢复行驶。预算耗尽但交互未完成仍拒收。每个入库锚点须有真实当前及后1/2/3秒证据。
 片段保存`segment_capture.json`与逐物理帧证据，原官方部分路线状态/分数不改写；
 片段完成不等于官方路线成功。已有合格完整路线仍可复用。`--capture-mode full_route`
 保留旧完整路线采集方式，独立`run_fail2drive.py`正式A/B/C评测结束条件保持原样。
@@ -677,7 +684,7 @@ criteria更新后停止manager；不移动起点、不改NPC或场景触发，�
 --workbench-root <已有offline_memory_builder目录>` 复用原工作台，按真实制动、转向和
 重新起步选择最多3个具有后续3秒证据的锚点；仍需真实DINO、部署教师标注、人工审核
 和冻结发布。正式论文 Agent/MPC 不调用专家；新库仅由显式反思检索入口读取。
-若采用旧的测评原路线采集方案，应披露为已知场景示范辅助。20/10划分则报告同类型
+若采用旧的测评原路线采集方案，应披露为已知场景示范辅助。配对留出划分报告同类型
 未入库路线案例对照，不作未见类别/城市或完整排行榜成绩主张；每类一个案例不能替代
 该类别的重复试验，也不保证检索到一条记忆就一定通行。
 

@@ -67,6 +67,7 @@
 !/scripts/capture_fail2drive_official.py
 !/scripts/build_fail2drive_official_memory.py
 !/config/fail2drive_memory_transfer_split.json
+!/config/fail2drive_memory_transfer_all17.json
 !/scripts/check_fail2drive_memory_split.py
 
 # 仅发布运行需要的DINOv2 Base，权重由Git LFS管理。

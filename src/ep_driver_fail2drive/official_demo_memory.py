@@ -306,6 +306,9 @@ def _binding(root,run,launch,guard):
             or configuration.get('official_commit')!=OFFICIAL_COMMIT):
         raise ValueError('Official checkpoint association changed route, repetitions or seed')
     spec=configuration.get('official_demo',{})
+    if (spec.get('collection_split_sha256')!=launch.get('collection_split_sha256')
+            or spec.get('collection_fallback')!=launch.get('collection_fallback')):
+        raise ValueError('Collection partition or reserve authorization differs from the fingerprinted launch')
     if (spec.get('scenario_family')!=run['scenario_family'] or spec.get('official_route_id')!=run['official_route_id']
             or spec.get('driver')!='official_autopilot' or spec.get('purpose')!='demonstration_only'
             or spec.get('scenario_mutations') is not False):
@@ -578,7 +581,7 @@ def _borrow_anchors(eligible,execution,*,earliest_entry=-math.inf):
                 blocker=policy.get('entry_gap_blocker')
                 if blocker and 'blocker_actor_id' not in stopped:
                     if (type(blocker.get('actor_id')) is not int or blocker.get('reason')
-                            not in ('vehicle_between_ego_and_return','arrival_gap_too_small')):
+                            not in ('vehicle_between_ego_and_return','arrival_gap_too_small','passing_body_not_clear')):
                         raise ValueError('Invalid current vehicle evidence for denied borrowing clearance')
                     # Prefer the first actual stopped frame with an identified
                     # vehicle over an earlier denial without an attributed cause.
@@ -733,6 +736,7 @@ def _export(root,run,raw,official=None):
 
 def _segment_source_binding(root,run,launch,*,freeze=False):
     """Rebuild target geometry from frozen original bytes after server transfer."""
+    from .demo_segment import segment_targets
     spec=launch.get('config',{}).get('official_demo',{}).get('segment')
     if not isinstance(spec,dict):raise ValueError('Missing fingerprinted interaction segment specification')
     original=_contained(root,'official_route.xml')
@@ -758,14 +762,7 @@ def _segment_source_binding(root,run,launch,*,freeze=False):
         routes=ET.parse(path).getroot().findall('route')
         if len(routes)!=1 or routes[0].get('id')!=str(identity) or routes[0].get('town')!=spec['map']:
             raise ValueError('Frozen segment XML route/map identity changed')
-        rows=[]
-        for item in routes[0].findall('.//scenario'):
-            trigger=item.find('trigger_point');distance=item.find('distance');kind=item.get('type')
-            if trigger is None:raise ValueError('Frozen segment target lacks original trigger geometry')
-            rows.append(dict(type=kind,name=item.get('name',''),
-                trigger_xyz_carla=[float(trigger.get(k)) for k in ('x','y','z')],
-                distance_m=float(distance.get('value')) if distance is not None else (12. if kind=='DynamicObjectCrossing' else 0.)))
-        return rows
+        return segment_targets(routes[0])
     if (spec.get('expected_scenarios')!=scenarios(original,rid)
             or spec.get('paired_gen_scenarios')!=scenarios(paired,paired_id)):
         raise ValueError('Segment target geometry does not reproduce the frozen original XML')
@@ -820,6 +817,17 @@ def _anchors_for_capture(frames,execution,requested=None,behavior_rows=None,segm
     if not ordinary:
         borrowing=_borrow_anchors(eligible,[r for r in execution if r['time']<=finish],earliest_entry=onset)
         if borrowing:return borrowing
+        for maneuver in (segment.get('physical_bypass') or {}).values():
+            if maneuver.get('status')!='returned_to_route_lane':continue
+            alongside=next((r for r in execution if r['frame']==maneuver['alongside_frame']),None)
+            if alongside is not None:
+                prior=[r for r in eligible if -1e-5<=alongside['time']-r['time']<1.+1e-5]
+                if prior:
+                    source=max(prior,key=lambda r:r['time'])
+                    return [dict(frame_id=source['snapshot']['frame_id'],time=source['time'],
+                        anchor_reason='observed_borrowed_lane_passage',target_actor_id=maneuver['passed_actor_id'],
+                        actual_alongside_frame=maneuver['alongside_frame'],actual_return_frame=maneuver['return_frame'],
+                        target_interaction_requires_human_confirmation=True)]
     during=[r for r in execution if onset<=r['time']<=finish]
     if not during:raise ValueError('No actual controls in captured interaction')
     strongest=max(during,key=lambda r:r['returned_control']['brake']+abs(r['returned_control']['steer']))
@@ -955,6 +963,8 @@ def _check_episode(root,requested=None,*,allow_min_speed_only=False):
             raise ValueError('Frozen official evidence changed: '+name)
     return dict(protocol=PROTOCOL,valid=True,passed=True,run_dir=str(root),episode=str(root),
         scenario_family=run['scenario_family'],official_route_id=route_id,seed=launch['repetition_seed'],
+        capture_collection_split_sha256=launch.get('collection_split_sha256'),
+        collection_fallback=deepcopy(launch.get('collection_fallback')),
         driver=run['reference_driver'],capture_count=len(frames),execution_count=len(execution),
         physical_world_audit=physical,
         demonstration_behavior_audit=behavior,
@@ -963,6 +973,40 @@ def _check_episode(root,requested=None,*,allow_min_speed_only=False):
         capture_mode=_capture_mode(run),actual_admission_scope=outcome.get('scope','whole_episode'),segment_capture=segment,
         human_driving_quality_approved=False,review_status='pending_real_human_driving_quality_review',
         admission_policy=deepcopy(frozen_policy),accepted_with_min_speed_penalty=outcome['accepted_with_min_speed_penalty'])
+
+
+def _generalization_interaction_coverage(split, partition, episodes):
+    """Summarize already audited target encounters separately from family labels and route scores."""
+    from .demo_segment import verified_bypass_evidence
+    selected = {(r['official_route_id'], r['source_manifest_sha256'])
+                for r in partition['selection_snapshot']['captures']}
+    admitted = set()
+    completed = set()
+    for episode in episodes:
+        rid = episode['official_route_id']
+        if (rid, episode.get('source_manifest_sha256')) not in selected:
+            continue
+        admitted.add(rid)
+        segment = episode.get('segment_capture') or {}
+        spec = segment.get('spec', {})
+        if (spec.get('variant') == 'Generalization' and spec.get('expected_scenarios')
+                and segment.get('target_observed') is True and segment.get('interaction_completed_frame') is not None
+                and verified_bypass_evidence(segment)):
+            # _check_episode has already replayed this evidence. This includes
+            # an official route ending naturally after the actual interaction.
+            completed.add(rid)
+    verified, unverified, missing = [], [], []
+    for row in split['rows']:
+        rid = next(r['route_id'] for r in row['collection'] if r['variant'] == 'Generalization')
+        if rid in completed:
+            verified.append(row['family'])
+        elif rid in admitted:
+            unverified.append(row['family'])
+        else:
+            missing.append(row['family'])
+    return dict(verified_target_interaction_families=verified,
+                admitted_without_target_completion_evidence=unverified,
+                missing_admitted_generalization_families=missing)
 
 
 def check_official_demonstrations(captures,*,anchor_frames=None,require_all_families=False,collection_split=None,
@@ -990,8 +1034,9 @@ def check_official_demonstrations(captures,*,anchor_frames=None,require_all_fami
         data_use='targeted_seen_scenario_demonstration;not_unseen_route_generalization')
     if collection_split is not None:
         from .memory_split import load_transfer_split,validate_collection_partition
-        partition=validate_collection_partition(load_transfer_split(collection_split),episodes,
-            allow_partial=allow_partial_collection)
+        split=load_transfer_split(collection_split)
+        partition=validate_collection_partition(split,episodes,allow_partial=allow_partial_collection)
+        partition['generalization_interaction_coverage']=_generalization_interaction_coverage(split,partition,episodes)
         report.update(collection_partition=partition,valid=report['valid'] and partition['valid'],
             data_use='same_family_heldout_route_pair;not_unseen_map_or_family_generalization')
     return report

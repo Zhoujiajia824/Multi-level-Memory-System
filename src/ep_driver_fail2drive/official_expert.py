@@ -574,11 +574,21 @@ def _maneuver_record(pilot, provider):
                                  'current_vehicle_gap_only' if evaluated else 'not_evaluated_this_frame'),
             actor_hazard_and_traffic_checks='executed_every_frame',
             gap_rule_forces_stop_in_committed_opposite_lane=False))
+    blocker = getattr(pilot, '_ep_gap_blocker', None)
+    estimates = getattr(pilot, '_ep_gap_time_estimates', [])
+    denial = getattr(pilot, '_ep_lane_denial', None)
+    if blocker is not None:
+        denial = 'first_rejecting_vehicle_in_iteration_order'
+    elif estimates and estimates[-1]['occupancy_estimate_s'] is None:
+        # The zero speed envelope returns before the vehicle loop. Its binding
+        # actor(s), if any, are already recorded with the corresponding estimate.
+        denial = 'zero_cautious_travel_speed'
     return dict(schema=DRIVING_POLICY_SCHEMA,maneuvers=rows,
         return_update=_container_copy(getattr(pilot,'_ep_return_update',None)),
-        entry_gap_blocker=_container_copy(getattr(pilot,'_ep_gap_blocker',None)),
+        entry_gap_denial=denial,
+        entry_gap_blocker=_container_copy(blocker),
         preentry_gap_rechecks=getattr(pilot,'_ep_preentry_gap_rechecks',0),
-        gap_time_estimates=_container_copy(getattr(pilot,'_ep_gap_time_estimates',[])),
+        gap_time_estimates=_container_copy(estimates),
         keep_driving_is_safety_override=False)
 
 
@@ -710,6 +720,24 @@ def _expert_tree(text, filename):
             RejectDeletion().visit(method)
         elif method.name == 'toggle_recording':
             method.body = [ast.Expr(value=ast.Call(func=ast.Name(id='_disabled_recorder',ctx=ast.Load()),args=[],keywords=[]))]
+        elif method.name == '_compute_target_speed_idm':
+            # When the upstream hazard/caution stage already calls for a stop,
+            # the IDM free-road term v / desired_speed is undefined (even at rest).
+            # Zero is the requested target; no RK45 integration is needed.
+            method.body[1:1] = ast.parse('if desired_speed == 0.:\n    return 0.').body
+        elif method.name == 'get_brake_and_target_speed':
+            # RoadBlocked stages its actors 200 m below the road until the
+            # official trigger moves them into place. Measure the existing
+            # 40 m approach distance in XYZ so a staged blocker cannot stop ego.
+            blocks = [node for node in ast.walk(method) if isinstance(node, ast.If)
+                      and ast.unparse(node.test) == "scen[0] == 'RoadBlocked'"]
+            if len(blocks) != 1:
+                raise ValueError('Unexpected RoadBlocked expert hazard branch')
+            flatten = [stmt for stmt in blocks[0].body if isinstance(stmt, ast.Assign)
+                       and ast.unparse(stmt) == 'diff_vector.z = 0']
+            if len(flatten) != 1:
+                raise ValueError('Unexpected RoadBlocked expert distance calculation')
+            blocks[0].body.remove(flatten[0])
         elif method.name == '_get_control':
             # The upstream keep_driving branch suppresses all pedestrian,
             # vehicle, traffic-light and stop-sign checks during overtaking.
@@ -786,7 +814,8 @@ def _expert_tree(text, filename):
                             and node.targets[0].slice.value==6
                             and isinstance(node.value,ast.Name) and node.value.id=='path_clear'):
                         gap_result_patches+=1
-                        permit=ast.parse('path_clear = path_clear and _permitted_borrow(self, scenario_type, direction, from_index, to_index)').body[0]
+                        permit=ast.parse('if path_clear and not _permitted_borrow(self, scenario_type, direction, from_index, to_index):\n'
+                            '    path_clear = False\n    self._ep_lane_denial = "crossing_not_permitted"').body[0]
                         after=ast.parse('self._ep_preentry_gap_rechecks += 1\nself._ep_entry_gap_evaluated = True\n'
                             'self._ep_entry_gap_key = (scenario_type, int(from_index), int(to_index))\n'
                             'if path_clear:\n    self._ep_cleared_entries.add(self._ep_entry_gap_key)\n'
@@ -819,7 +848,8 @@ def _expert_tree(text, filename):
                         # The unmodified early return keeps the cruise speed
                         # even if there is no lane into which the ego can pass.
                         node.body[0].value=ast.parse('(0., False, speed_reduced_by_obj)',mode='eval').body
-                        node.body[:0]=ast.parse('scenario_data[6] = False\n'
+                        node.body[:0]=ast.parse('self._ep_lane_denial = "no_adjacent_target_lane"\n'
+                            'scenario_data[6] = False\n'
                             'self._ep_cleared_entries.discard((scenario_type, int(from_index), int(to_index)))').body
                         missing_lane_patches+=1
                         return node
@@ -845,7 +875,7 @@ def _expert_tree(text, filename):
                     return node
             RecheckEntryGap().visit(method)
             reset=ast.parse('self._ep_entry_gap_evaluated = False\nself._ep_entry_gap_key = None\n'
-                            'self._ep_gap_time_estimates = []\nself._ep_gap_blocker = None').body
+                            'self._ep_gap_time_estimates = []\nself._ep_gap_blocker = None\nself._ep_lane_denial = None').body
             # Preserve the method's public docstring.
             method.body[1:1]=[ast.copy_location(item,method.body[0]) for item in reset]
     if patched != 1:

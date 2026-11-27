@@ -24,6 +24,7 @@ import xml.etree.ElementTree as ET
 
 from . import OFFICIAL_COMMIT
 from .demo_catalog import FAMILIES
+from .memory_split import ALL_FAMILIES_SPLIT
 
 ROOT = Path(__file__).resolve().parents[2]
 SCHEMA = 'fail2drive-official-demonstrations-1.0'
@@ -182,7 +183,101 @@ sys.exit(2 if failures else 0)
     return evidence
 
 
-def select_routes(args, catalog, source, launcher):
+def _fallback_evidence(batch_path, family, primary, effective):
+    def pair(split):
+        row=next(r for r in split['rows'] if r['family']==family)
+        return sorted(row['collection'],key=lambda r:r['variant']!='Base')
+
+    raw=batch_path.read_bytes()
+    batch=json.loads(raw)
+    if not isinstance(batch,dict):
+        raise ValueError('Original family batch must be a JSON object')
+    originals=pair(primary)
+    seed=primary['collection_seed']
+    members=batch.get('routes',[])
+    if (batch.get('scenario_family')!=family or batch.get('collection_succeeded') is not False
+            or 'collection_fallback' in batch or not isinstance(members,list) or len(members)!=2
+            or any(not isinstance(m,dict) or (m.get('official_route_id'),m.get('variant'),m.get('repetition_seed'))
+                   !=(r['route_id'],r['variant'],seed) for m,r in zip(members,originals))):
+        raise ValueError('Fallback needs the original family pair and its terminal batch result')
+    reasons=[]
+    for member,route in reversed(list(zip(members,originals))):
+        if member.get('status')!='capture_failed':
+            continue
+        try:
+            trigger=_borrow_failure(batch_path,member,route,family,seed,_digest(primary))
+        except (ValueError,OSError) as exc:
+            reasons.append('%04d: %s'%(route['route_id'],exc))
+            continue
+        return dict(family=family,original_route_ids=[r['route_id'] for r in originals],
+            replacement_route_ids=[r['route_id'] for r in pair(effective)],original_batch_path=str(batch_path),
+            original_batch_sha256=hashlib.sha256(raw).hexdigest(),original_split_sha256=_digest(primary),
+            effective_split_sha256=_digest(effective),**trigger)
+    raise ValueError('Original family pair lacks an eligible oncoming-traffic wait: '+', '.join(reasons or
+        [str(m.get('status')) for m in members]))
+
+
+def _borrow_failure(batch_path,member,route,family,seed,primary_hash):
+    rid=route['route_id']
+    route_root=batch_path.parent/str(seed)
+    collection=route_root/'run'/('%04d_collection.json'%rid)
+    if (batch_path.parent/str(member.get('collection_record',''))).resolve()!=collection.resolve():
+        raise ValueError('Original family batch does not point to this route capture record')
+    collection_raw=collection.read_bytes()
+    record=json.loads(collection_raw)
+    launch=_read(collection.with_name('%04d_launch.json'%rid))
+    if not isinstance(record,dict) or not isinstance(launch,dict):
+        raise ValueError('Original capture and launch records must be JSON objects')
+    rejection=record.get('failure_summary') or {}
+    if (record.get('official_route_id')!=rid or record.get('scenario_family')!=family
+            or record.get('variant')!=route['variant'] or record.get('repetition_seed')!=seed
+            or record.get('route_failure_reason')!='interaction_segment_not_completed'
+            or record.get('known_route_rejection')!='route_interaction_segment_rejection'
+            or record.get('segment_controlled_stop') is not True or record.get('segment_status')!='failed'
+            or not isinstance(rejection,dict) or rejection.get('message')!='collection_budget_exhausted'
+            or launch.get('official_commit')!=OFFICIAL_COMMIT or launch.get('official_route_id')!=rid
+            or launch.get('capture_mode')!='interaction_segment' or launch.get('repetition_seed')!=seed
+            or launch.get('routes_sha256')!=route['sha256'] or launch.get('collection_split_sha256')!=primary_hash
+            or 'collection_fallback' in launch):
+        raise ValueError('Fallback requires a budget-exhausted original interaction capture bound to this split and XML')
+    logs=list((route_root/'agent_runs'/('%04d'%rid)).glob('agent/*/execution.jsonl'))
+    if len(logs)!=1:
+        raise ValueError('Original terminal wait needs one preserved execution trace')
+    segment=_read(logs[0].with_name('segment_capture.json'))
+    if (not isinstance(segment,dict) or segment.get('status')!='failed'
+            or segment.get('stop_reason')!='collection_budget_exhausted' or segment.get('spec')!=launch.get('segment')
+            or type(segment.get('end_frame')) is not int or segment['end_frame']!=rejection.get('frame')):
+        raise ValueError('Original segment closing evidence does not match the budget rejection and route')
+    wait=_terminal_borrow_wait(logs[0],segment['end_frame'])
+    traffic=('vehicle_between_ego_and_return','arrival_gap_too_small','passing_body_not_clear')
+    if (not wait or wait['observed_stationary_wait_s']<=0
+            or not any(wait['first_reported_denial_counts'].get(reason) for reason in traffic)
+            or ('terminal_borrow_wait' in rejection and rejection['terminal_borrow_wait']!=wait)):
+        raise ValueError('Original capture has no matching continuous terminal wait caused by oncoming traffic')
+    return dict(original_collection_path=str(collection),original_collection_sha256=hashlib.sha256(collection_raw).hexdigest(),
+        trigger_route_id=rid,trigger_variant=route['variant'],trigger_reason='collection_budget_exhausted',
+        terminal_borrow_wait=wait)
+
+
+def _collection_partition(args,source):
+    from .memory_split import load_transfer_split,validate_transfer_source
+    split=load_transfer_split(getattr(args,'collection_split',None) or ALL_FAMILIES_SPLIT)
+    if 'collection_pair_reserves' in split:
+        raise ValueError('Start a reserve collection with the primary split, --family and --fallback-after')
+    validate_transfer_source(split,source)
+    after=getattr(args,'fallback_after',None)
+    if not after:
+        return split,None
+    from .memory_split import with_reserve_pairs
+    family=getattr(args,'collection_family',None)
+    if not family:
+        raise ValueError('--fallback-after requires --family')
+    effective=with_reserve_pairs(split,[family])
+    validate_transfer_source(effective,source)
+    return effective,_fallback_evidence(Path(after).resolve(),family,split,effective)
+
+
+def select_routes(args, catalog, source, launcher, *, split=None):
     route_input = launcher.absolute(args.routes,source)
     if route_input.is_dir():
         candidates = sorted(route_input.glob('*.xml'))
@@ -198,11 +293,19 @@ def select_routes(args, catalog, source, launcher):
         if details['official_route_id'] in indexed:
             raise ValueError('Official route IDs repeat in the selected input')
         indexed[details['official_route_id']] = (path,details)
-    if getattr(args,'selected_collection',False):
-        from .memory_split import load_transfer_split,route_ids,validate_transfer_source
-        split=load_transfer_split(getattr(args,'collection_split',None))
-        validate_transfer_source(split,source)
-        wanted=route_ids(split,'collection')
+    collection_family = getattr(args, 'collection_family', None)
+    if getattr(args,'selected_collection',False) or collection_family:
+        from .memory_split import route_ids
+        if split is None:
+            split,_=_collection_partition(args,source)
+        if collection_family:
+            row = next((r for r in split['rows'] if r['family'] == collection_family), None)
+            if row is None:
+                raise ValueError('Family absent from the selected collection split: ' + collection_family)
+            pair = sorted(row['collection'], key=lambda r: r['variant'] != 'Base')
+            wanted = [r['route_id'] for r in pair]
+        else:
+            wanted=route_ids(split,'collection')
     elif args.route_ids is not None:
         wanted = list(args.route_ids)
         if not wanted or len(set(wanted))!=len(wanted) or any(type(x) is not int for x in wanted):
@@ -216,7 +319,7 @@ def select_routes(args, catalog, source, launcher):
     if not set(wanted).issubset(indexed):
         raise ValueError('Selected original official routes are absent: '+str(sorted(set(wanted)-set(indexed))))
     rows = [indexed[identity] for identity in wanted]
-    if args.route_ids is None and not getattr(args,'selected_collection',False):
+    if args.route_ids is None and not (getattr(args,'selected_collection',False) or collection_family):
         canonical = {row['route_id']:row for row in catalog['demonstrations']}
         for path,details in rows:
             expected = canonical[details['official_route_id']]
@@ -241,16 +344,15 @@ def plan(args, *, preflight=None, launcher=None):
         simulator = launcher.verify_simulator(launcher.absolute(args.simulator_root))
         sdk = launcher.verify_sdk(args.evaluator_python or sys.executable,simulator)
         preflight = official,simulator,sdk
-    routes = select_routes(args,catalog,source,launcher)
     capture_mode=getattr(args,'capture_mode',None) or (
         'interaction_segment' if getattr(args,'selected_collection',False) else 'full_route')
+    split=fallback=None
+    if capture_mode=='interaction_segment' or getattr(args,'selected_collection',False):
+        split,fallback=_collection_partition(args,source)
+    routes = select_routes(args,catalog,source,launcher,split=split)
     segment_specs={}
-    split=None
     if capture_mode=='interaction_segment':
-        from .memory_split import load_transfer_split,validate_transfer_source
         from .demo_segment import build_segment_spec
-        split=load_transfer_split(getattr(args,'collection_split',None))
-        validate_transfer_source(split,source)
         records={record['route_id']:(row,record) for row in split['rows'] for record in row['collection']}
         if seeds!=[split['collection_seed']]:
             raise ValueError('Interaction collection must use its fixed collection seed')
@@ -263,7 +365,7 @@ def plan(args, *, preflight=None, launcher=None):
                 raise ValueError('Interaction capture XML differs from its frozen collection identity')
             partner=next(r for r in row['collection'] if r['variant']=='Generalization')
             segment_specs[identity]=build_segment_spec(route,source/partner['routes'],
-                max_seconds=getattr(args,'segment_max_seconds',90.))
+                max_seconds=getattr(args,'segment_max_seconds',None))
     implementation = _code_hashes(launcher)
     expert = _expert_hashes(source,launcher)
     expert_identity = _digest(expert)
@@ -271,6 +373,11 @@ def plan(args, *, preflight=None, launcher=None):
     allowed = (ROOT/'output'/'official_demonstrations').resolve()
     if not base.is_relative_to(allowed) or base==allowed:
         raise ValueError('Choose a new run directory below this branch output/official_demonstrations/')
+    if fallback:
+        original_dir=Path(fallback['original_batch_path']).parent
+        if (base.is_relative_to(original_dir) or original_dir.is_relative_to(base)
+                or any(base.glob('*_batch.json'))):
+            raise ValueError('Use a new separate family output directory for the reserve pair')
     jobs=[]
     dependencies=None
     for seed in seeds:
@@ -294,6 +401,7 @@ def plan(args, *, preflight=None, launcher=None):
                 config['official_demo'].update(capture_mode=capture_mode,
                     segment=segment_specs[details['official_route_id']],
                     collection_split_sha256=_digest(split))
+                if fallback:config['official_demo']['collection_fallback']=fallback
             command=list(command)
             command[command.index('--agent')+1] = str(AGENT)
             # Preserve the official import search path. The expert adapter
@@ -335,11 +443,13 @@ def plan(args, *, preflight=None, launcher=None):
                     custom_episode_limit=config['official_demo']['segment']['max_sim_seconds'],
                     collection_only_early_stop=True,official_route_success_claimed=False,
                     ego_policy_is_the_only_substitution=False,official_scoring_unmodified=True)
+                if fallback:metadata['collection_fallback']=fallback
             jobs.append(dict(config=config,runtime_path=runtime,launch_path=launch,checkpoint=checkpoint,
                 agent_output=Path(config['output_dir']),command=command,env=env,metadata=metadata))
     return dict(output_dir=base,jobs=jobs,implementation_sha256=implementation,expert_sha256=expert,
                 catalog=catalog,official_root=source,launcher=launcher,
-                capture_mode=capture_mode,
+                capture_mode=capture_mode,collection_family=getattr(args,'collection_family',None),
+                collection_fallback=fallback,
                 continue_on_route_failure=bool(getattr(args,'continue_on_route_failure',False)))
 
 
@@ -347,7 +457,7 @@ def preview(planned):
     return dict(schema=SCHEMA,purpose='demonstration_only',dry_run=True,
         output_dir=str(planned['output_dir']),jobs=[dict(
             official_route_id=job['metadata']['official_route_id'],scenario_family=job['metadata']['scenario_family'],
-            map=job['metadata']['map'],repetition_seed=job['metadata']['repetition_seed'],
+            variant=job['metadata']['variant'],map=job['metadata']['map'],repetition_seed=job['metadata']['repetition_seed'],
             traffic_manager_seed=job['metadata']['traffic_manager_seed'],command=job['command'],
             runtime_path=str(job['runtime_path']),checkpoint=str(job['checkpoint']),
             agent_output=str(job['agent_output']),fingerprint=job['metadata']['fingerprint']) for job in planned['jobs']],
@@ -356,6 +466,7 @@ def preview(planned):
         custom_episode_limit=(planned['jobs'][0]['metadata']['custom_episode_limit']
                               if planned.get('capture_mode')=='interaction_segment' else None),
         simulator_started_by_launcher=False,accepted_for_memory=False,memory_published=False,
+        collection_fallback=planned.get('collection_fallback'),
         continue_on_known_route_rejection=planned.get('continue_on_route_failure',False))
 
 
@@ -409,6 +520,55 @@ def _failure_summary(root,capture):
     return result,failure
 
 
+def _terminal_borrow_wait(path, end_frame):
+    """Describe only a continuous, stationary pre-entry wait ending at the rejection."""
+    start = previous = maneuver = last_estimate = None
+    reasons = {}
+    try:
+        with path.open(encoding='utf-8') as stream:
+            for line in stream:
+                row = json.loads(line)
+                frame, stamp = row['frame'], row['time']
+                decision = row.get('expert_decision') or {}
+                policy = decision.get('maneuver_policy') or {}
+                waits = [m for m in policy.get('maneuvers', ())
+                         if m.get('current_preentry_vehicle_gap_clear') is False
+                         and m.get('maneuver_committed') is False
+                         and m.get('home_lane_reference_while_waiting') is True]
+                key = ((waits[0]['kind'], waits[0]['from_index'], waits[0]['to_index'])
+                       if len(waits) == 1 else None)
+                valid = (type(frame) is int and type(stamp) in (int, float) and math.isfinite(stamp)
+                         and frame == row.get('source_frame') and stamp == row.get('source_time')
+                         and decision.get('source_frame') == frame and decision.get('source_time') == stamp)
+                speed = decision.get('ego_speed_xyz')
+                if not valid or key is None or type(speed) not in (int, float) or not 0 <= speed < .15:
+                    start = previous = None
+                    continue
+                if previous is None or previous[0] + 1 != frame or previous[1] >= stamp or key != maneuver:
+                    start, maneuver, reasons, last_estimate = (frame, stamp), key, {}, None
+                previous = frame, stamp
+                blocker = policy.get('entry_gap_blocker') or {}
+                reason = blocker.get('reason') or policy.get('entry_gap_denial')
+                for estimate in policy.get('gap_time_estimates', ()):
+                    if estimate.get('source_frame') != frame or estimate.get('source_time') != stamp:
+                        continue
+                    if estimate.get('occupancy_estimate_s') is not None:
+                        last_estimate = {k: estimate.get(k) for k in
+                            ('source_frame', 'predicted_ego_travel_m', 'cautious_gap_speed_mps', 'occupancy_estimate_s')}
+                    elif not reason and estimate.get('cautious_gap_speed_mps') == 0:
+                        reason = 'zero_cautious_travel_speed'
+                reason = reason or 'unspecified'
+                reasons[reason] = reasons.get(reason, 0) + 1
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+    if previous is None or previous[0] != end_frame:
+        return None
+    return dict(maneuver=maneuver[0], start_frame=start[0], end_frame=end_frame,
+                observed_stationary_wait_s=round(previous[1]-start[1], 3),
+                stationary_speed_threshold_mps=.15, denied_checks=end_frame-start[0]+1,
+                first_reported_denial_counts=reasons, last_available_ego_estimate=last_estimate)
+
+
 def _known_route_rejection(root,capture,failure,verdict):
     """Whitelist route-level quality stops; never skip unknown runtime faults."""
     if (not isinstance(capture,dict) or capture.get('complete') is not False
@@ -449,7 +609,19 @@ def run_plan(planned):
     write_plan(planned)
     outcomes=[]
     stop_reason=None
-    for job in planned['jobs']:
+    family=planned.get('collection_family')
+    if family:
+        batch_path=planned['output_dir']/(family+'_batch.json')
+        batch=dict(scenario_family=family,collection_succeeded=None,batch_stop_reason=None,routes=[])
+        if planned.get('collection_fallback'):
+            batch['collection_fallback']=planned['collection_fallback']
+        for job in planned['jobs']:
+            metadata=job['metadata']
+            batch['routes'].append(dict(official_route_id=metadata['official_route_id'],variant=metadata['variant'],
+                repetition_seed=metadata['repetition_seed'],status='not_run'))
+        with batch_path.open('x',encoding='utf-8') as stream:
+            json.dump(batch,stream,ensure_ascii=False,indent=2)
+    for i,job in enumerate(planned['jobs']):
         launcher=planned['launcher']
         if (_code_hashes(launcher)!=planned['implementation_sha256']
                 or _expert_hashes(planned['official_root'],launcher)!=planned['expert_sha256']):
@@ -459,13 +631,18 @@ def run_plan(planned):
         if hashlib.sha256(launcher.io_path(source).read_bytes()).hexdigest()!=metadata['routes_sha256']:
             raise ValueError('Original official route changed after planning')
         route=metadata['official_route_id'];seed_root=job['runtime_path'].parent.parent
+        if family:
+            member=batch['routes'][i]
+            member.update(status='started',stdout_path=(seed_root/'out'/('%04d_out.log'%route)).relative_to(planned['output_dir']).as_posix(),
+                stderr_path=(seed_root/'err'/('%04d_err.log'%route)).relative_to(planned['output_dir']).as_posix())
+            _write(batch_path,batch)
         print('Running official-world demonstration %04d (%s), seed %d'%(route,metadata['scenario_family'],metadata['repetition_seed']),flush=True)
         with (seed_root/'out'/('%04d_out.log'%route)).open('x',encoding='utf-8') as out, \
                 (seed_root/'err'/('%04d_err.log'%route)).open('x',encoding='utf-8') as err:
             code=subprocess.call(job['command'],cwd=ROOT,env=job['env'],stdout=out,stderr=err)
         verdict=launcher.official_result(job['checkpoint'],route)
         archives=sorted(job['agent_output'].glob('agent/*/run.json'))
-        result=dict(official_route_id=route,scenario_family=metadata['scenario_family'],
+        result=dict(official_route_id=route,scenario_family=metadata['scenario_family'],variant=metadata['variant'],
             repetition_seed=metadata['repetition_seed'],evaluator_returncode=code,official_result=verdict,
             checkpoint=str(job['checkpoint']),launch_path=str(job['launch_path']),runtime_path=str(job['runtime_path']),
             agent_output=str(job['agent_output']),run_dir=str(archives[0].parent) if len(archives)==1 else None,
@@ -498,6 +675,8 @@ def run_plan(planned):
                 status=validate_segment_report(segment,run=capture,spec=job['config']['official_demo']['segment'])
                 result.update(segment_completed=status['completed'],segment_controlled_stop=status['controlled_stop'],
                     segment_status=segment['status'],segment_evidence_path=str(archives[0].parent/'segment_capture.json'))
+                if segment.get('physical_bypass'):
+                    result['physical_bypass']=segment['physical_bypass']
                 if not status['completed']:
                     natural=(verdict.get('route_completed') is True and not status['controlled_stop']
                              and segment.get('termination')=='official_route_ended_naturally')
@@ -539,6 +718,10 @@ def run_plan(planned):
                 classification=segment_rejection,message=str(fatal if result.get('natural_full_route_completion')
                     else segment.get('stop_reason') or last.get('reason','incomplete interaction'))[:1200],
                 frame=segment.get('end_frame'),time=segment.get('end_time'))
+            if segment.get('stop_reason') == 'collection_budget_exhausted':
+                wait = _terminal_borrow_wait(archives[0].parent/'execution.jsonl', segment.get('end_frame'))
+                if wait is not None:
+                    result['failure_summary']['terminal_borrow_wait'] = wait
         rejection=segment_rejection or (_known_route_rejection(archives[0].parent,capture,failure,verdict)
                    if fatal and code==0 and len(archives)==1 else None)
         continue_route=bool(planned.get('continue_on_route_failure',False) and rejection)
@@ -568,7 +751,22 @@ def run_plan(planned):
                     review_status='ready_for_video_review' if ready else 'admission_failed',
                     admission_report=str(admission),admission_stderr=str(error_log))
                 if ready:result['review_video']=str(archives[0].parent/'planning'/'video.mp4')
-        _write(job['launch_path'].with_name('%04d_collection.json'%route),result)
+                elif isinstance(report,dict) and report.get('reasons'):
+                    result['admission_reasons']=report['reasons']
+        record=job['launch_path'].with_name('%04d_collection.json'%route)
+        _write(record,result)
+        if family:
+            member.update(status='capture_failed' if fatal else result.get('review_status','awaiting_finalization'),
+                collection_record=record.relative_to(planned['output_dir']).as_posix())
+            if fatal:
+                member['failure_reason']=fatal
+                member['detail']=result['failure_summary']['message']
+            elif 'admission_reasons' in result:
+                member['admission_reasons']=result['admission_reasons']
+            for key in ('admission_report','admission_stderr','review_video'):
+                if key in result:
+                    member[key]=Path(result[key]).relative_to(planned['output_dir']).as_posix()
+            _write(batch_path,batch)
         outcomes.append(result)
         print(json.dumps(result,ensure_ascii=False),flush=True)
         if fatal is not None and not continue_route:
@@ -587,10 +785,12 @@ def run_plan(planned):
     review_ok=not planned.get('review_policy') or all(row.get('review_status')=='ready_for_video_review' for row in outcomes)
     segments_ok=segment_mode and finished and healthy and all(row.get('segment_completed') is True or
         row.get('natural_full_route_completion') is True for row in outcomes)
-    return dict(schema=SCHEMA,collection_finished=finished,results=outcomes,
+    report=dict(schema=SCHEMA,collection_finished=finished,results=outcomes,
         planned_jobs=len(planned['jobs']),finished_jobs=len(outcomes),stopped_early=not finished,batch_stop_reason=stop_reason,
         all_routes_attempted=finished,
-        completed_with_route_failures=finished and any(row.get('route_failure_reason') or
+        unattempted_jobs=[{k:j['metadata'][k] for k in ('scenario_family','variant','official_route_id','repetition_seed')}
+                          for j in planned['jobs'][len(outcomes):]],
+        completed_with_route_failures=finished and any(row.get('route_failure_reason') or row.get('review_status')=='admission_failed' or
             (not (row.get('segment_completed') is True or row.get('natural_full_route_completion') is True) if segment_mode else
              row['official_result'].get('route_completed') is not True) for row in outcomes),
         continue_on_known_route_rejection=planned.get('continue_on_route_failure',False),
@@ -602,6 +802,11 @@ def run_plan(planned):
         official_routes_completed=routes_ok,
         finalization_required=any(row['finalization_required'] for row in outcomes),
         accepted_for_memory=False,memory_published=False)
+    if family:
+        batch.update(collection_succeeded=report['collection_succeeded'],batch_stop_reason=stop_reason)
+        _write(batch_path,batch)
+        report['family_batch_path']=str(batch_path)
+    return report
 
 
 def parser(*, collection_entry=False):
@@ -612,19 +817,24 @@ def parser(*, collection_entry=False):
     selection.add_argument('--route-ids',nargs='+',type=int)
     if collection_entry:
         result.set_defaults(family=None,all_families=False)
+        selection.add_argument('--family', dest='collection_family', choices=FAMILIES,
+            help='Run only this family: its frozen Base route followed by its Generalization partner')
+        result.add_argument('--fallback-after',metavar='PRIMARY_BATCH_JSON',
+            help='Run the predeclared reserve pair after a recorded terminal oncoming-traffic wait in the primary family batch')
         result.add_argument('--allow-min-speed-only',action='store_true',
             help='Accept only the official minimum-speed penalty during post-capture review admission')
     else:
         selection.add_argument('--family',choices=FAMILIES)
         selection.add_argument('--all-families',action='store_true')
     selection.add_argument('--selected-collection',action='store_true',
-        help='Collect both Base/Generalization partners of the selected 10-family split; defaults to interaction segments')
-    result.add_argument('--collection-split',help='Frozen collection/test partition; defaults to the selected 10-family split')
+        help='Collect both original Base/Generalization partners per family; defaults to interaction segments')
+    result.add_argument('--collection-split',default=str(ALL_FAMILIES_SPLIT),
+        help='Frozen collection/test partition; defaults to 34 official collection routes across 17 families')
     result.add_argument('--capture-mode',choices=(('interaction_segment',) if collection_entry else ('full_route','interaction_segment')),
         default='interaction_segment' if collection_entry else None,
         help='Interaction segments stop after the actual target interaction and recovery; official evaluation is unchanged')
-    result.add_argument('--segment-max-seconds',type=float,default=90.,
-        help='Simulation budget for segment collection only; reaching it without completion is a rejection')
+    result.add_argument('--segment-max-seconds',type=float,
+        help='Override the scenario-specific simulation budget for segment collection only')
     result.add_argument('--fail2drive-root')
     result.add_argument('--simulator-root')
     result.add_argument('--routes',default='fail2drive_split')
@@ -644,8 +854,10 @@ def parser(*, collection_entry=False):
     result.add_argument('--port',type=int,default=39000)
     result.add_argument('--traffic-manager-port',type=int,default=39003)
     result.add_argument('--debug',type=int,choices=(0,1,2,3),default=0)
-    result.add_argument('--continue-on-route-failure',action='store_true',
-        help='Continue after a structured route grounding/geometry rejection only; unknown Agent, SDK, encoder and source failures still stop; any failure retains exit 2')
+    result.add_argument('--continue-on-route-failure',
+        action=argparse.BooleanOptionalAction if collection_entry else 'store_true',
+        default=None if collection_entry else False,
+        help='Continue after a known route grounding, geometry or interaction rejection (default for multi-route collection); runtime failures stop the batch and any rejection retains exit 2')
     return result
 
 
@@ -654,17 +866,18 @@ def main(argv=None, *, collection_entry=False):
     try:
         if collection_entry:
             args.selected_collection=args.route_ids is None
+            if args.fallback_after and not args.collection_family:
+                raise ValueError('--fallback-after requires --family')
+            if args.continue_on_route_failure is None:
+                args.continue_on_route_failure = args.selected_collection or len(args.route_ids) > 1
             if args.list:
                 if not args.fail2drive_root:
                     command.error('Use --fail2drive-root to inspect the original collection XML')
-                from .memory_split import load_transfer_split,validate_transfer_source
-                split=load_transfer_split(args.collection_split)
                 launcher=_launcher()
                 source=launcher.absolute(args.fail2drive_root)
-                if args.route_ids is not None:
-                    validate_transfer_source(split,source)
+                split,_=_collection_partition(args,source)
                 records={record['route_id']:record for row in split['rows'] for record in row['collection']}
-                for _,details in select_routes(args,load_catalog(args.catalog),source,launcher):
+                for _,details in select_routes(args,load_catalog(args.catalog),source,launcher,split=split):
                     record=records.get(details['official_route_id'])
                     if (not record or record['routes']!=details['source_relative_path']
                             or record['sha256']!=details['routes_sha256']):

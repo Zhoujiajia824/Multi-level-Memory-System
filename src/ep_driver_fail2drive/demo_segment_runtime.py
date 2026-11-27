@@ -8,7 +8,8 @@ import math
 import traceback
 import weakref
 
-from .demo_segment import SegmentTracker, STOP_METHOD
+from .demo_segment import SegmentTracker, STOP_METHOD, lane_body_sample
+from .demo_behavior import _hull
 from .route import lane_key, project, xy
 
 
@@ -20,6 +21,24 @@ def _status(node):
 def _walk(node):
     yield node
     for child in getattr(node,'children',()):yield from _walk(child)
+
+
+def _route_lane_section(waypoint):
+    """Keep the map basis used to replay the observed vehicle's cross-section."""
+    transform=waypoint.transform
+    axis=transform.get_forward_vector();norm=math.hypot(axis.x,axis.y)
+    width=float(waypoint.lane_width)
+    if not math.isfinite(width) or width<=0 or not math.isfinite(norm) or norm<1e-6:
+        raise ValueError('Invalid original route lane cross-section')
+    sides=[]
+    for side in ('left','right'):
+        neighbor=getattr(waypoint,'get_'+side+'_lane')()
+        if (neighbor and str(neighbor.lane_type).split('.')[-1].lower()=='driving'
+                and waypoint.lane_id*neighbor.lane_id<0):
+            sides.append(side)
+    return dict(lane_id=lane_key(waypoint),width_m=width,opposing_sides=sides,
+                center_xy_carla_m=[transform.location.x,transform.location.y],
+                forward_xy_carla=[axis.x/norm,axis.y/norm])
 
 
 def _json_value(value):
@@ -55,6 +74,34 @@ class SegmentRuntime:
         self.agent=weakref.ref(agent);self.tracker=SegmentTracker(agent.config['official_demo']['segment'])
         self.previous_s=0.;self.previous_leaders={};self.gate=None;self.termination=None
         self.stop=None;self.tick_count=0;self.last_frame=None
+        self.stop_sign_ids={}
+
+    def _target_stop(self,manager,scenario,snapshot):
+        """Match the route stop criterion to the sign selected by ObscuredStopSign."""
+        criterion=next((c for c in manager.scenario.get_criteria()
+                        if type(c).__name__=='RunningStopTest'),None)
+        sign=getattr(criterion,'_target_stop_sign',None)
+        if sign is None:return None,False
+        if scenario not in self.stop_sign_ids:
+            # Pinned ObscuredStopSign selects the first sign along the trigger
+            # lane, before the junction, whose trigger centre is within 1.5 m.
+            trigger=scenario.config.trigger_points[0].location
+            signs=[]
+            for actor in criterion._list_stop_signs:
+                frozen=snapshot.find(actor.id)
+                if frozen is None:continue
+                center=frozen.get_transform().transform(actor.trigger_volume.location)
+                if center.distance(trigger)<=scenario.max_stop_dist:signs.append((actor.id,center))
+            wp=scenario._ego_wp
+            while wp and not wp.is_junction and wp.transform.location.distance(trigger)<=scenario.max_stop_dist:
+                match=next((key for key,center in signs if wp.transform.location.distance_2d(center)<=1.5),None)
+                if match is not None:
+                    self.stop_sign_ids[scenario]=match
+                    break
+                following=wp.next(1.)
+                wp=following[0] if following else None
+        if sign.id!=self.stop_sign_ids.get(scenario):return None,False
+        return sign,criterion._stop_completed is True
 
     def _gate(self,route):
         if self.gate is not None:return self.gate
@@ -79,8 +126,28 @@ class SegmentRuntime:
             row=dict(target_key=str(index)+':'+item['type'],type=item['type'],name=item['name'],
                      instantiated=bool(matches),active=False,ended=False,observed_near=False,
                      vulnerable_motion_observed=False,actors_observed=[],main_status='NOT_INSTANTIATED',timeout=False)
+            # The pinned expert brakes at 40 m from a full blockage.
+            near_limit=40. if item['type']=='RoadBlocked' else self.tracker.spec['target_near_distance_m']
+            row['observed_near_limit_m']=near_limit
+            trailing_actor=None
             if matches:
                 scenario=matches[0];children=list(scenario.behavior_tree.children)
+                if row['target_key'] in self.tracker.bypasses and getattr(scenario,'_construction_wp',None) is not None:
+                    # Use the same physical neighbor as the pinned upstream constructor,
+                    # which explicitly handles mislabeled TwoWays XML at same-direction sites.
+                    home=scenario._construction_wp
+                    side='left' if scenario._direction=='right' else 'right'
+                    other=getattr(home,'get_'+side+'_lane')()
+                    if other is None or str(other.lane_type).split('.')[-1].lower()!='driving':
+                        raise ValueError('Official construction site has no adjacent driving lane')
+                    row['bypass_site']=dict(side=side,home_lane_id=lane_key(home),neighbor_lane_id=lane_key(other),
+                                            opposing=home.lane_id*other.lane_id<0)
+                    # Same trailing obstacle reference the official construction behavior
+                    # registers with the expert; retain its current footprint, never its spawn pose.
+                    if item['type']=='ConstructionObstacleTwoWays':
+                        trailing_actor=scenario.other_actors[-2]
+                    else:
+                        trailing_actor=scenario.last
                 # BasicScenario wraps actual behavior between a trigger and a
                 # reset-blackboard/WaitForever tail. The root stays RUNNING.
                 trigger=children[0] if children else None
@@ -96,6 +163,15 @@ class SegmentRuntime:
                 # only actor references; the paired transforms are future spawn
                 # poses, never evidence of a currently observed physical body.
                 actors.extend(item[0] for item in (getattr(scenario,'_construction_transforms',()) or ()) if item)
+                registry={'RoadBlocked':'obstacle_transforms','ImageOnObject':'props',
+                          'ObscuredStopSign':'props','PedestrianCrowd':'pedestrians'}.get(item['type'])
+                if registry:
+                    actors.extend(entry[0] for entry in getattr(scenario,registry))
+                sign=None
+                if item['type']=='ObscuredStopSign' and row['active']:
+                    sign,completed=self._target_stop(manager,scenario,snapshot)
+                    row['stop_sign_completed']=completed
+                    if sign is not None:actors.append(sign)
                 # ConstructionObstaclePedestrian registers the crossing walker
                 # as `adversary`, not in BasicScenario.other_actors.
                 adversary=getattr(scenario,'adversary',None)
@@ -111,8 +187,24 @@ class SegmentRuntime:
                     velocity=frozen.get_velocity();speed=math.hypot(velocity.x,velocity.y)
                     data=dict(id=int(actor.id),type_id=str(actor.type_id),distance_m=distance,
                               position_xyz_carla_m=[pose.location.x,pose.location.y,pose.location.z],speed_mps=speed)
+                    if trailing_actor is not None and row['active'] and distance<=near_limit:
+                        vertices=actor.bounding_box.get_world_vertices(pose)
+                        try:
+                            data['footprint_xy_carla_m']=_hull([(v.x,v.y) for v in vertices])
+                        except ValueError:
+                            # A zero-area prop cannot establish that the lane was obstructed.
+                            data['footprint_xy_carla_m']=[]
+                        if actor.id==trailing_actor.id:row['trailing_obstacle_id']=int(actor.id)
                     row['actors_observed'].append(data)
-                    if distance<=self.tracker.spec['target_near_distance_m']:
+                    if distance<=near_limit:
+                        if item['type']=='RoadBlocked':
+                            front=ego_pose.get_forward_vector()
+                            if ((pose.location.x-ego_pose.location.x)*front.x
+                                    +(pose.location.y-ego_pose.location.y)*front.y)>0.:
+                                row['blockage_ahead']=True
+                        # For an obscured sign require the physical occluder to
+                        # have been seen as well as the criterion's real stop.
+                        if sign is not None and actor.id==sign.id and scenario.prop_name!='none':continue
                         row['observed_near']=True
                         if actor.type_id.startswith(('walker.','animal.')) and speed>.2:
                             row['vulnerable_motion_observed']=True
@@ -174,6 +266,10 @@ class SegmentRuntime:
                  target_scenarios=targets,lead_braking_observed=lead_braking and any(t['active'] for t in targets),
                  observed_leading_vehicles=[dict(id=k,speed_mps=v) for k,v in leaders.items()],
                  criteria=criteria,failure_reason=failure)
+        if self.tracker.bypasses and valid and failure is None:
+            section=_route_lane_section(route.waypoints[i])
+            row['route_lane_section']=section
+            row['ego_lane_body']=lane_body_sample(section,position,observed['heading'],observed['length'],observed['width'])
         self.tracker.observe(row);self.tick_count+=1;self.last_frame=frame
         agent.archive.append('segment_ticks',row)
         if self.tracker.status!='incomplete' and manager._running:
