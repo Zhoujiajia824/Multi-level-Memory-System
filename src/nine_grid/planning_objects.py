@@ -298,6 +298,36 @@ def planning_scene(scene, config=None, answer=None):
 def planning_view(scene, predictions, config=None, answer=None):
     """保留原帧和原始数据，只给本次MPC生成局部浅拷贝视图。"""
     scoped_scene, diagnostic = planning_scene(scene, config, answer)
+    navsim = scene.scenario == 'navsim' and isinstance((config or {}).get('navsim_execution'), dict)
+    if navsim and scene.diagnostics.get('planning_scope') is None:
+        additions, evidence = _navsim_predicted_conflicts(scene, predictions, config, diagnostic['selected_ids'])
+        diagnostic = deepcopy(diagnostic)
+        diagnostic['predicted_conflict_expansion'] = evidence
+        if additions:
+            perceived = scoped_scene.diagnostics['perception_scope']
+            available = {actor.id: actor for actor in scene.actors}
+            identities = set(diagnostic['selected_ids']) | set(additions)
+            selected = [available[key] for key in sorted(identities)]
+            diagnostic.update(selected_ids=sorted(identities), selected_count=len(identities),
+                prediction_only_ids=sorted(set(diagnostic['perception_ids'])-identities),
+                optimization_policy='lane_scope_union_attention_union_predicted_reachable_corridor_conflicts',
+                exception_added_ids=sorted(set(diagnostic['exception_added_ids']) | set(additions)),
+                excluded=[row for row in diagnostic['excluded'] if row['id'] not in additions],
+                conflict_screen='NAVSIM: same-time predicted body sweep intersects public reachable lane corridor',
+                limitation='Only observed causal predictions; conservative 2D admission, not a collision certificate')
+            diagnostic['exception_added_count'] = len(diagnostic['exception_added_ids'])
+            for key in additions:
+                diagnostic['direct_conflict_reasons'][key] = ['predicted_reachable_corridor_conflict']
+                diagnostic['selected_roles'][key] = []
+                diagnostic['selected_state'][key] = deepcopy(perceived['objects'][key])
+            scoped_scene = replace(scoped_scene, actors=selected)
+        diagnostic['selected_input_signature'] = _selected_input_signature(scoped_scene, scoped_scene.actors)
+        diagnostic['selected_prediction_signature'] = _prediction_signature(predictions, diagnostic['selected_ids'])
+        scoped_scene = replace(scoped_scene, diagnostics={**scoped_scene.diagnostics,
+            'planning_scope': deepcopy(diagnostic)})
+    elif navsim and diagnostic.get('selected_prediction_signature') is not None:
+        if diagnostic['selected_prediction_signature'] != _prediction_signature(predictions, diagnostic['selected_ids']):
+            raise ValueError('已筛选NAVSIM规划视图的预测已变化，须从完整原帧重新筛选')
     selected=scoped_scene.actors
     identities = {actor.id for actor in selected}
     missing=identities-set(predictions.trajectories)
@@ -309,3 +339,145 @@ def planning_view(scene, predictions, config=None, answer=None):
         diagnostics={key: value for key, value in predictions.diagnostics.items()
                      if key in identities or key not in predictions.actors})
     return scoped_scene, scoped_predictions, diagnostic
+
+
+def _prediction_signature(predictions, identities):
+    value = dict(times=np.asarray(predictions.times).tolist(), trajectories={
+        key: np.asarray(predictions.trajectories[key]).tolist() for key in sorted(identities)})
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
+        allow_nan=False).encode('utf-8')).hexdigest()
+
+
+def _navsim_predicted_conflicts(scene, predictions, config, selected_ids):
+    """补入已感知、已预测且可能在本次时域占用合法走廊的实体。
+
+    只扩大下游优化集合。模型输入和八向量程不变，不读取评分未来。
+    加减速包络故意放松jerk，形成保守准入粗筛；没有安全验收或制动决定。
+    当前二维输入无法判别立交高度，不能将本筛选解释为三维安全证明。
+    """
+    from shapely.geometry import LineString
+    from shapely.ops import unary_union, substring
+    from .geometry import actor_shape, wrap_angle
+    from .object_scope import lane_role_geometry
+    from .lane_roles import project
+
+    started = time.perf_counter()
+    p = config['mpc']
+    horizon = float(p['horizon_steps']*p['step_s'])
+    times = np.asarray(predictions.times, float)
+    if (predictions.frame_id != scene.frame_id or predictions.coordinates != scene.coordinates
+            or not np.isclose(predictions.time, scene.time, rtol=0., atol=1e-8)
+            or times.ndim != 1 or len(times) < 2 or not np.isfinite(times).all()
+            or abs(times[0]) > 1e-8 or np.any(np.diff(times) <= 0)
+            or times[-1] < horizon-1e-8):
+        raise ValueError('NAVSIM冲突纳入必须使用同帧完整时域的当前观测预测')
+    allowed = set(scene.diagnostics.get('perception_scope', {}).get('selected_ids', []))
+    # A raw snapshot is also accepted by planning_view; its newly frozen
+    # perception selection is recomputed without restoring hidden objects.
+    if scene.diagnostics.get('perception_scope') is None:
+        from .perception_scope import select_perception_objects
+        _, perception = select_perception_objects(scene, config)
+        allowed = set(perception['selected_ids'])
+    available = {actor.id: actor for actor in scene.actors
+        if actor.visible and actor.id in allowed and actor.kind in KINDS}
+    candidates = sorted(set(available)-set(selected_ids))
+    evidence = dict(version='navsim-predicted-reachable-corridor-1.0', horizon_s=horizon,
+        candidate_count=len(candidates), added_ids=[], added_count=0, conflicts={},
+        source='current_perception_and_existing_causal_prediction_only',
+        model_input_and_eight_regions_unchanged=True,
+        limitation='Piecewise predicted sweeps and relaxed reachability are admission only; no future truth or height discrimination')
+    if not candidates:
+        evidence['selection_seconds'] = time.perf_counter()-started
+        return {}, evidence
+    speed = float(np.linalg.norm(scene.ego.velocity))
+    accel = max(0., float(p['acceleration_max_mps2']))
+    brake = max(1e-6, -float(p['acceleration_min_mps2']))
+    lateral_accel = float(p['lateral_acceleration_abs_max_mps2'])
+    margin = float(config.get('planning_objects', {}).get('conflict_margin_m', .5))
+    maximum_speed = max(speed, float(p['maximum_speed_mps']))
+
+    def upper_reach(t):
+        accelerating = min(t, max(0., (maximum_speed-speed)/accel)) if accel > 0 else 0.
+        return speed*accelerating+.5*accel*accelerating**2+maximum_speed*(t-accelerating) if accel > 0 else speed*t
+
+    front = upper_reach(horizon)+scene.ego.length/2+margin
+    geometry_scene = replace(scene, diagnostics=deepcopy(scene.diagnostics))
+    traces, _, cache = lane_role_geometry(geometry_scene, front_m=max(40., front), rear_m=20.)
+    center = traces.get('center')
+    if center is None:
+        evidence.update(status='no_public_current_lane_corridor', selection_seconds=time.perf_counter()-started)
+        return {}, evidence
+    line = LineString(center['points'])
+    ego_s = float(center['ego_s'])
+    _, _, heading, offcenter = project(center['points'], scene.ego.position)
+    lateral_speed = abs(float(scene.ego.velocity @ np.array([-np.sin(heading), np.cos(heading)])))
+    shapes = []
+    for trace in traces.values():
+        if trace is None:
+            continue
+        for key in trace['lane_ids']:
+            if key not in cache:
+                continue
+            lane, polygon, native = cache[key]
+            if np.isfinite(lane.width) and lane.width > 0:
+                shapes.append(polygon.intersection(native.buffer(float(lane.width)/2, cap_style=2)))
+        shapes.extend(link['shape'] for link in trace.get('navigation_connections', []))
+    domain = unary_union(shapes).intersection(scene.drivable)
+    if domain.is_empty:
+        evidence.update(status='empty_public_current_lane_corridor', selection_seconds=time.perf_counter()-started)
+        return {}, evidence
+    corridors = []
+    for index, (t0, t1) in enumerate(zip(times[:-1], times[1:])):
+        if t0 >= horizon-1e-8:
+            break
+        t1 = min(float(t1), horizon)
+        braking_t = min(float(t0), speed/brake)
+        lower = speed*braking_t-.5*brake*braking_t**2
+        a = max(0., ego_s+lower-scene.ego.length/2-margin)
+        b = min(line.length, ego_s+upper_reach(t1)+scene.ego.length/2+margin)
+        if a >= b:
+            continue
+        lateral = offcenter+scene.ego.width/2+lateral_speed*t1+.5*lateral_accel*t1*t1+margin
+        shape = substring(line, a, b).buffer(lateral, cap_style=2).intersection(domain)
+        if not shape.is_empty:
+            corridors.append((index, float(t0), t1, shape, np.asarray(shape.bounds)))
+    additions = {}
+    for identity in candidates:
+        actor = available[identity]
+        if identity not in predictions.actors or identity not in predictions.trajectories:
+            raise ValueError('当前感知冲突候选缺少既有预测：'+identity)
+        trajectory = np.asarray(predictions.trajectories[identity], float)
+        if (trajectory.shape != (len(times), 4) or not np.isfinite(trajectory).all()
+                or not np.allclose(trajectory[0, :2], actor.position, rtol=0., atol=1e-8)):
+            raise ValueError('当前感知冲突候选的预测轨迹或首点无效：'+identity)
+        radius = float(np.hypot(actor.length, actor.width)/2 if actor.kind != 'pedestrian'
+                       else actor.radius or actor.width/2)
+        for index, t0, t1, corridor, bounds in corridors:
+            first = trajectory[index]
+            fraction = (t1-times[index])/(times[index+1]-times[index])
+            last = first+(trajectory[index+1]-first)*fraction
+            last[2] = first[2]+fraction*float(wrap_angle(trajectory[index+1, 2]-first[2]))
+            low = np.minimum(first[:2], last[:2])-radius
+            high = np.maximum(first[:2], last[:2])+radius
+            if np.any(high < bounds[:2]) or np.any(low > bounds[2:]):
+                continue
+            a = actor_shape(actor, first[:2], first[2])
+            b = actor_shape(actor, last[:2], last[2])
+            swept = a.union(b).convex_hull
+            # Bound the bulge of a rotating corner between the two endpoint
+            # boxes. This is geometry-derived, not another safety-distance knob.
+            rotation = abs(float(wrap_angle(last[2]-first[2])))
+            if actor.kind != 'pedestrian' and rotation > 1e-8:
+                swept = swept.buffer(radius*(1-np.cos(rotation/2)))
+            if swept.intersects(corridor):
+                additions[identity] = dict(reason='predicted_reachable_corridor_conflict',
+                    time_interval_s=[t0, t1], current_lane_id=actor.lane_id)
+                break
+    evidence.update(status='complete', front_reach_m=front, acceleration_max_mps2=accel,
+        braking_mps2=brake, lateral_acceleration_max_mps2=lateral_accel, margin_m=margin,
+        reference_front_coverage_m=max(0., line.length-ego_s),
+        reference_coverage_shortfall_m=max(0., front-(line.length-ego_s)),
+        added_count=len(additions), added_ids=sorted(additions), conflicts=deepcopy(additions),
+        lane_ids=sorted({key for trace in traces.values() if trace for key in trace['lane_ids']}),
+        selection_seconds=time.perf_counter()-started)
+    return additions, evidence

@@ -824,9 +824,12 @@ class Planner:
                 residual('penalty_'+name,np.minimum(margin,0.),derivative,penalties.get(name,100.),scale)
                 hard_margin=margin if constraint_margin is None else np.asarray(constraint_margin)
                 rows.append(jac);lower.append(-hard_margin);upper.append(np.full(len(margin),np.inf))
-            # Reserve is an optimization preference/constraint, never a change
-            # to the real drivable polygon or an independent postsolve veto.
-            penalty('road_clearance',road_distance.ravel()-road_tracking_reserve_m+tolerance,road_jac)
+            # An observed state cannot instantly gain a tracking reserve. In
+            # NAVSIM retain that reserve in the unchanged soft cost, while the
+            # QP enforces the actual road. The full reserve and actual body
+            # remain independently diagnosed without a postsolve brake veto.
+            penalty('road_clearance',road_distance.ravel()-road_tracking_reserve_m+tolerance,road_jac,
+                    constraint_margin=road_distance.ravel() if navsim and audit_only else None)
             domain_inside=field_projection['domain_valid'][1:]
             domain_margin,domain_normal=potential_geometry.domain_clearance(current[:,:2])
             penalty('potential_domain',domain_margin,
@@ -925,7 +928,8 @@ class Planner:
                 else:
                     gap,partial=rectangle_gap(current,sample[1:],scene.ego.length,scene.ego.width,actor.length,actor.width)
                 penalty('actor_clearance',gap-actor_clearance+tolerance,
-                        lambda c,partial=partial:np.einsum('ni,nij->nj',partial,c['sens']))
+                        lambda c,partial=partial:np.einsum('ni,nij->nj',partial,c['sens']),
+                        constraint_margin=gap-clearance if navsim and audit_only else None)
                 minima.append(float((gap-actor_clearance).min()))
                 source_projection={key:value[1:] for key,value in source_projections[actor.id].items()}
                 field=potential_geometry.repulsion_from_projection(field_query,source_projection,class_risk,
@@ -1354,7 +1358,8 @@ class Planner:
                 'reserve_remaining_m':accepted['minima']['road_clearance']-road_tracking_reserve_m,
                 'reserve_is_certified_bound':False,'real_drivable_polygon_unchanged':True,
                 'actual_offroad_samples':accepted['dense_validation']['offroad_samples'],
-                'scope':'MPC_road_cost_and_linearized_constraints_only;not_independent_audit'},
+                'scope':('NAVSIM_tracking_reserve_soft_cost_and_physical_road_hard_constraint;no_postsolve_veto'
+                         if navsim and audit_only else 'MPC_road_cost_and_linearized_constraints_only;not_independent_audit')},
             'actor_clearance':{'body_margin_m':clearance,'execution_tracking_reserve_m':actor_tracking_reserve_m,
                 'total_margin_m':actor_clearance,'scope':'traffic_entities_only',
                 'tracking_reserve_is_certified_bound':False},
@@ -1433,7 +1438,18 @@ class Planner:
             accepted_initialization_source=accepted['initialization_source'],
             minimum_constraint=min(accepted['minima'].values()),constraint_minima=accepted['minima'],semantic_enabled=answer is not None,
             active_goal=active_goal is not None,goal_evaluation=accepted.get('goal_evidence'),
-            constraint_policy='optimizer_constraints_with_diagnostic_postsolve_v1' if audit_only else 'safety_first_tracking_v2',trajectory_available=True,
+            constraint_policy='physical_constraints_soft_tracking_reserve_diagnostic_postsolve_v2' if audit_only else 'safety_first_tracking_v2',trajectory_available=True,
+            tracking_reserve_enforcement=dict(
+                policy='soft_optimizer_cost_with_physical_hard_constraints' if navsim and audit_only else 'original_hard_and_soft_constraints',
+                road_hard_clearance_m=0. if navsim and audit_only else road_tracking_reserve_m-tolerance,
+                actor_hard_clearance_m=clearance if navsim and audit_only else actor_clearance-tolerance,
+                road_tracking_reserve_m=road_tracking_reserve_m,actor_tracking_reserve_m=actor_tracking_reserve_m,
+                original_soft_penalties_preserved=True,body_diagnostics_preserved=True,
+                diagnostic_clearance_semantics={
+                    'road_clearance':'actual_signed_body_road_clearance_without_tracking_reserve',
+                    'actor_clearance:*':'actual_body_gap_minus_body_margin_and_tracking_reserve',
+                    'road_execution_tracking.reserve_remaining_m':'actual_road_clearance_minus_tracking_reserve'},
+                postsolve_veto_enabled=not audit_only),
             safety_feasible=accepted['safety_feasible'],initial_safety_checks=initial_safety,
             speed_numerical_tolerance_mps=speed_tolerance,
             hard_constraint_groups=['dynamics','acceleration','steering','nonnegative_speed','jerk','steering_rate',

@@ -423,7 +423,8 @@
     "postsolve_safety_policy": "audit_only",
     "audit_horizon_s": 4.0,
     "actor_tracking_margin_m": 0.75,
-    "road_tracking_margin_m": 0.2
+    "road_tracking_margin_m": 0.5,
+    "steering_rate_weight": 1.0
   },
   "diagnostics": {
     "enabled": true,

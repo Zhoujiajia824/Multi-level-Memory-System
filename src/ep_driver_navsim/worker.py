@@ -55,8 +55,10 @@ def planning_config(parameters, dino_model):
     if not isinstance(supplied_policy, dict):
         raise ValueError("NAVSIM execution policy must be a mapping")
     policy = {"postsolve_safety_policy": "audit_only", "audit_horizon_s": HORIZON_S,
-              "actor_tracking_margin_m": .75, "road_tracking_margin_m": .2, **supplied_policy}
-    if set(policy) != {"postsolve_safety_policy", "audit_horizon_s", "actor_tracking_margin_m", "road_tracking_margin_m"}:
+              "actor_tracking_margin_m": .75, "road_tracking_margin_m": .5,
+              "steering_rate_weight": 1.0, **supplied_policy}
+    if set(policy) != {"postsolve_safety_policy", "audit_horizon_s", "actor_tracking_margin_m",
+                      "road_tracking_margin_m", "steering_rate_weight"}:
         raise ValueError("Unknown NAVSIM execution policy setting")
     if policy["postsolve_safety_policy"] != "audit_only":
         raise ValueError("NAVSIM postsolve_safety_policy must be audit_only")
@@ -69,6 +71,14 @@ def planning_config(parameters, dino_model):
     road_margin = policy["road_tracking_margin_m"]
     if type(road_margin) not in (int, float) or not np.isfinite(road_margin) or road_margin < 0:
         raise ValueError("NAVSIM road tracking margin must be finite and nonnegative")
+    steering_weight = policy["steering_rate_weight"]
+    if type(steering_weight) not in (int, float) or not np.isfinite(steering_weight) or steering_weight < 0:
+        raise ValueError("NAVSIM steering-rate weight must be finite and nonnegative")
+    # A planner-side tracking preference for the official controller, rather
+    # than a certified tracking bound or another postsolve rejection policy.
+    # Keep the shared Highway/CARLA MPC weights unchanged and permit an exact
+    # explicit override (including zero) for NAVSIM experiments.
+    config["mpc"]["weights"]["steering_rate"] = steering_weight
     config["navsim_execution"] = policy
     config["perception"]["fully_occluded_in_current_planning"] = True
     config["mpc"]["horizon_steps"] = PLANNING_STEPS
