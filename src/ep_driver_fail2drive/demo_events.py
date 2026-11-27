@@ -4,12 +4,98 @@ The environment may schedule its own events. The teacher never receives this
 object, role labels, event timers, actor plans or release decisions. Completion
 here describes the observed interaction, not successful/official driving.
 """
+import json
 import math
 
-from .demo_routes import station_waypoint, crossing_drive_path, _stop_controls_route
-from .route import xy, project, point_in_polygon, wrap
+from .demo_routes import (station_waypoint, crossing_drive_path, oncoming_drive_path, crossing_lights,
+                          right_walking_exit, _stop_controls_route, _bypass_stations)
+from .route import xy, project, point_in_polygon, wrap, lane_key
 
 WALKABLE_SURFACES = frozenset(('Roads','RoadLines','Sidewalks','Ground','Terrain'))
+
+
+def requires_borrow_proof(spec):
+    return (spec.get('interaction_reconstruction',{}).get('schema')=='fail2drive-authored-interaction-2.0'
+            and spec.get('teacher_policy',{}).get('allow_opposite_lane') is True)
+
+
+def verify_borrow_capture(directory, spec, execution=None, events=None):
+    """Replay the authored two-car interaction against frozen public decisions and physical bodies."""
+    if not requires_borrow_proof(spec):return None
+    def read_json(name):
+        with (directory/name).open(encoding='utf-8') as handle:return json.load(handle)
+    def read_rows(name):
+        with (directory/name).open(encoding='utf-8') as handle:return [json.loads(line) for line in handle]
+    actors=read_json('demonstration_actors.json')
+    route=read_json('demonstration_design.json')['route_xy']
+    geometry=read_json('development_site_geometry.json')
+    layout={a['id']:a for a in actors}
+    designed=[a for a in spec['actor_specs'] if a['role']=='oncoming_vehicle']
+    ids={}
+    for a in designed:
+        spawned=layout[a['id']]
+        if spawned['config']!=a or not spawned['type_id'].startswith('vehicle.'):
+            raise ValueError('Opposing borrow has no matching spawned vehicle for '+a['id'])
+        ids['second' if a.get('release_on_borrow') else 'first']=spawned['actor_id']
+    if len(designed)!=2 or len(ids)!=2 or ids['first']==ids['second']:
+        raise ValueError('Opposing borrow requires two distinct authored oncoming vehicles')
+    first,second=ids['first'],ids['second']
+    first_id,second_id='carla_'+str(first),'carla_'+str(second)
+    blockers={layout[a['id']]['actor_id'] for a in spec['actor_specs'] if a['role'] in ('blocking_vehicle','blocking_obstacle')}
+    footprints={a['actor_id']:a['footprint_xy'] for a in geometry['actors']}
+    if not blockers or not blockers.issubset(footprints):raise ValueError('Missing spawned blocking footprints')
+    blocker_tail=max(project(point,route)['s_m'] for i in blockers for point in footprints[i])
+    if execution is None:execution=read_rows('execution.jsonl')
+    if events is None:events=read_rows('event_evidence.jsonl')
+    by_frame={row['frame']:row for row in execution}
+    npc_events={}
+    for event in events:
+        if event.get('event') not in ('oncoming_body_passed_waiting_ego','oncoming_released','scripted_npc_observation'):continue
+        frame=event['frame']
+        if event.get('source_frame')!=frame or frame not in by_frame or abs(event['time']-by_frame[frame]['time'])>1e-5:
+            raise ValueError('Opposing borrow event is not bound to its execution frame')
+        npc_events.setdefault(frame,[]).append(event)
+    stages={}
+    for row in execution:
+        frame=row['frame'];observed=row['observed_ego'];b=row.get('teacher',{}).get('borrow') or {}
+        scene_events=npc_events.get(frame,[])
+        actual={a['actor_id']:a for e in scene_events if e['event']=='scripted_npc_observation' for a in e['actors']}
+        seen={a['id']:a for a in b.get('observed_oncoming',())}
+        if b.get('center_in_opposing_lane') is True and 'first_passed' not in stages:
+            raise ValueError('Ego entered the opposing lane before a prior frame proved the first vehicle had passed')
+        front_wait=first_id in b.get('denied_ids',()) and first_id in seen
+        if ('wait' not in stages and front_wait and first in actual and math.hypot(*observed['velocity'])<=.15
+                and b.get('body_on_home_lane') is True):
+            stages['wait']=frame
+        if 'wait' not in stages:continue
+        if ('first_passed' not in stages and first in actual and frame>stages['wait']
+                and any(e.get('event')=='oncoming_body_passed_waiting_ego' and e.get('actor_id')==first
+                    and e['npc_body_s_m'][1]+.25<b['ego_rear_s_m'] for e in scene_events)):
+            stages['first_passed']=frame
+        if 'first_passed' not in stages or frame<=stages['first_passed']:continue
+        if (b.get('center_in_opposing_lane') is True and b.get('ego_lane_id')==observed.get('lane_id')
+                and b.get('entered_opposing_lane') is True):
+            stages.setdefault('entered_opposing',frame)
+        if 'entered_opposing' not in stages:continue
+        if second in actual and any(e['event']=='oncoming_released' and e['actor_id']==second and
+                                    e['reason']=='ego_observed_in_borrowed_lane' for e in scene_events):
+            stages.setdefault('second_released',frame)
+        if ('second_released' in stages and frame>stages['second_released'] and second in actual and second_id in seen
+                and seen[second_id]['closing_mps']>.25 and b.get('early_return_trigger_id')==second_id
+                and b.get('return_path')=='early' and b.get('early_return_s_m',math.inf)<b.get('nominal_return_s_m',0.)
+                and b.get('return_clearance')=='sampled_road_and_observed_motion_clear'
+                and b.get('obstacle_cleared') is True and b.get('ego_rear_s_m',-math.inf)>blocker_tail):
+            stages.setdefault('clear_and_select_early',frame)
+        if ('clear_and_select_early' in stages and frame>stages['clear_and_select_early'] and
+                b.get('stage')=='returned' and b.get('return_path')=='early' and b.get('home_corners')==4
+                and b.get('body_on_home_lane') is True and b.get('ego_lane_id')==observed.get('lane_id')
+                and b.get('ego_rear_s_m',-math.inf)>blocker_tail and abs(b.get('measured_lateral_m',math.inf))<.35):
+            stages.setdefault('returned_home',frame)
+    required=('wait','first_passed','entered_opposing','second_released','clear_and_select_early','returned_home')
+    missing=[k for k in required if k not in stages]
+    if missing:raise ValueError('Missing observed opposing-borrow phases: '+', '.join(missing))
+    return dict(schema='authored-opposing-borrow-proof-1.0',actor_ids=ids,blocking_actor_ids=sorted(blockers),
+                measured_last_blocker_s_m=blocker_tail,phase_frames=stages)
 
 
 def _hull(points):
@@ -32,8 +118,16 @@ def _hull(points):
     return sides
 
 
-def _body(actor):
-    return _hull([xy(v) for v in actor.bounding_box.get_world_vertices(actor.get_transform())])
+def _body(actor, state=None):
+    points=[xy(v) for v in actor.bounding_box.get_world_vertices((state or actor).get_transform())]
+    try:return _hull(points)
+    except ValueError:
+        if not actor.type_id.startswith('static.') or not all(math.isfinite(v) for p in points for v in p):raise
+        # Some upright official image assets have a genuine line footprint.
+        # Keep its measured span for clearance without giving it artificial thickness.
+        ends=max(((a,b) for a in points for b in points),key=lambda pair:math.dist(*pair))
+        if math.dist(*ends)<1e-5:raise
+        return list(ends)
 
 
 def _point_segment(point, a, b):
@@ -179,6 +273,12 @@ class DemoEvents:
         self.last_time = None
         self.geometry_audit = None
         self.walker_placements = []
+        self.manual=spec.get('interaction_reconstruction',{}).get('schema')=='fail2drive-authored-interaction-2.0'
+        self.signal_program=None
+        self.traffic_lights=[]
+        self.ego_moved=False
+        self.geometry_by_path={}
+        self.ego_width,self.ego_length=2.,5.
 
     def _cross_branch(self, desired_station):
         result = crossing_drive_path(self.waypoints, desired_station)
@@ -328,7 +428,22 @@ class DemoEvents:
             if role == 'cross_traffic_vehicle':
                 cross_path,interaction_station,branch_station = self._cross_branch(config['s_offset_m'])
                 pose,lateral = cross_path[0].transform,0.
+            if role=='oncoming_vehicle':
+                cross_path=oncoming_drive_path(self.waypoints,station)
+                if not cross_path:raise RuntimeError('Missing continuous real opposing lane for '+config['id'])
+                pose,lateral=cross_path[0].transform,0.
             yaw = math.radians(pose.rotation.yaw)
+            if role=='construction_advance_warning':
+                # Keep the roadside advance sign beyond the entire bank of
+                # contiguous travel lanes, including any same-direction neighbour.
+                edge=-original.lane_width/2.
+                for neighbour in _adjacent_lanes(original,right=True):
+                    kind=str(neighbour.lane_type).split('.')[-1]
+                    if kind!='Driving':break
+                    n=neighbour.transform.location
+                    d=(n.x-pose.location.x)*math.sin(yaw)-(n.y-pose.location.y)*math.cos(yaw)
+                    edge=min(edge,d-neighbour.lane_width/2.)
+                lateral=min(lateral,edge-1.5)
             if occluded and role == 'roadside_occluder':
                 # Put the static prop between the approaching vehicle and the
                 # measured pedestrian start, even for a kerb-side alternative.
@@ -346,9 +461,27 @@ class DemoEvents:
                 lateral = (observer[0]+t*ray[0]-center[0])*math.sin(yaw)+(observer[1]+t*ray[1]-center[1])*math.cos(yaw)
             location = self.carla.Location(x=pose.location.x+lateral*math.sin(yaw),
                 y=pose.location.y-lateral*math.cos(yaw),z=pose.location.z+.35)
+            if self.manual and config['actor_type']!='walker':
+                if (not cross_path and role!='stop_sign_visual_occluder' and wp is original):
+                    center,heading=_at(self.route,station)
+                    location.x=center[0]-lateral*math.sin(heading)
+                    location.y=-center[1]-lateral*math.cos(heading)
+                location.z=pose.location.z+2.
+                hit=self.world.ground_projection(location,4.)
+                ground=pose.location.z
+                if (hit is not None and math.hypot(hit.location.x-location.x,hit.location.y-location.y)<.15
+                        and str(hit.label).split('.')[-1] in WALKABLE_SURFACES
+                        and abs(hit.location.z-ground)<1.):
+                    ground=hit.location.z
+                elif role=='construction_advance_warning':
+                    raise RuntimeError('No measured roadside ground for the construction advance warning')
+                location.z=ground+float(config.get('z_offset_m',.3 if config['actor_type']=='vehicle' else .03))
             # A public cross branch supplies the actual actor heading. Applying
             # the catalog's generic +90 offset again would point it off-road.
             rotation = self.carla.Rotation(yaw=pose.rotation.yaw+(0. if cross_path else config['yaw_offset_deg']))
+            if self.manual:
+                rotation.pitch=pose.rotation.pitch+float(config.get('pitch_offset_deg',0.))
+                rotation.roll=pose.rotation.roll+float(config.get('roll_offset_deg',0.))
             if config['actor_type'] == 'walker':
                 actor = None
                 for delta in ((0., 2., -2., 4., -4., 6., -6., 8., -8.) if occluded else (0.,)):
@@ -387,7 +520,7 @@ class DemoEvents:
                 actor.set_simulate_physics(False)
             # Make full-wall props' physical long axis road-normal. This is
             # initialization-only, audited below, never an online teleport.
-            if role == 'full_blocker' and config['actor_type'] == 'obstacle':
+            if role == 'full_blocker' and config['actor_type'] == 'obstacle' and not any(config.get(k) for k in ('pitch_offset_deg','roll_offset_deg')):
                 body = _body(actor)
                 _,heading = _at(self.route,interaction_station)
                 tangent = [p[0]*math.cos(heading)+p[1]*math.sin(heading) for p in body]
@@ -406,19 +539,23 @@ class DemoEvents:
             self.rows.append(row)
             if config['actor_type'] == 'vehicle':
                 if role == 'braking_lead':
-                    self._clear_brake_light(actor)
+                    self._set_brake_light(actor,False)
                     self._drive_vehicle(row,self.waypoints,float(config['speed_mps']))
                 else:
                     actor.apply_control(self.carla.VehicleControl(brake=1.))
         if occluded:
             order = {config['id']: i for i,config in enumerate(self.spec['actor_specs'])}
             self.rows.sort(key=lambda row:order[row['config']['id']])
+        if self.manual:
+            self._plan_walkers()
+            self._configure_crossing_signals()
         return [dict(id=row['config']['id'],actor_id=row['actor'].id,type_id=row['actor'].type_id,
                      config=row['config'],actual_position_xy=xy(row['actor'].get_location()),
                      actual_yaw_deg=row['actor'].get_transform().rotation.yaw,
                      interaction_station_m=row['interaction_station_m'],
                      branch_crossing_s_m=row['branch_crossing_s_m'],
                      stop_sign_id=row['stop_sign_id'],
+                     authored_motion=(self._motion_design(row) if self.manual else None),
                      crossing_left_limit_m=row['crossing_left_limit_m'],
                      control_interface=('CARLA.WalkerControl' if row['config']['role'] in ('crossing_actor','slow_lead')
                                         else 'CARLA.VehicleControl' if row['config']['actor_type']=='vehicle' else 'static_prop'),
@@ -428,18 +565,76 @@ class DemoEvents:
                      initial_light_state=(int(row['actor'].get_light_state()) if row['config']['role']=='braking_lead' else None))
                 for row in self.rows]
 
-    def validate_bodies(self, teaching_path, ego_width, ego_length=5.):
+    def _plan_walkers(self):
+        for row in self.rows:
+            config=row['config']
+            if config['role'] not in ('crossing_actor','slow_lead'):continue
+            start=row['start'];station=row['interaction_station_m'];wp=row['original_waypoint']
+            points=[[start.x,start.y,start.z]]
+            if config['role']=='slow_lead':
+                station+=float(config['speed_mps'])*float(self.spec['wait_s'])
+                wp=station_waypoint(self.waypoints,station)
+                # Follow the configured lane offset until the group starts to leave it.
+                center=wp.transform.location;right=wp.transform.get_right_vector()
+                lateral=config['lateral_offset_m']
+                points.append([center.x-right.x*lateral,center.y-right.y*lateral,center.z])
+                exit_lane=right_walking_exit(wp)
+                if exit_lane is None:raise RuntimeError('Slow pedestrian has no adjoining mapped shoulder/sidewalk exit')
+                p=exit_lane.transform.location
+                points.append([p.x,p.y,p.z])
+            else:
+                center=wp.transform.location;right=wp.transform.get_right_vector()
+                edge=row['crossing_left_limit_m']+1.25
+                points.append([center.x-edge*right.x,center.y-edge*right.y,center.z])
+            row['walker_path']=points
+            row['walker_index']=1
+
+    def _motion_design(self,row):
+        config=row['config'];path=row.get('cross_path')
+        if config['role']=='braking_lead':path=self.waypoints
+        start=row['start']
+        coords=row.get('walker_path') or ([[p.transform.location.x,p.transform.location.y,p.transform.location.z]
+                  for p in path] if path else [[start.x,start.y,start.z]])
+        return dict(path_xyz_carla_m=coords,target_speed_mps=config['speed_mps'],
+                    trigger_specs=self.spec['trigger_specs'],role=config['role'],
+                    release_time_s=config.get('release_time_s'),release_on_borrow=config.get('release_on_borrow',False),
+                    traffic_signals=self.signal_program if config['role']=='cross_traffic_vehicle' else None)
+
+    def _configure_crossing_signals(self):
+        crossing=next((r for r in self.rows if r['config']['role']=='cross_traffic_vehicle'),None)
+        if crossing is None:return
+        lights=list(self.world.get_actors().filter('traffic.traffic_light'))
+        main,cross=crossing_lights(lights,self.waypoints,crossing['cross_path'])
+        if not main and not cross:
+            self.signal_program=dict(mode='yield_to_cross_traffic',controlled_light_ids=[])
+            return
+        if not main or not cross or {a.id for a in main}&{a.id for a in cross}:
+            raise RuntimeError('Cannot map distinct physical signals to both crossing approaches')
+        frozen={light.is_frozen() for light in lights}
+        if len(frozen)!=1:raise RuntimeError('Cannot restore mixed global traffic-light freeze settings')
+        members={member.id:member for a in main+cross for member in a.get_group_traffic_lights()}
+        members.update({a.id:a for a in main+cross})
+        self.traffic_lights=[(a,a.get_state()) for a in members.values()]
+        self.signal_program=dict(mode='ego_green_crossing_red',ego_green_ids=[a.id for a in main],
+            crossing_red_ids=[a.id for a in cross],previously_frozen=frozen.pop())
+        self.world.freeze_all_traffic_lights(True)
+        for light,_ in self.traffic_lights:
+            light.set_state(self.carla.TrafficLightState.Green if light.id in self.signal_program['ego_green_ids']
+                            else self.carla.TrafficLightState.Red)
+
+    def validate_bodies(self, teaching_path, ego_width, ego_length=5., *, path_name='normal'):
         """Return measured-footprint prechecks, never a physical safety proof."""
         if not all(math.isfinite(v) and v > 0. for v in (ego_width,ego_length)):
             raise ValueError('Measured ego dimensions must be positive')
         if (len(teaching_path) < 2 or any(len(p)!=2 or not all(math.isfinite(v) for v in p) for p in teaching_path)
                 or any(math.dist(a,b)<1e-5 for a,b in zip(teaching_path,teaching_path[1:]))):
             raise ValueError('Teaching path requires distinct consecutive finite XY points')
-        self.teaching_path,self.ego_width = teaching_path,float(ego_width)
+        if path_name=='normal':self.teaching_path=teaching_path
+        self.ego_width,self.ego_length=float(ego_width),float(ego_length)
         audit = dict(schema='independent-demo-body-precheck-1.0',actors=[],full_lane_blockage=None,
                      passing_clearance=None,ego_width_m=ego_width,ego_length_m=ego_length,
                      limitation='Planar initialization precheck only; actual physical contact and compliance remain independently audited')
-        self.geometry_audit = audit
+        if path_name=='normal':self.geometry_audit=audit
         for row in self.rows:
             audit['actors'].append(dict(id=row['config']['id'],actor_id=row['actor'].id,footprint_xy=_body(row['actor'])))
         if 'full_lane_blockage' in self.spec['required_capabilities']:
@@ -459,7 +654,8 @@ class DemoEvents:
                 raise RuntimeError('Measured actors do not cover the full current lane at a common station')
             audit['full_lane_blockage'] = dict(station_m=station,intervals_d_m=intervals,lane_width_m=width,covered=True)
         fixed_roles = {'blocking_vehicle','blocking_obstacle','passable_edge_obstacle','roadside_occluder',
-                       'adjacent_construction','roadside_visual_distractor','stop_sign_visual_occluder','roadside_crowd'}
+                       'adjacent_construction','roadside_visual_distractor','stop_sign_visual_occluder','roadside_crowd',
+                       'construction_advance_warning'}
         measured = []
         for row in self.rows:
             if row['config']['role'] not in fixed_roles:
@@ -497,35 +693,45 @@ class DemoEvents:
                 evidence='planar_approach_sightline_intersects_measured_blocker_footprint')
             if sight > 1e-5 or separation <= 0.:
                 raise RuntimeError('Measured blocker must occlude the crossing pedestrian with separate physical bodies')
-        self.geometry_audit = audit
+        self.geometry_by_path[path_name]=dict(passing_clearance=measured)
+        if self.geometry_audit is not None:self.geometry_audit['path_checks']=dict(self.geometry_by_path)
         return audit
 
     def _observed(self, row, scene):
         identity = 'carla_'+str(row['actor'].id)
         return next((a for a in scene.get('actors',[]) if a.get('id') == identity),None)
 
-    def _drive_vehicle(self, row, path, speed):
+    def _drive_vehicle(self, row, path, speed, state=None):
         actor = row['actor']
-        point = xy(actor.get_location())
+        state=state or actor
+        pose=state.get_transform();point=xy(pose.location)
         points = [xy(wp.transform.location) for wp in path]
         progress = project(point,points)['s_m']
         target,_ = _at(points,progress+max(4.,1.2*speed))
-        current_yaw = -math.radians(actor.get_transform().rotation.yaw)
+        current_yaw = -math.radians(pose.rotation.yaw)
         dx,dy = target[0]-point[0],target[1]-point[1]
         left = -dx*math.sin(current_yaw)+dy*math.cos(current_yaw)
         # NPC actuator approximation is explicit; actual response is observed.
         wheel = math.atan2(2.*2.7*left,max(.1,dx*dx+dy*dy))
         steer = max(-1.,min(1.,-wheel/math.radians(35.)))
+        if self.manual:
+            velocity=state.get_velocity()
+            measured=math.hypot(velocity.x,velocity.y)
+            error=speed-measured
+            control=self.carla.VehicleControl(steer=steer,throttle=min(.65,max(0.,.09+.32*error)),
+                brake=min(.8,max(0.,-.40*(error+.2))))
+            if control.brake>0.:control.throttle=0.
+            actor.apply_control(control)
+            return
         actor.apply_control(self.carla.VehicleControl(steer=steer))
         target_wp = min(path,key=lambda wp:math.dist(point,xy(wp.transform.location)))
         forward = target_wp.transform.get_forward_vector()
         actor.set_target_velocity(self.carla.Vector3D(x=speed*forward.x,y=speed*forward.y,z=speed*forward.z))
 
-    def _clear_brake_light(self,actor):
-        """Only the owned demonstration leader's Brake bit is suppressed."""
+    def _set_brake_light(self,actor,on):
         current=int(actor.get_light_state())
         brake=int(self.carla.VehicleLightState.Brake)
-        actor.set_light_state(self.carla.VehicleLightState(current & ~brake))
+        actor.set_light_state(self.carla.VehicleLightState(current|brake if on else current & ~brake))
 
     def _observe_brake_light(self,row,scene,observed_speed):
         """Read real actor state before commanding this tick, never infer it."""
@@ -537,18 +743,77 @@ class DemoEvents:
         if not math.isfinite(applied_brake) or not 0.<=applied_brake<=1.:
             raise ValueError('Invalid actual leader brake pedal during light observation')
         lit=bool(bits & brake_bit)
-        if applied_brake>0. and lit:
-            raise RuntimeError('HardBrake leader has an observed lit Brake lamp while actually braking')
-        if applied_brake>0. and not lit:
-            row['brake_without_lights_observed']=True
+        wanted=row['config'].get('brake_lights_on',False)
+        if applied_brake>0. and lit!=wanted:
+            raise RuntimeError('HardBrake leader actual Brake lamp differs from the scripted braking condition')
+        if applied_brake>0.:
+            row['required_brake_light_observed']=True
+            if not lit:row['brake_without_lights_observed']=True
         return dict(phase='interact',event='lead_brake_light_observed',actor_id=actor.id,
             source_frame=frame,source_time=float(scene['time']),observed_light_state=bits,brake_light_bit=brake_bit,
             brake_light_on=lit,observed_applied_brake=applied_brake,observed_speed_mps=observed_speed,
             measurement='actual_Actor.get_light_state_and_Vehicle.get_control_in_paused_source_frame',
             completed=False)
 
-    def update(self, scene, dt):
+    def _oncoming(self,row,scene,state,progress,ego_speed):
+        actor,config=row['actor'],row['config']
+        second=config.get('release_on_borrow') is True
+        ego=scene['ego'];station=project(ego['position'],self.route)
+        wp=station_waypoint(self.waypoints,progress)
+        adjacent=wp.get_left_lane()
+        ego_in_opposing=(station['lateral_m']>wp.lane_width/2. and adjacent is not None and
+                         wp.lane_id*adjacent.lane_id<0 and ego.get('lane_id')==lane_key(adjacent))
+        first=next(r for r in self.rows if r['config']['role']=='oncoming_vehicle' and not r['config'].get('release_on_borrow'))
+        signal=('ego_observed_in_borrowed_lane' if second else 'ego_wait_observed')
+        release=(first.get('passed_ego') and ego_in_opposing) if second else (self.ego_moved and ego_speed<.15)
+        frame=scene['diagnostics']['carla_frame'];events=[]
+        if release and not row.get('released') and scene['time']-self.activated_at>=config.get('release_time_s',0.):
+            row['released']=True
+            events.append(dict(event='oncoming_released',reason=signal))
+        body=_body(actor,state)
+        xy_center=xy(state.get_transform().location)
+        samples=[project(p,self.route)['s_m'] for p in body]
+        velocity=state.get_velocity();speed=math.hypot(velocity.x,velocity.y)
+        if row.get('released'):
+            if speed>.5:row['observed_moving']=True
+            if (row.get('observed_moving') and not row.get('passed_ego')
+                    and max(samples)<progress-self.ego_length/2.-.3):
+                row['passed_ego']=True
+                events.append(dict(event='oncoming_body_passed_waiting_ego' if not second else 'second_oncoming_body_passed_ego'))
+            destination=xy(row['cross_path'][-1].transform.location)
+            if math.dist(xy_center,destination)>2.:
+                self._drive_vehicle(row,row['cross_path'],config['speed_mps'],state)
+            else:
+                actor.apply_control(self.carla.VehicleControl(brake=1.))
+        else:
+            actor.apply_control(self.carla.VehicleControl(brake=1.))
+        for e in events:e.update(phase='interact',completed=False,actor_id=actor.id,source_frame=frame,
+            source_time=scene['time'],observed_ego_speed_mps=ego_speed,observed_npc_speed_mps=speed,
+            ego_route_s_m=progress,npc_body_s_m=[min(samples),max(samples)])
+        return events
+
+    def _observed_crossing(self,row,clearance,progress,scene,events):
+        """Record actual occupation in front of the ego before accepting a clear path."""
+        if not self.manual:return True
+        if clearance<=self.ego_width/2. and not row.get('conflict_observed'):
+            if progress+self.ego_length/2.>row['interaction_station_m']+.25:
+                raise RuntimeError('Crossing actor entered the ego path only after the ego front reached the conflict point')
+            row['conflict_observed']=True
+            events.append(dict(event='crossing_actor_occupied_driving_path',actor_id=row['actor'].id,
+                source_frame=scene['diagnostics']['carla_frame'],source_time=scene['time'],phase='interact',
+                ego_route_s_m=progress,crossing_s_m=row['interaction_station_m'],path_body_clearance_m=clearance,completed=False))
+        return bool(row.get('conflict_observed'))
+
+    def update(self, scene, dt, *, snapshot=None):
         stamp,projection = float(scene['time']),scene['diagnostics']['route_projection']
+        states={}
+        if self.manual:
+            frame=scene['diagnostics'].get('carla_frame')
+            if snapshot is None or snapshot.frame!=frame:raise ValueError('Scripted actor observations require the same official world frame')
+            for row in self.rows:
+                actor=row['actor'];state=snapshot.find(actor.id)
+                if state is None and actor.is_alive:raise RuntimeError('Owned actor absent from current frozen frame: '+row['config']['id'])
+                if state is not None:states[actor.id]=state
         if not math.isfinite(dt) or dt <= 0. or not math.isfinite(stamp):
             raise ValueError('Event observation time must be finite and dt positive')
         if self.last_time is not None and stamp <= self.last_time:
@@ -563,8 +828,28 @@ class DemoEvents:
         self.last_time = stamp
         ego_speed = math.hypot(*scene['ego']['velocity'])
         distance = next((event['distance_m'] for event in self.spec['trigger_specs'] if 'distance_m' in event),20.)
-        first_station = min(row['interaction_station_m'] for row in self.rows)
+        critical=[r for r in self.rows if r['config']['role'] not in ('oncoming_vehicle','construction_advance_warning')]
+        first_station = min(row['interaction_station_m'] for row in critical)
         kind,events = self.spec['interaction_kind'],[]
+        if self.manual and kind in ('crossing','construction_crossing'):
+            first_station=min(r['interaction_station_m'] for r in critical if r['config']['role']=='crossing_actor')
+        self.ego_moved |= ego_speed>.5
+        if self.manual:
+            observations=[]
+            for row in self.rows:
+                actor=row['actor'];state=states.get(actor.id);cfg=row['config']
+                if state is None or cfg['actor_type'] not in ('vehicle','walker'):continue
+                p=state.get_transform();v=state.get_velocity();ctrl=actor.get_control()
+                previous_control={k:getattr(ctrl,k) for k in ('steer','throttle','brake','speed') if hasattr(ctrl,k)}
+                if hasattr(ctrl,'direction'):previous_control['direction_xyz']=[ctrl.direction.x,ctrl.direction.y,ctrl.direction.z]
+                observations.append(dict(actor_id=actor.id,id=cfg['id'],xyz_carla_m=[p.location.x,p.location.y,p.location.z],
+                       yaw_deg=p.rotation.yaw,velocity_xyz_mps=[v.x,v.y,v.z],observed_control=previous_control))
+            signals={str(light.id):str(light.get_state()).split('.')[-1] for light,_ in self.traffic_lights}
+            if self.traffic_lights and any(signals[str(i)]!=desired for ids,desired in
+                    ((self.signal_program['ego_green_ids'],'Green'),(self.signal_program['crossing_red_ids'],'Red'))
+                    for i in ids):raise RuntimeError('Observed traffic signal differs from scripted crossing phase')
+            events.append(dict(phase='interact' if self.active else 'approach',event='scripted_npc_observation',
+                source_frame=snapshot.frame,source_time=stamp,actors=observations,signal_states=signals,completed=False))
         obligations = scene.get('rules',{}).get('stop_sign_obligations',[])
         if kind == 'stop_sign':
             targets = {row.get('stop_sign_id') for row in self.rows if row.get('stop_sign_id') is not None}
@@ -573,10 +858,13 @@ class DemoEvents:
         if kind == 'hard_brake':
             lead = next(row for row in self.rows if row['config']['role'] == 'braking_lead')
             observed = self._observed(lead,scene)
-            current_station = project(observed['position'] if observed else xy(lead['actor'].get_location()),self.route)['s_m']
+            measured=states.get(lead['actor'].id) or lead['actor']
+            current_station = project(observed['position'] if observed else xy(measured.get_transform().location),self.route)['s_m']
             trigger = 0. <= current_station-progress <= distance
         else:
             trigger = bool(obligations) if kind == 'stop_sign' else progress >= first_station-distance
+            if any(r['config']['role']=='oncoming_vehicle' for r in self.rows):
+                trigger=trigger or progress>=max(0.,_bypass_stations(self.spec)[0]-12.)
         if not self.active and trigger:
             self.active,self.activated_at = True,stamp
             events.append(dict(phase='interact',event='activated',completed=False,observed_progress_m=progress,
@@ -585,7 +873,7 @@ class DemoEvents:
             if row['config']['role'] == 'braking_lead' and not self.active:
                 observed = self._observed(row,scene)
                 row['prior_motion_observed'] |= observed is not None and math.hypot(*observed['velocity']) > 1.
-                self._drive_vehicle(row,self.waypoints,float(row['config']['speed_mps']))
+                self._drive_vehicle(row,self.waypoints,float(row['config']['speed_mps']),states.get(row['actor'].id))
         if not self.active:
             return events
         elapsed = stamp-self.activated_at
@@ -611,12 +899,31 @@ class DemoEvents:
                     continue
                 raise RuntimeError('Required demonstration actor disappeared before completion: '+config['id'])
             role,speed = config['role'],float(config['speed_mps'])
+            current=states.get(a.id) or a
             yaw = math.radians(row['original_waypoint'].transform.rotation.yaw)
             observed = self._observed(row,scene)
+            if role=='oncoming_vehicle':
+                events.extend(self._oncoming(row,scene,current,progress,ego_speed))
+                continue
             if kind == 'blocked_wait' and elapsed >= self.spec['wait_s']:
                 if not a.destroy():
                     raise RuntimeError('Failed to remove owned blockage actor')
                 events.append(dict(phase='interact',event='owned_blockage_removed',actor_id=a.id,completed=False))
+            elif role=='slow_lead' and self.manual:
+                path=row['walker_path'];location=current.get_transform().location
+                destination=path[row['walker_index']]
+                dx,dy=destination[0]-location.x,destination[1]-location.y
+                if math.hypot(dx,dy)<.5 and row['walker_index']<len(path)-1:
+                    row['walker_index']+=1;destination=path[row['walker_index']]
+                    dx,dy=destination[0]-location.x,destination[1]-location.y
+                gap=_path_body_distance(self.route,_body(a,current))
+                complete=row['walker_index']==len(path)-1 and math.hypot(dx,dy)<.55 and gap>self.ego_width/2.+.25
+                norm=max(.01,math.hypot(dx,dy))
+                a.apply_control(self.carla.WalkerControl(direction=self.carla.Vector3D(x=dx/norm,y=dy/norm),speed=0. if complete else speed))
+                moving_complete.append(complete)
+                if complete and not row['finished']:
+                    row['finished']=True;events.append(dict(event='walker_exited_driving_path',actor_id=a.id,
+                        phase='interact',completed=False,path_body_clearance_m=gap,source_frame=snapshot.frame))
             elif role == 'slow_lead':
                 a.apply_control(self.carla.WalkerControl(direction=self.carla.Vector3D(x=math.cos(yaw),y=math.sin(yaw)),speed=speed))
                 if elapsed >= self.spec['wait_s']:
@@ -625,14 +932,15 @@ class DemoEvents:
                     events.append(dict(phase='interact',event='owned_slow_actor_removed',actor_id=a.id,completed=False))
             elif role == 'crossing_actor':
                 origin = row['original_waypoint'].transform.location
-                location = a.get_location()
+                location = current.get_transform().location
                 lateral = (location.x-origin.x)*math.sin(yaw)-(location.y-origin.y)*math.cos(yaw)
-                body = _body(a)
+                body = _body(a,current)
                 # Hull is in public XY (CARLA Y negated). The entire body must
                 # leave the driving lanes, while the opposite shoulder can be narrow.
                 trailing_edge = min((x-origin.x)*math.sin(yaw)+(y+origin.y)*math.cos(yaw) for x,y in body)
                 clearance = min(_path_body_distance(path,body) for path in (self.route,self.teaching_path))
-                complete = trailing_edge >= row['crossing_left_limit_m']+.1 and clearance > self.ego_width/2.+.2
+                occupied=self._observed_crossing(row,clearance,progress,scene,events)
+                complete = occupied and trailing_edge >= row['crossing_left_limit_m']+.1 and clearance > self.ego_width/2.+.2
                 a.apply_control(self.carla.WalkerControl(direction=self.carla.Vector3D(x=math.sin(yaw),y=-math.cos(yaw)),speed=0. if complete else speed))
                 moving_complete.append(complete)
                 if complete and not row['finished']:
@@ -641,7 +949,8 @@ class DemoEvents:
                                        lateral_m=lateral,body_trailing_lateral_m=trailing_edge,
                                        path_body_clearance_m=clearance,completed=False))
             elif role == 'braking_lead':
-                observed_speed = math.hypot(*observed['velocity']) if observed is not None else math.hypot(a.get_velocity().x,a.get_velocity().y)
+                velocity=current.get_velocity()
+                observed_speed = math.hypot(*observed['velocity']) if observed is not None else math.hypot(velocity.x,velocity.y)
                 row['prior_motion_observed'] |= not row['brake_observed'] and observed_speed > 1.
                 if row['brake_observed'] and observed_speed >= .1 and row['resume_origin'] is None:
                     row['brake_stopped_at'] = None
@@ -652,33 +961,40 @@ class DemoEvents:
                                        observed_speed_mps=observed_speed,completed=False))
                 hold_complete = (row['brake_stopped_at'] is not None and
                                  stamp-row['brake_stopped_at']+1e-8 >= self.spec['wait_s'])
-                events.append(self._observe_brake_light(row,scene,observed_speed))
+                if row['resume_origin'] is None:events.append(self._observe_brake_light(row,scene,observed_speed))
                 if not hold_complete:
-                    self._clear_brake_light(a)
+                    self._set_brake_light(a,config.get('brake_lights_on',False))
                     a.apply_control(self.carla.VehicleControl(brake=1.))
-                    self._clear_brake_light(a)
+                    self._set_brake_light(a,config.get('brake_lights_on',False))
                     if 'brake' not in row['actions']:
                         events.append(dict(phase='interact',event='lead_brake_commanded',actor_id=a.id,observed_speed_mps=observed_speed,completed=False))
                         row['actions'].add('brake')
                 else:
                     if row['resume_origin'] is None:
-                        row['resume_origin'] = xy(a.get_location())
+                        row['resume_origin'] = xy(current.get_transform().location)
                         events.append(dict(phase='interact',event='lead_resume_commanded',actor_id=a.id,completed=False))
-                    self._drive_vehicle(row,self.waypoints,speed)
-                    moved = math.dist(xy(a.get_location()),row['resume_origin'])
-                    moving_complete.append(row['brake_observed'] and row.get('brake_without_lights_observed') is True
+                    self._drive_vehicle(row,self.waypoints,speed,current)
+                    self._set_brake_light(a,False)
+                    moved = math.dist(xy(current.get_transform().location),row['resume_origin'])
+                    moving_complete.append(row['brake_observed'] and row.get('required_brake_light_observed') is True
                                            and observed_speed > 1. and moved > 2.)
             elif role == 'cross_traffic_vehicle':
                 path = row['cross_path']
-                branch = project(xy(a.get_location()),[xy(wp.transform.location) for wp in path])
-                clearance = min(_path_body_distance(p,_body(a)) for p in (self.route,self.teaching_path))
-                complete = branch['s_m'] >= row['branch_crossing_s_m']+8. and clearance > self.ego_width/2.+.5
+                branch = project(xy(current.get_transform().location),[xy(wp.transform.location) for wp in path])
+                clearance = min(_path_body_distance(p,_body(a,current)) for p in (self.route,self.teaching_path))
+                occupied=self._observed_crossing(row,clearance,progress,scene,events)
+                complete = occupied and branch['s_m'] >= row['branch_crossing_s_m']+8. and clearance > self.ego_width/2.+.5
                 if complete:
                     a.apply_control(self.carla.VehicleControl(brake=1.))
+                    if self.manual and not row['finished']:
+                        row['finished']=True
+                        events.append(dict(event='cross_traffic_body_cleared',actor_id=a.id,phase='interact',
+                                source_frame=snapshot.frame,source_time=stamp,path_body_clearance_m=clearance,completed=False))
                 else:
-                    self._drive_vehicle(row,path,speed)
+                    self._drive_vehicle(row,path,speed,current)
                 moving_complete.append(complete)
-        if kind in ('blocked_wait','slow_lead'):
+        if kind=='slow_lead' and self.manual:ready=bool(moving_complete) and all(moving_complete)
+        elif kind in ('blocked_wait','slow_lead'):
             ready = elapsed >= self.spec['wait_s'] and all(not row['actor'].is_alive for row in self.rows)
         elif kind == 'stop_sign':
             fulfilled = [value for value in self.stop_encounters.values() if value.get('status') == 'fulfilled']
@@ -689,7 +1005,11 @@ class DemoEvents:
         elif kind in ('crossing','construction_crossing','cross_traffic','hard_brake'):
             ready = bool(moving_complete) and all(moving_complete)
         else:
-            ready = progress >= max(row['interaction_station_m'] for row in self.rows)+5.
+            ready = progress >= max(row['interaction_station_m'] for row in critical)+5.
+        oncoming=[r for r in self.rows if r['config']['role']=='oncoming_vehicle']
+        if oncoming:
+            ready=(ready and all(r.get('observed_moving') if r['config'].get('release_on_borrow')
+                   else r.get('passed_ego') for r in oncoming) and abs(project(scene['ego']['position'],self.route)['lateral_m'])<.6)
         if ready and not self.completed:
             if kind == 'blocked_wait' and self.stationary_s < 3.:
                 raise RuntimeError('Blockage disappeared without a genuinely observed wait')
@@ -701,6 +1021,12 @@ class DemoEvents:
 
     def close(self):
         errors = []
+        if self.traffic_lights:
+            for light,state in self.traffic_lights:
+                try:light.set_state(state)
+                except RuntimeError as exc:errors.append(str(exc))
+            try:self.world.freeze_all_traffic_lights(self.signal_program['previously_frozen'])
+            except RuntimeError as exc:errors.append(str(exc))
         for actor in reversed(self.actors):
             try:
                 if actor.is_alive and not actor.destroy():

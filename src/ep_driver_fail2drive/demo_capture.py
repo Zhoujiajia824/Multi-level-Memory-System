@@ -14,8 +14,8 @@ import traceback
 
 from .archive import RouteArchive, _png
 from .demo_catalog import capture_implementation
-from .demo_events import DemoEvents, NoWalkableCrossingSurface
-from .demo_routes import select_demonstration_site, teaching_path, validate_teaching_road_path
+from .demo_events import DemoEvents, NoWalkableCrossingSurface, requires_borrow_proof, verify_borrow_capture
+from .demo_routes import _bypass_stations, select_demonstration_site, teaching_path, validate_teaching_road_path
 from .demo_teacher import DemoTeacher, SCHEMA as TEACHER_SCHEMA
 from .execution import SignedAccelerationController
 from .public_state import PublicStateExtractor
@@ -42,17 +42,15 @@ class InteractionCaptureWindow:
     def __init__(self,spec,waypoints,actor_rows):
         self.route=[xy(wp.transform.location) for wp in waypoints]
         self.lanes=[lane_key(wp) for wp in waypoints]
-        stations=[float(row['interaction_station_m']) for row in actor_rows]
+        interaction_rows=[row for row in actor_rows if row['config'].get('role') not in
+                          ('oncoming_vehicle', 'construction_advance_warning')]
+        stations=[float(row['interaction_station_m']) for row in interaction_rows]
         if not stations or not all(math.isfinite(s) for s in stations):
             raise ValueError('Interaction collection requires actual finite hazard stations')
         self.gate=max(stations)+5.
         if spec['interaction_kind'] in ('parked_bypass','construction_bypass','construction_crossing'):
-            blockers=[float(row['config']['s_offset_m']) for row in actor_rows
-                      if row['config'].get('lane_offset',0)==0]
-            if not blockers:raise ValueError('Bypass collection lacks its authored return section')
-            # Same return_end used by demo_routes.teaching_path, not an
-            # arbitrary distance at which a still-borrowing car is accepted.
-            self.gate=max(self.gate,max(blockers)+25.)
+            route_spec=dict(spec,actor_specs=[row['config'] for row in interaction_rows])
+            self.gate=max(self.gate,_bypass_stations(route_spec)[-1])
         self.start = None
         self.anchor = None
         self.sources = []
@@ -459,8 +457,11 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                                                        unusable_site=unusable_site)
             run['selected_site'] = site
             authored = teaching_path(waypoints, spec)
+            opposing_borrow = spec['teacher_policy'].get('allow_opposite_lane', False)
+            early_authored = teaching_path(waypoints, spec, early_return=True) if opposing_borrow else None
             route = [xy(wp.transform.location) for wp in waypoints]
             archive.json('demonstration_design.json', dict(spec=spec, route_xy=route, teaching_path_xy=authored,
+                early_return_path_xy=early_authored,
                 source=site['mode'], selected_site=site, collection_route_reference=spec.get('route_source'),
                 official_route_used=False, official_event_replayed=False,
                 formal_evaluation_control=False, runtime_success_not_yet_verified=True))
@@ -538,6 +539,8 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
         startup('await_first_observation', ego_actor_id=ego.id)
         first_time, previous, extractor, teacher, controller = None, None, None, None, None
         arrived_time, recovery_start = None, None
+        previous_borrow_stage = None
+        return_update_recorded = False
         while True:
             frame = int(world.tick(30.))
             snapshot = world.get_snapshot()
@@ -568,7 +571,8 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                         camera_mount_matrix_m=mounts['front_rgb'].get_matrix()), frame=frame, timestamp=stamp)
                 archive.json('ego_geometry.json', geometry)
                 extractor = PublicStateExtractor(world, ego, [wp.transform for wp in waypoints],
-                    config=dict(desired_speed_mps=spec['cruise_speed_mps'], teaching_junction_overlap=True),
+                    config=dict(desired_speed_mps=spec['cruise_speed_mps'], teaching_junction_overlap=True,
+                                teaching_opposing_shared_edges=True),
                     route_id=output.name, ego_geometry=geometry)
                 if spec['interaction_kind'] == 'stop_sign':
                     # A real public trigger is still required. This stricter
@@ -577,13 +581,15 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                     archive.json('demonstration_stop_policy.json',dict(real_stop_sign_required=True,
                         observed_hold_s=extractor.traffic_rules.hold_s,formal_rules_modified=False))
                 teacher_settings = dict(cruise_speed_mps=spec['cruise_speed_mps'],corridor_margin_m=.2)
+                teacher_settings.update(spec['teacher_policy'].get('settings', {}))
                 if spec['interaction_kind'] == 'stop_sign':
                     # The public stop trigger requires an observed stop within
                     # 4m. A 2.5m front margin plus half a car would stop outside
                     # that trigger forever. Keep the body behind the real line
                     # while allowing the measured public obligation to complete.
                     teacher_settings['stop_margin_m'] = .5
-                teacher = DemoTeacher(route, geometry['wheelbase_m'],settings=teacher_settings,bypass_reference=authored)
+                teacher = DemoTeacher(route, geometry['wheelbase_m'],settings=teacher_settings,bypass_reference=authored,
+                    opposing_borrow=opposing_borrow,early_return_reference=early_authored)
                 archive.json('demonstration_teacher.json',dict(schema=TEACHER_SCHEMA,settings=teacher.settings,
                     formal_evaluation_control=False,safety_certified=False))
                 steering = math.radians(max(w.max_steer_angle for w in physics.wheels))
@@ -605,8 +611,27 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                 if not body_evidence['road_coverage']['valid']:
                     raise RuntimeError('Teaching reference failed full-body road preflight: '+
                         json.dumps(body_evidence['road_coverage']['first_failure'], ensure_ascii=False))
+                if early_authored is not None:
+                    early_evidence = events.validate_bodies(early_authored, measured['width'],
+                        ego_length=measured['length'], path_name='early_return')
+                    early_evidence['road_coverage'] = validate_teaching_road_path(
+                        early_authored, scene['drivable_polygons'], measured['length'], measured['width'])
+                    body_evidence['early_return'] = early_evidence
+                    archive.json('development_site_geometry.json', body_evidence)
+                    if not early_evidence['road_coverage']['valid']:
+                        raise RuntimeError('Early return reference failed full-body road preflight: '+
+                            json.dumps(early_evidence['road_coverage']['first_failure'], ensure_ascii=False))
             actual = ego.get_control()
             command = teacher.step(scene, 1/HZ)
+            borrow = command.get('borrow')
+            if borrow is not None and borrow['stage'] != previous_borrow_stage:
+                archive.append('event_evidence', dict(frame=frame,time=stamp,phase='interact',
+                    event='observed_borrow_'+borrow['stage'],completed=False,borrow=borrow))
+                previous_borrow_stage = borrow['stage']
+            if borrow is not None and borrow.get('early_return_trigger_id') is not None and not return_update_recorded:
+                archive.append('event_evidence', dict(frame=frame,time=stamp,phase='interact',
+                    event='observed_oncoming_early_return_selection',completed=False,borrow=borrow))
+                return_update_recorded = True
             speed = math.hypot(*scene['ego']['velocity'])
             heading = scene['ego']['heading']
             acceleration = sum(v*d for v,d in zip(scene['ego']['acceleration'], (math.cos(heading),math.sin(heading))))
@@ -618,7 +643,7 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
             execution=dict(frame=frame,time=stamp,applied_control=_control(actual),
                 returned_control=_control(returned), observed_ego=scene['ego'],
                 teacher=command,controller=control,audit=audit)
-            for event in events.update(scene,1/HZ):
+            for event in events.update(scene,1/HZ,snapshot=snapshot):
                 archive.append('event_evidence', dict(frame=frame,time=stamp,**event))
             progress = scene['diagnostics']['route_projection'].get('trusted_progress_m')
             if interaction_window is not None:
@@ -767,6 +792,11 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
         if interaction_window is not None:
             evaluation['interaction_segment']=interaction_window.report()
         goal_complete=(interaction_window.complete if interaction_window is not None else reached)
+        if complete and requires_borrow_proof(spec):
+            try:
+                evaluation['opposing_borrow_proof']=verify_borrow_capture(output,spec)
+            except (OSError,ValueError,KeyError,TypeError,IndexError) as error:
+                errors.append('Authored opposing borrow verification: '+str(error))
         evaluation['passed'] = bool(complete and not errors and goal_complete and evaluation['interaction_complete']
             and recovery_complete and not evaluation['collision_count'] and not evaluation['offroad_count']
             and not evaluation['rule_violation_count'] and evaluation['projection_valid'] and restored)

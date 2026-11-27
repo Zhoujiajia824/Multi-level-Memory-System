@@ -690,12 +690,28 @@ criteria更新后停止manager；不移动起点、不改NPC或场景触发，�
 
 # 独立长尾驾驶示范采集
 
+当前手工采集采用 `scripts/collect_fail2drive_reconstructions.py`，默认覆盖17类、每类两段，共34段。加 `--family ConstructionPedestrian` 时一次只采该类两段。地点以冻结采集XML为锚点，演员、轨迹、触发条件和恢复过程由本项目定义，产物按重建示范归档。每次新实验使用新的输出根目录。
+
+示例在已运行的专用 CARLA 上执行，使用现有两个Python环境。
+
+```bash
+/home/zjj/miniconda3/envs/ep-fail2drive/bin/python scripts/collect_fail2drive_reconstructions.py \
+  --fail2drive-root /data/zjj/code/EP-Driver/fail2drive-devkit \
+  --worker-python /home/zjj/miniconda3/envs/ep-driver-fail2drive/bin/python \
+  --output-dir output/authored34/new_collection \
+  --host 127.0.0.1 --port 39000 \
+  --allow-map-load --allow-similar-road \
+  --family ConstructionPedestrian --run
+```
+
+双向施工与异常物体绕行设置有限数量的对向车辆。首车实际通过后再判断可用窗口，第二辆按实际借道触发启动。示范车跟踪预先核验的正常/提前归道参考，同时依据当前帧车辆、行人和交通规则调整速度及选择参考。每个NPC的路径、触发和实际执行留在场景设计与事件归档中。视频默认开启。完成交互且回归原导航后，保留连续3秒的恢复图像即结束采集。停等、借道和归道阶段优先选择实际已保存且具有后续3秒证据的记忆锚点。
+
 `config/fail2drive_demonstrations.json` 包含17类交互的设计。用 `--map Town13` 按所需车道几何选择示范地点。
 也可以用 `--collection-route-id` 和 `--fail2drive-root` 选择已划入采集集的原始事件地点。两种方式均由示范脚本布置交通参与者。
 Town13 的动物横穿使用动物实体，具体蓝图和独立布置的车辆、物体都随采集保存。
 加 `--interaction-only` 后，自车完成交互、驶过冲突位置并稳定行驶，保存恢复后的3秒观测即结束片段。
 
-独立开发重建及历史批次续采使用 `scripts/collect_fail2drive_reconstructions.py`。传入 `--fail2drive-root <devkit> --output-dir output/teaching_clips` 可离线核对20条设计。用 SDK Python 执行同一命令，加 `--worker-python <数值Python> --allow-map-load --allow-similar-road --run` 可复现过去的独立教学采集。已有 `teaching20_*` 和 `priority6_*` 目录的来源仍是重建场景。
+传入 `--fail2drive-root <devkit> --output-dir output/teaching_clips` 可离线核对34段设计。复核旧20条划分时显式指定 `--collection-split config/fail2drive_memory_transfer_split.json`。历史采集和新设计通过代码与参数指纹区分，参数变更后使用新目录。已有 `teaching20_*` 和 `priority6_*` 目录保留原始来源。
 
 两个采集编号对应同类的两种教学交互，具体演员、布置、触发和示范速度见离线清单与每轮 `demonstration_design.json`。某些官方 Base 没有对应长尾事件，该编号的重建会加入交互。允许相似道路时，采集器优先尝试原采集锚点，并记录最终事件位置与改选原因。每条视频在 `clips/<编号>_try_<次数>/planning/video.mp4`。机器审核通过的片段列在 `review_paths.txt`，人工审片后再送工作台。
 
@@ -704,7 +720,7 @@ Town13 的动物横穿使用动物实体，具体蓝图和独立布置的车辆�
 CARLA SDK环境执行，只接受空闲专用世界；需要换图时显式加 `--allow-map-load`。
 默认录制1920×1080、20Hz示例视角视频，1Hz保存严格同帧六相机与状态、20Hz保存
 实测控制和独立物理审计。采集产物保存在本分支 `output/` 下指定的目录，每次重试保留旧轮次。
-全封闭类保留60秒清障等待。教学参考与跟踪器仅用于离线采集，正式Agent/MPC不调用它。
+手工封闭片段的清障等待时长写入当轮设计，包含实测停车与重新起步。独立示范跟踪器用于经验采集；正式测评仍由论文Agent/MPC执行官方场景。
 
 地图条件、蓝图、合法绕行或实测净空不满足时拒绝采集；碰撞、离路、规则违规、
 交互未完成或恢复行驶不足时不得入库。设计核查和离线运动学测试均不是CARLA成功证明。

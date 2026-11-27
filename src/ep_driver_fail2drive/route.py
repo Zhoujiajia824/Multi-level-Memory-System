@@ -220,7 +220,7 @@ def _distinct_lane_samples(waypoints):
     return result,removed
 
 
-def _shared_lane_edges(road_map, groups, same_level):
+def _shared_lane_edges(road_map, groups, same_level, *, include_opposing=False):
     """Use one public cross-section boundary for directly adjacent lanes.
 
     Independent float32 lane centres and differing longitudinal sample grids
@@ -238,9 +238,15 @@ def _shared_lane_edges(road_map, groups, same_level):
             other=getattr(middle,'get_'+side+'_lane')()
             other_key=lane_key(other)
             if (not _driving(other) or other_key not in groups or
-                    (other.road_id,other.section_id)!=(middle.road_id,middle.section_id) or
-                    math.cos(math.radians(other.transform.rotation.yaw-middle.transform.rotation.yaw))<.9 or
-                    lane_key(getattr(other,'get_'+opposite+'_lane')())!=key):
+                    (other.road_id,other.section_id)!=(middle.road_id,middle.section_id)):
+                continue
+            alignment=math.cos(math.radians(other.transform.rotation.yaw-middle.transform.rotation.yaw))
+            if abs(alignment)<.9 or (alignment<0 and not include_opposing):
+                continue
+            # A shared centre divider is left/left for opposite-facing lanes.
+            # Mutual topology and float32 equality below still exclude medians.
+            peer_side=side if alignment<0 else opposite
+            if lane_key(getattr(other,'get_'+peer_side+'_lane')())!=key:
                 continue
             identity=tuple(sorted((key,other_key)))
             if identity in seen:
@@ -263,7 +269,7 @@ def _shared_lane_edges(road_map, groups, same_level):
                 if (lane_key(a)!=key or lane_key(b)!=other_key or
                         not same_level(a) or not same_level(b) or
                         lane_key(getattr(a,'get_'+side+'_lane')())!=other_key or
-                        lane_key(getattr(b,'get_'+opposite+'_lane')())!=key or
+                        lane_key(getattr(b,'get_'+peer_side+'_lane')())!=key or
                         min(a.lane_width,b.lane_width)<=0):
                     shared=[];break
                 pa,pb=xy(a.transform.location),xy(b.transform.location)
@@ -271,7 +277,7 @@ def _shared_lane_edges(road_map, groups, same_level):
                     p=xy(wp.transform.location);yaw=math.radians(wp.transform.rotation.yaw)
                     sign=1. if edge=='left' else -1.
                     return [p[0]+sign*math.sin(yaw)*wp.lane_width/2.,p[1]+sign*math.cos(yaw)*wp.lane_width/2.]
-                gap=math.dist(raw_edge(a,side),raw_edge(b,opposite))
+                gap=math.dist(raw_edge(a,side),raw_edge(b,peer_side))
                 def ulp32(value):
                     value=abs(float(value))
                     return math.ldexp(1.,-149 if value==0. else max(-149,math.frexp(value)[1]-24))
@@ -287,7 +293,7 @@ def _shared_lane_edges(road_map, groups, same_level):
             if len(shared)<2:
                 continue
             edges[(key,side)]=[(s,p,a) for s,p,a,b in shared]
-            edges[(other_key,opposite)]=[(s,p,b) for s,p,a,b in shared]
+            edges[(other_key,peer_side)]=[(s,p,b) for s,p,a,b in shared]
             audit.append(dict(lane_ids=list(identity),sample_count=len(shared),
                 maximum_original_boundary_gap_m=separation,
                 source='same_road_section_direct_adjacent_public_s_half_width_interpolation'))
@@ -428,7 +434,8 @@ class RouteAdapter:
         self.lane_junctions = {}
         shared_edges,shared_audit=_shared_lane_edges(self.map,groups,lambda wp:
             abs(wp.transform.location.z-self.height_at(xy(wp.transform.location)))<=
-            float(self.config.get('same_level_tolerance_m',1.5)))
+            float(self.config.get('same_level_tolerance_m',1.5)),
+            include_opposing=bool(self.config.get('teaching_opposing_shared_edges',False)))
         self.map_sample_audit=dict(policy='exact_xy_adjacent_numerical_alias_only;first_sample_retained',
             no_spatial_merging=True,official_navigation_unchanged=True,removed_samples=[],
             lane_end_samples=lane_ends, lane_end_source='public_opendrive_section_limit_get_waypoint_xodr',

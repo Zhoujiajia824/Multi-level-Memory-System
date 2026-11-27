@@ -14,6 +14,9 @@ the teacher sees that path; the ordinary navigation remains ``route_xy``.
 from __future__ import annotations
 
 import math
+from bisect import bisect_left
+
+from .route import point_in_polygon, polygons_intersect
 
 
 SCHEMA = "ep-driver-independent-demo-teacher-1.0"
@@ -87,10 +90,11 @@ class _Path:
             self.segments.append((self.length, self.length + distance, a, b,
                                   math.atan2(b[1] - a[1], b[0] - a[0])))
             self.length += distance
+        self.ends = [r[1] for r in self.segments]
 
     def at(self, station):
         station = _clamp(station, 0., self.length)
-        segment = next((r for r in self.segments if r[1] >= station), self.segments[-1])
+        segment = self.segments[bisect_left(self.ends, station)]
         start, end, a, b, heading = segment
         ratio = (station - start) / (end - start)
         return ((a[0] + ratio * (b[0] - a[0]), a[1] + ratio * (b[1] - a[1])), heading)
@@ -162,6 +166,216 @@ def _actor_body(actor):
     return position, velocity, polygon
 
 
+def _body_box(center, yaw, half_length, half_width):
+    c, s = math.cos(yaw), math.sin(yaw)
+    return [(center[0] + u*c-v*s, center[1]+u*s+v*c)
+            for u, v in ((half_length, half_width), (half_length, -half_width),
+                         (-half_length, -half_width), (-half_length, half_width))]
+
+
+def _swept_polygon(polygon,velocity,t_min,t_max):
+    """Convex hull of a body translated over a bounded arrival-time interval."""
+    vertices=sorted(set((x+velocity[0]*t,y+velocity[1]*t) for t in (t_min,t_max) for x,y in polygon))
+    def chain(points):
+        result=[]
+        for p in points:
+            while len(result)>=2:
+                a,b=result[-2:]
+                if (b[0]-a[0])*(p[1]-a[1])-(b[1]-a[1])*(p[0]-a[0])>0.:
+                    break
+                result.pop()
+            result.append(p)
+        return result[:-1]
+    return chain(vertices)+chain(reversed(vertices))
+
+
+def _bypass_span(home, other):
+    """Map a complete surveyed reference to stations of departure and return."""
+    offset = []
+    for index in range(math.ceil(other.length)+1):
+        distance = min(float(index), other.length)
+        center, yaw = other.at(distance)
+        q = home.project(center, yaw)
+        if abs(q['lateral_m']) > .20:
+            offset.append((distance, q['s_m'], q['lateral_m']))
+    if not offset:
+        raise ValueError('Opposing bypass reference never leaves the home lane')
+    return dict(entry=offset[0][1], exit=offset[-1][1], path_exit=offset[-1][0],
+                offset=max((v[2] for v in offset),key=abs))
+
+
+class _OpposingBorrow:
+    """Select among surveyed paths from observed bodies and their current velocities."""
+    def __init__(self, home, normal, early):
+        self.home, self.normal, self.early = home, normal, early
+        self.span, self.early_span = _bypass_span(home,normal), _bypass_span(home,early)
+        if (self.span['offset'] <= 0 or self.early_span['offset'] <= 0
+                or self.early_span['exit'] >= self.span['exit']
+                or abs(self.span['entry'] - self.early_span['entry']) > 1.5):
+            raise ValueError('Early return must share the entry and reach the home lane sooner')
+        self.committed = self.shortened = self.returned = False
+        self.clear_seconds = 0.
+        self.blocker_tail = None
+        self.denied_ids = set()
+        self.entered = False
+        self.peak_lateral = 0.
+
+    def _footprint(self,scene,nav,length,width):
+        ego=scene['ego']
+        corners=_body_box(ego['position'],ego['heading'],length/2.,width/2.)
+        route_ids=set(scene.get('route_lane_ids',[]))
+        home=[lane for lane in scene.get('lanes',[]) if lane['id'] in route_ids]
+        home_corners=sum(any(point_in_polygon(corner,lane['polygon']) for lane in home) for corner in corners)
+        ego_lane=ego.get('lane_id')
+        parts=str(ego_lane).split('|')
+        opposite=False
+        if len(parts)==3:
+            for lane in home:
+                key=lane['id'].split('|')
+                if len(key)==3 and key[:2]==parts[:2] and int(key[2])*int(parts[2])<0:
+                    opposite=True
+                    break
+        dx,dy=math.cos(nav['heading_rad']),math.sin(nav['heading_rad'])
+        half_s=max(abs((x-ego['position'][0])*dx+(y-ego['position'][1])*dy) for x,y in corners)
+        return dict(ego_lane_id=ego_lane,center_in_opposing_lane=opposite,
+                    home_corners=home_corners,body_on_home_lane=bool(home) and home_corners==len(corners),
+                    measured_lateral_m=nav['lateral_m'],ego_rear_s_m=nav['s_m']-half_s)
+
+    def _traffic(self, scene, nav, ego_length, ego_width):
+        s, oncoming, blockers, bodies = nav['s_m'], [], [], []
+        actors=scene.get('actors',[])
+        if not isinstance(actors,list) or any(not isinstance(actor,dict) for actor in actors):
+            raise ValueError('scene.actors must be a list of current observations')
+        for actor in actors:
+            if actor.get('visible') is False:
+                continue
+            center, velocity, polygon = _actor_body(actor)
+            extent = max(math.dist(center,p) for p in polygon)
+            if math.dist(center,scene['ego']['position']) > 145.+extent:
+                continue
+            q = self.home.project(center)
+            heading = q['heading_rad']
+            c, sn = math.cos(heading), math.sin(heading)
+            closest = self.home.at(q['s_m'])[0]
+            # Preserve signed longitudinal distance for visible actors just beyond a path endpoint.
+            along = [q['s_m'] + (x-closest[0])*c + (y-closest[1])*sn for x,y in polygon]
+            side = [-(x-closest[0])*sn + (y-closest[1])*c for x,y in polygon]
+            lo, hi = min(along), max(along)
+            bodies.append((str(actor['id']),center,velocity,polygon,extent))
+            kind = actor.get('kind')
+            if (kind in ('static_obstacle','vehicle') and math.hypot(*velocity)<.25
+                    and lo<=self.span['exit'] and hi>=self.span['entry']
+                    and min(side)<ego_width/2.+.20 and max(side)>-ego_width/2.-.20):
+                blockers.append((str(actor['id']),hi))
+            direction = math.cos(_wrap(actor.get('heading',heading)-heading))
+            closing = -(velocity[0]*c+velocity[1]*sn)
+            if (kind!='vehicle' or direction>-.5 or hi<s-ego_length/2.-.5
+                    or q['lateral_m']<self.span['offset']*.4 or min(side)>self.span['offset']+ego_width/2.+.45):
+                continue
+            oncoming.append(dict(id=str(actor['id']),front_s_m=lo,rear_s_m=hi,closing_mps=max(0.,closing)))
+        return oncoming,blockers,bodies
+
+    def _early_clear(self, scene, nav, bodies, length, width, speed, cruise, acceleration):
+        ego = scene['ego']
+        projection = self.early.project(ego['position'], ego['heading'],max(0.,nav['s_m']-6.),nav['s_m']+10.)
+        if projection['distance_m']>.65 or projection['heading_error_rad']>.30:
+            return False,'outside_early_return_tracking_corridor'
+        polygons = scene.get('drivable_polygons') or []
+        if not polygons:
+            return False,'missing_drivable_road'
+        start = projection['s_m']
+        end = min(self.early.length,self.early_span['path_exit']+length/2.+1.)
+        if end<=start:
+            return False,'past_early_return'
+        # Both whole authored references were already audited at their real site.
+        # Recheck the forward footprint and measured actor boxes at the switch.
+        count = math.ceil((end-start)/.5)
+        ref_origin, ref_yaw=self.early.at(start)
+        initial_error=(ego['position'][0]-ref_origin[0],ego['position'][1]-ref_origin[1])
+        yaw_error=_wrap(ego['heading']-ref_yaw)
+        v_max=max(speed,min(cruise,4.2))
+        ramp_t=(v_max-speed)/acceleration
+        ramp_s=(v_max+speed)*ramp_t/2.
+        for i in range(count+1):
+            delta = (end-start)*i/count
+            center, yaw = self.early.at(start+delta)
+            tracking_error=max(0.,1.-delta/5.)
+            center=(center[0]+tracking_error*initial_error[0],center[1]+tracking_error*initial_error[1])
+            box = _body_box(center,yaw+tracking_error*yaw_error,length/2.+.2,width/2.+.12)
+            if any(not any(point_in_polygon(pt,poly) for poly in polygons) for pt in box):
+                return False,'return_footprint_outside_road'
+            fastest=((math.sqrt(speed*speed+2.*acceleration*delta)-speed)/acceleration
+                     if delta<=ramp_s else ramp_t+(delta-ramp_s)/v_max)
+            slowest=max(fastest,delta/max(.5,speed))+.35
+            for identity,pos,velocity,polygon,radius in bodies:
+                begin=(pos[0]+velocity[0]*fastest,pos[1]+velocity[1]*fastest)
+                final=(pos[0]+velocity[0]*slowest,pos[1]+velocity[1]*slowest)
+                if _segment_distance(center,begin,final)>math.hypot(length/2.+.2,width/2.+.12)+radius:
+                    continue
+                if polygons_intersect(box,_swept_polygon(polygon,velocity,fastest,slowest)):
+                    return False,'return_conflict_with_'+identity
+        return True,'sampled_road_and_observed_motion_clear'
+
+    def select(self, scene, nav, speed, length, width, dt, cruise, acceleration):
+        s = nav['s_m']
+        if self.returned:
+            return self.home, None, dict(stage='returned',entered_opposing_lane=True,
+                return_path='early' if self.shortened else 'nominal',**self._footprint(scene,nav,length,width))
+        oncoming,blockers,bodies = self._traffic(scene,nav,length,width)
+        if blockers:
+            far_edge = max(tail for _,tail in blockers)
+            self.blocker_tail = far_edge if self.blocker_tail is None else max(self.blocker_tail,far_edge)
+        exit_s = self.span['exit']+length/2.+.75
+        intended_speed = min(cruise,4.2)
+        distance = max(0.,exit_s-s)
+        # Conservative time to get the whole body home, including acceleration from a stop.
+        ramp = max(0.,intended_speed-speed)
+        needed = distance/intended_speed + ramp*ramp/(2.*acceleration*intended_speed) + 1.5
+        denied=[]
+        for row in oncoming:
+            space = row['front_s_m']-exit_s
+            closing = row['closing_mps']
+            row['arrival_margin_s'] = space/closing-needed if closing>.15 else None
+            if space<.5 or (closing>.15 and row['arrival_margin_s']<0):
+                denied.append(row['id'])
+        evidence=dict(stage='approach',observed_oncoming=oncoming,denied_ids=denied,
+            observed_blocker_ids=[b[0] for b in blockers],observed_blocker_rear_limit_s_m=self.blocker_tail,
+            needed_clearance_time_s=needed,nominal_return_s_m=self.span['exit'],early_return_s_m=self.early_span['exit'])
+        footprint=self._footprint(scene,nav,length,width)
+        evidence.update(footprint)
+        if self.committed and not self.entered and denied and footprint['body_on_home_lane'] and abs(nav['lateral_m'])<.35:
+            self.committed=False
+        if not self.committed:
+            self.denied_ids.update(denied)
+            self.clear_seconds=0. if denied else self.clear_seconds+dt
+            if self.blocker_tail is None or self.clear_seconds<.5 or s<self.span['entry']-length-3.:
+                hold_distance = max(0.,self.span['entry']-s-length/2.-.4) if denied or self.denied_ids else None
+                evidence.update(stage='waiting' if denied and speed<=.15 and hold_distance<=.6 else 'approach',
+                                hold_distance_m=hold_distance)
+                return self.home, hold_distance, evidence
+            self.committed=True
+        self.entered |= footprint['center_in_opposing_lane']
+        self.peak_lateral=max(self.peak_lateral,nav['lateral_m'])
+        passed=self.blocker_tail is not None and footprint['ego_rear_s_m']>self.blocker_tail+.35
+        evidence.update(entered_opposing_lane=self.entered,yielded_to_ids=sorted(self.denied_ids),obstacle_cleared=passed)
+        if self.entered and passed and footprint['body_on_home_lane'] and abs(nav['lateral_m'])<.35:
+            self.returned=True
+            evidence.update(stage='returned',return_path='early' if self.shortened else 'nominal')
+            return self.home, None, evidence
+        evidence['stage']='entering' if not self.entered else (
+            'returning' if passed and self.peak_lateral-nav['lateral_m']>.15 else 'borrowed')
+        # Once borrowing, an available earlier return reduces exposure to an
+        # approaching car even while a narrow nominal time surplus remains.
+        approaching=[row for row in oncoming if row['closing_mps']>.25 and row['arrival_margin_s']<=2.]
+        if self.entered and not self.shortened and approaching and passed:
+            evidence['early_return_margin_threshold_s']=2.
+            self.shortened,evidence['return_clearance'] = self._early_clear(scene,nav,bodies,length,width,speed,cruise,acceleration)
+            if self.shortened:
+                evidence['early_return_trigger_id']=min(approaching,key=lambda row:row['front_s_m'])['id']
+        evidence['return_path']='early' if self.shortened else 'nominal'
+        return self.early if self.shortened else self.normal, None, evidence
+
+
 class DemoTeacher:
     """Follow an offline teaching reference; never used by formal evaluation.
 
@@ -169,7 +383,8 @@ class DemoTeacher:
     unsuccessful demonstration. No hidden teleport, automatic success, model
     call, scenario timer or emergency fallback is provided here.
     """
-    def __init__(self, route_xy, wheelbase_m, settings=None, bypass_reference=None):
+    def __init__(self, route_xy, wheelbase_m, settings=None, bypass_reference=None, *,
+                 opposing_borrow=False, early_return_reference=None):
         self.settings = dict(DEFAULT_SETTINGS)
         supplied = dict(settings or {})
         unknown = set(supplied) - set(self.settings)
@@ -195,6 +410,15 @@ class DemoTeacher:
         self.path = _Path(bypass_reference, "bypass_reference") if bypass_reference is not None else self.navigation
         if any(math.dist(self.path.points[index], self.navigation.points[index]) > .1 for index in (0, -1)):
             raise ValueError("bypass_reference must retain the original navigation start and finish")
+        self.borrow = None
+        if opposing_borrow or early_return_reference is not None:
+            if not opposing_borrow or early_return_reference is None or bypass_reference is None:
+                raise ValueError("Opposing borrow requires both surveyed bypass references")
+            early = _Path(early_return_reference,'early_return_reference')
+            if any(math.dist(early.points[i],self.navigation.points[i])>.1 for i in (0,-1)):
+                raise ValueError("Early return must retain the original navigation start and finish")
+            self.borrow = _OpposingBorrow(self.navigation,self.path,early)
+            self.path = self.navigation
         self.last_frame, self.last_time, self.last_position = None, None, None
         self.nav_s, self.path_s = None, None
         self.acceleration, self.steering = 0., 0.
@@ -253,7 +477,16 @@ class DemoTeacher:
             center = _point(actor.get("position"), "actor.position")
             extent = max(math.dist(center, point) for point in polygon)
             motion_range = math.hypot(*velocity) * p["actor_prediction_horizon_s"]
-            if min(math.dist(center, point) for _, point in samples) > corridor + extent + motion_range:
+            nearest, near_station = min((math.dist(center, point), s) for s, point in samples)
+            # A person or cyclist beside the intended path can enter between
+            # observations, even with zero measured speed on the current frame.
+            if (actor.get('kind') in ('pedestrian','bicycle') and station-1. <= near_station <= station+14.
+                    and nearest-extent < corridor+2.):
+                cautious = 2.8 + max(0., near_station-station-4.)*.15
+                cap = min(cap,cautious)
+                conflicts.append(dict(id=str(actor.get('id','unidentified')),reason='nearby_vulnerable_road_user',
+                    speed_cap_mps=cautious,requires_stop=False,evidence='current_actor_body_and_velocity'))
+            if nearest > corridor + extent + motion_range:
                 continue
             occupied = [(s, point) for s, point in samples if _body_distance(point, polygon) <= corridor]
             if occupied:
@@ -339,6 +572,13 @@ class DemoTeacher:
             if math.dist(position, self.last_position) > reachable:
                 raise ValueError("observed displacement exceeds the causal teaching projection window")
         nav = self._projection(self.navigation, position, heading, self.nav_s, speed, dt)
+        hold_distance = borrow = None
+        if self.borrow:
+            reference,hold_distance,borrow = self.borrow.select(scene,nav,speed,length,width,dt,
+                p['cruise_speed_mps'],p['acceleration_max_mps2'])
+            if reference is not self.path:
+                self.path = reference
+                self.path_s = self.path.project(position,heading,max(0.,nav['s_m']-6.),nav['s_m']+10.)['s_m']
         projection = self._projection(self.path, position, heading, self.path_s, speed, dt)
         station = projection["s_m"]
         lookahead = _clamp(p["lookahead_min_m"] + speed * p["lookahead_time_s"],
@@ -376,6 +616,16 @@ class DemoTeacher:
         reasons = ["authored_reference_tracking"]
         must_stop = False
         conflicts = []
+        if hold_distance is not None:
+            hold_cap = self._stop_speed(hold_distance)
+            target_speed = min(target_speed,hold_cap)
+            must_stop = hold_cap<=.05
+            reasons.append('hold_home_lane_until_borrow_clear')
+        target_navigation_offset = self.navigation.project(target_point,
+            lower=max(0., nav["s_m"] - 2.), upper=nav["s_m"] + lookahead + 15.)["distance_m"]
+        if self.path is not self.navigation and max(abs(nav['lateral_m']),target_navigation_offset)>.30:
+            target_speed=min(target_speed,4.2)
+            reasons.append('limited_speed_on_lateral_maneuver')
         if rules.get("stop_s") is not None:
             stop_station = _number(rules["stop_s"], "rules.stop_s")
             gap = stop_station - nav["s_m"] - length / 2. - p["stop_margin_m"]
@@ -415,8 +665,6 @@ class DemoTeacher:
         interaction = self.observed_interaction or bool(conflicts)
         offset = abs(nav["lateral_m"])
         peak = max(self.bypass_peak, offset)
-        target_navigation_offset = self.navigation.project(target_point,
-            lower=max(0., nav["s_m"] - 2.), upper=nav["s_m"] + lookahead + 15.)["distance_m"]
         if finish_arrived:
             phase, target_speed = "DONE", 0.
             reasons.append("observed_demonstration_finish_not_official_score")
@@ -434,6 +682,9 @@ class DemoTeacher:
                   "projection": {"navigation": nav, "teaching": projection},
                   "tracking_target_xy": list(target_point), "teaching_remaining_m": remaining,
                   "safety_certified": False, "formal_evaluation_control": False}
+        if borrow is not None:
+            borrow.update(source_frame=frame,source_time=time)
+            output['borrow'] = borrow
         self.last_frame, self.last_time, self.last_position = frame, time, position
         self.nav_s = nav["s_m"] if self.nav_s is None else max(self.nav_s, nav["s_m"])
         self.path_s = station if self.path_s is None else max(self.path_s, station)

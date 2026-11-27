@@ -1,8 +1,4 @@
-"""Independent development demonstrations, never official evaluation answers.
-
-The catalog describes mechanisms and relative placements only. Loading a design
-does not certify a successful episode or authorize publishing it as memory.
-"""
+"""Authored driving demonstrations and their official collection-route location anchors."""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -44,7 +40,7 @@ SUCCESS_REQUIREMENTS = frozenset({
 })
 CAPABILITIES = frozenset({
     "straight_route", "same_direction_left_lane", "crossable_left_boundary",
-    "same_direction_right_lane", "opposite_left_lane", "right_sidewalk",
+    "same_direction_right_lane", "opposite_left_lane", "right_sidewalk", "walkable_right_exit",
     "real_stop_sign", "conflicting_junction", "full_lane_blockage",
     "verified_passing_clearance",
 })
@@ -60,14 +56,18 @@ COLLECTION_BLUEPRINTS = frozenset({
     "vehicle.nissan.patrol_2021", "vehicle.kawasaki.ninja",
     "walker.pedestrian.0027", "walker.pedestrian.0040", "walker.pedestrian.0034",
     "walker.pedestrian.0015", "walker.animal.1009", "static.prop.kiosk_01", "static.prop.gnome",
+    "static.prop.ampel", "static.prop.brickwall", "static.prop.snow", "vehicle.carlamotors.european_hgv",
+    "static.prop.warningconstruction", "static.prop.trafficwarning",
+    "static.prop.dirtdebris02", "static.prop.constructioncone",
 })
+AUTHORED_SCHEMA = 'fail2drive-authored-interaction-2.0'
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CATALOG = ROOT / "config" / "fail2drive_demonstrations.json"
 _FORBIDDEN_KEYS = frozenset({
     "official_route", "official_route_id", "official_seed", "route_id",
-    "official_coordinates", "world_coordinates", "future_controls",
-    "future_states", "ground_truth_future", "expert_controls", "evaluation_result",
+    "official_coordinates", "evaluation_result",
 })
+_FUTURE_INPUT_KEYS = frozenset({"future_controls","future_states","ground_truth_future","expert_controls"})
 
 
 def _number(value, label, *, minimum=None, maximum=None):
@@ -89,7 +89,8 @@ def _strings(value, label, *, nonempty=True):
 def _check_payload(value, label="catalog"):
     if isinstance(value, dict):
         for key, item in value.items():
-            if not isinstance(key, str) or key in _FORBIDDEN_KEYS:
+            if (not isinstance(key,str) or key in _FORBIDDEN_KEYS
+                    or '.teacher_policy' in label and key in _FUTURE_INPUT_KEYS):
                 raise ValueError(label + " contains a forbidden evaluation/future field: " + str(key))
             _check_payload(item, label + "." + key)
     elif isinstance(value, list):
@@ -110,8 +111,8 @@ def validate_catalog(catalog):
     if not isinstance(catalog, dict):
         raise ValueError("demonstration catalog must be an object")
     payload=deepcopy(catalog)
-    # Only this explicitly validated provenance block may carry a collection
-    # route ID. Future/evaluation fields remain forbidden everywhere else.
+    # Route IDs are source provenance. The world scheduler may define NPC
+    # trajectories. The ego teacher does not receive those future states.
     for item in payload.get('demonstrations',[]) if isinstance(payload.get('demonstrations'),list) else ():
         if isinstance(item,dict):item.pop('route_source',None)
     _check_payload(payload)
@@ -151,13 +152,14 @@ def validate_catalog(catalog):
         _number(spec.get("approach_m"), identity + ".approach_m", minimum=20)
         _number(spec.get("interaction_m"), identity + ".interaction_m", minimum=5)
         _number(spec.get("recovery_m"), identity + ".recovery_m", minimum=15)
-        _number(spec.get("cruise_speed_mps"), identity + ".cruise_speed_mps", minimum=0.1, maximum=6)
+        _number(spec.get("cruise_speed_mps"), identity + ".cruise_speed_mps", minimum=0.1)
         wait = _number(spec.get("wait_s"), identity + ".wait_s", minimum=0)
         duration = _number(spec.get("max_duration_s"), identity + ".max_duration_s", minimum=30)
         travel = sum(spec[key] for key in ("approach_m", "interaction_m", "recovery_m"))
         if duration < wait + travel / spec["cruise_speed_mps"] + 15:
             raise ValueError(identity + ": duration does not cover approach, interaction and recovery")
-        if family in {"FullyBlocked", "Wall"} and (
+        authored = spec.get('interaction_reconstruction',{}).get('schema') == AUTHORED_SCHEMA
+        if family in {"FullyBlocked", "Wall"} and not authored and (
                 spec["interaction_kind"] != "blocked_wait" or wait < 60 or duration < 150):
             raise ValueError(identity + ": preserve at least 60 seconds blockage and 150 seconds episode budget")
         capabilities = _strings(spec.get("required_capabilities"), identity + ".required_capabilities")
@@ -210,12 +212,20 @@ def validate_catalog(catalog):
             raise ValueError(identity + ": triggers require current-observation provenance")
         policy = spec.get("teacher_policy")
         if (not isinstance(policy, dict) or policy.get("observation_only") is not True
-                or policy.get("allow_opposite_lane") is not False
+                or not isinstance(policy.get("allow_opposite_lane"),bool)
+                or policy['allow_opposite_lane'] and (
+                    not authored or not {'opposite_left_lane','crossable_left_boundary'}.issubset(capabilities))
                 or policy.get("kind") != spec["interaction_kind"]):
             raise ValueError(identity + ": teacher must use current observations and legal driving corridors")
         if not SUCCESS_REQUIREMENTS.issubset(_strings(
                 spec.get("success_requirements"), identity + ".success_requirements")):
             raise ValueError(identity + ": incomplete executed-success requirements")
+        if 'authored_variants' in spec:
+            variants=spec['authored_variants']
+            if not isinstance(variants,dict) or set(variants)!={'Base','Generalization'}:
+                raise ValueError(identity + ': specify the two authored route variants')
+            for name in variants:
+                _authored_variant(spec,name)
     if families != set(FAMILIES):
         raise ValueError("catalog family coverage differs from the official 17-category taxonomy")
     return deepcopy(catalog)
@@ -263,80 +273,103 @@ def _map_assets(spec):
     return spec
 
 
-# Keys name actual actors in the authored catalog. Each tuple describes the
-# physical reconstruction and changes real spawn or Walker/VehicleControl input.
-# A None entry removes an actor for that variant. Unlisted actors are retained.
-# Both short demos deliberately contain a relevant interaction, even where the
-# official Base XML has an ordinary approach or an empty scenario element.
-_COLLECTION_INTERACTIONS = {
-    'BadParking': {
-        'Base': ('轿车沿路侧平行停放，车身部分占道，减速后合法绕过。',
-                 {'parked_car': dict(yaw_offset_deg=0., lateral_offset_m=-.8)}),
-        'Generalization': ('斜停的日产巡逻车突出车道，减速后留出侧向净距。',
-                           {'parked_car': dict(blueprint_candidates=['vehicle.nissan.patrol_2021'],
-                                               yaw_offset_deg=15., lateral_offset_m=-.4)}),
-    },
-    'ConstructionPedestrian': {
-        'Base': ('施工绕行时工人从右侧较远位置缓慢横穿，待其清空后通过。',
-                 {'worker': dict(lateral_offset_m=-5., speed_mps=1.15)}),
-        'Generalization': ('施工物后近侧工人横穿，绕行期间让行并确认净空。',
-                           {'worker': dict(blueprint_candidates=['walker.pedestrian.0040'],
-                                           lateral_offset_m=-3.2, speed_mps=1.5)}),
-    },
-    'ConstructionPermutations': {
-        'Base': ('锥桶及路障纵向排列，减速后在允许的邻道绕行。',
-                 {'cone_one': dict(lateral_offset_m=-.2), 'cone_two': dict(lateral_offset_m=-.2)}),
-        'Generalization': ('散开的锥桶与斜置路障形成不规则施工边界，绕过最后一个锥桶后归道。',
-                           {'barrier': dict(yaw_offset_deg=25.), 'cone_two': dict(s_offset_m=43.)}),
-    },
-    'CustomObstacles': {
-        'Base': ('散落箱体与桶侵占车道，减速、留距绕行。',
-                 {'road_debris': dict(blueprint_candidates=['static.prop.box03']),
-                  'road_barrel': dict(blueprint_candidates=['static.prop.barrel'])}),
-        'Generalization': ('园艺摆件占道，确认邻道可用后绕行。', {}),
-    },
-    'HardBrake': {
-        'Base': ('较慢前车行驶后急停且刹车灯不亮，自车减速跟停，待前车恢复后再起步。',
-                 {'lead_car': dict(s_offset_m=25., speed_mps=1.6)}),
-        'Generalization': ('前车以更高速度行驶后无灯急刹，自车跟停并恢复。',
-                           {'lead_car': dict(s_offset_m=27., speed_mps=2.2)}),
-    },
-    'RightOfWay': {
-        'Base': ('轿车从交叉支路驶入冲突区，自车按实际占用让行。', {}),
-        'Generalization': ('摩托车从交叉支路抢行，自车观察、让行并恢复。',
-                           {'crossing_vehicle': dict(blueprint_candidates=['vehicle.kawasaki.ninja'],
-                                                     speed_mps=4.)}),
-    },
-    'PassableObstacles': {
-        'Base': ('路侧锥桶仍留有本车道净空，保持车道通过。',
-                 {'edge_cone': dict(blueprint_candidates=['static.prop.trafficcone01'],
-                                    lateral_offset_m=-2.2, yaw_offset_deg=0.), 'edge_cone_two': None}),
-        'Generalization': ('路边自动售货机仍留有本车道净空，核实后保持车道通过。', {}),
-    },
-    'PedestrianOtherBlocker': {
-        'Base': ('自动售货机旁出现横穿行人，减速避让。', {}),
-        'Generalization': ('行人从路边售货亭后横穿，等待行人清空。',
-                           {'roadside_blocker': dict(blueprint_candidates=['static.prop.kiosk_01'],
-                                                     lateral_offset_m=-4.),
-                            'crossing_pedestrian': dict(blueprint_candidates=['walker.pedestrian.0027'],
-                                                        lateral_offset_m=-4.8)}),
-    },
-    'Animals': {
-        'Base': ('真实动物从较远路侧缓慢横穿，观察并让行。',
-                 {'crossing_proxy': dict(blueprint_candidates=['walker.animal.1009'],
-                                         lateral_offset_m=-5., speed_mps=1.2)}),
-        'Generalization': ('真实动物从较近路侧快速横穿，减速并确认其离开行驶区域。',
-                           {'crossing_proxy': dict(lateral_offset_m=-3.3, speed_mps=2.)}),
-    },
-    'PedestriansOnRoad': {
-        'Base': ('单个行人在机动车道内慢行，自车减速跟随。',
-                 {'walker_two': None, 'walker_three': None}),
-        'Generalization': ('三名行人在机动车道内错落行走，自车减速跟随直至道路恢复通行。',
-                           {'walker_one': dict(blueprint_candidates=['walker.pedestrian.0034'], speed_mps=2.),
-                            'walker_two': dict(blueprint_candidates=['walker.pedestrian.0007'], speed_mps=2.),
-                            'walker_three': dict(blueprint_candidates=['walker.pedestrian.0015'], speed_mps=2.)}),
-    },
-}
+def _construction_work_zone(site):
+    """Build the roadside warning and physical L-shaped closure from road stations."""
+    if (not isinstance(site,dict) or set(site)!={'station_m','advance_warning_station_m','cone_left_m','lane_warning'}
+            or type(site['lane_warning']) is not bool):
+        raise ValueError('Invalid work zone layout or missing explicit lane-warning choice')
+    station=_number(site.get('station_m'),'work-zone station',minimum=10.)
+    advance=_number(site.get('advance_warning_station_m'),'advance warning station',minimum=0.,maximum=station-5.)
+    left=_number(site.get('cone_left_m'),'construction cone row offset',minimum=0.3)
+
+    def prop(name,blueprint,s,d,yaw,z,role='blocking_obstacle'):
+        return dict(id=name,role=role,actor_type='obstacle',blueprint_candidates=['static.prop.'+blueprint],
+                    lane_offset=0,s_offset_m=s,lateral_offset_m=d,yaw_offset_deg=yaw,
+                    z_offset_m=z,speed_mps=0.,required=True)
+
+    # Relative positions and asset pivots follow the pinned construction_crash_vehicle.py.
+    props=[prop('advance_warning','warningconstruction',advance,-3.4,90.,.2,'construction_advance_warning')]
+    if site['lane_warning']:
+        props.append(prop('lane_warning','trafficwarning',station-5.,0.,270.,.03))
+    props.append(prop('worksite_debris','dirtdebris02',station+2.,0.,90.,1.))
+    for index in range(1,5):
+        props.append(prop('side_cone_'+str(index),'constructioncone',station+2.*index,left,0.,.1))
+    for index in range(1,4):
+        props.append(prop('end_cone_'+str(index),'constructioncone',station+8.,left-index,90.,.1))
+    return props
+
+
+def _authored_variant(template, variant):
+    """Resolve concrete actor placements, motion triggers and ego objectives."""
+    result=deepcopy(template)
+    variants=result.pop('authored_variants',{})
+    if not isinstance(variants,dict) or variant not in variants:
+        raise ValueError('Missing authored '+variant+' execution design for '+template['family'])
+    design=variants[variant]
+    allowed={'description','actors','cruise_speed_mps','activation_distance_m','wait_s','opposing_borrow','construction_site'}
+    if (not isinstance(design,dict) or set(design)-allowed or not isinstance(design.get('description'),str)
+        or not design['description'].strip() or not isinstance(design.get('actors'),dict)
+        or type(design.get('opposing_borrow',False)) is not bool):
+        raise ValueError('Invalid authored variant for '+template['family'])
+    result['map']='Town13'
+    if variant=='Generalization':
+        _map_assets(result)
+    result['cruise_speed_mps']=_number(design.get('cruise_speed_mps'),'authored cruise speed',minimum=.1)
+    if 'activation_distance_m' in design:
+        distance=_number(design['activation_distance_m'],'activation distance',minimum=.1)
+        result['trigger_specs'][0]['distance_m']=distance
+    if 'wait_s' in design:
+        result['wait_s']=_number(design['wait_s'],'authored waiting time',minimum=0.)
+        for trigger in result['trigger_specs']:
+            if 'duration_s' in trigger:
+                trigger['duration_s']=result['wait_s']
+    actors={a['id']:a for a in result['actor_specs']}
+    for name,changes in design['actors'].items():
+        if changes is None:
+            actors.pop(name,None)
+        elif isinstance(changes,dict) and 'id' not in changes:
+            actors.setdefault(name,{'id':name}).update(changes)
+        else:
+            raise ValueError('Invalid authored actor '+name)
+    if 'construction_site' in design:
+        site=design['construction_site']
+        for actor in _construction_work_zone(site):
+            if actor['id'] in actors:
+                raise ValueError('Duplicate construction actor '+actor['id'])
+            actors[actor['id']]=actor
+        result['construction_site_station_m']=site['station_m']
+    result['actor_specs']=list(actors.values())
+    if not actors:
+        raise ValueError('Authored scene requires a physical interaction')
+    legal=STANDARD_BLUEPRINTS|COLLECTION_BLUEPRINTS
+    ego_length=sum(result[k] for k in ('approach_m','interaction_m','recovery_m'))
+    for actor in actors.values():
+        choices=_strings(actor.get('blueprint_candidates'),actor['id']+' blueprints')
+        if (not set(choices)<=legal or actor.get('required') is not True
+                or actor.get('actor_type') not in {'obstacle','vehicle','walker','visual_proxy'}
+                or type(actor.get('lane_offset')) is not int or abs(actor['lane_offset'])>1):
+            raise ValueError('Invalid authored physical actor '+actor['id'])
+        # Oncoming traffic can start upstream of the recorded ego segment.
+        maximum=None if actor['role']=='oncoming_vehicle' else ego_length
+        _number(actor['s_offset_m'],'actor station',minimum=0.,maximum=maximum)
+        for k in ('lateral_offset_m','yaw_offset_deg','pitch_offset_deg','roll_offset_deg','z_offset_m'):
+            _number(actor.get(k,0.),'actor '+k)
+        _number(actor['speed_mps'],'actor speed',minimum=0.)
+    if design.get('opposing_borrow'):
+        vehicles=[a for a in actors.values() if a['role']=='oncoming_vehicle']
+        if (len(vehicles)!=2 or vehicles[0].get('release_time_s')!=0. or vehicles[1].get('release_on_borrow') is not True
+            or vehicles[0]['s_offset_m']>=vehicles[1]['s_offset_m']
+            or any(a['lane_offset']!=1 or a['actor_type']!='vehicle' or a['speed_mps']<=0. for a in vehicles)):
+            raise ValueError('Authored two-way borrowing needs the two ordered, independently released oncoming vehicles')
+        result['teacher_policy']['allow_opposite_lane']=True
+        result['required_capabilities']=['opposite_left_lane','crossable_left_boundary']
+    if result['interaction_kind']=='slow_lead':
+        result['required_capabilities'].append('walkable_right_exit')
+    result['interaction_reconstruction']=dict(schema=AUTHORED_SCHEMA,variant=variant,description=design['description'],
+        scope='authored_short_interaction;not_official_traffic_replay',official_scoring=False)
+    result['proxy']=dict(description=design['description'],official_visual_shift_reproduced=False,
+        limitations='基于该家族采集路线位置手工设置演员、交通和交互；正式评测使用其独立官方路线及交通。')
+    return result
 
 
 def catalog_digest(catalog):
@@ -349,10 +382,10 @@ def catalog_digest(catalog):
 def _collection_route_source(official_root,route_id,split_path=None):
     """Derive the sole location-provenance record from frozen collection XML."""
     import xml.etree.ElementTree as ET
-    from .memory_split import load_transfer_split,_digest
+    from .memory_split import ALL_FAMILIES_SPLIT,load_transfer_split,_digest
     from . import OFFICIAL_COMMIT
-    split=load_transfer_split(split_path)
-    if _digest(split)!=_digest(load_transfer_split()):
+    split=load_transfer_split(split_path or ALL_FAMILIES_SPLIT)
+    if split not in (load_transfer_split(ALL_FAMILIES_SPLIT),load_transfer_split()):
         raise ValueError('Use the configured frozen collection/test partition')
     records={r['route_id']:(row,r) for row in split['rows'] for r in row['collection']}
     if type(route_id) is not int or route_id not in records:
@@ -374,23 +407,34 @@ def _collection_route_source(official_root,route_id,split_path=None):
     if len(geometry)<2 or geometry!=[p.attrib for p in reference.findall('waypoints/position')]:
         raise ValueError('Collection location needs matching Base/Generalization sparse route geometry')
     events=reference.findall('scenarios/scenario')
+    if row['family']=='PedestrianCrowd':
+        events=[e for e in events if e.get('type')=='PedestrianCrowd']
     if len(events)!=1:
         raise ValueError('Collection-location hint needs one unambiguous original scenario anchor')
     event=events[0];trigger=event.find('trigger_point');distance=event.find('distance')
+    if row['family']=='PedestrianCrowd':
+        distance=event.find('pedestrian_center')
     if trigger is None:
         raise ValueError('Original collection scenario lacks a trigger anchor')
     xyz=[float(trigger.get(k)) for k in ('x','y','z')]
     yaw=float(trigger.get('yaw'))
-    offset=(float(distance.get('value')) if distance is not None else
-            (12. if event.get('type')=='DynamicObjectCrossing' else 0.))
+    default_offsets={'DynamicObjectCrossing':12.,'ConstructionObstacleRightLane':100.}
+    offset=float(distance.get('value')) if distance is not None else default_offsets.get(event.get('type'),0.)
     for value in [*xyz,yaw]:_number(value,'collection anchor coordinate or heading')
     _number(offset,'collection event distance',minimum=0)
-    return dict(schema='fail2drive-demo-route-source-1.0',mode='collection_route_anchor',
+    source=dict(schema='fail2drive-demo-route-source-1.0',mode='collection_route_anchor',
         official_route_id=route_id,variant=record['variant'],official_routes_path=str(path),
         routes_sha256=record['sha256'],collection_split_sha256=_digest(split),official_commit=OFFICIAL_COMMIT,
         original_scenario_types=[s.get('type') for s in route.findall('scenarios/scenario')],
         map='Town13',family=row['family'],trigger_xyz_carla_m=xyz,trigger_yaw_deg=yaw,event_offset_m=offset,
         official_scene_reproduced=False)
+    if len(split['rows'])==len(FAMILIES):
+        source.update(schema='fail2drive-demo-route-source-2.0',
+            anchor_kind={'RightOfWay':'conflicting_junction_ahead','ObscuredStop':'controlled_stop_ahead'}.get(
+                row['family'],'lane_station'),
+            anchor_scenario_type=event.get('type'),anchor_reference_sha256=paired['sha256'],
+            anchor_reference_variant='Generalization')
+    return source
 
 
 def validate_route_source(spec):
@@ -404,7 +448,9 @@ def validate_route_source(spec):
             or not isinstance(source,dict) or not isinstance(source.get('official_routes_path'),str)):
         raise ValueError('Unsupported demonstration route provenance')
     path=filesystem_path(source['official_routes_path'])
-    expected=_collection_route_source(path.parent.parent,source.get('official_route_id'))
+    from .memory_split import DEFAULT,load_transfer_split,_digest
+    old_split=DEFAULT if source.get('collection_split_sha256')==_digest(load_transfer_split(DEFAULT)) else None
+    expected=_collection_route_source(path.parent.parent,source.get('official_route_id'),old_split)
     if 'original_scenario_types' not in source:  # Legacy location-only record.
         expected.pop('original_scenario_types')
     if spec.get('family')!=expected['family'] or source!=expected:
@@ -417,28 +463,9 @@ def with_collection_route_anchor(spec,official_root,route_id,split_path=None):
     source=_collection_route_source(official_root,route_id,split_path)
     if source['family']!=spec.get('family'):
         raise ValueError('Anchor route family differs from the selected demonstration')
-    result=deepcopy(spec)
-    result.update(map='Town13',route_policy='collection_route_anchored_topology',route_source=source)
-    variant=source['variant']
-    if variant=='Generalization':
-        _map_assets(result)
-    description,changes=_COLLECTION_INTERACTIONS[spec['family']][variant]
-    actors={actor['id']:actor for actor in result['actor_specs']}
-    for identity,settings in changes.items():
-        if settings is None:
-            # The standalone Town13 design may already have removed an actor.
-            actors.pop(identity,None)
-        else:
-            actors[identity].update(settings)
-    result['actor_specs']=list(actors.values())
-    # Time the fast crossing to the approach: at cruising speed 20 m would
-    # let the animal finish crossing the ego lane before the car encounters it.
-    if variant=='Generalization' and spec['family'] in ('Animals','ConstructionPedestrian'):
-        result['trigger_specs'][0]['distance_m']=12. if spec['family']=='Animals' else 14.
-    result['interaction_reconstruction']=dict(variant=variant,description=description,
-        scope='authored_short_interaction;not_official_traffic_replay')
-    result['proxy']=dict(description=description,limitations=(
-        '按该类别编写短交互，演员布置、动态交通和时序为重建设计；'
-        '两个版本均包含可采集的交互，官方 Base 可能缺少此事件或使用不同演员。'),
-        official_visual_shift_reproduced=False)
+    result=_authored_variant(spec,source['variant'])
+    result.update(route_policy='collection_route_anchored_topology',route_source=source)
+    if spec['family']=='PedestrianCrowd':
+        result['interaction_reconstruction']['target_event']='PedestrianCrowd'
+        result['proxy']['limitations']+=' 本片段聚焦路侧人群，官方同路线的开车门伴随事件另行区分。'
     return result

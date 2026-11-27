@@ -1,11 +1,11 @@
 {
   "schema_version": "fail2drive-demonstrations-1.0",
-  "catalog_id": "independent_standard_asset_demonstrations_v1",
+  "catalog_id": "authored_town13_family_pairs_v2",
   "taxonomy_source": {
     "repository": "autonomousvision/fail2drive",
     "commit": "bceb18afb7d62e06e990739e013e750d92ad7a88",
     "file": "tools/f2d_result_parser.py",
-    "use": "category_names_only"
+    "use": "family_names;verified_collection_map_route_anchors_and_selected_assets_for_authored_pairs"
   },
   "independent_design": true,
   "official_evaluation": false,
@@ -108,7 +108,61 @@
         "interaction_completed",
         "recovery_completed",
         "arrival"
-      ]
+      ],
+      "authored_variants": {
+        "Base": {
+          "description": "临时隔离段横断整条本车道；停在封闭线前等待撤除，再平稳恢复。",
+          "cruise_speed_mps": 6.5,
+          "wait_s": 13.0,
+          "activation_distance_m": 25.0,
+          "actors": {
+            "barrier_extra_left": {
+              "role": "full_blocker",
+              "actor_type": "obstacle",
+              "blueprint_candidates": [
+                "static.prop.streetbarrier"
+              ],
+              "s_offset_m": 37.0,
+              "lateral_offset_m": 2.2,
+              "lane_offset": 0,
+              "yaw_offset_deg": 0.0,
+              "speed_mps": 0.0,
+              "required": true
+            },
+            "barrier_extra_right": {
+              "role": "full_blocker",
+              "actor_type": "obstacle",
+              "blueprint_candidates": [
+                "static.prop.streetbarrier"
+              ],
+              "s_offset_m": 37.0,
+              "lateral_offset_m": -2.2,
+              "lane_offset": 0,
+              "yaw_offset_deg": 0.0,
+              "speed_mps": 0.0,
+              "required": true
+            }
+          }
+        },
+        "Generalization": {
+          "description": "实体砖墙横断本车道，提前制动并保持停车；墙移走后确认通路开放再起步。",
+          "cruise_speed_mps": 6.0,
+          "wait_s": 16.0,
+          "activation_distance_m": 25.0,
+          "actors": {
+            "barrier_left": null,
+            "barrier_right": null,
+            "barrier_center": {
+              "blueprint_candidates": [
+                "static.prop.brickwall"
+              ],
+              "yaw_offset_deg": 90.0,
+              "roll_offset_deg": 90.0,
+              "z_offset_m": 1.5
+            }
+          }
+        }
+      }
     },
     {
       "id": "demo_fully_blocked",
@@ -178,7 +232,39 @@
         "interaction_completed",
         "recovery_completed",
         "arrival"
-      ]
+      ],
+      "authored_variants": {
+        "Base": {
+          "description": "横置货车封住道路，停车并保持安全车距，清障后恢复。",
+          "cruise_speed_mps": 6.0,
+          "wait_s": 13.0,
+          "activation_distance_m": 26.0,
+          "actors": {
+            "blocking_truck": {
+              "blueprint_candidates": [
+                "vehicle.carlamotors.carlacola"
+              ],
+              "yaw_offset_deg": 90.0,
+              "lateral_offset_m": 0.0
+            }
+          }
+        },
+        "Generalization": {
+          "description": "斜横的重型卡车完全封住车道；确认所有车轮所在通路真正清空后再行。",
+          "cruise_speed_mps": 6.5,
+          "wait_s": 15.0,
+          "activation_distance_m": 26.0,
+          "actors": {
+            "blocking_truck": {
+              "blueprint_candidates": [
+                "vehicle.carlamotors.european_hgv"
+              ],
+              "yaw_offset_deg": 105.0,
+              "lateral_offset_m": -0.25
+            }
+          }
+        }
+      }
     },
     {
       "id": "demo_pedestrians_on_road",
@@ -274,7 +360,45 @@
         "interaction_completed",
         "recovery_completed",
         "arrival"
-      ]
+      ],
+      "authored_variants": {
+        "Base": {
+          "description": "单名行人在机动车道内步行；减速跟随，观察行人退到路侧后恢复。",
+          "cruise_speed_mps": 5.8,
+          "actors": {
+            "walker_two": null,
+            "walker_three": null
+          },
+          "wait_s": 8.0,
+          "activation_distance_m": 22.0
+        },
+        "Generalization": {
+          "description": "三名行人错落占道；跟随最慢者，确认最后一人走出行驶带再恢复。",
+          "cruise_speed_mps": 5.5,
+          "actors": {
+            "walker_one": {
+              "blueprint_candidates": [
+                "walker.pedestrian.0034"
+              ],
+              "speed_mps": 2.0
+            },
+            "walker_two": {
+              "blueprint_candidates": [
+                "walker.pedestrian.0007"
+              ],
+              "speed_mps": 1.6
+            },
+            "walker_three": {
+              "blueprint_candidates": [
+                "walker.pedestrian.0015"
+              ],
+              "speed_mps": 1.8
+            }
+          },
+          "wait_s": 10.0,
+          "activation_distance_m": 23.0
+        }
+      }
     },
     {
       "id": "demo_construction_pedestrian",
@@ -369,7 +493,52 @@
         "interaction_completed",
         "recovery_completed",
         "arrival"
-      ]
+      ],
+      "authored_variants": {
+        "Base": {
+          "description": "接近路侧预警牌及L形施工区，减速从相邻车道绕过警示架、泥土和七个锥桶，给末端横穿的工人让行后归道。",
+          "cruise_speed_mps": 5.6,
+          "actors": {
+            "worker": {
+              "lateral_offset_m": -5.0,
+              "speed_mps": 1.15,
+              "s_offset_m": 48.0
+            },
+            "construction_cone": null,
+            "construction_barrier": null
+          },
+          "activation_distance_m": 15.0,
+          "construction_site": {
+            "station_m": 37.0,
+            "advance_warning_station_m": 19.0,
+            "cone_left_m": 1.45,
+            "lane_warning": true
+          }
+        },
+        "Generalization": {
+          "description": "路侧预警后出现占道警示架、泥土和七锥桶围成的L形施工区；靠近工区出口时，工人从右侧横穿绕行路线，确认工人清空后再归道。",
+          "cruise_speed_mps": 5.2,
+          "actors": {
+            "worker": {
+              "blueprint_candidates": [
+                "walker.pedestrian.0040"
+              ],
+              "lateral_offset_m": -3.2,
+              "speed_mps": 1.5,
+              "s_offset_m": 48.0
+            },
+            "construction_cone": null,
+            "construction_barrier": null
+          },
+          "activation_distance_m": 11.0,
+          "construction_site": {
+            "station_m": 37.0,
+            "advance_warning_station_m": 19.0,
+            "cone_left_m": 1.45,
+            "lane_warning": true
+          }
+        }
+      }
     },
     {
       "id": "demo_bad_parking",
@@ -435,7 +604,32 @@
         "interaction_completed",
         "recovery_completed",
         "arrival"
-      ]
+      ],
+      "authored_variants": {
+        "Base": {
+          "description": "轿车沿路侧平行停放，车身部分占道，减速后合法绕过。",
+          "cruise_speed_mps": 6.5,
+          "actors": {
+            "parked_car": {
+              "yaw_offset_deg": 0.0,
+              "lateral_offset_m": -0.8
+            }
+          }
+        },
+        "Generalization": {
+          "description": "斜停的日产巡逻车突出车道，减速后留出侧向净距。",
+          "cruise_speed_mps": 6.0,
+          "actors": {
+            "parked_car": {
+              "blueprint_candidates": [
+                "vehicle.nissan.patrol_2021"
+              ],
+              "yaw_offset_deg": 15.0,
+              "lateral_offset_m": -0.4
+            }
+          }
+        }
+      }
     },
     {
       "id": "demo_construction_permutations",
@@ -529,7 +723,99 @@
         "interaction_completed",
         "recovery_completed",
         "arrival"
-      ]
+      ],
+      "authored_variants": {
+        "Base": {
+          "description": "路侧预警牌之后有占道施工警示架、泥土和七锥桶L形围界。等第一辆对向车通过再借道绕行，发现第二辆来车后调整归道。",
+          "cruise_speed_mps": 6.0,
+          "actors": {
+            "cone_one": null,
+            "cone_two": null,
+            "oncoming_first": {
+              "role": "oncoming_vehicle",
+              "actor_type": "vehicle",
+              "blueprint_candidates": [
+                "vehicle.audi.a2"
+              ],
+              "s_offset_m": 51.0,
+              "lateral_offset_m": 0.0,
+              "lane_offset": 1,
+              "yaw_offset_deg": 0.0,
+              "speed_mps": 5.5,
+              "required": true,
+              "release_time_s": 0.0
+            },
+            "oncoming_second": {
+              "role": "oncoming_vehicle",
+              "actor_type": "vehicle",
+              "blueprint_candidates": [
+                "vehicle.tesla.model3"
+              ],
+              "s_offset_m": 154.0,
+              "lateral_offset_m": 0.0,
+              "lane_offset": 1,
+              "yaw_offset_deg": 0.0,
+              "speed_mps": 5.5,
+              "required": true,
+              "release_on_borrow": true
+            },
+            "barrier": null
+          },
+          "opposing_borrow": true,
+          "activation_distance_m": 24.0,
+          "construction_site": {
+            "station_m": 37.0,
+            "advance_warning_station_m": 19.0,
+            "cone_left_m": 1.45,
+            "lane_warning": true
+          }
+        },
+        "Generalization": {
+          "description": "工区保留路侧预警牌、泥土和七锥桶L形围界，缺少车道内的前置警示架。等第一辆对向车通过再借道绕行，发现第二辆来车后调整归道。",
+          "cruise_speed_mps": 5.5,
+          "actors": {
+            "barrier": null,
+            "cone_two": null,
+            "oncoming_first": {
+              "role": "oncoming_vehicle",
+              "actor_type": "vehicle",
+              "blueprint_candidates": [
+                "vehicle.audi.a2"
+              ],
+              "s_offset_m": 51.0,
+              "lateral_offset_m": 0.0,
+              "lane_offset": 1,
+              "yaw_offset_deg": 0.0,
+              "speed_mps": 6.0,
+              "required": true,
+              "release_time_s": 0.0
+            },
+            "oncoming_second": {
+              "role": "oncoming_vehicle",
+              "actor_type": "vehicle",
+              "blueprint_candidates": [
+                "vehicle.tesla.model3"
+              ],
+              "s_offset_m": 140.0,
+              "lateral_offset_m": 0.0,
+              "lane_offset": 1,
+              "yaw_offset_deg": 0.0,
+              "speed_mps": 5.5,
+              "required": true,
+              "release_on_borrow": true
+            },
+            "cone_one": null
+          },
+          "opposing_borrow": true,
+          "activation_distance_m": 24.0,
+          "construction_site": {
+            "station_m": 37.0,
+            "advance_warning_station_m": 19.0,
+            "cone_left_m": 1.45,
+            "lane_warning": false
+          }
+        }
+      }
     },
     {
       "id": "demo_custom_obstacles",
@@ -611,7 +897,223 @@
         "interaction_completed",
         "recovery_completed",
         "arrival"
-      ]
+      ],
+      "authored_variants": {
+        "Base": {
+          "description": "遇到车道内的箱体和桶，观察第一辆对向车并停车让行；来车通过后跨虚线借道，绕清末件物体，再依据第二辆远处来车调整归道。",
+          "cruise_speed_mps": 6.0,
+          "actors": {
+            "road_debris": {
+              "blueprint_candidates": [
+                "static.prop.box03"
+              ]
+            },
+            "road_barrel": {
+              "blueprint_candidates": [
+                "static.prop.barrel"
+              ]
+            },
+            "oncoming_first": {
+              "role": "oncoming_vehicle",
+              "actor_type": "vehicle",
+              "blueprint_candidates": [
+                "vehicle.audi.a2"
+              ],
+              "s_offset_m": 46.0,
+              "lateral_offset_m": 0.0,
+              "lane_offset": 1,
+              "yaw_offset_deg": 0.0,
+              "speed_mps": 5.5,
+              "required": true,
+              "release_time_s": 0.0
+            },
+            "oncoming_second": {
+              "role": "oncoming_vehicle",
+              "actor_type": "vehicle",
+              "blueprint_candidates": [
+                "vehicle.tesla.model3"
+              ],
+              "s_offset_m": 135.0,
+              "lateral_offset_m": 0.0,
+              "lane_offset": 1,
+              "yaw_offset_deg": 0.0,
+              "speed_mps": 5.5,
+              "required": true,
+              "release_on_borrow": true
+            }
+          },
+          "opposing_borrow": true,
+          "activation_distance_m": 24.0
+        },
+        "Generalization": {
+          "description": "遇到车道内呈三角形密集摆放的十个园艺摆件，观察第一辆对向车并停车让行；来车通过后跨虚线借道，绕清末件物体，再依据第二辆远处来车调整归道。",
+          "cruise_speed_mps": 5.8,
+          "actors": {
+            "oncoming_first": {
+              "role": "oncoming_vehicle",
+              "actor_type": "vehicle",
+              "blueprint_candidates": [
+                "vehicle.audi.a2"
+              ],
+              "s_offset_m": 44.2,
+              "lateral_offset_m": 0.0,
+              "lane_offset": 1,
+              "yaw_offset_deg": 0.0,
+              "speed_mps": 6.0,
+              "required": true,
+              "release_time_s": 0.0
+            },
+            "oncoming_second": {
+              "role": "oncoming_vehicle",
+              "actor_type": "vehicle",
+              "blueprint_candidates": [
+                "vehicle.tesla.model3"
+              ],
+              "s_offset_m": 133.2,
+              "lateral_offset_m": 0.0,
+              "lane_offset": 1,
+              "yaw_offset_deg": 0.0,
+              "speed_mps": 5.5,
+              "required": true,
+              "release_on_borrow": true
+            },
+            "road_debris": null,
+            "road_barrel": null,
+            "gnome_01": {
+              "role": "blocking_obstacle",
+              "actor_type": "obstacle",
+              "blueprint_candidates": [
+                "static.prop.gnome"
+              ],
+              "s_offset_m": 37.0,
+              "lateral_offset_m": 0,
+              "lane_offset": 0,
+              "yaw_offset_deg": 90.0,
+              "speed_mps": 0.0,
+              "required": true
+            },
+            "gnome_02": {
+              "role": "blocking_obstacle",
+              "actor_type": "obstacle",
+              "blueprint_candidates": [
+                "static.prop.gnome"
+              ],
+              "s_offset_m": 37.4,
+              "lateral_offset_m": 0.2,
+              "lane_offset": 0,
+              "yaw_offset_deg": 90.0,
+              "speed_mps": 0.0,
+              "required": true
+            },
+            "gnome_03": {
+              "role": "blocking_obstacle",
+              "actor_type": "obstacle",
+              "blueprint_candidates": [
+                "static.prop.gnome"
+              ],
+              "s_offset_m": 37.4,
+              "lateral_offset_m": -0.2,
+              "lane_offset": 0,
+              "yaw_offset_deg": 90.0,
+              "speed_mps": 0.0,
+              "required": true
+            },
+            "gnome_04": {
+              "role": "blocking_obstacle",
+              "actor_type": "obstacle",
+              "blueprint_candidates": [
+                "static.prop.gnome"
+              ],
+              "s_offset_m": 37.8,
+              "lateral_offset_m": 0,
+              "lane_offset": 0,
+              "yaw_offset_deg": 90.0,
+              "speed_mps": 0.0,
+              "required": true
+            },
+            "gnome_05": {
+              "role": "blocking_obstacle",
+              "actor_type": "obstacle",
+              "blueprint_candidates": [
+                "static.prop.gnome"
+              ],
+              "s_offset_m": 37.8,
+              "lateral_offset_m": 0.4,
+              "lane_offset": 0,
+              "yaw_offset_deg": 90.0,
+              "speed_mps": 0.0,
+              "required": true
+            },
+            "gnome_06": {
+              "role": "blocking_obstacle",
+              "actor_type": "obstacle",
+              "blueprint_candidates": [
+                "static.prop.gnome"
+              ],
+              "s_offset_m": 37.8,
+              "lateral_offset_m": -0.4,
+              "lane_offset": 0,
+              "yaw_offset_deg": 90.0,
+              "speed_mps": 0.0,
+              "required": true
+            },
+            "gnome_07": {
+              "role": "blocking_obstacle",
+              "actor_type": "obstacle",
+              "blueprint_candidates": [
+                "static.prop.gnome"
+              ],
+              "s_offset_m": 38.2,
+              "lateral_offset_m": 0.2,
+              "lane_offset": 0,
+              "yaw_offset_deg": 90.0,
+              "speed_mps": 0.0,
+              "required": true
+            },
+            "gnome_08": {
+              "role": "blocking_obstacle",
+              "actor_type": "obstacle",
+              "blueprint_candidates": [
+                "static.prop.gnome"
+              ],
+              "s_offset_m": 38.2,
+              "lateral_offset_m": -0.2,
+              "lane_offset": 0,
+              "yaw_offset_deg": 90.0,
+              "speed_mps": 0.0,
+              "required": true
+            },
+            "gnome_09": {
+              "role": "blocking_obstacle",
+              "actor_type": "obstacle",
+              "blueprint_candidates": [
+                "static.prop.gnome"
+              ],
+              "s_offset_m": 38.2,
+              "lateral_offset_m": -0.6,
+              "lane_offset": 0,
+              "yaw_offset_deg": 90.0,
+              "speed_mps": 0.0,
+              "required": true
+            },
+            "gnome_10": {
+              "role": "blocking_obstacle",
+              "actor_type": "obstacle",
+              "blueprint_candidates": [
+                "static.prop.gnome"
+              ],
+              "s_offset_m": 38.2,
+              "lateral_offset_m": 0.6,
+              "lane_offset": 0,
+              "yaw_offset_deg": 90.0,
+              "speed_mps": 0.0,
+              "required": true
+            }
+          },
+          "opposing_borrow": true,
+          "activation_distance_m": 24.0
+        }
+      }
     },
     {
       "id": "demo_obscured_stop",
@@ -675,7 +1177,33 @@
         "interaction_completed",
         "recovery_completed",
         "arrival"
-      ]
+      ],
+      "authored_variants": {
+        "Base": {
+          "description": "临近真实停车牌，路侧小物遮挡部分观察角度；遵从本车道路权规则停车、观察后通行。",
+          "cruise_speed_mps": 6.2,
+          "actors": {
+            "stop_occluder": {
+              "blueprint_candidates": [
+                "static.prop.barrel"
+              ]
+            }
+          }
+        },
+        "Generalization": {
+          "description": "停车牌旁的雪片遮挡标志外观，沿实际受控车道接近，停稳后再通过。",
+          "cruise_speed_mps": 5.5,
+          "actors": {
+            "stop_occluder": {
+              "blueprint_candidates": [
+                "static.prop.snow"
+              ],
+              "roll_offset_deg": 90.0,
+              "z_offset_m": 1.6
+            }
+          }
+        }
+      }
     },
     {
       "id": "demo_hard_brake",
@@ -744,7 +1272,35 @@
         "interaction_completed",
         "recovery_completed",
         "arrival"
-      ]
+      ],
+      "authored_variants": {
+        "Base": {
+          "description": "有灯前车先行、急刹并保持停车；自车留出跟停距离，确认前车起步后跟随。",
+          "cruise_speed_mps": 7.0,
+          "actors": {
+            "lead_car": {
+              "s_offset_m": 23.0,
+              "speed_mps": 3.5,
+              "brake_lights_on": true
+            }
+          },
+          "activation_distance_m": 16.0,
+          "wait_s": 4.0
+        },
+        "Generalization": {
+          "description": "更快的前车急刹，刹车灯不亮；根据实测相对速度跟停并恢复。",
+          "cruise_speed_mps": 7.5,
+          "actors": {
+            "lead_car": {
+              "s_offset_m": 26.0,
+              "speed_mps": 4.0,
+              "brake_lights_on": false
+            }
+          },
+          "activation_distance_m": 17.0,
+          "wait_s": 5.0
+        }
+      }
     },
     {
       "id": "demo_right_of_way",
@@ -807,7 +1363,26 @@
         "interaction_completed",
         "recovery_completed",
         "arrival"
-      ]
+      ],
+      "authored_variants": {
+        "Base": {
+          "description": "轿车从交叉支路驶入冲突区，自车按实际占用让行。",
+          "cruise_speed_mps": 6.0,
+          "actors": {}
+        },
+        "Generalization": {
+          "description": "摩托车从交叉支路抢行，自车观察、让行并恢复。",
+          "cruise_speed_mps": 5.5,
+          "actors": {
+            "crossing_vehicle": {
+              "blueprint_candidates": [
+                "vehicle.kawasaki.ninja"
+              ],
+              "speed_mps": 4.0
+            }
+          }
+        }
+      }
     },
     {
       "id": "demo_animals",
@@ -874,7 +1449,34 @@
         "interaction_completed",
         "recovery_completed",
         "arrival"
-      ]
+      ],
+      "authored_variants": {
+        "Base": {
+          "description": "真实动物从较远路侧缓慢横穿，观察并让行。",
+          "cruise_speed_mps": 5.7,
+          "actors": {
+            "crossing_proxy": {
+              "blueprint_candidates": [
+                "walker.animal.1009"
+              ],
+              "lateral_offset_m": -5.0,
+              "speed_mps": 1.2
+            }
+          },
+          "activation_distance_m": 17.0
+        },
+        "Generalization": {
+          "description": "真实动物从较近路侧快速横穿，减速并确认其离开行驶区域。",
+          "cruise_speed_mps": 5.2,
+          "actors": {
+            "crossing_proxy": {
+              "lateral_offset_m": -3.3,
+              "speed_mps": 2.0
+            }
+          },
+          "activation_distance_m": 13.0
+        }
+      }
     },
     {
       "id": "demo_pedestrian_other_blocker",
@@ -953,7 +1555,34 @@
         "interaction_completed",
         "recovery_completed",
         "arrival"
-      ]
+      ],
+      "authored_variants": {
+        "Base": {
+          "description": "自动售货机旁出现横穿行人，减速避让。",
+          "cruise_speed_mps": 5.6,
+          "actors": {},
+          "activation_distance_m": 19.0
+        },
+        "Generalization": {
+          "description": "行人从路边售货亭后横穿，等待行人清空。",
+          "cruise_speed_mps": 5.2,
+          "actors": {
+            "roadside_blocker": {
+              "blueprint_candidates": [
+                "static.prop.kiosk_01"
+              ],
+              "lateral_offset_m": -4.0
+            },
+            "crossing_pedestrian": {
+              "blueprint_candidates": [
+                "walker.pedestrian.0027"
+              ],
+              "lateral_offset_m": -4.8
+            }
+          },
+          "activation_distance_m": 16.0
+        }
+      }
     },
     {
       "id": "demo_right_construction",
@@ -1031,7 +1660,42 @@
         "interaction_completed",
         "recovery_completed",
         "arrival"
-      ]
+      ],
+      "authored_variants": {
+        "Base": {
+          "description": "施工锥桶和隔离段占据右侧相邻车道，留在本车道正常通行。",
+          "cruise_speed_mps": 6.8,
+          "actors": {
+            "right_barrier": {
+              "s_offset_m": 40.0,
+              "yaw_offset_deg": 0.0
+            }
+          }
+        },
+        "Generalization": {
+          "description": "右侧相邻车道中的封闭区更长，道具交错靠近分道线；观察净距，避免无故并道。",
+          "cruise_speed_mps": 6.2,
+          "actors": {
+            "right_barrier": {
+              "s_offset_m": 42.0,
+              "yaw_offset_deg": 15.0
+            },
+            "right_tail_cone": {
+              "role": "adjacent_construction",
+              "actor_type": "obstacle",
+              "blueprint_candidates": [
+                "static.prop.trafficcone01"
+              ],
+              "s_offset_m": 46.0,
+              "lateral_offset_m": 0.45,
+              "lane_offset": -1,
+              "yaw_offset_deg": 0.0,
+              "speed_mps": 0.0,
+              "required": true
+            }
+          }
+        }
+      }
     },
     {
       "id": "demo_opposite_construction",
@@ -1109,7 +1773,42 @@
         "interaction_completed",
         "recovery_completed",
         "arrival"
-      ]
+      ],
+      "authored_variants": {
+        "Base": {
+          "description": "施工锥桶和隔离段占据对向车道，留在本车道正常通行。",
+          "cruise_speed_mps": 7.0,
+          "actors": {
+            "opposite_barrier": {
+              "s_offset_m": 40.0,
+              "yaw_offset_deg": 0.0
+            }
+          }
+        },
+        "Generalization": {
+          "description": "对向车道中的封闭区更长，道具交错靠近分道线；观察净距，避免无故并道。",
+          "cruise_speed_mps": 6.5,
+          "actors": {
+            "opposite_barrier": {
+              "s_offset_m": 42.0,
+              "yaw_offset_deg": 15.0
+            },
+            "opposite_tail_cone": {
+              "role": "adjacent_construction",
+              "actor_type": "obstacle",
+              "blueprint_candidates": [
+                "static.prop.trafficcone01"
+              ],
+              "s_offset_m": 46.0,
+              "lateral_offset_m": 0.45,
+              "lane_offset": 1,
+              "yaw_offset_deg": 0.0,
+              "speed_mps": 0.0,
+              "required": true
+            }
+          }
+        }
+      }
     },
     {
       "id": "demo_image_on_object",
@@ -1173,7 +1872,50 @@
         "interaction_completed",
         "recovery_completed",
         "arrival"
-      ]
+      ],
+      "authored_variants": {
+        "Base": {
+          "description": "路侧公交站台可见，本车道畅通；沿原路线通过。",
+          "cruise_speed_mps": 6.8,
+          "actors": {
+            "visual_distractor": {
+              "blueprint_candidates": [
+                "static.prop.busstop"
+              ],
+              "yaw_offset_deg": 180.0,
+              "lateral_offset_m": -4.8
+            }
+          }
+        },
+        "Generalization": {
+          "description": "公交站上展示交通信号灯图像；区分画面与真实路口信号，保持本车道通行。",
+          "cruise_speed_mps": 6.5,
+          "actors": {
+            "visual_distractor": {
+              "blueprint_candidates": [
+                "static.prop.busstop"
+              ],
+              "yaw_offset_deg": 180.0,
+              "lateral_offset_m": -4.8
+            },
+            "signal_image": {
+              "role": "roadside_visual_distractor",
+              "actor_type": "visual_proxy",
+              "blueprint_candidates": [
+                "static.prop.ampel"
+              ],
+              "s_offset_m": 34.95,
+              "lateral_offset_m": -5.05,
+              "lane_offset": 0,
+              "yaw_offset_deg": 90.0,
+              "speed_mps": 0.0,
+              "required": true,
+              "roll_offset_deg": 90.0,
+              "z_offset_m": 1.55
+            }
+          }
+        }
+      }
     },
     {
       "id": "demo_passable_obstacles",
@@ -1253,7 +1995,28 @@
         "interaction_completed",
         "recovery_completed",
         "arrival"
-      ]
+      ],
+      "authored_variants": {
+        "Base": {
+          "description": "路侧锥桶仍留有本车道净空，保持车道通过。",
+          "cruise_speed_mps": 6.8,
+          "actors": {
+            "edge_cone": {
+              "blueprint_candidates": [
+                "static.prop.trafficcone01"
+              ],
+              "lateral_offset_m": -2.2,
+              "yaw_offset_deg": 0.0
+            },
+            "edge_cone_two": null
+          }
+        },
+        "Generalization": {
+          "description": "路边自动售货机仍留有本车道净空，核实后保持车道通过。",
+          "cruise_speed_mps": 6.2,
+          "actors": {}
+        }
+      }
     },
     {
       "id": "demo_pedestrian_crowd",
@@ -1345,7 +2108,59 @@
         "interaction_completed",
         "recovery_completed",
         "arrival"
-      ]
+      ],
+      "authored_variants": {
+        "Base": {
+          "description": "路侧三人驻足，不进入本车道；适度减速并保持行驶。",
+          "cruise_speed_mps": 6.0,
+          "actors": {}
+        },
+        "Generalization": {
+          "description": "多名行人分布在右侧人行道，观察临路者动向、留有余量后通过。",
+          "cruise_speed_mps": 5.4,
+          "actors": {
+            "crowd_four": {
+              "role": "roadside_crowd",
+              "actor_type": "walker",
+              "blueprint_candidates": [
+                "walker.pedestrian.0040"
+              ],
+              "s_offset_m": 43.0,
+              "lateral_offset_m": -4.0,
+              "lane_offset": 0,
+              "yaw_offset_deg": 0.0,
+              "speed_mps": 0.0,
+              "required": true
+            },
+            "crowd_five": {
+              "role": "roadside_crowd",
+              "actor_type": "walker",
+              "blueprint_candidates": [
+                "walker.pedestrian.0015"
+              ],
+              "s_offset_m": 45.0,
+              "lateral_offset_m": -4.5,
+              "lane_offset": 0,
+              "yaw_offset_deg": 0.0,
+              "speed_mps": 0.0,
+              "required": true
+            },
+            "crowd_six": {
+              "role": "roadside_crowd",
+              "actor_type": "walker",
+              "blueprint_candidates": [
+                "walker.pedestrian.0034"
+              ],
+              "s_offset_m": 47.0,
+              "lateral_offset_m": -4.0,
+              "lane_offset": 0,
+              "yaw_offset_deg": 0.0,
+              "speed_mps": 0.0,
+              "required": true
+            }
+          }
+        }
+      }
     }
   ]
 }

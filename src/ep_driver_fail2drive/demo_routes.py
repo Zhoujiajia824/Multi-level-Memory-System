@@ -62,6 +62,41 @@ def _driving_neighbor(wp, side, same_direction=True):
     return other
 
 
+def _bypass_lane(wp, opposing, returning=False):
+    if not opposing:
+        other=left_neighbor(wp)
+        return other if other is not None and (not returning or _return_allowed(other)) else None
+    other=_driving_neighbor(wp,'left',same_direction=False)
+    if other is None or wp.is_junction or other.is_junction:return None
+    # In opposite directions the adjoining face is the left marking on BOTH
+    # lanes. CARLA LaneChange.NONE is common for broken opposing dividers.
+    markings=(wp.left_lane_marking,other.left_lane_marking)
+    if not all(str(m.type).split('.')[-1].lower() in ('broken','brokenbroken') for m in markings):return None
+    return other
+
+
+def oncoming_drive_path(waypoints, station):
+    """Actual opposite lane, in its own direction, from this actor's spawn to behind the ego."""
+    length=_stations(waypoints)[-1]
+    if station>length:
+        tail=chain(waypoints[-1],station-length+1.)
+        if not tail:return None
+        waypoints=[*waypoints,*tail[1:]]
+    start=station_waypoint(waypoints,station)
+    index=waypoints.index(start)
+    if index<2:return None
+    result=[]
+    for wp in reversed(waypoints[:index+1]):
+        other=_driving_neighbor(wp,'left',same_direction=False)
+        if other is None or other.is_junction:return None
+        if result and result[-1].transform.location.distance(other.transform.location)>2.5:return None
+        result.append(other)
+    # Continue in the actual opposing direction past the ego spawn. A car
+    # stopping at ego s=3 can still have its rear beside a near-start waiting ego.
+    tail=chain(result[-1],12.)
+    return result+tail[1:] if tail else None
+
+
 def _right_sidewalk(wp):
     """Traverse public right-side lanes without inventing a sidewalk."""
     seen = {lane_key(wp)}
@@ -73,6 +108,27 @@ def _right_sidewalk(wp):
         if str(wp.lane_type).split('.')[-1] == 'Sidewalk':
             return wp
     return None
+
+
+def right_walking_exit(wp):
+    """A walker can immediately leave its travel lane without traversing another driving lane."""
+    other=wp.get_right_lane()
+    if (other is not None and str(other.lane_type).split('.')[-1] in ('Shoulder','Sidewalk')
+            and other.lane_width>=1. and abs(other.transform.location.z-wp.transform.location.z)<.65):
+        return other
+    return None
+
+
+def crossing_lights(lights,ego_path,cross_path):
+    def matches(stops,path):
+        return any(lane_key(s)==lane_key(p) and s.transform.location.distance(p.transform.location)<6.
+                   for s in stops for p in path)
+    main=[];cross=[]
+    for light in lights:
+        stops=list(light.get_stop_waypoints())
+        if matches(stops,ego_path):main.append(light)
+        if matches(stops,cross_path):cross.append(light)
+    return main,cross
 
 
 def _stations(waypoints):
@@ -212,7 +268,7 @@ def _start_clear(start, actors):
     return True
 
 
-def _anchor_candidates(road_map,locations,source,hazard_station):
+def _anchor_candidates(road_map,locations,source,hazard_station,signs=()):
     """Stay on the actual collection lane; never search a remote substitute site."""
     if not locations:raise RuntimeError('Map has no public spawn-point location type for anchor lookup')
     try:
@@ -229,6 +285,20 @@ def _anchor_candidates(road_map,locations,source,hazard_station):
     reference=[origin] if distance==0. else list(origin.next(distance))
     if len(reference)!=1:raise NoSuitableSite('Original collection anchor has no unambiguous connected forward interaction segment')
     event=reference[0]
+    kind=source.get('anchor_kind')
+    if kind in ('controlled_stop_ahead','conflicting_junction_ahead'):
+        forward=chain(event,100.) or chain(event,60.) or chain(event,35.)
+        if not forward:raise NoSuitableSite('No connected ahead segment for the referenced public event')
+        if kind=='controlled_stop_ahead':
+            event=next((wp for wp in forward if any(_stop_controls_route(sign,[wp]) for sign in signs)),None)
+        else:
+            event=None
+            for wp,station in zip(forward,_stations(forward)):
+                if wp.is_junction:
+                    crossing=crossing_drive_path(forward,station)
+                    if crossing:
+                        event=station_waypoint(forward,crossing[1]);break
+        if event is None:raise NoSuitableSite('Referenced lane lacks its required forward stop control or crossing')
     starts=list(event.previous(float(hazard_station)))
     return starts,event
 
@@ -257,8 +327,11 @@ def _spawn_candidates(road_map, poses):
 
 def _bypass_stations(spec):
     stations = [float(actor['s_offset_m']) for actor in spec['actor_specs']
-                if actor.get('lane_offset', 0) == 0]
+                if actor.get('lane_offset', 0) == 0 and actor.get('role') not in
+                ('construction_advance_warning','oncoming_vehicle','crossing_actor')]
     first, last = min(stations), max(stations)
+    if spec.get('teacher_policy',{}).get('allow_opposite_lane') is True:
+        return max(1.,first-28.),first-8.,last+9.,last+29.
     return max(1., first-20.), first-8., last+10., last+25.
 
 
@@ -282,7 +355,7 @@ def select_route(world, spec, *, near_xyz=None, rejected_crossing_xyz=None):
         if wp.is_junction and not allow_junction:
             return False
         if bypass or 'crossable_left_boundary' in capabilities:
-            if left_neighbor(wp) is None:
+            if _bypass_lane(wp,opposing) is None:
                 return False
         elif 'same_direction_left_lane' in capabilities and _driving_neighbor(wp, 'left') is None:
             return False
@@ -294,20 +367,22 @@ def select_route(world, spec, *, near_xyz=None, rejected_crossing_xyz=None):
 
     actors = list(world.get_actors())
     signs = [actor for actor in actors if actor.type_id.startswith('traffic.stop')]
-    actor_stations = [float(actor['s_offset_m']) for actor in spec['actor_specs']]
-    hazard_station = min(actor_stations)
+    opposing=spec.get('teacher_policy',{}).get('allow_opposite_lane') is True
+    actor_stations = [float(actor['s_offset_m']) for actor in spec['actor_specs'] if actor['role']!='oncoming_vehicle']
+    oncoming_stations=[float(a['s_offset_m']) for a in spec['actor_specs'] if a['role']=='oncoming_vehicle']
+    hazard_station = float(spec.get('construction_site_station_m',min(actor_stations)))
     if bypass:
         change_start, _, return_start, return_end = _bypass_stations(spec)
     # The complete return ends at last actor +25m in teaching_path. Screening
     # only the approach would return an unusable first candidate and prevent
     # searching later sites that really support the whole maneuver.
     end_station = max(float(spec['approach_m'])+float(spec['interaction_m']),
-                      max(actor_stations)+25. if bypass else 0.)
+                      return_end if bypass else 0.)
     from .demo_catalog import validate_route_source
     source=validate_route_source(spec)
     event=None
     if source is not None:
-        candidates,event=_anchor_candidates(road_map,locations,source,hazard_station)
+        candidates,event=_anchor_candidates(road_map,locations,source,hazard_station,signs)
     else:
         candidates = _spawn_candidates(road_map, locations)
     for start in candidates:
@@ -331,6 +406,7 @@ def select_route(world, spec, *, near_xyz=None, rejected_crossing_xyz=None):
         if end_index is None:
             continue
         waypoints = examined[:end_index+1]
+        if any(not oncoming_drive_path(waypoints,s) for s in oncoming_stations):continue
         if event is not None and not _same_anchor_station(waypoints,hazard_station,event):
             continue
         if rejected_crossing_xyz is not None:
@@ -344,6 +420,11 @@ def select_route(world, spec, *, near_xyz=None, rejected_crossing_xyz=None):
         if any(str(wp.lane_type).split('.')[-1] != 'Driving'
                or (wp.is_junction and not allow_junction) for wp in examined):
             continue
+        if spec.get('interaction_reconstruction',{}).get('schema')=='fail2drive-authored-interaction-2.0':
+            # Allow the vehicle to spawn, travel, and clear the finish with its
+            # actual body before selecting a lane that only widens further ahead.
+            rear=list(start.previous(3.))
+            if min(wp.lane_width for wp in [*examined,*rear])<2.6:continue
         active = [wp for wp, station in zip(waypoints, stations)
                   if (change_start <= station < return_end if bypass else 8. <= station <= end_station+1.)]
         if any(abs(wrap(math.radians(b.transform.rotation.yaw-a.transform.rotation.yaw))) > .12
@@ -355,15 +436,22 @@ def select_route(world, spec, *, near_xyz=None, rejected_crossing_xyz=None):
             continue
         if not all(usable_section(wp) for wp in active):
             continue
-        if bypass and any(not _return_allowed(left_neighbor(wp))
+        if bypass and any(_bypass_lane(wp,opposing,returning=True) is None
                           for wp, s in zip(waypoints, stations)
-                          if return_start < s < return_start+15.):
+                          if return_start < s < return_end):
+            continue
+        if 'walkable_right_exit' in capabilities and not all(right_walking_exit(station_waypoint(
+                waypoints,a['s_offset_m']+a['speed_mps']*spec['wait_s'])) is not None
+                for a in spec['actor_specs'] if a['role']=='slow_lead'):
             continue
         if 'conflicting_junction' in capabilities:
             if not _conflicting_branch(waypoints, target_station=hazard_station):
                 continue
-            if crossing_drive_path(waypoints, hazard_station) is None:
+            crossing=crossing_drive_path(waypoints,hazard_station)
+            if crossing is None:
                 continue
+            main,cross=crossing_lights([a for a in actors if a.type_id=='traffic.traffic_light'],waypoints,crossing[0])
+            if bool(main)!=bool(cross) or {a.id for a in main}&{a.id for a in cross}:continue
         if 'real_stop_sign' in capabilities and not any(_stop_controls_route(
                 sign, waypoints, target_station=hazard_station) for sign in signs):
             continue
@@ -400,7 +488,8 @@ def select_demonstration_site(world, spec, *, allow_similar_road=False, unusable
         waypoints = select_route(world, local_spec, near_xyz=source['trigger_xyz_carla_m'],
                                  rejected_crossing_xyz=rejected_xyz)
         mode = 'same_map_similar_road'
-    station = min(float(actor['s_offset_m']) for actor in spec['actor_specs'])
+    station = float(spec.get('construction_site_station_m',min(float(actor['s_offset_m'])
+                    for actor in spec['actor_specs'] if actor['role'] not in ('oncoming_vehicle','construction_advance_warning'))))
     event = station_waypoint(waypoints, station)
     position = event.transform.location
     return waypoints, dict(
@@ -410,12 +499,16 @@ def select_demonstration_site(world, spec, *, allow_similar_road=False, unusable
         site_lane_yaw_deg=event.transform.rotation.yaw)
 
 
-def teaching_path(waypoints, spec):
+def teaching_path(waypoints, spec, *, early_return=False):
     """Full smooth lane change and return, legal site verified before use."""
     route = [xy(wp.transform.location) for wp in waypoints]
     if spec['interaction_kind'] not in ('parked_bypass', 'construction_bypass', 'construction_crossing'):
         return route
     change_start, change_end, return_start, return_end = _bypass_stations(spec)
+    opposing=spec.get('teacher_policy',{}).get('allow_opposite_lane') is True
+    if early_return:
+        if not opposing:raise ValueError('Early return is only defined for the authored opposing-lane bypass')
+        return_start-=3.;return_end-=3.
     result, arc = [], 0.
     for i, wp in enumerate(waypoints):
         if i:
@@ -425,8 +518,8 @@ def teaching_path(waypoints, spec):
             return 10*t**3-15*t**4+6*t**5
         amount = smooth((arc-change_start)/(change_end-change_start))*(1-smooth((arc-return_start)/(return_end-return_start)))
         if amount > 1e-9:
-            adjacent = left_neighbor(wp)
-            if wp.is_junction or adjacent is None or (arc > return_start and not _return_allowed(adjacent)):
+            adjacent = _bypass_lane(wp,opposing,returning=arc>return_start)
+            if wp.is_junction or adjacent is None:
                 raise RuntimeError('Teaching path would cross an unverified lane boundary')
             target = xy(adjacent.transform.location)
             result.append([route[i][j]+amount*(target[j]-route[i][j]) for j in (0, 1)])

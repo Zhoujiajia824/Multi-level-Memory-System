@@ -1,4 +1,4 @@
-"""Collect or resume independent teaching reconstructions for development."""
+"""Collect authored short driving interactions, one Base/Generalization family pair at a time."""
 import argparse
 from contextlib import contextmanager
 import hashlib
@@ -12,8 +12,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 
-from ep_driver_fail2drive.demo_catalog import capture_implementation, get_demonstration, load_catalog, with_collection_route_anchor
-from ep_driver_fail2drive.memory_split import load_transfer_split, validate_transfer_source
+from ep_driver_fail2drive.demo_catalog import FAMILIES, capture_implementation, get_demonstration, load_catalog, with_collection_route_anchor
+from ep_driver_fail2drive.memory_split import ALL_FAMILIES_SPLIT, load_transfer_split, validate_transfer_source
 from nine_grid.paths import filesystem_path
 
 
@@ -36,8 +36,8 @@ def read_json(path):
     return json.loads(path.read_text(encoding='utf-8-sig'))
 
 
-def build_plan(source, similar):
-    split = load_transfer_split()
+def build_plan(source, similar, split_path=None):
+    split = load_transfer_split(split_path or ALL_FAMILIES_SPLIT)
     verified = validate_transfer_source(split, source)
     catalog = load_catalog()
     routes = {}
@@ -50,8 +50,8 @@ def build_plan(source, similar):
             routes[f'{rid:04d}'] = dict(family=row['family'], variant=record['variant'],
                                         description=spec['interaction_reconstruction']['description'],
                                         spec_sha256=digest(spec))
-    if len(routes) != 20 or len(split['rows']) != 10:
-        raise ValueError('Expected the frozen ten-family, twenty-demonstration collection')
+    if len(routes) != 2*len(split['rows']):
+        raise ValueError('Each family needs its two frozen collection references')
     return dict(schema='fail2drive-interaction-batch-1', split_sha256=verified['split_sha256'],
                 implementation_sha256=capture_implementation(), allow_similar_road=similar,
                 seed=split['collection_seed'], routes=routes)
@@ -218,7 +218,11 @@ def main(argv=None):
     parser.add_argument('--fail2drive-root', required=True)
     parser.add_argument('--output-dir', required=True, help='Dedicated resumable batch under this branch output/')
     parser.add_argument('--worker-python')
-    parser.add_argument('--route-ids', nargs='+', type=int, help='One or more frozen collection IDs, default all twenty')
+    parser.add_argument('--collection-split', default=str(ALL_FAMILIES_SPLIT),
+                        help='Collection reference partition, default 17 families with two authored clips each')
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument('--route-ids', nargs='+', type=int, help='One or more frozen collection reference IDs')
+    selection.add_argument('--family', choices=FAMILIES, help='Run only this family, Base design then Generalization design')
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=39000)
     parser.add_argument('--allow-map-load', action='store_true')
@@ -229,9 +233,15 @@ def main(argv=None):
     base = filesystem_path(ROOT / 'output')
     if root == base or not root.is_relative_to(base):
         parser.error('Choose a dedicated subdirectory under branch output/')
-    plan = build_plan(args.fail2drive_root, args.allow_similar_road)
+    plan = build_plan(args.fail2drive_root, args.allow_similar_road, args.collection_split)
     routes = plan['routes']
-    selected = list(routes) if args.route_ids is None else [f'{n:04d}' for n in args.route_ids]
+    if args.family:
+        selected = sorted((tag for tag, record in routes.items() if record['family'] == args.family),
+                          key=lambda tag: routes[tag]['variant'] != 'Base')
+        if len(selected) != 2:
+            parser.error('Selected collection partition does not contain this complete family pair')
+    else:
+        selected = list(routes) if args.route_ids is None else [f'{n:04d}' for n in args.route_ids]
     if len(set(selected)) != len(selected) or set(selected) - set(routes):
         parser.error('Use distinct collection route IDs; held-out evaluation IDs are ineligible')
     if not args.run:
@@ -273,7 +283,8 @@ def main(argv=None):
                 detail = f"{item['failure_stage']}: {item['reason']}  ({item['failure_log']})"
             else:
                 detail = item['path']
-            print(f"[{tag}] {item['status']} ({len(ready)}/{len(routes)})  {detail}", flush=True)
+            batch_ready = sum(results.get(t, {}).get('status') == 'ready_for_video_review' for t in selected)
+            print(f"[{tag}] {item['status']} (batch {batch_ready}/{len(selected)}, total {len(ready)}/{len(routes)})  {detail}", flush=True)
             if item.get('batch_stop_reason'):
                 print(f"本批次已停止（{item['batch_stop_reason']}，采集退出码 {item['capture_exit']}）。"
                       f"请确认 {args.host}:{args.port} 专用世界空闲后再续跑。", flush=True)

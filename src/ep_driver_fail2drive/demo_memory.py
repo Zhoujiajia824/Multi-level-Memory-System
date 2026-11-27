@@ -18,6 +18,7 @@ import sys
 
 from nine_grid.paths import filesystem_path
 from .demo_catalog import FAMILIES
+from .demo_events import requires_borrow_proof, verify_borrow_capture
 
 
 DEMO_SUITE = 'fail2drive-targeted-demonstrations-1.0'
@@ -164,6 +165,20 @@ def _camera_proof(root, row, required):
     required.add(native)
 
 
+def _borrow_anchors(frames, execution_by_frame):
+    """Select only actual imaged maneuver states with already verified future evidence."""
+    anchors = []
+    stages = (('waiting', 'interact'), ('borrowed', 'interact'), ('returned', 'recovery'))
+    for stage, phase in stages:
+        matches = [row for row in frames if execution_by_frame[_frame(row)].get('teacher', {})
+                   .get('borrow', {}).get('stage') == stage]
+        if matches:
+            row = matches[0]
+            anchors.append(dict(frame_id=row['snapshot']['frame_id'], time=row['time'],
+                                phase=phase, maneuver_stage=stage, actual_behavior_frame=_frame(row)))
+    return anchors
+
+
 def _episode(root, requested_anchors=None):
     run = _json(_contained(root, 'run.json'))
     manifest = _json(_contained(root, 'capture_manifest.json'))
@@ -258,6 +273,14 @@ def _episode(root, requested_anchors=None):
     if len(frames) < 4:
         raise ValueError('No complete actual current/+1/+2/+3 second evidence')
     events = _rows(_contained(root, files['event_evidence_path']))
+    parameters=run.get('parameters') or {}
+    if requires_borrow_proof(parameters):
+        for name in ('demonstration_actors.json','development_site_geometry.json','demonstration_design.json'):
+            _contained(root,name)
+            required.add(name)
+        proof=verify_borrow_capture(root,parameters,execution,events)
+        if evaluation.get('opposing_borrow_proof')!=proof:
+            raise ValueError('Opposing-borrow capture proof differs from the replay of actual frames')
     phases = {}
     for event in events:
         source = _frame(event)
@@ -321,6 +344,9 @@ def _episode(root, requested_anchors=None):
             if identity not in used:
                 selected.append(dict(frame_id=identity, time=row['time'], phase=phase))
                 used.add(identity)
+        borrow_anchors = _borrow_anchors(eligible, by_frame)
+        if borrow_anchors:
+            selected = borrow_anchors
     else:
         selected, used = [], set()
         for phase in PHASES:
