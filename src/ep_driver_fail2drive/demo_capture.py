@@ -364,6 +364,27 @@ def _world_preflight(world):
         blocking_actor_count=count, blocking_actor_counts=counts, blocking_actor_examples=examples)
 
 
+def _destroy_owned_ids(client, carla, ids, already_destroyed):
+    """Destroy registered actors even when their spawn is newer than the last snapshot."""
+    ids = list(dict.fromkeys(ids))
+    pending = [actor_id for actor_id in ids if actor_id not in already_destroyed]
+    report = dict(owned_ids=ids, previously_destroyed_ids=[i for i in ids if i in already_destroyed],
+                  requested_ids=pending, acknowledged_ids=[], errors=[])
+    if not pending:
+        return report
+    try:
+        responses = client.apply_batch_sync([carla.command.DestroyActor(i) for i in pending], False)
+        for index, actor_id in enumerate(pending):
+            error = responses[index].error if index < len(responses) else 'missing server response'
+            if error:
+                report['errors'].append(f'DestroyActor({actor_id}): {error}')
+            else:
+                report['acknowledged_ids'].append(actor_id)
+    except Exception as exc:
+        report['errors'].append(f'DestroyActor{pending}: {exc}')
+    return report
+
+
 def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=False, video=True,
             interaction_only=False, allow_similar_road=False):
     if type(interaction_only) is not bool:
@@ -390,6 +411,24 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
     audit_rows, recovery_complete, geometry = [], False, None
     interaction_window=None
     preflight = None
+    cleanup_reports, destroyed_ids = [], set()
+    def release_site(stage):
+        event_actors = [] if events is None else events.actors
+        if events is not None:
+            destroyed_ids.update(events.released_actor_ids)
+            try:
+                events.close(destroy_actors=False)
+            except Exception as exc:
+                errors.append('restore event signals: '+str(exc))
+        ids = [actor.id for actor in (*reversed(owned), *reversed(event_actors))]
+        if not ids:
+            return
+        report = _destroy_owned_ids(client, carla, ids, destroyed_ids)
+        report['stage'] = stage
+        cleanup_reports.append(report)
+        destroyed_ids.update(report['acknowledged_ids'])
+        errors.extend(report['errors'])
+
     def startup(operation, timeout_s=30., status='entered', **details):
         # Survives a native SDK abort, which bypasses Python exception handling.
         atomic_json(output/'startup_stage.json', dict(operation=operation, timeout_s=timeout_s,
@@ -496,11 +535,11 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                 # No cameras or driving frames exist yet. Release only this attempt's actors.
                 archive.json('walker_site_rejection.json', dict(selected_site=site, reason=str(exc),
                     walker_placements=events.walker_placements))
-                events.close()
+                release_site('replace_site')
+                if errors:
+                    raise RuntimeError('Failed to release actors or signals before replacing the site: '+errors[-1])
                 events = None
-                if ego.is_alive and not ego.destroy():
-                    raise RuntimeError('Failed to release the previous site hero before selecting a replacement')
-                owned.remove(ego)
+                owned.clear()
                 unusable_site = site
                 LOG.info('行人横穿起点没有可验证地面，保留现场并尝试另一处已允许的同图路段')
             finally:
@@ -717,6 +756,8 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                              if preflight is not None and not preflight['idle'] else {})
             archive.json('capture_failure.json',dict(error=errors[-1],traceback=traceback.format_exc(),
                 walker_placements=events.walker_placements if events is not None else [],
+                capture_actor_ids=[a.id for a in owned],
+                interaction_actor_ids=[a.id for a in events.actors] if events is not None else [],
                 frame=locals().get('frame'),time=locals().get('stamp'),successful_memory_created=False,
                 **busy_evidence))
         except Exception as write_error:
@@ -744,17 +785,8 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                 sensor.stop()
             except Exception as exc:
                 errors.append('sensor stop: '+str(exc))
-        try:
-            if events is not None:
-                events.close()
-        except Exception as exc:
-            errors.append(str(exc))
-        for actor in reversed(owned):
-            try:
-                if actor.is_alive and not actor.destroy():
-                    errors.append('destroy returned false: '+str(actor.id))
-            except Exception as exc:
-                errors.append('destroy: '+str(exc))
+        release_site('final')
+        remaining_check = None
         if saved is not None:
             if saved_weather is not None:
                 try:
@@ -766,6 +798,18 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                 restored = True
             except Exception as exc:
                 errors.append('restore settings: '+str(exc))
+        if cleanup_reports and restored and not saved.synchronous_mode:
+            # Consume a naturally published snapshot after restoration. Looking up actors
+            # before the world advances can return the stale, pre-destruction cache.
+            try:
+                snapshot = world.wait_for_tick(3.)
+                owned_ids = {i for report in cleanup_reports for i in report['owned_ids']}
+                remaining = sorted(i for i in owned_ids if snapshot.find(i) is not None)
+                remaining_check = dict(frame=snapshot.frame, remaining_owned_ids=remaining)
+                if remaining:
+                    errors.append('Owned actors still present after restoration: '+str(remaining))
+            except Exception as exc:
+                remaining_check = dict(error=str(exc), remaining_owned_ids=None)
         archive.json('physical_events.json',dict(collisions=collisions,line_events=line_events))
         try:
             archive.close()
@@ -787,6 +831,7 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
             rule_violation_count=max(len(line_events),sum(a['rule_violation'] for a in audit_rows)),
             projection_valid=bool(audit_rows) and all(a['projection_valid'] for a in audit_rows),
             world_settings_restored=restored,errors=errors,official_score=False,
+            actor_cleanup=dict(attempts=cleanup_reports, post_restore_snapshot=remaining_check),
             evidence='actual_20hz_execution_and_sensors_not_designed_reference',
             visual_proxy=spec['proxy'])
         if interaction_window is not None:

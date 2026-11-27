@@ -264,6 +264,7 @@ class DemoEvents:
         self.teaching_path = self.route
         self.ego_width = 2.
         self.actors, self.rows = [], []
+        self.released_actor_ids = set()
         self.activated_at = self.completion_progress_m = None
         self.completed, self.active = False, False
         self.stationary_s = 0.
@@ -386,13 +387,27 @@ class DemoEvents:
             if blueprint.has_attribute('is_invincible'):
                 blueprint.set_attribute('is_invincible','false')
             station = float(config['s_offset_m'])+shift
-            wp = original = station_waypoint(self.waypoints,station)
-            for _ in range(abs(config['lane_offset'])):
-                wp = wp.get_left_lane() if config['lane_offset'] > 0 else wp.get_right_lane()
-                if wp is None or str(wp.lane_type).split('.')[-1] != 'Driving':
-                    raise RuntimeError('Required physical actor driving lane does not exist: '+config['id'])
-            pose, lateral, role = wp.transform,float(config['lateral_offset_m']),config['role']
+            role = config['role']
             cross_path, branch_station, interaction_station = None,None,station
+            if role=='oncoming_vehicle':
+                # NPC traffic may start well upstream of the short clip's end.
+                # Resolve its full physical path before consulting either lane.
+                cross_path=oncoming_drive_path(self.waypoints,station)
+                if not cross_path:raise RuntimeError('Missing continuous real opposing lane for '+config['id'])
+                wp=cross_path[0]
+                original=wp.get_left_lane()
+                if (config['lane_offset']!=1 or original is None or
+                        str(original.lane_type).split('.')[-1]!='Driving' or wp.lane_id*original.lane_id>=0):
+                    raise RuntimeError('Oncoming spawn lacks its adjoining original travel lane: '+config['id'])
+                lateral=0.
+            else:
+                wp = original = station_waypoint(self.waypoints,station)
+                for _ in range(abs(config['lane_offset'])):
+                    wp = wp.get_left_lane() if config['lane_offset'] > 0 else wp.get_right_lane()
+                    if wp is None or str(wp.lane_type).split('.')[-1] != 'Driving':
+                        raise RuntimeError('Required physical actor driving lane does not exist: '+config['id'])
+                lateral=float(config['lateral_offset_m'])
+            pose=wp.transform
             stop_sign_id = None
             if role == 'roadside_crowd':
                 sidewalk, visited = original.get_right_lane(),set()
@@ -428,10 +443,6 @@ class DemoEvents:
             if role == 'cross_traffic_vehicle':
                 cross_path,interaction_station,branch_station = self._cross_branch(config['s_offset_m'])
                 pose,lateral = cross_path[0].transform,0.
-            if role=='oncoming_vehicle':
-                cross_path=oncoming_drive_path(self.waypoints,station)
-                if not cross_path:raise RuntimeError('Missing continuous real opposing lane for '+config['id'])
-                pose,lateral=cross_path[0].transform,0.
             yaw = math.radians(pose.rotation.yaw)
             if role=='construction_advance_warning':
                 # Keep the roadside advance sign beyond the entire bank of
@@ -908,6 +919,7 @@ class DemoEvents:
             if kind == 'blocked_wait' and elapsed >= self.spec['wait_s']:
                 if not a.destroy():
                     raise RuntimeError('Failed to remove owned blockage actor')
+                self.released_actor_ids.add(a.id)
                 events.append(dict(phase='interact',event='owned_blockage_removed',actor_id=a.id,completed=False))
             elif role=='slow_lead' and self.manual:
                 path=row['walker_path'];location=current.get_transform().location
@@ -929,6 +941,7 @@ class DemoEvents:
                 if elapsed >= self.spec['wait_s']:
                     if not a.destroy():
                         raise RuntimeError('Failed to remove owned slow-walking actor')
+                    self.released_actor_ids.add(a.id)
                     events.append(dict(phase='interact',event='owned_slow_actor_removed',actor_id=a.id,completed=False))
             elif role == 'crossing_actor':
                 origin = row['original_waypoint'].transform.location
@@ -1019,7 +1032,7 @@ class DemoEvents:
                                official_success=False))
         return events
 
-    def close(self):
+    def close(self, *, destroy_actors=True):
         errors = []
         if self.traffic_lights:
             for light,state in self.traffic_lights:
@@ -1027,7 +1040,7 @@ class DemoEvents:
                 except RuntimeError as exc:errors.append(str(exc))
             try:self.world.freeze_all_traffic_lights(self.signal_program['previously_frozen'])
             except RuntimeError as exc:errors.append(str(exc))
-        for actor in reversed(self.actors):
+        for actor in (reversed(self.actors) if destroy_actors else ()):
             try:
                 if actor.is_alive and not actor.destroy():
                     errors.append('destroy returned false: '+str(actor.id))
