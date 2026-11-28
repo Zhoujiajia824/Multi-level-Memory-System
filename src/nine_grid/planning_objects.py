@@ -323,9 +323,30 @@ def planning_view(scene, predictions, config=None, answer=None):
             scoped_scene = replace(scoped_scene, actors=selected)
         diagnostic['selected_input_signature'] = _selected_input_signature(scoped_scene, scoped_scene.actors)
         diagnostic['selected_prediction_signature'] = _prediction_signature(predictions, diagnostic['selected_ids'])
+        diagnostic['conflict_context_signature'] = _navsim_conflict_context_signature(config,scene)
+        diagnostic['full_prediction_context'] = _navsim_prediction_context(predictions)
         scoped_scene = replace(scoped_scene, diagnostics={**scoped_scene.diagnostics,
             'planning_scope': deepcopy(diagnostic)})
-    elif navsim and diagnostic.get('selected_prediction_signature') is not None:
+    elif navsim:
+        context=diagnostic.get('full_prediction_context')
+        if not isinstance(context,dict) or diagnostic.get('selected_prediction_signature') is None:
+            raise ValueError('NAVSIM旧规划子集缺少完整预测上下文，须从完整冻结帧重新筛选')
+        identity={key:getattr(predictions,key) for key in ('frame_id','time','version','coordinates')}
+        if identity!=context.get('identity'):
+            raise ValueError('NAVSIM复用预测身份不匹配完整原始上下文')
+        incoming=set(predictions.trajectories)
+        if set(predictions.actors)!=incoming:
+            raise ValueError('NAVSIM复用预测实体集合不匹配')
+        if incoming==set(context['actor_ids']):
+            if _navsim_prediction_context(predictions)!=context:
+                raise ValueError('NAVSIM完整候选预测上下文已变化，须重新筛选')
+        elif incoming==set(diagnostic['selected_ids']):
+            if predictions.diagnostics.get('navsim_original_prediction_context')!=context:
+                raise ValueError('NAVSIM预测子集缺少绑定原始上下文的证明')
+        else:
+            raise ValueError('NAVSIM复用预测必须提供完整候选或已绑定的完整优化子集')
+        if diagnostic.get('conflict_context_signature') != _navsim_conflict_context_signature(config,scene):
+            raise ValueError('已筛选NAVSIM冲突走廊的时域或可达参数已变化，须从完整原帧重新筛选')
         if diagnostic['selected_prediction_signature'] != _prediction_signature(predictions, diagnostic['selected_ids']):
             raise ValueError('已筛选NAVSIM规划视图的预测已变化，须从完整原帧重新筛选')
     selected=scoped_scene.actors
@@ -338,6 +359,8 @@ def planning_view(scene, predictions, config=None, answer=None):
         trajectories={key: predictions.trajectories[key] for key in sorted(identities)},
         diagnostics={key: value for key, value in predictions.diagnostics.items()
                      if key in identities or key not in predictions.actors})
+    if navsim:
+        scoped_predictions.diagnostics['navsim_original_prediction_context']=deepcopy(diagnostic['full_prediction_context'])
     return scoped_scene, scoped_predictions, diagnostic
 
 
@@ -346,6 +369,131 @@ def _prediction_signature(predictions, identities):
         key: np.asarray(predictions.trajectories[key]).tolist() for key in sorted(identities)})
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
         allow_nan=False).encode('utf-8')).hexdigest()
+
+
+def _navsim_prediction_context(predictions):
+    from .contracts import plain
+    if set(predictions.actors)!=set(predictions.trajectories):
+        raise ValueError('NAVSIM完整预测上下文的实体与轨迹集合不匹配')
+    actors=[{key:getattr(predictions.actors[identity],key) for key in
+        ('id','kind','position','velocity','acceleration','heading','length','width','radius','visible','lane_id')}
+        for identity in sorted(predictions.actors)]
+    current_state_sha256=hashlib.sha256(json.dumps(plain(actors),sort_keys=True,
+        separators=(',',':'),allow_nan=False).encode()).hexdigest()
+    return dict(version='navsim-original-prediction-context-1',
+        identity={key:getattr(predictions,key) for key in ('frame_id','time','version','coordinates')},
+        actor_ids=sorted(predictions.trajectories),
+        current_actor_state_sha256=current_state_sha256,
+        trajectories_sha256=_prediction_signature(predictions,predictions.trajectories))
+
+
+def _navsim_conflict_context_signature(config,scene):
+    p=config['mpc']
+    value=dict(version='navsim-public-reference-conflict-corridor-2.0',
+        mpc={key:p[key] for key in ('horizon_steps','step_s','acceleration_max_mps2',
+            'acceleration_min_mps2','lateral_acceleration_abs_max_mps2','maximum_speed_mps')},
+        recovery_distance_m=p.get('tracking_recovery_distance_m',15.),
+        sample_m=config.get('local_reference',{}).get('sample_m',.5),
+        margin_m=config.get('planning_objects',{}).get('conflict_margin_m',.5),
+        drivable_sha256=hashlib.sha256(scene.drivable.wkb).hexdigest(),
+        navigation_initialization=scene.diagnostics.get('navigation_initialization'))
+    return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
+
+
+def _navsim_public_reference_corridor(scene,config,front,role_domain):
+    """Additional admission area on the reference MPC actually receives.
+
+    Overlapping native lane labels can differ from the public navigation lane.
+    Do not change the model/eight-region ownership to repair that downstream
+    mismatch. Keep the old role area and add public lane/recovery footprints.
+    This area selects existing predictions; it never authorizes ego motion.
+    """
+    import shapely
+    from shapely.geometry import LineString,Polygon
+    from .geometry import actor_shape,clean_polyline,rectangle_corners,wrap_angle
+    from .lane_roles import project
+    from .navigation_initialization import initialization_geometry
+
+    points=clean_polyline(scene.route);line=LineString(points)
+    ego_s,foot,heading,offcenter=project(points,scene.ego.position)
+    lanes={lane.id:lane for lane in scene.lanes}
+    shapes=[];lane_parts=[];recovery_parts=[]
+    for key in scene.route_lane_ids:
+        lane=lanes.get(key)
+        if lane is None:continue
+        shape=Polygon(lane.polygon)
+        stations=[project(points,p)[0] for p in lane.center]
+        shapes.append(shape);lane_parts.append((min(stations),max(stations),shape))
+    length=max(float(config['mpc'].get('tracking_recovery_distance_m',15.)),1e-6)
+    step=float(config.get('local_reference',{}).get('sample_m',.5))
+    if not np.isfinite(step) or step<=0:raise ValueError('NAVSIM恢复走廊需要合法参考采样间隔')
+    extent=max(0.,min(front,line.length-ego_s))
+    arc=np.linspace(ego_s,ego_s+extent,max(2,int(np.ceil(extent/step))+1))
+    native=np.asarray([line.interpolate(float(s)).coords[0] for s in arc])
+    headings=np.unwrap(np.asarray([project(points,p)[2] for p in native]))
+    lateral=float((scene.ego.position-foot)@np.array([-np.sin(heading),np.cos(heading)]))
+    recovery=np.exp(-(arc-ego_s)/length)
+    xy=native+lateral*recovery[:,None]*np.c_[-np.sin(headings),np.cos(headings)]
+    body_h=headings+float(wrap_angle(scene.ego.heading-heading))*recovery
+    bodies=shapely.polygons(np.stack([rectangle_corners(p,h,scene.ego.length,scene.ego.width)
+                                     for p,h in zip(xy,body_h)]))
+    radius=float(np.hypot(scene.ego.length,scene.ego.width)/2)
+    native_coverage={}
+    for index,(first,last) in enumerate(zip(bodies[:-1],bodies[1:])):
+        shape=first.union(last).convex_hull
+        rotation=abs(float(wrap_angle(body_h[index+1]-body_h[index])))
+        if rotation>1e-8:shape=shape.buffer(radius*(1-np.cos(rotation/2)))
+        shapes.append(shape)
+        # A footprint already covered by a native lane spanning this complete
+        # interval is redundant in every corresponding admission window.
+        active=tuple(j for j,(low,high,_) in enumerate(lane_parts)
+                     if low<=arc[index] and high>=arc[index+1])
+        if active not in native_coverage:
+            native_coverage[active]=shapely.union_all([lane_parts[j][2] for j in active])
+        if not native_coverage[active].covers(shape):
+            recovery_parts.append((float(arc[index]),float(arc[index+1]),shape))
+    registered=initialization_geometry(scene)
+    if registered is not None:
+        shapes.append(registered['shape'])
+        stations=[project(points,p)[0] for p in scene.diagnostics['navigation_initialization']['points_world']]
+        recovery_parts.append((min(stations),max(stations),registered['shape']))
+    # Actual current footprint is an observation even if partly off road. Its
+    # inclusion here does not expand the MPC's unchanged drivable polygon.
+    current_body=actor_shape(scene.ego)
+    stations=[project(points,p)[0] for p in np.asarray(current_body.exterior.coords)]
+    domain=shapely.union_all([role_domain,*shapes]).intersection(scene.drivable).union(current_body)
+    return dict(line=line,ego_s=float(ego_s),heading=heading,offcenter=float(offcenter),domain=domain,
+        kind='public_navigation_and_current_full_body_recovery',lane_ids=list(scene.route_lane_ids),
+        public_lane_parts=lane_parts,recovery_parts=recovery_parts,
+        current_body_part=(min(stations),max(stations),current_body),road=scene.drivable,
+        interval_domain_cache={})
+
+
+def _navsim_interval_corridor_domain(reference,start_s,end_s):
+    """Clip only added public geometry to this time window's route interval.
+
+    A later returning parallel road can be physically close while far away
+    along the route. Actor bodies remain the intersection test, so crossing
+    pedestrians and long vehicles are not rejected by centre projection.
+    The original lane-role sweep remains separately in the final union.
+    """
+    if reference['kind']=='lane_role_corridor':return reference['domain']
+    import shapely
+    native=tuple(j for j,(low,high,_) in enumerate(reference['public_lane_parts'])
+                 if high>=start_s and low<=end_s)
+    recovery=tuple(j for j,(low,high,_) in enumerate(reference['recovery_parts'])
+                   if high>=start_s and low<=end_s)
+    low,high,current=reference['current_body_part']
+    include_current=high>=start_s and low<=end_s
+    key=(native,recovery,include_current)
+    cache=reference['interval_domain_cache']
+    if key not in cache:
+        shapes=[reference['public_lane_parts'][j][2] for j in native]
+        shapes.extend(reference['recovery_parts'][j][2] for j in recovery)
+        domain=shapely.union_all(shapes).intersection(reference['road'])
+        if include_current:domain=domain.union(current)
+        cache[key]=domain
+    return cache[key]
 
 
 def _navsim_predicted_conflicts(scene, predictions, config, selected_ids):
@@ -365,7 +513,7 @@ def _navsim_predicted_conflicts(scene, predictions, config, selected_ids):
     p = config['mpc']
     horizon = float(p['horizon_steps']*p['step_s'])
     times = np.asarray(predictions.times, float)
-    if (predictions.frame_id != scene.frame_id or predictions.coordinates != scene.coordinates
+    if (predictions.frame_id != scene.frame_id or predictions.version != scene.version or predictions.coordinates != scene.coordinates
             or not np.isclose(predictions.time, scene.time, rtol=0., atol=1e-8)
             or times.ndim != 1 or len(times) < 2 or not np.isfinite(times).all()
             or abs(times[0]) > 1e-8 or np.any(np.diff(times) <= 0)
@@ -381,7 +529,7 @@ def _navsim_predicted_conflicts(scene, predictions, config, selected_ids):
     available = {actor.id: actor for actor in scene.actors
         if actor.visible and actor.id in allowed and actor.kind in KINDS}
     candidates = sorted(set(available)-set(selected_ids))
-    evidence = dict(version='navsim-predicted-reachable-corridor-1.0', horizon_s=horizon,
+    evidence = dict(version='navsim-public-reference-conflict-corridor-2.0', horizon_s=horizon,
         candidate_count=len(candidates), added_ids=[], added_count=0, conflicts={},
         source='current_perception_and_existing_causal_prediction_only',
         model_input_and_eight_regions_unchanged=True,
@@ -404,13 +552,6 @@ def _navsim_predicted_conflicts(scene, predictions, config, selected_ids):
     geometry_scene = replace(scene, diagnostics=deepcopy(scene.diagnostics))
     traces, _, cache = lane_role_geometry(geometry_scene, front_m=max(40., front), rear_m=20.)
     center = traces.get('center')
-    if center is None:
-        evidence.update(status='no_public_current_lane_corridor', selection_seconds=time.perf_counter()-started)
-        return {}, evidence
-    line = LineString(center['points'])
-    ego_s = float(center['ego_s'])
-    _, _, heading, offcenter = project(center['points'], scene.ego.position)
-    lateral_speed = abs(float(scene.ego.velocity @ np.array([-np.sin(heading), np.cos(heading)])))
     shapes = []
     for trace in traces.values():
         if trace is None:
@@ -423,24 +564,29 @@ def _navsim_predicted_conflicts(scene, predictions, config, selected_ids):
                 shapes.append(polygon.intersection(native.buffer(float(lane.width)/2, cap_style=2)))
         shapes.extend(link['shape'] for link in trace.get('navigation_connections', []))
     domain = unary_union(shapes).intersection(scene.drivable)
-    if domain.is_empty:
-        evidence.update(status='empty_public_current_lane_corridor', selection_seconds=time.perf_counter()-started)
-        return {}, evidence
+    references=[]
+    if center is not None and not domain.is_empty:
+        _, _, heading, offcenter = project(center['points'], scene.ego.position)
+        references.append(dict(line=LineString(center['points']),ego_s=float(center['ego_s']),
+            heading=heading,offcenter=offcenter,domain=domain,kind='lane_role_corridor',lane_ids=center['lane_ids']))
+    references.append(_navsim_public_reference_corridor(scene,config,front,domain))
+    evidence['corridor_sources']=[dict(kind=row['kind'],lane_ids=row['lane_ids']) for row in references]
     corridors = []
-    for index, (t0, t1) in enumerate(zip(times[:-1], times[1:])):
-        if t0 >= horizon-1e-8:
-            break
-        t1 = min(float(t1), horizon)
-        braking_t = min(float(t0), speed/brake)
-        lower = speed*braking_t-.5*brake*braking_t**2
-        a = max(0., ego_s+lower-scene.ego.length/2-margin)
-        b = min(line.length, ego_s+upper_reach(t1)+scene.ego.length/2+margin)
-        if a >= b:
-            continue
-        lateral = offcenter+scene.ego.width/2+lateral_speed*t1+.5*lateral_accel*t1*t1+margin
-        shape = substring(line, a, b).buffer(lateral, cap_style=2).intersection(domain)
-        if not shape.is_empty:
-            corridors.append((index, float(t0), t1, shape, np.asarray(shape.bounds)))
+    for reference in references:
+        line=reference['line'];ego_s=reference['ego_s'];heading=reference['heading']
+        lateral_speed=abs(float(scene.ego.velocity @ np.array([-np.sin(heading),np.cos(heading)])))
+        for index, (t0, t1) in enumerate(zip(times[:-1], times[1:])):
+            if t0 >= horizon-1e-8:break
+            t1 = min(float(t1), horizon)
+            braking_t = min(float(t0), speed/brake)
+            lower = speed*braking_t-.5*brake*braking_t**2
+            a = max(0., ego_s+lower-scene.ego.length/2-margin)
+            b = min(line.length, ego_s+upper_reach(t1)+scene.ego.length/2+margin)
+            if a >= b:continue
+            lateral=reference['offcenter']+scene.ego.width/2+lateral_speed*t1+.5*lateral_accel*t1*t1+margin
+            shape=substring(line,a,b).buffer(lateral,cap_style=2).intersection(_navsim_interval_corridor_domain(reference,a,b))
+            if not shape.is_empty:
+                corridors.append((index,float(t0),t1,shape,np.asarray(shape.bounds),reference['kind']))
     additions = {}
     for identity in candidates:
         actor = available[identity]
@@ -452,7 +598,7 @@ def _navsim_predicted_conflicts(scene, predictions, config, selected_ids):
             raise ValueError('当前感知冲突候选的预测轨迹或首点无效：'+identity)
         radius = float(np.hypot(actor.length, actor.width)/2 if actor.kind != 'pedestrian'
                        else actor.radius or actor.width/2)
-        for index, t0, t1, corridor, bounds in corridors:
+        for index, t0, t1, corridor, bounds,source in corridors:
             first = trajectory[index]
             fraction = (t1-times[index])/(times[index+1]-times[index])
             last = first+(trajectory[index+1]-first)*fraction
@@ -471,12 +617,12 @@ def _navsim_predicted_conflicts(scene, predictions, config, selected_ids):
                 swept = swept.buffer(radius*(1-np.cos(rotation/2)))
             if swept.intersects(corridor):
                 additions[identity] = dict(reason='predicted_reachable_corridor_conflict',
-                    time_interval_s=[t0, t1], current_lane_id=actor.lane_id)
+                    time_interval_s=[t0, t1], current_lane_id=actor.lane_id,corridor_source=source)
                 break
     evidence.update(status='complete', front_reach_m=front, acceleration_max_mps2=accel,
         braking_mps2=brake, lateral_acceleration_max_mps2=lateral_accel, margin_m=margin,
-        reference_front_coverage_m=max(0., line.length-ego_s),
-        reference_coverage_shortfall_m=max(0., front-(line.length-ego_s)),
+        reference_front_coverage_m=max(0.,references[-1]['line'].length-references[-1]['ego_s']),
+        reference_coverage_shortfall_m=max(0.,front-(references[-1]['line'].length-references[-1]['ego_s'])),
         added_count=len(additions), added_ids=sorted(additions), conflicts=deepcopy(additions),
         lane_ids=sorted({key for trace in traces.values() if trace for key in trace['lane_ids']}),
         selection_seconds=time.perf_counter()-started)

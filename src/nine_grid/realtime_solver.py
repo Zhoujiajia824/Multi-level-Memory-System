@@ -74,11 +74,13 @@ class QuadraticSolver:
         self.solvers={}
         self.cache_builds=0;self.cache_hits=0;self.setup_seconds=0.
         self.last_diagnostics={}
+        self.last_unscaled_duals=None
 
     def solve(self,hessian,gradient,matrix,lower,upper,step_lower,step_upper):
         begin=time.perf_counter()
         original_matrix=np.asarray(matrix,float)
         original_lower=np.asarray(lower,float);original_upper=np.asarray(upper,float)
+        self.last_unscaled_duals=None
         # 空的物理控制箱与信赖域交集没有可解QP，不能交给CasADi抛异常，
         # 更不能交换上下界或裁剪边界来掩盖不可行。调用方仍只可执行已验收候选。
         self.last_diagnostics={'valid':False,'scaled_stationarity_inf':None,'scaled_primal_violation':None,
@@ -125,6 +127,11 @@ class QuadraticSolver:
             a=ca.DM(sparsity,scaled[rr,cc]),lba=lower,uba=upper,lbx=low_box,ubx=high_box)
         z=result['x'].full().ravel();step=z*scale
         dual_rows=result['lam_a'].full().ravel();dual_box=result['lam_x'].full().ravel()
+        if self.require_feasible_iterate and np.isfinite(dual_rows).all():
+            # Undo only row scaling; original control-variable units are
+            # restored by the caller's nonlinear constraint normalization.
+            self.last_unscaled_duals=np.zeros(len(original_lower))
+            self.last_unscaled_duals[active]=dual_rows/row_scale
         # 这些是当前缩放QP的残差，不是非线性MPC已达全局最优的证明。
         self.last_diagnostics={'valid':False,'scaled_stationarity_inf':None,'scaled_primal_violation':None,
             'unscaled_stationarity_inf':None,'unscaled_primal_violation':None}

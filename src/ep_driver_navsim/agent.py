@@ -7,6 +7,7 @@ import queue
 import subprocess
 import threading
 import uuid
+import time
 
 import numpy as np
 from navsim.agents.abstract_agent import AbstractAgent
@@ -16,11 +17,14 @@ from nuplan.planning.simulation.trajectory.trajectory_sampling import Trajectory
 from .input_adapter import build_packet, CAMERAS
 from .protocol import digest, write_json
 from .profiles import get_profile, is_v1
+from .execution_rpc import (PREVIEW_PREFIX, PROTOCOL as PREVIEW_PROTOCOL,
+                            MAX_CALLS as PREVIEW_MAX_CALLS, validate_poses, validate_states)
 
 
 class CoreProcess:
     def __init__(self, python, settings, timeout_s):
         self.timeout_s = timeout_s
+        self.benchmark_profile = get_profile(settings)["id"]
         self.path = Path(settings["output_dir"])
         self.path.mkdir(parents=True, exist_ok=True)
         settings_path = self.path / ("worker_settings_" + uuid.uuid4().hex + ".json")
@@ -54,9 +58,11 @@ class CoreProcess:
         def read():
             try:
                 for line in self.process.stdout:
-                    if line.startswith("EP_NAVSIM_REPLY "):
+                    prefix = next((value for value in ("EP_NAVSIM_REPLY ", PREVIEW_PREFIX)
+                                   if line.startswith(value)), None)
+                    if prefix is not None:
                         try:
-                            self.responses.put(json.loads(line[len("EP_NAVSIM_REPLY "):]))
+                            self.responses.put(json.loads(line[len(prefix):]))
                         except ValueError as exc:
                             self.responses.put({"protocol_error": str(exc)})
                     else:
@@ -71,9 +77,9 @@ class CoreProcess:
             self.close()
             raise RuntimeError("Numerical worker failed to initialize; see " + str(self.path))
 
-    def receive(self):
+    def receive(self, timeout_s=None):
         try:
-            reply = self.responses.get(timeout=self.timeout_s)
+            reply = self.responses.get(timeout=self.timeout_s if timeout_s is None else timeout_s)
         except queue.Empty:
             self.close()
             raise TimeoutError("EP-Driver numerical worker timed out")
@@ -87,7 +93,38 @@ class CoreProcess:
         self.process.stdin.write(json.dumps(dict(request_id=request_id, packet=packet,
             output_dir=str(output_dir)), allow_nan=False) + "\n")
         self.process.stdin.flush()
-        reply = self.receive()
+        deadline = time.monotonic() + self.timeout_s
+        preview = None
+        preview_calls = 0
+        while True:
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                self.close()
+                raise TimeoutError("Numerical planning exceeded its total request deadline")
+            reply = self.receive(remaining)
+            if reply.get("operation") != "native_preview":
+                break
+            if (reply.get("protocol") != PREVIEW_PROTOCOL or reply.get("request_id") != request_id
+                    or reply.get("frame_id") != packet["identity"]["token"]
+                    or not isinstance(reply.get("preview_id"), str) or not reply["preview_id"]):
+                self.close()
+                raise RuntimeError("Controller preview request is not bound to the active source frame")
+            preview_calls += 1
+            response = {key: reply[key] for key in ("protocol", "request_id", "preview_id", "frame_id")}
+            response["operation"] = "native_preview_result"
+            try:
+                if preview_calls > PREVIEW_MAX_CALLS:
+                    raise RuntimeError("Controller preview exceeded its bounded call count")
+                poses = validate_poses(reply["poses"])
+                if preview is None:
+                    from .native_preview import NativeControllerPreview
+                    preview = NativeControllerPreview(packet, self.benchmark_profile)
+                states = validate_states(preview(poses), len(poses))
+                response.update(ok=True, states=states.tolist(), provenance=preview.provenance)
+            except Exception as exc:
+                response.update(ok=False, error=type(exc).__name__ + ": " + str(exc))
+            self.process.stdin.write(json.dumps(response, allow_nan=False) + "\n")
+            self.process.stdin.flush()
         if reply.get("request_id") != request_id:
             raise RuntimeError("Numerical worker response belongs to another request")
         if not reply.get("ok"):

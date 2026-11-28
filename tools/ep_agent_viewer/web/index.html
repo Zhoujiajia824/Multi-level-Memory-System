@@ -80,8 +80,8 @@
     <details id="navsim-panel" class="panel" hidden style="padding:16px;margin-top:14px">
       <summary>轨迹对照 · 非官方诊断</summary>
       <p id="navsim-note" class="context-caption"></p>
-      <div id="navsim-plot" style="height:260px" aria-label="源规划中心、提交后轴及官方仿真后轴三条真实轨迹"></div>
-      <p class="context-caption">坐标固定于源帧后轴：x向前、y向左，单位米。绿色为源规划车身中心；橙色为提交的8个未来后轴姿态（0.5–4秒）；蓝色为官方评分仿真后轴。参考点不同，中心与后轴的偏移是真实车体几何。</p>
+      <div id="navsim-plot" style="height:260px" aria-label="原始MPC中心、最终提交后轴、预计执行后轴与官方实际后轴轨迹"></div>
+      <p class="context-caption">坐标固定于源帧后轴：x向前、y向左，单位米。绿色为原始MPC车身中心；橙色为最终提交的8个后轴姿态（0.5–4秒）；蓝色虚线为预计执行，蓝色实线为官方实际执行。中心与后轴的偏移来自车体几何；预计执行不是官方实际或安全证明。旧产物没有预计执行时保留原始MPC展示。</p>
     </details>
     <section id="potential-panel" class="panel potential-panel" hidden>
       <div class="panel-heading"><div><h2>车道势场</h2></div><span id="potential-status" class="badge">等待计算</span><button id="expand-potential" class="icon-button" aria-label="放大势场" title="放大势场">⛶</button><button id="close-potential" class="icon-button" aria-label="关闭势场">×</button></div>

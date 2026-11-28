@@ -19,7 +19,8 @@ import numpy as np
 import shapely
 
 from .protocol import (digest, trajectory_from_centers, validate_packet, write_json, horizon_contract,
-                       relative_asset_path, HORIZON_S, PLANNING_STEP_S, PLANNING_STEPS)
+                       relative_asset_path, HORIZON_S, PLANNING_STEP_S, PLANNING_STEPS,
+                       prediction_diagnostic_horizon)
 from .archive import write_input_packet, serialize_retrieval, write_json_gz
 from .resume import (build_run_identity, sample_identity, load_completed_sample,
                      begin_sample, complete_sample, fail_sample)
@@ -31,6 +32,8 @@ from .model_transport import model_request_policy
 from .model_guidance import (GuidanceMismatch, guidance_prompt, validate_answer_consistency,
                              refine_model_prompt)
 from .progress import record_sample_progress
+from .execution_refinement import validate_config as validate_refinement_config, refine_execution
+from .execution_evidence import expected_execution_plan, audit_expected_execution
 from nine_grid.contracts import Actor, Lane, SceneSnapshot, RetrievalResult, plain
 from nine_grid.configuration import validate_config
 from nine_grid.models import (VisionClient, load_system_prompts, build_prompt, parse_answer,
@@ -80,6 +83,8 @@ def planning_config(parameters, dino_model):
     # explicit override (including zero) for NAVSIM experiments.
     config["mpc"]["weights"]["steering_rate"] = steering_weight
     config["navsim_execution"] = policy
+    config["navsim_execution_refinement"] = validate_refinement_config(
+        config.get("navsim_execution_refinement"))
     config["perception"]["fully_occluded_in_current_planning"] = True
     config["mpc"]["horizon_steps"] = PLANNING_STEPS
     config["mpc"]["step_s"] = PLANNING_STEP_S
@@ -87,8 +92,7 @@ def planning_config(parameters, dino_model):
     config["prediction"]["step_s"] = PLANNING_STEP_S
     # Retain the real TTC tail beyond the four-second planning/reference horizon.
     # Predictor.predict reads this diagnostic horizon when no override is supplied.
-    config["prediction"]["diagnostic_horizon_s"] = HORIZON_S + max(
-        config.get("quality", {}).get("ttc_offsets_s", [0, .3, .6, .9]))
+    config["prediction"]["diagnostic_horizon_s"] = prediction_diagnostic_horizon(config)
     config["dino"]["model"] = str(Path(dino_model).resolve())
     config["memory"].update(write_enabled=False, mode="formal")
     config = validate_config(config)
@@ -168,10 +172,10 @@ class NumericalPipeline:
         self.extractor = DINOExtractor(self.config["dino"]["model"],
             device=self.config["dino"].get("device"), local_files_only=True)
 
-    def compute(self, packet, output_dir):
+    def compute(self, packet, output_dir, native_preview=None):
         attempt = {}
         try:
-            return self._compute(packet, output_dir, attempt)
+            return self._compute(packet, output_dir, attempt, native_preview)
         except Exception as exc:
             source = packet.get("identity") if isinstance(packet, dict) else None
             token = source.get("token") if isinstance(source, dict) else None
@@ -184,7 +188,7 @@ class NumericalPipeline:
                 logger.error("Failed to publish sample failure state: %s", type(state_error).__name__)
             raise
 
-    def _compute(self, packet, output_dir, attempt):
+    def _compute(self, packet, output_dir, attempt, native_preview=None):
         started = time.perf_counter()
         root = filesystem_path(output_dir)
         root.mkdir(parents=True, exist_ok=True)
@@ -377,14 +381,38 @@ class NumericalPipeline:
         base_scene, base_predictions = prepare_planning_context(scene, self.config)
         baseline = create_planner(self.config).solve(base_scene, base_predictions)
         timing["reference_s"] = time.perf_counter() - tick
+        execution_refinement = None
+        final_plan, final_baseline = plan, baseline
+        if self.config["navsim_execution_refinement"]["enabled"]:
+            tick = time.perf_counter()
+            record_sample_progress(root, state, "execution_refinement")
+            main_execution = refine_execution(scoped, plan, predictions, self.config,
+                                              native_preview, answer=answer,
+                                              benchmark_profile=self.settings["benchmark_profile"])
+            reference_execution = refine_execution(base_scene, baseline, base_predictions,
+                                                   self.config, native_preview,
+                                                   benchmark_profile=self.settings["benchmark_profile"])
+            execution_refinement = dict(schema="navsim-execution-refinement-evidence-1",
+                source_token=scene.frame_id, source_timestamp_us=packet["identity"]["timestamp_us"],
+                benchmark_profile=self.settings["benchmark_profile"],
+                uses_future_ground_truth=False, uses_metric_cache=False,
+                controller_provenance=getattr(native_preview, "provenance", None),
+                plan=plain(main_execution), reference=plain(reference_execution))
+            final_plan = expected_execution_plan(scoped, plan, main_execution)
+            final_baseline = expected_execution_plan(base_scene, baseline, reference_execution)
+            timing["execution_refinement_s"] = time.perf_counter() - tick
         tick = time.perf_counter()
         record_sample_progress(root, state, "quality")
-        quality = evaluate(scoped, plan, baseline, predictions, self.config)
-        audit = execution_audit(scoped, plan, predictions, self.config,
-            execution_horizon_s=self.config["navsim_execution"]["audit_horizon_s"])
+        quality = evaluate(scoped, final_plan, final_baseline, predictions, self.config)
+        if execution_refinement is not None:
+            audit = audit_expected_execution(quality, final_plan, main_execution, self.config)
+        else:
+            audit = execution_audit(scoped, plan, predictions, self.config,
+                execution_horizon_s=self.config["navsim_execution"]["audit_horizon_s"])
         timing["internal_quality_s"] = time.perf_counter() - tick
         audit.update(policy="diagnostic_only", veto_enabled=False,
-                     submission_replaced=False, source="submitted_optimizer_candidate",
+                     submission_replaced=False,
+                     source="causal_native_controller_preview" if execution_refinement is not None else "submitted_optimizer_candidate",
                      executed_policy="完整四秒提交独立诊断；不否决或替换MPC输出")
         semantic_fallback=plan.diagnostics.get("semantic_fallback")
         model_semantics_applied=answer is not None and semantic_fallback is None
@@ -394,7 +422,7 @@ class NumericalPipeline:
         representation_paths = dict(bev=Path(reps.bev_path), feature=Path(reps.feature_image_path),
             grid=Path(reps.grid_path), occupancy=Path(reps.bev_path).with_name(
                 Path(reps.bev_path).name.replace("_bev.png", "_occupancy.npz")))
-        render_goal_overlay(scene, plan).save(root / "trajectory_bev.png")
+        render_goal_overlay(scene, final_plan).save(root / "trajectory_bev.png")
         evidence = dict(identity=packet["identity"], input_condition=packet["input_condition"],
             benchmark_profile=self.settings.get("benchmark_profile", "v2_two_stage"),
             official_metric=self.settings.get("official_metric"), official_commit=self.settings.get("official_commit"),
@@ -412,6 +440,9 @@ class NumericalPipeline:
             model_response_format_sha256=digest(response_format) if response_format else None,
             retrieval=serialize_retrieval(retrieved, root), memory_snapshot_id=self.memory_snapshot_id,
             dino_signature=self.extractor.signature, plan=plain(plan), reference=plain(baseline),
+            execution_refinement=execution_refinement,
+            final_execution_diagnostics=plain(final_plan.diagnostics) if execution_refinement is not None else None,
+            internal_quality_trajectory_source="causal_native_controller_preview" if execution_refinement is not None else "nominal_mpc",
             predictions=plain(predictions),
             reference_prediction_times_s=base_predictions.times.tolist(),
             horizon_contract=checked_horizon,
@@ -424,12 +455,14 @@ class NumericalPipeline:
         write_json(root / "planning_evidence.json", evidence)
         if not plan.valid:
             raise RuntimeError("Planner did not produce an executable trajectory: " + plan.reason)
-        poses = trajectory_from_centers(plan.states, self.config["mpc"]["step_s"],
-                                        scene.ego.rear_axle_to_center_m)
+        poses = (np.asarray(main_execution["submitted_poses"], dtype=np.float32)
+                 if execution_refinement is not None else trajectory_from_centers(
+                     plan.states, self.config["mpc"]["step_s"], scene.ego.rear_axle_to_center_m))
         timing["total_s"] = time.perf_counter() - started
         result = dict(poses=poses.tolist(), frame_id=scene.frame_id, sampling=dict(horizon_s=4.0, interval_s=0.5),
-                      execution_mode=plan.diagnostics.get("execution_mode"), timing_s=timing,
-                      safety_feasible=plan.diagnostics.get("safety_feasible"), evidence=str(root / "planning_evidence.json"))
+                      execution_mode=final_plan.diagnostics.get("execution_mode"), timing_s=timing,
+                      safety_feasible=final_plan.diagnostics.get("safety_feasible"), evidence=str(root / "planning_evidence.json"),
+                      trajectory_source="execution_aware_reference" if execution_refinement is not None else "nominal_mpc")
         result["condition_audit"] = dict(model_requested=self.fast.enabled, model_answer_valid=model_semantics_applied,
             benchmark_profile=self.settings.get("benchmark_profile", "v2_two_stage"),
             model_answer_parsed_valid=answer is not None, model_semantics_applied=model_semantics_applied,
@@ -477,7 +510,11 @@ def main():
         if request.get("operation") == "close":
             break
         try:
-            result = pipeline.compute(request["packet"], request["output_dir"])
+            from .execution_rpc import WorkerPreview
+            preview = WorkerPreview(protocol_stdout, sys.stdin, request["request_id"],
+                                    request["packet"]["identity"]["token"],
+                                    packet_sha256=digest(request["packet"]))
+            result = pipeline.compute(request["packet"], request["output_dir"], native_preview=preview)
             reply = dict(ok=True, result=result, request_id=request["request_id"])
         except Exception as exc:
             traceback.print_exc(file=sys.stderr)

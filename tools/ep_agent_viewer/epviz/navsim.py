@@ -324,6 +324,52 @@ def _rows(value, columns=3):
         all(_finite(v) is not None for v in row[:columns]) for row in value)
 
 
+def _expected_preview(planning, packet, submitted, token, rear):
+    """Read the causal preview separately from the nominal plan and SDK replay."""
+    record = planning.get("execution_refinement")
+    if record is None:
+        return None
+    identity = packet.get("identity") or {}
+    main = record.get("plan") if isinstance(record, dict) else None
+    states = (main or {}).get("expected_states")
+    poses = (main or {}).get("submitted_poses")
+    final_poses = submitted.get("poses")
+    if (not isinstance(record, dict) or record.get("schema") != "navsim-execution-refinement-evidence-1"
+            or record.get("source_token") != token or identity.get("token") != token
+            or record.get("source_timestamp_us") != identity.get("timestamp_us")
+            or identity.get("timestamp_us") is None
+            or record.get("uses_future_ground_truth") is not False
+            or record.get("uses_metric_cache") is not False
+            or not isinstance(main, dict) or not _rows(states, 11) or len(states) != 41
+            or any(len(row) != 11 for row in states)
+            or not _rows(poses) or len(poses) != 8 or not _rows(final_poses) or len(final_poses) != 8
+            or any(len(row) != 3 for row in poses + final_poses)
+            or any(abs(float(a)-float(b)) > 1e-6 for x, y in zip(poses, final_poses) for a, b in zip(x, y))
+            or rear is None or rear <= 0
+            or any(abs(float(value)) > 1e-6 for value in states[0][:3])):
+        raise ValueError("Expected execution source, full 0–4s grid or submitted poses differ from the anchor")
+    ego = packet.get("ego") or {}
+    position, heading = ego.get("position"), _finite(ego.get("heading"))
+    if not _rows([position], 2) or heading is None:
+        raise ValueError("Expected execution lacks its source ego pose")
+    c, s = math.cos(heading), math.sin(heading)
+    origin = [position[0]-rear*c, position[1]-rear*s]
+    rear_path, center_states = [], []
+    for row in states:
+        x, y = float(row[0]), float(row[1])
+        angle = math.atan2(math.sin(row[2]+heading), math.cos(row[2]+heading))
+        point = [c*x-s*y+origin[0], s*x+c*y+origin[1], angle]
+        rear_path.append(point)
+        speed = math.hypot(row[3], row[4]+rear*row[9])
+        center_states.append([point[0]+rear*math.cos(angle), point[1]+rear*math.sin(angle), angle, speed])
+    diagnostics = planning.get("final_execution_diagnostics")
+    if not isinstance(diagnostics, dict):
+        raise ValueError("Expected execution lacks its final diagnostic source")
+    return dict(rear_path=rear_path, center_states=center_states,
+                diagnostics=copy.deepcopy(diagnostics), step_s=.1, horizon_s=4.,
+                source="causal_native_controller_preview", actual_official_evaluation=False)
+
+
 class NavsimEpisode(_Episode):
     @staticmethod
     def current_attempt_complete(path):
@@ -591,6 +637,7 @@ class NavsimEpisode(_Episode):
             standard_sensor_only_comparable=benchmark.get("standard_sensor_only_comparable"))
         result = dict(internal_quality=_compact(self.planning.get("internal_quality")),
             internal_quality_is_official_metric=False,
+            internal_quality_trajectory_source=self.planning.get("internal_quality_trajectory_source", "nominal_mpc"),
             official_anchor=_compact(final), official_csv_anchor=csv_row,
             official_run_aggregate=aggregate,
             semantics="Internal quality, official anchor metrics, CSV anchor row and complete run summary are distinct; none are instantaneous replay metrics")
@@ -647,6 +694,11 @@ class NavsimEpisode(_Episode):
         rear_offset = _finite((trace.get("ego") or {}).get("rear_axle_to_center_m"))
         if rear_offset is None:
             rear_offset = _finite((packet.get("vehicle") or {}).get("rear_axle_to_center_m"))
+        expected = None
+        try:
+            expected = _expected_preview(self.planning, packet, self.submitted, self.token, rear_offset)
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            warnings.append("Expected execution excluded: " + str(exc))
         display_states = []
         if trace_poses and rear_offset is not None:
             display_states = [[p[0] + rear_offset * math.cos(p[2]), p[1] + rear_offset * math.sin(p[2]), p[2],
@@ -677,6 +729,11 @@ class NavsimEpisode(_Episode):
             warnings.append("Rear-axle-to-centre offset is missing; future ego body geometry excluded")
         if index == 0:
             plan = copy.deepcopy(self.plan) or None
+            if expected:
+                plan = dict(frame_id=self.token, time=0., states=expected["center_states"],
+                            diagnostics=expected["diagnostics"], valid=True,
+                            coordinates="source_anchor_local_xy_m;geometric_center",
+                            source="causal_native_controller_preview_not_official_execution")
         else:
             plan = dict(frame_id=record.frame_id, time=record.time, states=display_states,
                         diagnostics={"semantic_enabled": False}, coordinates="source_anchor_local_xy_m;geometric_center",
@@ -701,12 +758,18 @@ class NavsimEpisode(_Episode):
                              origin_source=origin_source, ego_body_reference="geometric_center",
                              rear_axle_to_center_m=rear_offset),
             trajectories=dict(source_plan_center=source_path, submitted_rear_axle=submitted_path,
+                              expected_simulated_rear_axle=expected["rear_path"] if expected else [],
                               official_simulated_rear_axle=trace_poses),
             sampling=dict(source_plan_step_s=(self.planning.get("parameters", {}).get("mpc") or {}).get("step_s"),
+                          expected_step_s=expected["step_s"] if expected else None,
+                          expected_horizon_s=expected["horizon_s"] if expected else None,
                           submitted=self.submitted.get("sampling"), official_step_s=trace.get("dt_s")),
             scores=self._scores(), model_error=self.planning.get("model_error"),
             horizon_contract=_compact(self.planning.get("horizon_contract")),
             source_plan_metadata=_compact(self.plan), input_condition=self.planning.get("input_condition"),
+            displayed_plan_source=("causal_native_controller_preview" if expected else "nominal_mpc") if index == 0 else "official_simulated_execution",
+            expected_execution_metadata=(dict(source=expected["source"], actual_official_evaluation=False,
+                diagnostics=_compact(expected["diagnostics"]), step_s=expected["step_s"], horizon_s=expected["horizon_s"])) if expected else None,
             provenance=_compact(trace.get("provenance")), events=_compact(trace.get("events", [])))
         return dict(episode_id=self.id, dataset="navsim", platform="navsim", index=index,
             frame_id=record.frame_id, time=record.time, source_time=0., pending=False,

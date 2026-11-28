@@ -294,8 +294,18 @@ def _validate_output(root, identity, assets):
     poses = np.asarray(result["poses"], float)
     if poses.shape != (8, 3) or not np.isfinite(poses).all():
         raise ValueError("Checkpoint trajectory must contain eight finite SE2 poses")
-    expected_poses = trajectory_from_centers(evidence["plan"]["states"],
-        evidence["parameters"]["mpc"]["step_s"], packet["ego"]["rear_axle_to_center_m"])
+    refinement_enabled = bool(evidence["parameters"].get("navsim_execution_refinement", {}).get("enabled"))
+    if refinement_enabled:
+        from .execution_evidence import validate_refinement_record
+        expected_poses = validate_refinement_record(evidence.get("execution_refinement"), packet, poses,
+            benchmark_profile=identity['run'].get('benchmark', {}).get('profile'))
+        if result.get("trajectory_source") != "execution_aware_reference":
+            raise ValueError("Checkpoint does not identify its execution-aware submission")
+    else:
+        if evidence.get("execution_refinement") is not None:
+            raise ValueError("Disabled execution refinement must not claim refined evidence")
+        expected_poses = trajectory_from_centers(evidence["plan"]["states"],
+            evidence["parameters"]["mpc"]["step_s"], packet["ego"]["rear_axle_to_center_m"])
     if not np.array_equal(poses.astype(np.float32), expected_poses):
         raise ValueError("Checkpoint trajectory differs from its planned states")
     plans = {key: SimpleNamespace(**{field: evidence[key][field] for field in ("states", "controls")})

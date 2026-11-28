@@ -203,6 +203,7 @@ async function loadFrame(index,{fromPlayback=false,fromVideoClock=false}={}){
   finally{if(epoch===state.epoch){state.fetching=false;if(fromVideoClock)syncFromVideo();}}
 }
 function renderFrame(frame,{exactVideoSeek=false,fromVideoClock=false}={}){
+  if(frame.navsim?.source_frame&&frame.visualization){const expected=frame.navsim.displayed_plan_source==='causal_native_controller_preview';frame.visualization.trajectory_provenance={kind:expected?'predicted_execution':'archived_plan',title:expected?'预计执行 · 当前观测控制器预览（非官方实际）':'原始MPC规划 · 源锚点'};frame.visualization.corridor_note=expected?'预计执行车身中心轨迹；当前观测预测，无未来真值，不是官方实际或安全证明。':'原始MPC车身中心轨迹；最终提交与官方实际轨迹单独展示。';}
   $('stage-empty').hidden=state.view!=='scene'||!!frame.ego;if(!state.isNavsim||state.view==='scene')scene?.setFrame(frame);
   const vis=frame.visualization||{},diagnostics=frame.plan?.diagnostics||{},selection=diagnostics.planning_object_selection||{};
   for(const name of['sidewalk','junction','crosswalk']){const input=document.querySelector(`[data-layer="${name}"]`),layer=vis.render_geometry?.semantic_surfaces?.[name];input.disabled=!layer?.polygons?.length;input.closest('label').classList.toggle('unavailable',input.disabled);input.closest('label').title=input.disabled?(layer?.reason||'当前归档未提供此地图图层'):layer.source||'归档地图图层';sceneLayers[name]=Boolean(input.checked&&!input.disabled);scene?.setLayer(name,sceneLayers[name]);}
@@ -234,9 +235,11 @@ function renderNavsim(frame){
   $('potential-toggle').disabled=!!n;
   if(!n){navsimPlotToken=null;return;}
   $('alignment').textContent=n.source_frame?'独立源锚点 · t=0':'官方评分回放 · 无重新规划';
-  $('scene-description').textContent=state.view==='video'?`${state.manifest?.video?.visualization_label||'归档执行视频'} · 每样本独立4秒`:state.view==='scene'?'自定义三维诊断（非官方绘图） · 源帧局部坐标':'源规划BEV诊断图（非官方绘图） · 仅t=0';
+  const expected=n.displayed_plan_source==='causal_native_controller_preview';
+  $('scene-description').textContent=state.view==='video'?`${state.manifest?.video?.visualization_label||'归档执行视频'} · 每样本独立4秒`:state.view==='scene'?`自定义三维诊断（非官方绘图） · ${n.source_frame?(expected?'预计执行 · 车身中心':'原始MPC · 车身中心'):'官方实际执行'}`:`${n.expected_execution_metadata?'预计执行':'原始MPC'}BEV诊断图（非官方绘图） · 仅t=0`;
   $('navsim-note').textContent=`锚点 ${n.anchor_token} · ${fmt(frame.time,1)}s · ${n.trace_available?'官方仿真轨迹已归档':'未归档官方仿真，仅展示源帧'} · 所有分数均为最终或源锚点评分，不随时间轴变化。`;
   if(!n.source_frame){$('plan-safety').className='badge subtle';$('plan-safety').textContent='官方评分仿真回放';}
+  else if(expected){const safe=n.expected_execution_metadata?.diagnostics?.safety_feasible;$('plan-safety').className=`badge ${safe===false?'warn':'subtle'}`;$('plan-safety').textContent=safe===false?'预计执行诊断有风险':'预计执行诊断（非安全证明）';}
   $('potential-panel').hidden=true;
   if(!$('navsim-panel').open)return;
   if(!window.Plotly){
@@ -245,10 +248,10 @@ function renderNavsim(frame){
   }
   const paths=n.trajectories||{},point=(paths.official_simulated_rear_axle||[])[frame.index];
   const plotKey=`${frame.episode_id}:${n.anchor_token}`;
-  if(navsimPlotToken===plotKey){Plotly.restyle('navsim-plot',{x:[point?[point[0]]:[]],y:[point?[point[1]]:[]]},[3]);return;}
+  if(navsimPlotToken===plotKey){Plotly.restyle('navsim-plot',{x:[point?[point[0]]:[]],y:[point?[point[1]]:[]]},[4]);return;}
   navsimPlotToken=plotKey;
-  const specs=[['源规划 · 中心','source_plan_center','#6bdda2'],['提交 · 后轴','submitted_rear_axle','#f3b75e'],['官方仿真 · 后轴','official_simulated_rear_axle','#70b9fa']];
-  const traces=specs.map(([name,key,color])=>{const rows=paths[key]||[];return {name,x:rows.map(p=>p[0]),y:rows.map(p=>p[1]),mode:key==='submitted_rear_axle'?'lines+markers':'lines',line:{color,width:2},marker:{size:5},hovertemplate:'x=%{x:.2f} m<br>y=%{y:.2f} m<extra>'+name+'</extra>'};});
+  const specs=[['原始MPC · 中心','source_plan_center','#6bdda2'],['最终提交 · 后轴','submitted_rear_axle','#f3b75e'],['预计执行 · 后轴','expected_simulated_rear_axle','#70b9fa'],['官方实际 · 后轴','official_simulated_rear_axle','#70b9fa']];
+  const traces=specs.map(([name,key,color])=>{const rows=paths[key]||[];return {name,x:rows.map(p=>p[0]),y:rows.map(p=>p[1]),mode:key==='submitted_rear_axle'?'lines+markers':'lines',line:{color,width:2,dash:key==='expected_simulated_rear_axle'?'dot':'solid'},marker:{size:5},hovertemplate:'x=%{x:.2f} m<br>y=%{y:.2f} m<extra>'+name+'</extra>'};});
   traces.push({name:'当前仿真采样',x:point?[point[0]]:[],y:point?[point[1]]:[],mode:'markers',marker:{size:9,color:'#263b38'},showlegend:false});
   Plotly.react('navsim-plot',traces,{paper_bgcolor:'transparent',plot_bgcolor:'transparent',font:{color:'#52665c',size:12},margin:{l:45,r:12,t:10,b:45},legend:{orientation:'h',y:1.12},xaxis:{title:'源帧 x / m',gridcolor:'#e1e9e2',zerolinecolor:'#c2d1c4'},yaxis:{title:'y / m',scaleanchor:'x',scaleratio:1,gridcolor:'#e1e9e2',zerolinecolor:'#c2d1c4'},uirevision:plotKey},{responsive:true,displayModeBar:false});
 }
@@ -343,13 +346,13 @@ function renderMemory(frame){
 function renderMetrics(frame){
   const panel=$('metrics-panel');panel.replaceChildren();const plan=frame.plan||{},d=plan.diagnostics||{},timing=frame.timing||{},audit=frame.execution_audit||{};
   if(frame.navsim){
-    const n=frame.navsim,s=n.scores||{},q=s.internal_quality||{},a=s.official_anchor||{},run=s.official_run_aggregate||s.official_two_stage_aggregate||{},meta=n.source_plan_metadata||{},single=['v1_navtest','v2_navtest'].includes(run.benchmark_profile);
-    metricList(panel,'ANCHOR · 独立样本',[['源token',n.anchor_token],['回放偏移秒',frame.time],['输入条件',n.input_condition],['源规划可执行',meta.valid],['源规划安全条件满足',meta.diagnostics?.safety_feasible]]);
-    metricList(panel,'INTERNAL · 源规划内部质量（非官方分数）',[['内部quality',q.score],['内部有效',q.valid]]);
+    const n=frame.navsim,s=n.scores||{},q=s.internal_quality||{},a=s.official_anchor||{},run=s.official_run_aggregate||s.official_two_stage_aggregate||{},meta=n.source_plan_metadata||{},single=['v1_navtest','v2_navtest'].includes(run.benchmark_profile),expected=s.internal_quality_trajectory_source==='causal_native_controller_preview',diagnostics=expected?n.expected_execution_metadata?.diagnostics:meta.diagnostics,label=expected?'预计执行':'原始MPC';
+    metricList(panel,'ANCHOR · 独立样本',[['源token',n.anchor_token],['回放偏移秒',frame.time],['输入条件',n.input_condition],['原始MPC轨迹可用',meta.valid],[`${label}诊断安全条件满足`,diagnostics?.safety_feasible]]);
+    metricList(panel,`INTERNAL · ${label}内部质量（非官方分数）`,[['内部quality',q.score],['内部有效',q.valid]]);
     metricList(panel,'OFFICIAL · 单锚点',[['归档score',a.score??a.pdm_score],['CSV单锚点score',s.official_csv_anchor?.score],['CSV有效',s.official_csv_anchor?.valid]]);
     metricList(panel,`OFFICIAL · 整轮${single?'单阶段汇总':'两阶段聚合'}`,[[`官方 ${run.score_name||'EPDMS'}`,run.score],['已评估token',run.evaluated_tokens],['失败token',run.failed_tokens],['split',run.split],['可与纯传感器标准条件直接比较',run.standard_sensor_only_comparable]]);
     panel.append(el('p','context-caption','上述值为源规划或官方最终评分，回放中不会重算；整轮汇总来自完整官方CSV。'));
-    rawDetails(panel,'内部quality原始字段（已省略内部数组）',s.internal_quality);rawDetails(panel,'官方单锚点原始指标',s.official_anchor);rawDetails(panel,'官方CSV本token行',s.official_csv_anchor);rawDetails(panel,'源规划诊断摘要',meta);rawDetails(panel,'归档时域约定（主轨迹与诊断尾段分开）',n.horizon_contract);rawDetails(panel,'坐标与来源',n.coordinates);rawDetails(panel,'评分回放来源',n.provenance);rawDetails(panel,'源模型/规划耗时',timing);rawDetails(panel,'数据来源证据',frame.evidence);return;
+    rawDetails(panel,'内部quality原始字段（已省略内部数组）',s.internal_quality);rawDetails(panel,'官方单锚点原始指标',s.official_anchor);rawDetails(panel,'官方CSV本token行',s.official_csv_anchor);rawDetails(panel,'原始MPC诊断摘要',meta);if(n.expected_execution_metadata)rawDetails(panel,'预计执行诊断摘要（非官方实际）',n.expected_execution_metadata);rawDetails(panel,'归档时域约定（主轨迹与诊断尾段分开）',n.horizon_contract);rawDetails(panel,'坐标与来源',n.coordinates);rawDetails(panel,'评分回放来源',n.provenance);rawDetails(panel,'源模型/规划耗时',timing);rawDetails(panel,'数据来源证据',frame.evidence);return;
   }
   metricList(panel,'PLANNING · 当前源帧',[
     ['源帧',frame.frame_id],['规划后端',d.planner_backend||state.manifest?.summary?.planner_backend],['轨迹可执行',plan.valid??plan.executable??plan.success],['安全条件满足',plan.safety_feasible??d.safety_feasible],['执行状态',d.execution_mode||plan.execution_mode],['候选来源',d.candidate_source||d.selected_candidate||d.optimizer_termination],['规划耗时',finite(d.planning_seconds)?`${fmt(d.planning_seconds*1000,1)} ms`:finite(plan.solve_seconds)?`${fmt(plan.solve_seconds*1000,1)} ms`:timing.mpc_s?`${fmt(timing.mpc_s*1000,1)} ms`:undefined],['质量评分',frame.quality?.score],

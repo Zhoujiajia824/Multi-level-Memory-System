@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from dataclasses import replace
 import math
 import time
 import numpy as np
@@ -322,7 +323,74 @@ class Predictor:
         self.tracks = {}
         self.preparation_seconds=0.
 
-    def _observe(self, actor, time):
+    def _bootstrap_navsim_history(self, actor, time):
+        """Initialize one-shot anchors from observed history, never from future.
+
+        NAVSIM history timestamps are relative to the current anchor. Online
+        platforms retain their original persistent-track update path.
+        """
+        observations=[]
+        last_time=-np.inf
+        for item in actor.history:
+            relative=float(item['time'])
+            if not np.isfinite(relative) or relative>1e-8 or relative<=last_time:
+                raise ValueError('NAVSIM预测历史必须按时间严格递增，且不得包含未来')
+            last_time=relative
+            if item.get('observed') is not True:
+                continue
+            row=dict(time=relative, heading=float(item['heading']))
+            for key in ('position','velocity','acceleration'):
+                row[key]=np.asarray(item[key],float)
+                if row[key].shape!=(2,) or not np.isfinite(row[key]).all():
+                    raise ValueError('NAVSIM预测历史包含非法观测：'+key)
+            if not np.isfinite(row['heading']):
+                raise ValueError('NAVSIM预测历史包含非法航向')
+            if abs(relative)<=1e-8:
+                if (any(not np.allclose(row[key],getattr(actor,key),rtol=0,atol=1e-7)
+                        for key in ('position','velocity','acceleration'))
+                        or abs(float(wrap(row['heading']-actor.heading)))>1e-7):
+                    raise ValueError('NAVSIM预测历史当前观测与当前对象不一致')
+                continue  # The Actor is the single authoritative current row.
+            observations.append(row)
+        for row in observations:
+            historical=replace(actor, position=row['position'], velocity=row['velocity'],
+                acceleration=row['acceleration'],heading=row['heading'],history=[])
+            self._observe(historical,time+row['time'],derived_motion=True)
+        track=self._observe(actor,time,derived_motion=True)
+        current=dict(time=0.,position=actor.position,velocity=actor.velocity,
+            acceleration=actor.acceleration,heading=actor.heading)
+        track['bootstrap_observations']=[*observations,current]
+        track['history_bootstrap_pending']=bool(observations)
+        track['history_bootstrap']=dict(applied=bool(observations),
+            past_observations=len(observations), current_observations=1,
+            relative_times_s=[row['time'] for row in observations]+[0.],
+            measurement_policy='position_velocity_course; derived_acceleration_and_turn_rate_are_latent',
+            source='observed_current_and_past_actor_history_only')
+        return track
+
+    def _bootstrap_lateral_hold(self, track, reference, sign):
+        """Only count intervals whose two observed ends show the same crossing.
+
+        A single instantaneous lateral velocity is not a sustained lane-change
+        observation. This uses the present public reference for past positions,
+        without guessing a hidden route or historical lane membership.
+        """
+        observations=track.get('bootstrap_observations',[])
+        if len(observations)<2:
+            return 0.
+        threshold=self.cfg.get('lane_change_min_lateral_speed_mps',.3)
+        lateral=[]
+        for row in observations:
+            _,_,heading=_projection(row['position'],reference)
+            lateral.append(float(np.dot(row['velocity'],[-np.sin(heading),np.cos(heading)])))
+        duration=0.
+        for index in range(len(observations)-2,-1,-1):
+            if min(sign*lateral[index],sign*lateral[index+1])<threshold:
+                break
+            duration+=observations[index+1]['time']-observations[index]['time']
+        return float(duration)
+
+    def _observe(self, actor, time, derived_motion=False):
         noise=self.cfg.get('measurement_std',{})
         rp=noise.get('position_m',.05)**2
         rv=noise.get('speed_mps',.1)**2
@@ -331,23 +399,39 @@ class Predictor:
         if actor.kind == 'pedestrian':
             measurement = np.array([actor.position[0], actor.velocity[0], actor.acceleration[0], actor.position[1], actor.velocity[1], actor.acceleration[1]])
             z, p = measurement.copy(), np.diag(self.cfg.get('pedestrian_initial_variances',[.1]*6))
+            if derived_motion:
+                z[[2,5]]=0.  # A prior, not an additional acceleration sensor.
             if old is not None:
                 dt = time-old['time']
                 if dt > 0:
                     f, q = singer_matrices(round(dt, 8), self.cfg.get('singer_tau_s', 1.), self.cfg.get('singer_accel_std_mps2', 1.5))
                     ff = np.kron(np.eye(2), f)
                     z, p = ff@old['z'], ff@old['p']@ff.T + np.kron(np.eye(2), q)
-                    z, p = joseph_update(z, p, measurement, list(range(6)), [rp,rv,ra]*2)
+                    if derived_motion:
+                        indices=[0,1,3,4]
+                        z,p=joseph_update(z,p,measurement[indices],indices,[rp,rv,rp,rv])
+                    else:
+                        z, p = joseph_update(z, p, measurement, list(range(6)), [rp,rv,ra]*2)
                 else:
                     z, p = old['z'], old['p']
         else:
             measurement,measurement_covariance,moving=motion_measurement(actor,self.cfg)
             z,p=measurement.copy(),measurement_covariance.copy()
+            if derived_motion:
+                # NAVSIM acceleration is a difference of these same velocity
+                # observations; omega is reconstructed from v/a. Counting them
+                # again as independent sensors reuses the same information.
+                variance=self.cfg.get('initial_acceleration_variance',1.)
+                if type(variance) not in (int,float) or not np.isfinite(variance) or variance<=0:
+                    raise ValueError('派生运动滤波的加速度初始方差必须为有限正数')
+                z[[3,5]]=0.
+                p[[3,5],:]=0.;p[:,[3,5]]=0.
+                p[3,3]=variance;p[5,5]=self.cfg.get('initial_turn_rate_variance',.1)
             if old is not None:
                 dt = time-old['time']
                 if dt > 0:
                     z, p = ctra_propagate(old['z'], old['p'], dt, self.cfg.get('ctra_jerk_psd', 1.), self.cfg.get('ctra_yaw_accel_psd', .04),self.cfg.get('integration_step_s',.02))
-                    inds=[0,1,2,3,4,5] if moving else [0,1,2,3]
+                    inds=([0,1,2,4] if moving else [0,1,2]) if derived_motion else ([0,1,2,3,4,5] if moving else [0,1,2,3])
                     z,p=joseph_update(z,p,measurement[inds],inds,measurement_covariance[np.ix_(inds,inds)],4)
                     z[4] = wrap(z[4])
                 else:
@@ -355,6 +439,12 @@ class Predictor:
         track = dict(old or {})
         track['observation_dt'] = max(0.,time-old['time']) if old else 0.
         track.update(z=z, p=p, time=time)
+        if derived_motion:
+            track['derived_motion_filter']=dict(
+                measurement_policy='position_velocity_course_only' if actor.kind!='pedestrian' else 'position_velocity_only',
+                acceleration_is_independent_measurement=False,
+                turn_rate_is_independent_measurement=False,
+                posterior_covariance_diagonal=np.diag(p).tolist())
         self.tracks[actor.id] = track
         return track
 
@@ -419,6 +509,8 @@ class Predictor:
         # 当前公开车道的后继以短时运动几何选取，绝不读取真实路线。
         visited = {lane.id} | ({predecessor.id} if predecessor is not None else set())
         successors = []
+        branch_evidence = []
+        navsim_causal_branches = scene.scenario == 'navsim'
         while np.sum(np.linalg.norm(np.diff(line, axis=0), axis=1))-s < max(20., float(free[:, 3].max())*times[-1]+5,required_distance):
             options = [lanes[k] for k in lane.successors if k in lanes and k not in visited]
             if not options:
@@ -440,7 +532,7 @@ class Predictor:
                 errors=(distance/max(candidate.width/2,.1))**2+(
                     wrap(ph-free[indexes,2])/self.cfg.get('map_successor_heading_scale_rad',np.pi/6))**2
                 return float(np.mean(errors)),*geometry_cost(candidate)
-            if not successors:
+            if not successors or navsim_causal_branches:
                 # 同一后继道路的平行车道只留一个几何延续；已锁定的横向
                 # 收敛负责换道，不能在参考选择中再叠加一次横移。
                 remaining={candidate.id for candidate in options}
@@ -457,7 +549,41 @@ class Predictor:
                     representatives.append(min((lanes[identity] for identity in group),key=geometry_cost))
                 # 仅第一层真实分叉使用当前运动证据；远端不能重复使用原
                 # 时刻的短前缀，也不能让合法出口间隙绝对压倒驶出证据。
-                lane=min(representatives,key=motion_cost)
+                if navsim_causal_branches and len(representatives)>1:
+                    # A unique connecting segment is not a decision. At the
+                    # first actual fork (or a later one), a tiny seam-angle
+                    # difference cannot identify another driver's intention.
+                    # Only distinguish branches when the existing short causal
+                    # motion prefix reaches beyond their common segment and
+                    # one fits decisively at the existing lane/heading scales.
+                    # Otherwise retain the already filtered free-motion model;
+                    # do not invent a route or consult a future annotation.
+                    common_length=float(np.sum(np.linalg.norm(np.diff(line,axis=0),axis=1)))
+                    position_uncertainty=float(np.sqrt(max(0.,track['p'][0,0]+track['p'][1,1])))
+                    evidence=[]
+                    for candidate in representatives:
+                        trial=np.vstack([line,candidate.center[1:] if np.linalg.norm(line[-1]-candidate.center[0])<1e-6 else candidate.center])
+                        ps,_,_=_projections(free[indexes,:2],_curve(trial))
+                        evidence.append(dict(lane_id=candidate.id,motion_cost=motion_cost(candidate)[0],
+                            prefix_beyond_fork_m=float(np.max(ps)-common_length)))
+                    evidence.sort(key=lambda row:(row['motion_cost'],row['lane_id']))
+                    best,runner_up=evidence[:2]
+                    reached=best['prefix_beyond_fork_m']>position_uncertainty
+                    separated=runner_up['motion_cost']-best['motion_cost']>=1.
+                    supported=reached and separated and best['motion_cost']<=1.
+                    branch_evidence.append(dict(source_lane_id=lane.id,
+                        candidates=evidence,short_prefix_s=float(times[indexes[-1]]),
+                        position_uncertainty_m=position_uncertainty,
+                        decision='supported_causal_branch' if supported else 'uncertain_free_motion',
+                        evidence_scale='existing_lane_half_width_and_map_successor_heading_scale',
+                        normalized_cost_separation_required=1.))
+                    if not supported:
+                        return free,dict(map_applied=False,valid=False,branch_uncertain=True,
+                            reason='公开车道分叉缺少足够的当前运动证据，保留因果自由运动',
+                            successors=successors,branch_evidence=branch_evidence)
+                    lane=lanes[best['lane_id']]
+                else:
+                    lane=min(representatives,key=motion_cost)
             else:
                 lane=min(options,key=geometry_cost)
             visited.add(lane.id)
@@ -476,7 +602,13 @@ class Predictor:
         tangential_speed=float(np.dot(actor.velocity,[np.cos(heading),np.sin(heading)]))
         sd=tangential_speed/(q*metric)
         # d 的二阶导数由同一连续曲线得到；不可将向心加速度当作横向换道加速度。
-        ad = float(np.dot(actor.acceleration, [-np.sin(heading), np.cos(heading)]))-curvature*tangential_speed**2/q
+        acceleration=actor.acceleration
+        if track.get('derived_motion_filter') and actor.kind!='pedestrian':
+            # Use the same causal posterior for map conditioning. Reinjecting
+            # the finite-difference acceleration here would undo the filter.
+            latent=track['z'];unit=np.array([np.cos(latent[4]),np.sin(latent[4])])
+            acceleration=latent[3]*unit+latent[2]*latent[5]*np.array([-unit[1],unit[0]])
+        ad = float(np.dot(acceleration, [-np.sin(heading), np.cos(heading)]))-curvature*tangential_speed**2/q
         target_id = track.get('target_lane')
         elapsed=track.get('observation_dt',0.)
         if target_id is not None and target_id in lanes:
@@ -488,7 +620,8 @@ class Predictor:
             else:
                 track['settled'] = 0.
         elif abs(vd) >= self.cfg.get('lane_change_min_lateral_speed_mps',.3):
-            track['lateral_duration'] = track.get('lateral_duration', 0.)+elapsed
+            track['lateral_duration'] = (self._bootstrap_lateral_hold(track,reference,np.sign(vd))
+                if track.get('history_bootstrap_pending') else track.get('lateral_duration', 0.)+elapsed)
             candidate = lane.left if vd > 0 else lane.right
             if track['lateral_duration'] >= self.cfg.get('lane_change_detect_hold_s',.3) and candidate in lanes:
                 track['target_lane'] = candidate
@@ -519,6 +652,8 @@ class Predictor:
                              'reference_heading_rad':float(heading),'predecessor':predecessor.id if predecessor else None,
                              'successors':successors,'lateral':lateral_diagnostic,
                              'cancelled_target_lane':cancelled_target}
+        if navsim_causal_branches:
+            geometry_diagnostic['branch_evidence']=branch_evidence
         if lateral is None:
             return free, {'map_applied': False, 'valid':False,'reason': '横向收敛无可行参数',**geometry_diagnostic}
         ds,lateral_speeds,_=lateral
@@ -590,8 +725,14 @@ class Predictor:
             actors[actor.id] = actor
             if actor.kind == 'static_obstacle':
                 trajectories[actor.id] = np.tile([*actor.position,actor.heading,0.],(len(times),1))
+                # t=0 remains the observed state, even when a nominally static
+                # annotation contains tiny measured velocity. Future motion
+                # still follows the explicit static-object model.
+                trajectories[actor.id][0,3] = float(np.linalg.norm(actor.velocity))
                 continue
-            track = self._observe(actor,scene.time)
+            bootstrap=scene.scenario=='navsim' and actor.id not in self.tracks
+            track = (self._bootstrap_navsim_history(actor,scene.time) if bootstrap
+                     else self._observe(actor,scene.time,derived_motion=scene.scenario=='navsim'))
             z, p = track['z'].copy(), track['p'].copy()
             output = [[*actor.position,actor.heading,float(np.linalg.norm(actor.velocity))]]
             if actor.kind == 'pedestrian':
@@ -600,12 +741,25 @@ class Predictor:
                 for _ in times[1:]:
                     z,p=ff@z,ff@p@ff.T+qq
                     output.append([z[0],z[3],np.arctan2(z[4],z[1]),np.hypot(z[1],z[4])])
+                if bootstrap:
+                    output=np.asarray(output,float)
+                    output[1:,:2]+=actor.position-track['z'][[0,3]]
             else:
                 sequence=_ctra_sequence(z,p,step,len(times)-1,self.cfg.get('ctra_jerk_psd',1.),
                                         self.cfg.get('ctra_yaw_accel_psd',.04),self.cfg.get('integration_step_s',.02))
                 headings=wrap(sequence[:,4]+wrap(actor.heading-track['z'][4]))
-                output.extend(np.column_stack([sequence[:,:2],headings,sequence[:,2]]))
+                positions=sequence[:,:2]
+                if bootstrap:
+                    # Preserve the filtered displacement, anchored to the
+                    # current observed position rather than a posterior offset.
+                    positions=positions+(actor.position-track['z'][:2])
+                output.extend(np.column_stack([positions,headings,sequence[:,2]]))
             output,info=self._mapped(actor,scene,track,np.array(output),times)
+            if bootstrap:
+                info['history_bootstrap']=track['history_bootstrap']
+            if scene.scenario=='navsim':
+                info['motion_observation_filter']=track['derived_motion_filter']
+            track['history_bootstrap_pending']=False
             # 地图先验失败不等于基础物理预测不存在；保留对象和失败原因，明确实际来源。
             info['map_valid']=bool(info.get('map_applied') and info.get('valid'))
             info['trajectory_source']='map_conditioned_ekf' if info['map_valid'] else ('singer' if actor.kind=='pedestrian' else 'ctra_ekf')

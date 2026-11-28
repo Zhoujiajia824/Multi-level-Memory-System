@@ -5,6 +5,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
+import time
 
 import numpy as np
 from nine_grid.paths import filesystem_path
@@ -15,11 +16,35 @@ HORIZON_S = 4.0
 PLANNING_STEP_S = 0.1
 PLANNING_STEPS = 40
 OUTPUT_INTERVAL_S = 0.5
+EXECUTION_TTC_OFFSETS_S = (0., .3, .6, .9)
 
 
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
                                      ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def _replace_with_retry(source, target, *, platform=None, replace=None, clock=None, sleep=None):
+    """Bound transient Windows sharing failures while preserving atomic replace."""
+    platform = os.name if platform is None else platform
+    replace = os.replace if replace is None else replace
+    clock = time.monotonic if clock is None else clock
+    sleep = time.sleep if sleep is None else sleep
+    delays = (.01, .02, .04, .08, .08)
+    deadline, attempt = clock() + .25, 0
+    while True:
+        try:
+            replace(source, target)
+            return
+        except OSError as exc:
+            if (platform != "nt" or getattr(exc, "winerror", None) not in (5, 32, 33)
+                    or attempt >= len(delays)):
+                raise
+            pause = delays[attempt]
+            if clock() + pause > deadline:
+                raise
+            sleep(pause)
+            attempt += 1
 
 
 def write_bytes(path, payload):
@@ -34,7 +59,7 @@ def write_bytes(path, payload):
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        _replace_with_retry(temporary, path)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -58,9 +83,25 @@ def relative_asset_path(path, root):
     return relative.as_posix()
 
 
+def prediction_diagnostic_horizon(config):
+    """Cover quality and native TTC queries on the same complete 0.1s grid."""
+    offsets = config.get("quality", {}).get("ttc_offsets_s", EXECUTION_TTC_OFFSETS_S)
+    if (not isinstance(offsets, (list, tuple)) or not offsets
+            or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                   or not math.isfinite(value) or value < 0 for value in offsets)):
+        raise ValueError("NAVSIM TTC offsets must be finite nonnegative seconds")
+    refinement = config.get("navsim_execution_refinement", {})
+    if not isinstance(refinement, dict) or type(refinement.get("enabled", False)) is not bool:
+        raise ValueError("NAVSIM execution refinement enabled must be boolean")
+    tail = max(offsets)
+    if refinement.get("enabled", False):
+        tail = max(tail, max(EXECUTION_TTC_OFFSETS_S))
+    return float(PLANNING_STEP_S * math.ceil((HORIZON_S + tail) / PLANNING_STEP_S - 1e-9))
+
+
 def horizon_contract(config, plans=None, predictions=None):
     """Check the actual grids, including the predictor's diagnostic horizon."""
-    diagnostic_horizon = HORIZON_S + max(config.get("quality", {}).get("ttc_offsets_s", [0, .3, .6, .9]))
+    diagnostic_horizon = prediction_diagnostic_horizon(config)
     if (config["mpc"]["horizon_steps"] != PLANNING_STEPS
             or not math.isclose(config["mpc"]["step_s"], PLANNING_STEP_S, abs_tol=1e-10)
             or any(not math.isclose(config["prediction"][key], expected, abs_tol=1e-10)
