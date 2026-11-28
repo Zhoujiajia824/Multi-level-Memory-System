@@ -8,7 +8,7 @@ import json
 import math
 
 from .demo_routes import (station_waypoint, crossing_drive_path, oncoming_drive_path, crossing_lights,
-                          right_walking_exit, _stop_controls_route, _bypass_stations)
+                          right_walking_exit, _stop_controls_route, _bypass_stations, chain)
 from .route import xy, project, point_in_polygon, wrap, lane_key
 
 WALKABLE_SURFACES = frozenset(('Roads','RoadLines','Sidewalks','Ground','Terrain'))
@@ -166,6 +166,24 @@ def _path_body_distance(path, polygon):
                for c,d in zip(polygon,polygon[1:]+polygon[:1]))
 
 
+def _teaching_body_clearance(path, polygon, length, width):
+    """Measured body sweep; .25m guards the gaps between .5m path samples."""
+    minimum=float('inf')
+    for a,b in zip(path,path[1:]):
+        arc=math.dist(a,b)
+        count=max(1,int(math.ceil(arc/.5)))
+        heading=math.atan2(b[1]-a[1],b[0]-a[0])
+        c,s=math.cos(heading),math.sin(heading)
+        for i in range(count+1):
+            t=i/count
+            center=[a[0]+t*(b[0]-a[0]),a[1]+t*(b[1]-a[1])]
+            footprint=[(center[0]+u*c-v*s,center[1]+u*s+v*c)
+                for u,v in ((length/2.+.25,width/2.),(length/2.+.25,-width/2.),
+                            (-length/2.-.25,-width/2.),(-length/2.-.25,width/2.))]
+            minimum=min(minimum,_polygon_distance(footprint,polygon))
+    return minimum
+
+
 def _at(path, station):
     arc = 0.
     for a, b in zip(path, path[1:]):
@@ -258,7 +276,7 @@ def _walker_starts(wp, lateral, crossing, *, probe_edges=False):
 
 
 class DemoEvents:
-    def __init__(self, world, waypoints, spec, carla):
+    def __init__(self, world, waypoints, spec, carla, *, ego=None):
         self.world, self.waypoints, self.spec, self.carla = world, waypoints, spec, carla
         self.route = [xy(wp.transform.location) for wp in waypoints]
         self.teaching_path = self.route
@@ -280,6 +298,12 @@ class DemoEvents:
         self.ego_moved=False
         self.geometry_by_path={}
         self.ego_width,self.ego_length=2.,5.
+        if ego is not None:
+            heading=-math.radians(ego.get_transform().rotation.yaw)
+            body=_body(ego)
+            along=[x*math.cos(heading)+y*math.sin(heading) for x,y in body]
+            side=[-x*math.sin(heading)+y*math.cos(heading) for x,y in body]
+            self.ego_length,self.ego_width=max(along)-min(along),max(side)-min(side)
 
     def _cross_branch(self, desired_station):
         result = crossing_drive_path(self.waypoints, desired_station)
@@ -443,6 +467,21 @@ class DemoEvents:
             if role == 'cross_traffic_vehicle':
                 cross_path,interaction_station,branch_station = self._cross_branch(config['s_offset_m'])
                 pose,lateral = cross_path[0].transform,0.
+            vehicle_path=None
+            if self.manual and role=='braking_lead':
+                # Let the resumed leader clear the ego's finish before its own
+                # bounded terminal stop. The critical brake/hold/resume stays
+                # on the unchanged original route.
+                tail=chain(self.waypoints[-1],34.)
+                if (not tail or any(w.is_junction or str(w.lane_type).split('.')[-1]!='Driving'
+                                    or w.lane_width<2.6 for w in tail)):
+                    raise RuntimeError('HardBrake leader requires a continuous driving exit beyond the ego finish')
+                exit_path=[tail[0]];arc=0.
+                for a,b in zip(tail,tail[1:]):
+                    arc+=a.transform.location.distance(b.transform.location)
+                    exit_path.append(b)
+                    if arc>=30.:break
+                vehicle_path=self.waypoints+exit_path[1:]
             yaw = math.radians(pose.rotation.yaw)
             if role=='construction_advance_warning':
                 # Keep the roadside advance sign beyond the entire bank of
@@ -529,6 +568,9 @@ class DemoEvents:
                 raise RuntimeError('Town13 Animals requires the actual 1075 walker.animal.1009 asset; no pedestrian substitute')
             if config['actor_type'] in ('obstacle','visual_proxy'):
                 actor.set_simulate_physics(False)
+            stop_occlusion=None
+            if self.manual and role=='stop_sign_visual_occluder':
+                stop_occlusion=self._place_stop_occluder(actor,sign,interaction_station)
             # Make full-wall props' physical long axis road-normal. This is
             # initialization-only, audited below, never an online teleport.
             if role == 'full_blocker' and config['actor_type'] == 'obstacle' and not any(config.get(k) for k in ('pitch_offset_deg','roll_offset_deg')):
@@ -542,16 +584,18 @@ class DemoEvents:
             if occluded:
                 interaction_station = project(xy(actor.get_location()),self.route)['s_m']
             row = dict(config=config,actor=actor,original_waypoint=original,cross_path=cross_path,
+                       vehicle_path=vehicle_path,
                        start=actor.get_location(),interaction_station_m=interaction_station,
                        branch_crossing_s_m=branch_station,finished=False,actions=set(),
                        stop_sign_id=stop_sign_id,
                        crossing_left_limit_m=self._crossing_left_limit(original) if role == 'crossing_actor' else None,
+                       stop_occlusion=stop_occlusion,
                        prior_motion_observed=False,brake_observed=False,brake_stopped_at=None,resume_origin=None)
             self.rows.append(row)
             if config['actor_type'] == 'vehicle':
                 if role == 'braking_lead':
                     self._set_brake_light(actor,False)
-                    self._drive_vehicle(row,self.waypoints,float(config['speed_mps']))
+                    self._drive_vehicle(row,row.get('vehicle_path') or self.waypoints,float(config['speed_mps']))
                 else:
                     actor.apply_control(self.carla.VehicleControl(brake=1.))
         if occluded:
@@ -566,6 +610,7 @@ class DemoEvents:
                      interaction_station_m=row['interaction_station_m'],
                      branch_crossing_s_m=row['branch_crossing_s_m'],
                      stop_sign_id=row['stop_sign_id'],
+                     stop_occlusion=row.get('stop_occlusion'),
                      authored_motion=(self._motion_design(row) if self.manual else None),
                      crossing_left_limit_m=row['crossing_left_limit_m'],
                      control_interface=('CARLA.WalkerControl' if row['config']['role'] in ('crossing_actor','slow_lead')
@@ -575,6 +620,58 @@ class DemoEvents:
                          if self.spec.get('family')=='Animals' and row['actor'].type_id=='walker.animal.1009' else None),
                      initial_light_state=(int(row['actor'].get_light_state()) if row['config']['role']=='braking_lead' else None))
                 for row in self.rows]
+
+    def _place_stop_occluder(self,actor,sign,station):
+        """Place an owned visual prop without narrowing the teaching corridor.
+
+        Candidates translate its measured footprint only during initialization.
+        The real stop actor and trigger never move. The frozen first observation
+        checks the resulting body and planar sign occlusion independently.
+        """
+        pose=actor.get_transform();initial=xy(pose.location)
+        offsets=[(x-initial[0],y-initial[1]) for x,y in _body(actor)]
+        sign_point=xy(sign.get_transform().location)
+        center,heading=_at(self.route,station)
+        normal=(-math.sin(heading),math.cos(heading))
+        sign_d=sum((sign_point[i]-center[i])*normal[i] for i in (0,1))
+        if abs(sign_d)<.5:raise RuntimeError('Real stop sign lacks a roadside occluder placement')
+        side=1. if sign_d>0. else -1.
+        inset=min(side*(x*normal[0]+y*normal[1]) for x,y in offsets)
+        # Keep reserve for the measured suspension/pose change before the
+        # first camera frame; the actual acceptance threshold remains .2m.
+        placement_clearance=.3
+        required=self.ego_width/2.+placement_clearance-inset
+        trigger=next(t['distance_m'] for t in self.spec['trigger_specs'] if 'distance_m' in t)
+        observer,_=_at(self.route,max(0.,station-trigger))
+        road_height=self.waypoints[min(range(len(self.route)),key=lambda i:math.dist(center,self.route[i]))].transform.location.z
+        height_offset=pose.location.z-road_height
+        radius=max(math.hypot(x,y) for x,y in offsets)
+        attempted=0
+        for before in (0.,.5,1.,2.,3.,4.,5.,6.,8.):
+            if station-before<0.:continue
+            origin,yaw=_at(self.route,station-before)
+            nearby=self.waypoints[min(range(len(self.route)),key=lambda i:math.dist(origin,self.route[i]))]
+            for padding in (0.,.1,.2,.4,.6,.8,1.2,1.6,2.):
+                attempted+=1
+                d=side*(required+padding)
+                target=[origin[0]-d*math.sin(yaw),origin[1]+d*math.cos(yaw)]
+                if math.dist(target,sign_point)<=radius+.25:continue
+                polygon=[(target[0]+x,target[1]+y) for x,y in offsets]
+                if _path_body_distance([observer,sign_point],polygon)>1e-7:continue
+                if _teaching_body_clearance(self.route,polygon,self.ego_length,self.ego_width)<placement_clearance-1e-6:continue
+                probe=self.carla.Location(x=target[0],y=-target[1],z=nearby.transform.location.z+2.)
+                hit=self.world.ground_projection(probe,4.)
+                if (hit is None or math.hypot(hit.location.x-probe.x,hit.location.y-probe.y)>.15
+                        or str(hit.label).split('.')[-1] not in WALKABLE_SURFACES
+                        or abs(hit.location.z-nearby.transform.location.z)>1.):continue
+                location=self.carla.Location(x=target[0],y=-target[1],z=hit.location.z+height_offset)
+                actor.set_transform(self.carla.Transform(location,pose.rotation))
+                return dict(real_stop_sign_id=sign.id,approach_viewpoint_xy=observer,sign_origin_xy=sign_point,
+                    initialized_actor_origin_xy=target,required_body_clearance_m=.2,
+                    placement_target_clearance_m=placement_clearance,candidates_examined=attempted,
+                    evidence='initialization_measured_footprint;first_frozen_frame_rechecks_geometry',
+                    limitation='planar_sightline_to_sign_origin;not_a_pixel_or_3d_visibility_proof')
+        raise RuntimeError('No measured roadside stop occluder placement preserves body clearance and sign sightline')
 
     def _plan_walkers(self):
         for row in self.rows:
@@ -602,7 +699,7 @@ class DemoEvents:
 
     def _motion_design(self,row):
         config=row['config'];path=row.get('cross_path')
-        if config['role']=='braking_lead':path=self.waypoints
+        if config['role']=='braking_lead':path=row.get('vehicle_path') or self.waypoints
         start=row['start']
         coords=row.get('walker_path') or ([[p.transform.location.x,p.transform.location.y,p.transform.location.z]
                   for p in path] if path else [[start.x,start.y,start.z]])
@@ -672,23 +769,18 @@ class DemoEvents:
             if row['config']['role'] not in fixed_roles:
                 continue
             polygon,minimum = _body(row['actor']),float('inf')
-            for a,b in zip(teaching_path,teaching_path[1:]):
-                length = math.dist(a,b)
-                count = max(1,int(math.ceil(length/.5)))
-                heading = math.atan2(b[1]-a[1],b[0]-a[0])
-                c,s = math.cos(heading),math.sin(heading)
-                for i in range(count+1):
-                    t = i/count
-                    center = [a[0]+t*(b[0]-a[0]),a[1]+t*(b[1]-a[1])]
-                    # The half-sample extension guards the gap between body
-                    # samples; width remains the measured physical ego width.
-                    footprint = [(center[0]+u*c-v*s,center[1]+u*s+v*c)
-                        for u,v in ((ego_length/2.+.25,ego_width/2.),(ego_length/2.+.25,-ego_width/2.),
-                                    (-ego_length/2.-.25,-ego_width/2.),(-ego_length/2.-.25,ego_width/2.))]
-                    minimum = min(minimum,_polygon_distance(footprint,polygon))
+            minimum=_teaching_body_clearance(teaching_path,polygon,ego_length,ego_width)
             measured.append(dict(id=row['config']['id'],minimum_body_clearance_m=minimum,required_m=.2))
             if minimum < .2-1e-6:
                 raise RuntimeError('Authored teaching path lacks measured body clearance: '+row['config']['id'])
+            if row.get('stop_occlusion') is not None:
+                proof=dict(row['stop_occlusion'])
+                proof['actual_body_clearance_m']=minimum
+                proof['actual_sightline_body_gap_m']=_path_body_distance(
+                    [proof['approach_viewpoint_xy'],proof['sign_origin_xy']],polygon)
+                audit.setdefault('stop_sign_occlusion',[]).append(proof)
+                if proof['actual_sightline_body_gap_m']>1e-7:
+                    raise RuntimeError('Actual stop occluder body no longer blocks the approach sign sightline')
         audit['passing_clearance'] = measured
         if self.spec.get('family') == 'PedestrianOtherBlocker':
             blocker = next(r for r in self.rows if r['config']['role'] == 'roadside_occluder')
@@ -728,6 +820,12 @@ class DemoEvents:
         if self.manual:
             velocity=state.get_velocity()
             measured=math.hypot(velocity.x,velocity.y)
+            remaining=sum(math.dist(a,b) for a,b in zip(points,points[1:]))-progress
+            stopping_gap=max(0.,remaining-1.)
+            speed=min(speed,math.sqrt(4.*stopping_gap),.8*stopping_gap)
+            if speed<.05:
+                actor.apply_control(self.carla.VehicleControl(steer=0.,throttle=0.,brake=.5))
+                return
             error=speed-measured
             control=self.carla.VehicleControl(steer=steer,throttle=min(.65,max(0.,.09+.32*error)),
                 brake=min(.8,max(0.,-.40*(error+.2))))
@@ -888,7 +986,8 @@ class DemoEvents:
             if row['config']['role'] == 'braking_lead' and not self.active:
                 observed = self._observed(row,scene)
                 row['prior_motion_observed'] |= observed is not None and math.hypot(*observed['velocity']) > 1.
-                self._drive_vehicle(row,self.waypoints,float(row['config']['speed_mps']),states.get(row['actor'].id))
+                self._drive_vehicle(row,row.get('vehicle_path') or self.waypoints,
+                                    float(row['config']['speed_mps']),states.get(row['actor'].id))
         if not self.active:
             return events
         elapsed = stamp-self.activated_at
@@ -990,7 +1089,7 @@ class DemoEvents:
                     if row['resume_origin'] is None:
                         row['resume_origin'] = xy(current.get_transform().location)
                         events.append(dict(phase='interact',event='lead_resume_commanded',actor_id=a.id,completed=False))
-                    self._drive_vehicle(row,self.waypoints,speed,current)
+                    self._drive_vehicle(row,row.get('vehicle_path') or self.waypoints,speed,current)
                     self._set_brake_light(a,False)
                     moved = math.dist(xy(current.get_transform().location),row['resume_origin'])
                     moving_complete.append(row['brake_observed'] and row.get('required_brake_light_observed') is True

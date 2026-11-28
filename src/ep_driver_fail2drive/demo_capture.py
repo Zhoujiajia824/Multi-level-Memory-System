@@ -9,6 +9,7 @@ import logging
 import math
 from pathlib import Path
 import queue
+import threading
 import time
 import traceback
 
@@ -129,15 +130,50 @@ class FrameBarrier:
         self.queues = {name: queue.Queue(maxsize=4) for name in names}
         self.errors = []
         self.last_frame, self.last_stamp = None, None
+        self._lock = threading.Lock()
+        self._received = {name: [] for name in names}
+        self._received_count = dict.fromkeys(names, 0)
+        self._selected_count = dict.fromkeys(names, 0)
+        self._overflow_count = dict.fromkeys(names, 0)
+        self._requested = None
+        self._accepted = {}
+        self.failure = None
+
+    @staticmethod
+    def _identity(image):
+        def value(item):
+            return item if type(item) in (int, float) and math.isfinite(item) else repr(item)
+        return dict(frame=value(getattr(image, 'frame', None)),
+                    timestamp=value(getattr(image, 'timestamp', None)))
+
+    def diagnostic(self):
+        """Snapshot bounded identities only; never retain extra raw images."""
+        with self._lock:
+            return dict(schema='exact-camera-barrier-diagnostic-1.0',
+                requested=None if self._requested is None else dict(self._requested),
+                accepted={name: dict(row) for name, row in self._accepted.items()},
+                last_complete_frame=self.last_frame, last_complete_time=self.last_stamp,
+                errors=list(self.errors), failure=None if self.failure is None else dict(self.failure),
+                cameras={name: dict(received_count=self._received_count[name],
+                    selected_count=self._selected_count[name],overflow_count=self._overflow_count[name],queue_size=rows.qsize(),
+                    recent_received=[dict(row) for row in self._received[name]])
+                    for name, rows in self.queues.items()},
+                identity_source='raw_callback_frame_and_timestamp;no_frame_substitution')
 
     def callback(self, name):
         if name not in self.queues:
             raise ValueError('Unregistered camera: '+str(name))
         def receive(image):
-            try:
-                self.queues[name].put_nowait(image)
-            except queue.Full:
-                self.errors.append('Camera queue overflow: '+name)
+            with self._lock:
+                self._received_count[name] += 1
+                self._received[name].append(self._identity(image))
+                del self._received[name][:-8]
+                try:
+                    self.queues[name].put_nowait(image)
+                except queue.Full:
+                    self._overflow_count[name] += 1
+                    if len(self.errors) < 8:
+                        self.errors.append('Camera queue overflow: '+name)
         return receive
 
     def get(self, frame, stamp, timeout=30.):
@@ -147,6 +183,19 @@ class FrameBarrier:
             raise ValueError('Requested camera frame, time and timeout must be finite and valid')
         if self.last_frame is not None and (frame != self.last_frame+1 or stamp <= self.last_stamp):
             raise ValueError('Camera barrier requests must use consecutive increasing source frames')
+        with self._lock:
+            self._requested = dict(frame=frame,timestamp=stamp,timeout_s=timeout)
+            self._accepted = {}
+            self.failure = None
+        try:
+            return self._get(frame, stamp, timeout)
+        except Exception as exc:
+            with self._lock:
+                self.failure = dict(error_type=type(exc).__name__,error=str(exc))
+            raise
+
+    def _get(self, frame, stamp, timeout):
+        number = lambda value: type(value) in (int, float) and math.isfinite(value)
         deadline, result = time.monotonic()+timeout, {}
         for name, rows in self.queues.items():
             if self.errors:
@@ -166,9 +215,13 @@ class FrameBarrier:
             if not valid:
                 raise ValueError('Camera lacks a finite raw image transform: '+name)
             result[name] = image
+            with self._lock:
+                self._accepted[name] = self._identity(image)
+                self._selected_count[name] += 1
         if self.errors:
             raise RuntimeError(self.errors[0])
-        self.last_frame, self.last_stamp = frame, stamp
+        with self._lock:
+            self.last_frame, self.last_stamp = frame, stamp
         return result
 
 
@@ -385,6 +438,63 @@ def _destroy_owned_ids(client, carla, ids, already_destroyed):
     return report
 
 
+def _simulator_health(client, world, timeout_s=3.):
+    """Bounded read-only failure probe; no settings, actors or ticks are changed."""
+    report = dict(available=False, ready=False, timeout_s=timeout_s, world_mutated=False)
+    deadline = time.monotonic()+timeout_s
+    def read(method):
+        remaining = deadline-time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('Read-only simulator health deadline exceeded')
+        client.set_timeout(remaining)
+        return method()
+    try:
+        report['server_version'] = read(client.get_server_version)
+        report['available'] = True
+        current = world if world is not None else read(client.get_world)
+        snapshot = read(current.get_snapshot)
+        stamp = float(snapshot.timestamp.elapsed_seconds)
+        if type(snapshot.frame) is not int or snapshot.frame < 0 or not math.isfinite(stamp):
+            raise ValueError('Simulator returned an invalid snapshot identity')
+        report.update(ready=True, frame=snapshot.frame, time=stamp)
+    except Exception as exc:
+        report.update(error_type=type(exc).__name__, error=str(exc))
+    return report
+
+
+def _rpc_failure(error):
+    text = str(error).lower()
+    return isinstance(error, (ConnectionRefusedError,ConnectionResetError,ConnectionAbortedError)) or any(
+        value in text for value in ('while waiting for the simulator','carla rpc','rpc::timeout','rpc_error'))
+
+
+def _streaming_policy(spec):
+    """Bound authored short interactions; leave all other capture modes unchanged."""
+    if spec.get('interaction_reconstruction',{}).get('schema') != 'fail2drive-authored-interaction-2.0':
+        return dict(policy='legacy_capture',distance_m=650.)
+    route = sum(float(spec[key]) for key in ('approach_m','interaction_m','recovery_m'))+8.
+    actors = []
+    for actor in spec['actor_specs']:
+        extent = abs(float(actor['s_offset_m']))+abs(float(actor.get('lateral_offset_m',0.)))
+        row = dict(id=actor['id'],role=actor['role'],initial_design_extent_m=extent)
+        if actor['role'] == 'braking_lead':
+            # Retain a full-duration motion reserve even though its authored
+            # exit path has its own endpoint brake. Never freeze the front car
+            # merely because the ego has stopped or failed to follow it.
+            extent += abs(float(actor['speed_mps']))*float(spec['max_duration_s'])
+            row['full_duration_motion_reserve_m'] = extent-row['initial_design_extent_m']
+        row['extent_m'] = extent
+        actors.append(row)
+    extent = max([route]+[row['extent_m'] for row in actors])
+    body_and_path_reserve, context_margin = 20., 150.
+    radius = max(350.,50.*math.ceil((extent+body_and_path_reserve+context_margin)/50.))
+    return dict(policy='authored_short_interaction_envelope',distance_m=radius,
+        route_extent_m=route,actor_extents=actors,design_extent_m=extent,
+        body_and_path_reserve_m=body_and_path_reserve,context_margin_m=context_margin,
+        minimum_distance_m=350.,rounding_step_m=50.,
+        limitation='Designed route/motion envelope; Unreal tile residency and GPU peak memory require runtime verification')
+
+
 def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=False, video=True,
             interaction_only=False, allow_similar_road=False):
     if type(interaction_only) is not bool:
@@ -412,15 +522,24 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
     interaction_window=None
     preflight = None
     cleanup_reports, destroyed_ids = [], set()
+    barrier, simulator_health, camera_sync, failure_code = None, None, None, None
+    camera_actor_ids, camera_configuration = {}, {}
     def release_site(stage):
         event_actors = [] if events is None else events.actors
+        ids = [actor.id for actor in (*reversed(owned), *reversed(event_actors))]
+        if simulator_health is not None and not simulator_health['ready']:
+            if ids:
+                reason = 'Simulator unavailable; owned actor teardown could not be confirmed'
+                cleanup_reports.append(dict(stage=stage,owned_ids=list(dict.fromkeys(ids)),
+                    requested_ids=[],acknowledged_ids=[],errors=[reason],skipped='simulator_unavailable'))
+                errors.append(reason)
+            return
         if events is not None:
             destroyed_ids.update(events.released_actor_ids)
             try:
                 events.close(destroy_actors=False)
             except Exception as exc:
                 errors.append('restore event signals: '+str(exc))
-        ids = [actor.id for actor in (*reversed(owned), *reversed(event_actors))]
         if not ids:
             return
         report = _destroy_owned_ids(client, carla, ids, destroyed_ids)
@@ -485,9 +604,15 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
         settings.max_substeps = 5
         large_map = spec['map'] == 'Town13'
         if large_map:
-            settings.tile_stream_distance = 650.
-            settings.actor_active_distance = 650.
+            streaming = _streaming_policy(spec)
+            settings.tile_stream_distance = streaming['distance_m']
+            settings.actor_active_distance = streaming['distance_m']
+            run['capture_streaming_policy'] = streaming
         world.apply_settings(settings)
+        run['applied_capture_settings'] = dict(synchronous_mode=True,fixed_delta_seconds=1/HZ,
+            no_rendering_mode=False,substepping=True,max_substep_delta_time=.01,max_substeps=5,
+            tile_stream_distance=streaming['distance_m'] if large_map else None,
+            actor_active_distance=streaming['distance_m'] if large_map else None)
         world.set_weather(carla.WeatherParameters.ClearNoon)
         unusable_site = None
         while True:
@@ -525,7 +650,7 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                     startup('register_streaming_hero', spawn_timeout, ego_actor_id=ego.id)
                     world.tick(spawn_timeout)
                 startup('spawn_interaction_actors', spawn_timeout, ego_actor_id=ego.id)
-                events = DemoEvents(world, waypoints, spec, carla)
+                events = DemoEvents(world, waypoints, spec, carla, ego=ego)
                 archive.json('demonstration_actors.json', events.spawn())
                 break
             except NoWalkableCrossingSurface as exc:
@@ -561,6 +686,10 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
             sensor = world.spawn_actor(camera, mount, attach_to=ego)
             owned.append(sensor); sensors.append(sensor); mounts[name] = mount
             sensor.listen(barrier.callback(name))
+            camera_actor_ids[name] = sensor.id
+            camera_configuration[name] = dict(actor_id=sensor.id,width=1920 if name=='rgb' else 800,
+                height=1080 if name=='rgb' else 450,fov_deg=110 if name=='rgb' else 100,
+                sensor_tick_s=0.,source='explicit_blueprint_configuration')
         for kind, sink in (('sensor.other.collision', collisions), ('sensor.other.lane_invasion', line_events)):
             sensor = world.spawn_actor(world.get_blueprint_library().find(kind), carla.Transform(), attach_to=ego)
             owned.append(sensor); sensors.append(sensor)
@@ -754,9 +883,25 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
             previous = scene
     except BaseException as exc:
         errors.append(type(exc).__name__+': '+str(exc))
+        camera_failure = barrier is not None and barrier.failure is not None
+        if camera_failure or _rpc_failure(exc):
+            simulator_health = _simulator_health(locals().get('client'),world)
+            failure_code = ('simulator_unavailable' if not simulator_health['ready'] else
+                            'camera_transport_error' if camera_failure else 'simulator_rpc_failure')
+        if camera_failure:
+            camera_sync = barrier.diagnostic()
+            camera_sync.update(camera_actor_ids=dict(camera_actor_ids), simulator_health=simulator_health,
+                camera_configuration=dict(camera_configuration),world_settings=run.get('applied_capture_settings'),
+                source_frame=locals().get('frame'), source_time=locals().get('stamp'))
+            camera_sync['limitation'] = 'Callback and RPC observations do not identify the renderer/driver failure cause'
         try:
             busy_evidence = (dict(failure_code='world_not_idle', world_preflight=preflight)
                              if preflight is not None and not preflight['idle'] else {})
+            if failure_code is not None:
+                busy_evidence.update(failure_code=failure_code,simulator_health=simulator_health)
+            if camera_sync is not None:
+                busy_evidence['camera_sync'] = camera_sync
+                archive.json('camera_sync_failure.json', camera_sync)
             archive.json('capture_failure.json',dict(error=errors[-1],traceback=traceback.format_exc(),
                 walker_placements=events.walker_placements if events is not None else [],
                 capture_actor_ids=[a.id for a in owned],
@@ -783,14 +928,15 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                 errors.append('geometry evidence: '+str(exc))
         # Drain no synthetic physics steps. Sensor callbacks are finalized before
         # their evidence is summarized; close/restore failures invalidate a run.
-        for sensor in reversed(sensors):
+        remote_available = simulator_health is None or simulator_health['ready']
+        for sensor in reversed(sensors) if remote_available else ():
             try:
                 sensor.stop()
             except Exception as exc:
                 errors.append('sensor stop: '+str(exc))
         release_site('final')
         remaining_check = None
-        if saved is not None:
+        if saved is not None and remote_available:
             if saved_weather is not None:
                 try:
                     world.set_weather(saved_weather)
@@ -813,6 +959,7 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                     errors.append('Owned actors still present after restoration: '+str(remaining))
             except Exception as exc:
                 remaining_check = dict(error=str(exc), remaining_owned_ids=None)
+                errors.append('Owned actor cleanup verification: '+str(exc))
         archive.json('physical_events.json',dict(collisions=collisions,line_events=line_events))
         try:
             archive.close()
@@ -837,6 +984,8 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
             actor_cleanup=dict(attempts=cleanup_reports, post_restore_snapshot=remaining_check),
             evidence='actual_20hz_execution_and_sensors_not_designed_reference',
             visual_proxy=spec['proxy'])
+        if failure_code is not None:
+            evaluation.update(failure_code=failure_code,simulator_health=simulator_health)
         if interaction_window is not None:
             evaluation['interaction_segment']=interaction_window.report()
         goal_complete=(interaction_window.complete if interaction_window is not None else reached)
