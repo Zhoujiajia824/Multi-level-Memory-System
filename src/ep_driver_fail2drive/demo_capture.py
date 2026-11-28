@@ -609,10 +609,13 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                         camera_world_matrix_m=raw_images['front_rgb'].transform.get_matrix(),
                         camera_mount_matrix_m=mounts['front_rgb'].get_matrix()), frame=frame, timestamp=stamp)
                 archive.json('ego_geometry.json', geometry)
+                navigation_config = dict(desired_speed_mps=spec['cruise_speed_mps'],
+                    teaching_junction_overlap=True, teaching_opposing_shared_edges=True)
+                if opposing_borrow:
+                    change_start, _, _, return_end = _bypass_stations(spec)
+                    navigation_config['teaching_opposing_borrow_interval_m'] = [change_start, return_end]
                 extractor = PublicStateExtractor(world, ego, [wp.transform for wp in waypoints],
-                    config=dict(desired_speed_mps=spec['cruise_speed_mps'], teaching_junction_overlap=True,
-                                teaching_opposing_shared_edges=True),
-                    route_id=output.name, ego_geometry=geometry)
+                    config=navigation_config, route_id=output.name, ego_geometry=geometry)
                 if spec['interaction_kind'] == 'stop_sign':
                     # A real public trigger is still required. This stricter
                     # teaching dwell applies only to this independent collector.

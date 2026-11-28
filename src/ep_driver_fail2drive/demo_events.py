@@ -832,7 +832,11 @@ class DemoEvents:
         if self.last_time is not None and abs(stamp-self.last_time-dt) > max(1e-5,dt*.01):
             raise ValueError('Event dt must match contiguous observed simulation time')
         if projection.get('valid') is False:
-            raise RuntimeError('Cannot advance demonstration events from an invalid route projection')
+            raise RuntimeError('Cannot advance demonstration events from an invalid route projection: '+
+                json.dumps(dict(source_frame=scene['diagnostics'].get('carla_frame'),
+                    reason=projection.get('reason'),observed_lane_id=scene['ego'].get('lane_id'),
+                    s_m=projection.get('s_m'),distance_m=projection.get('distance_m'),
+                    heading_error_rad=projection.get('heading_error_rad')),ensure_ascii=False))
         progress = projection.get('s_m',scene['diagnostics'].get('route_s'))
         if progress is None or not math.isfinite(progress):
             raise ValueError('Event trigger requires a finite current observed route station')

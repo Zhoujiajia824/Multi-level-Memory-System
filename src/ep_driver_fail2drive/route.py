@@ -361,6 +361,11 @@ class RouteAdapter:
         if self.maximum_gap>float(self.config.get('maximum_official_route_gap_m',8.)):
             raise ValueError('Official route is sparse; retain the evaluator dense plan before base-agent downsampling')
         self.length = sum(math.dist(a,b) for a,b in zip(self.points,self.points[1:]))
+        borrow_interval=self.config.get('teaching_opposing_borrow_interval_m')
+        if borrow_interval is not None and (not isinstance(borrow_interval,(tuple,list)) or len(borrow_interval)!=2
+                or not all(type(v) in (int,float) and math.isfinite(v) for v in borrow_interval)
+                or not 0.<=borrow_interval[0]<borrow_interval[1]<=self.length):
+            raise ValueError('Teaching borrow interval must be two ordered route stations within the original route')
         self.lanes = self._build_map()
         self.drivable_polygons = [lane['polygon'] for lane in self.lanes]
         self.previous_s, self.previous_position, self.previous_time = None, None, None
@@ -552,6 +557,34 @@ class RouteAdapter:
                         route_center_distance_m=p['distance_m'],connector_heading_difference_rad=turn)
         return None
 
+    def _teaching_opposing_borrow(self, point, projection, observed, interval):
+        """Associate a measured borrow with this local occurrence of the original route."""
+        if not interval[0]<=projection['s_m']<=interval[1] or not (self.last_projection or {}).get('valid'):
+            return None
+        i=projection['segment_index']
+        start,end=self.waypoints[i:i+2]
+        intended=lane_key(start)
+        if not intended or intended!=lane_key(end):return None
+        fraction=math.dist(self.points[i],projection['position'])/math.dist(self.points[i],self.points[i+1])
+        road_station=start.s+fraction*(end.s-start.s)
+        home=self.map.get_waypoint_xodr(start.road_id,start.lane_id,road_station)
+        if lane_key(home)!=intended or home.is_junction:return None
+        peer=home.get_left_lane()
+        if (not _driving(peer) or peer.is_junction or lane_key(peer)!=observed
+                or home.lane_id*peer.lane_id>=0 or lane_key(peer.get_left_lane())!=intended
+                or math.cos(math.radians(peer.transform.rotation.yaw-home.transform.rotation.yaw))>-.9):
+            return None
+        markings=[str(w.left_lane_marking.type).split('.')[-1] for w in (home,peer)]
+        if any(m.lower() not in ('broken','brokenbroken') for m in markings):return None
+        # The sampled shared cross-section excludes a median or different road layer.
+        pair=sorted((intended,observed))
+        if not any(row['lane_ids']==pair for row in self.map_sample_audit['shared_internal_boundaries']):return None
+        center=peer.transform.location
+        location=type(center)(x=point[0],y=-point[1],z=center.z)
+        if lane_key(self.map.get_waypoint(location,project_to_road=False))!=observed:return None
+        return dict(route_lane_id=intended,observed_lane_id=observed,route_interval_m=list(interval),
+                    road_s_m=road_station,divider_faces=['left','left'],markings=markings)
+
     def update(self, ego_position, ego_heading, frame, timestamp, speed, current_lane_id=None):
         if self.previous_frame == frame:
             return dict(self.last_projection)
@@ -564,7 +597,8 @@ class RouteAdapter:
         result = project(ego_position,self.points,0. if self.previous_s is None else self.previous_s,window,ego_heading)
         result.update(valid=True,reason='accepted',version=self.VERSION)
         teaching_overlap = self.config.get('teaching_junction_overlap', False)
-        if teaching_overlap:
+        borrow_interval=self.config.get('teaching_opposing_borrow_interval_m')
+        if teaching_overlap or borrow_interval is not None:
             result['observed_lane_id'] = current_lane_id
         maximum = float(self.config.get('route_projection_maximum_distance_m', 6.))
         if result['distance_m'] > maximum:
@@ -587,9 +621,13 @@ class RouteAdapter:
                 legal_adjacent |= _nearest_boundary_crossable(ego_position,edges)
             if not legal_adjacent:
                 overlap = self._junction_overlap(ego_position, result, current_lane_id) if teaching_overlap and result['valid'] else None
-                if overlap:
+                borrow=(self._teaching_opposing_borrow(ego_position,result,current_lane_id,borrow_interval)
+                        if result['valid'] and borrow_interval is not None and overlap is None else None)
+                if borrow:
+                    result.update(reason='authored_opposing_lane_borrow',teaching_opposing_borrow=borrow)
+                elif overlap:
                     result.update(reason='overlapping_junction_connectors', junction_overlap=overlap)
-                elif not teaching_overlap or result['valid']:
+                elif result['valid'] or (not teaching_overlap and borrow_interval is None):
                     result.update(valid=False,reason='current_lane_not_navigation_or_legal_adjacent')
         if result['valid']:
             self.previous_s = result['s_m']
