@@ -18,7 +18,7 @@ from ep_driver_fail2drive.memory_split import ALL_FAMILIES_SPLIT, load_transfer_
 from nine_grid.paths import filesystem_path
 
 TRANSPORT_FAILURES = frozenset(('camera_transport_error', 'camera_timeout', 'simulator_rpc_failure',
-    'simulator_unavailable', 'capture_process_terminated', 'owned_simulator_exited',
+    'simulator_unavailable', 'simulator_observation_pending', 'capture_process_terminated', 'owned_simulator_exited',
     'simulator_startup_timeout', 'managed_simulator_start_failed'))
 
 
@@ -168,32 +168,39 @@ def last_startup_step(episode):
 def _read_simulator_health(host, port, timeout=5.):
     """Read RPC readiness without spawning actors, changing settings or ticking."""
     import carla
-    result = dict(schema='fail2drive-collection-simulator-health-1', ready=False,
-                  host=host, port=port, timeout_s=timeout, world_mutated=False)
+    result = dict(schema='fail2drive-collection-simulator-health-1', ready=False, available=False,
+                  host=host, port=port, timeout_s=timeout, world_mutated=False, operations=[])
     deadline = time.monotonic()+timeout
     try:
         client = carla.Client(host, port)
-        def read(operation):
+        def read(name, operation):
+            result['phase'] = name
             remaining = deadline-time.monotonic()
             if remaining <= 0:
                 raise TimeoutError('Simulator readiness deadline exceeded')
             client.set_timeout(remaining)
-            return operation()
-        version = read(client.get_server_version)
-        result.update(server_version=version, client_version=client.get_client_version())
+            started = time.monotonic()
+            try:
+                return operation()
+            finally:
+                result['operations'].append(dict(name=name, timeout_s=remaining, elapsed_s=time.monotonic()-started))
+        version = read('get_server_version', client.get_server_version)
+        result.update(available=True, server_version=version, client_version=client.get_client_version())
         if result['client_version'] != version:
             result['failure_code'] = 'simulator_version_mismatch'
             result['error'] = 'CARLA client/server versions differ'
             return result
-        world = read(client.get_world)
-        snapshot = read(world.get_snapshot)
-        result.update(ready=True, frame=snapshot.frame, time=snapshot.timestamp.elapsed_seconds)
+        world = read('get_world', client.get_world)
+        snapshot = read('get_snapshot', world.get_snapshot)
+        result.update(ready=True, phase='ready', frame=snapshot.frame, time=snapshot.timestamp.elapsed_seconds)
     except Exception as error:
-        result.update(failure_code='simulator_unavailable', error=type(error).__name__+': '+str(error))
+        pending = result['available'] and result.get('phase') in ('get_world', 'get_snapshot')
+        result.update(failure_code='simulator_observation_pending' if pending else 'simulator_unavailable',
+                      error=type(error).__name__+': '+str(error))
     return result
 
 
-def simulator_health(host, port, timeout=5.):
+def _isolated_simulator_health(host, port, timeout):
     """Keep native SDK faults and hung read calls outside the batch process."""
     result = dict(schema='fail2drive-collection-simulator-health-1', ready=False,
                   host=host, port=port, timeout_s=timeout, world_mutated=False,
@@ -215,6 +222,18 @@ def simulator_health(host, port, timeout=5.):
                       probe_stderr=probe.stderr[-2000:])
     except (OSError, ValueError, IndexError, subprocess.TimeoutExpired) as error:
         result['error'] = type(error).__name__+': '+str(error)
+    return result
+
+
+def simulator_health(host, port, timeout=5.):
+    report = _isolated_simulator_health(host, port, timeout)
+    if report.get('failure_code') != 'simulator_observation_pending':
+        return report
+    # A live version RPC with a delayed episode subscription is not proof of an
+    # engine crash. Allow exactly one fresh, bounded subscription before recovery.
+    retry = _isolated_simulator_health(host, port, min(60., max(15., timeout)))
+    result = dict(retry)
+    result['probes'] = [report, retry]
     return result
 
 
@@ -370,7 +389,7 @@ def save_progress(root, selected, routes, results, status, current=None):
 def recover_owned_simulator(item, args):
     owner = getattr(args, '_simulator_owner', None)
     recoverable = item.get('retryable_transport_failure') or item.get('batch_stop_reason') in (
-        'simulator_unavailable', 'cleanup_unverified', 'capture_process_terminated',
+        'simulator_unavailable', 'simulator_observation_pending', 'cleanup_unverified', 'capture_process_terminated',
         'owned_simulator_exited', 'simulator_startup_timeout', 'managed_simulator_start_failed')
     if owner is None or not recoverable:
         return False
@@ -405,7 +424,7 @@ def main(argv=None):
     parser.add_argument('--transport-retries', type=int, default=1,
                         help='Extra tries for transient camera/RPC failures after verified cleanup (0-3; default 1)')
     parser.add_argument('--simulator-timeout', type=float, default=5.,
-                        help='Read-only RPC readiness deadline in seconds (default 5)')
+                        help='Initial read-only RPC deadline (default 5s); a live RPC with a delayed episode gets one 15s recheck')
     parser.add_argument('--simulator-root', help='Opt in to owning a dedicated local CarlaUE4.sh process (Linux)')
     parser.add_argument('--simulator-gpu-uuid', help='Explicit NVIDIA GPU UUID for owned CARLA only')
     parser.add_argument('--simulator-gpu-pci', help='Matching GPU PCI address, e.g. pci-0000_c1_00_0')

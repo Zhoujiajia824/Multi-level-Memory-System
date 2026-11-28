@@ -276,8 +276,9 @@ def _walker_starts(wp, lateral, crossing, *, probe_edges=False):
 
 
 class DemoEvents:
-    def __init__(self, world, waypoints, spec, carla, *, ego=None):
+    def __init__(self, world, waypoints, spec, carla, *, ego=None, register_actor=None):
         self.world, self.waypoints, self.spec, self.carla = world, waypoints, spec, carla
+        self.register_actor=register_actor
         self.route = [xy(wp.transform.location) for wp in waypoints]
         self.teaching_path = self.route
         self.ego_width = 2.
@@ -297,6 +298,7 @@ class DemoEvents:
         self.traffic_lights=[]
         self.ego_moved=False
         self.geometry_by_path={}
+        self.initialization_frame=None
         self.ego_width,self.ego_length=2.,5.
         if ego is not None:
             heading=-math.radians(ego.get_transform().rotation.yaw)
@@ -568,6 +570,12 @@ class DemoEvents:
                 raise RuntimeError('Town13 Animals requires the actual 1075 walker.animal.1009 asset; no pedestrian substitute')
             if config['actor_type'] in ('obstacle','visual_proxy'):
                 actor.set_simulate_physics(False)
+            elif config['actor_type']=='vehicle':
+                actor.apply_control(self.carla.VehicleControl(brake=1.))
+            elif config['actor_type']=='walker':
+                actor.apply_control(self.carla.WalkerControl(direction=self.carla.Vector3D(),speed=0.))
+            if self.register_actor is not None:
+                self.register_actor(actor,reason='spawn:'+config['id'])
             stop_occlusion=None
             if self.manual and role=='stop_sign_visual_occluder':
                 stop_occlusion=self._place_stop_occluder(actor,sign,interaction_station)
@@ -581,6 +589,8 @@ class DemoEvents:
                 if max(tangent)-min(tangent) > max(normal)-min(normal):
                     rotated = self.carla.Rotation(yaw=rotation.yaw+90.)
                     actor.set_transform(self.carla.Transform(location,rotated))
+                    if self.register_actor is not None:
+                        self.register_actor(actor,reason='full_blocker_rotation:'+config['id'])
             if occluded:
                 interaction_station = project(xy(actor.get_location()),self.route)['s_m']
             row = dict(config=config,actor=actor,original_waypoint=original,cross_path=cross_path,
@@ -595,7 +605,8 @@ class DemoEvents:
             if config['actor_type'] == 'vehicle':
                 if role == 'braking_lead':
                     self._set_brake_light(actor,False)
-                    self._drive_vehicle(row,row.get('vehicle_path') or self.waypoints,float(config['speed_mps']))
+                    if not self.manual:
+                        self._drive_vehicle(row,row.get('vehicle_path') or self.waypoints,float(config['speed_mps']))
                 else:
                     actor.apply_control(self.carla.VehicleControl(brake=1.))
         if occluded:
@@ -604,9 +615,28 @@ class DemoEvents:
         if self.manual:
             self._plan_walkers()
             self._configure_crossing_signals()
+        return self._actor_records()
+
+    def finalize_initialization(self,snapshot):
+        """Rebind every recorded start to the final, stationary spawn frame."""
+        if snapshot is None or self.active or self.last_time is not None:
+            raise ValueError('Actor initialization requires its frozen pre-collection snapshot')
+        for row in self.rows:
+            state=snapshot.find(row['actor'].id)
+            if state is None:raise RuntimeError('Initialized actor absent from the final frozen snapshot: '+row['config']['id'])
+            pose=state.get_transform()
+            row['start']=pose.location
+            row['initial_yaw_deg']=pose.rotation.yaw
+        self.initialization_frame=snapshot.frame
+        if self.manual:self._plan_walkers()
+        return self._actor_records()
+
+    def _actor_records(self):
         return [dict(id=row['config']['id'],actor_id=row['actor'].id,type_id=row['actor'].type_id,
-                     config=row['config'],actual_position_xy=xy(row['actor'].get_location()),
-                     actual_yaw_deg=row['actor'].get_transform().rotation.yaw,
+                     config=row['config'],actual_position_xy=xy(row['start']),
+                     actual_yaw_deg=(row['initial_yaw_deg'] if 'initial_yaw_deg' in row
+                                     else row['actor'].get_transform().rotation.yaw),
+                     initialization_source_frame=self.initialization_frame,
                      interaction_station_m=row['interaction_station_m'],
                      branch_crossing_s_m=row['branch_crossing_s_m'],
                      stop_sign_id=row['stop_sign_id'],
@@ -666,6 +696,8 @@ class DemoEvents:
                         or abs(hit.location.z-nearby.transform.location.z)>1.):continue
                 location=self.carla.Location(x=target[0],y=-target[1],z=hit.location.z+height_offset)
                 actor.set_transform(self.carla.Transform(location,pose.rotation))
+                if self.register_actor is not None:
+                    self.register_actor(actor,reason='stop_occluder_placement')
                 return dict(real_stop_sign_id=sign.id,approach_viewpoint_xy=observer,sign_origin_xy=sign_point,
                     initialized_actor_origin_xy=target,required_body_clearance_m=.2,
                     placement_target_clearance_m=placement_clearance,candidates_examined=attempted,
@@ -913,6 +945,35 @@ class DemoEvents:
                 ego_route_s_m=progress,crossing_s_m=row['interaction_station_m'],path_body_clearance_m=clearance,completed=False))
         return bool(row.get('conflict_observed'))
 
+    def _crossing_activation(self,scene,states,progress,ego_speed):
+        """Schedule the environment from its measured crossing placement.
+
+        The world may know an NPC's scripted walking speed. The teacher still
+        receives only the actor's observed current body and velocity. A wider
+        verge must not postpone an otherwise identical crossing until the ego
+        has already passed it.
+        """
+        if not self.ego_moved or ego_speed<=.5:return []
+        reserve=next((float(t['ttc_s']) for t in self.spec['trigger_specs'] if 'ttc_s' in t),3.)
+        evidence=[]
+        for row in self.rows:
+            if row['config']['role']!='crossing_actor':continue
+            speed=float(row['config']['speed_mps'])
+            if speed<=0.:raise ValueError('A scripted crossing actor needs a positive walking speed')
+            state=states.get(row['actor'].id) or row['actor']
+            body=_body(row['actor'],state)
+            clearance=min(_path_body_distance(path,body) for path in (self.route,self.teaching_path))
+            entry_s=max(0.,clearance-self.ego_width/2.-.2)/speed
+            front_gap=row['interaction_station_m']-progress-self.ego_length/2.
+            ego_eta=max(0.,front_gap)/ego_speed
+            if front_gap>=0. and ego_eta<=entry_s+reserve:
+                evidence.append(dict(actor_id=row['actor'].id,source_frame=scene['diagnostics']['carla_frame'],
+                    actual_path_body_clearance_m=clearance,scripted_crossing_speed_mps=speed,
+                    estimated_entry_time_s=entry_s,observed_ego_front_gap_m=front_gap,
+                    observed_ego_eta_s=ego_eta,configured_ttc_reserve_s=reserve,
+                    source='frozen_current_actor_body_and_ego_motion;environment_script_only'))
+        return evidence
+
     def update(self, scene, dt, *, snapshot=None):
         stamp,projection = float(scene['time']),scene['diagnostics']['route_projection']
         states={}
@@ -978,10 +1039,15 @@ class DemoEvents:
             trigger = bool(obligations) if kind == 'stop_sign' else progress >= first_station-distance
             if any(r['config']['role']=='oncoming_vehicle' for r in self.rows):
                 trigger=trigger or progress>=max(0.,_bypass_stations(self.spec)[0]-12.)
+        crossing_trigger=[]
+        if self.manual and kind in ('crossing','construction_crossing') and not self.active:
+            crossing_trigger=self._crossing_activation(scene,states,progress,ego_speed)
+            trigger=trigger or bool(crossing_trigger)
         if not self.active and trigger:
             self.active,self.activated_at = True,stamp
             events.append(dict(phase='interact',event='activated',completed=False,observed_progress_m=progress,
-                               trigger_station_m=first_station,trigger_source='current_observation'))
+                               trigger_station_m=first_station,trigger_source='current_observation',
+                               crossing_placement_evidence=crossing_trigger))
         for row in self.rows:
             if row['config']['role'] == 'braking_lead' and not self.active:
                 observed = self._observed(row,scene)

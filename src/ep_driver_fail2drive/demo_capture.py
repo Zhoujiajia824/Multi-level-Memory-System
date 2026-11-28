@@ -495,6 +495,86 @@ def _streaming_policy(spec):
         limitation='Designed route/motion envelope; Unreal tile residency and GPU peak memory require runtime verification')
 
 
+class InitializationRegistry:
+    """Explicit actor registration before cameras, event activation or source recording."""
+    def __init__(self,world,carla,owned,sensors,events,record,timeout_s):
+        self.world,self.carla,self.owned,self.sensors=world,carla,owned,sensors
+        self.events,self.record,self.timeout_s=events,record,timeout_s
+        self.closed=False
+        self.last_snapshot=None
+        self.frames=[]
+        self.pending=None
+
+    def _checkpoint(self):
+        self.record(dict(schema='demonstration-initialization-frames-1.0',frames=list(self.frames),
+            pending=None if self.pending is None else dict(self.pending),registration_closed=self.closed,
+            source_capture_started=False,synthetic_source_frames=0))
+
+    def close(self):
+        self.closed=True
+        self._checkpoint()
+
+    def __call__(self,actor,*,reason='spawn'):
+        event=self.events()
+        if self.closed or self.sensors or (event is not None and (event.active or event.activated_at is not None)):
+            raise RuntimeError('Actor registration is permitted only before sensors and event activation')
+        actors={item.id:item for item in self.owned}
+        if event is not None:
+            actors.update((item.id,item) for item in event.actors)
+        if actor.id not in actors:
+            raise ValueError('Register actors only after adding them to this attempt ownership list')
+        self.pending=dict(actor_id=actor.id,reason=str(reason),stage='hold_owned_dynamic_actors')
+        self._checkpoint()
+        held=[]
+        for item in actors.values():
+            if item.type_id.startswith('vehicle.'):
+                item.apply_control(self.carla.VehicleControl(brake=1.,hand_brake=False))
+                held.append(item.id)
+            elif item.type_id.startswith('walker.'):
+                item.apply_control(self.carla.WalkerControl(speed=0.))
+                held.append(item.id)
+        before=self.world.get_snapshot()
+        self.pending.update(stage='await_registration_tick',before_frame=before.frame)
+        self._checkpoint()
+        frame=self.world.tick(self.timeout_s)
+        snapshot=self.world.get_snapshot()
+        stamp=float(snapshot.timestamp.elapsed_seconds)
+        before_stamp=float(before.timestamp.elapsed_seconds)
+        if (type(before.frame) is not int or before.frame<0 or type(frame) is not int
+                or type(snapshot.frame) is not int or frame!=before.frame+1 or snapshot.frame!=frame
+                or not all(math.isfinite(value) for value in (before_stamp,stamp))
+                or abs(stamp-before_stamp-1/HZ)>1e-5):
+            raise RuntimeError('Initialization registration requires one consecutive fixed physical frame')
+        missing=sorted(i for i in actors if snapshot.find(i) is None)
+        if missing:
+            raise RuntimeError('Initialization snapshot is missing owned actors: '+str(missing))
+        frozen=snapshot.find(actor.id).get_transform()
+        position=[float(getattr(frozen.location,key)) for key in ('x','y','z')]
+        yaw=float(frozen.rotation.yaw)
+        if not all(math.isfinite(value) for value in [*position,yaw]):
+            raise ValueError('Initialization snapshot contains an invalid actor pose')
+        # get_transform() and get_location() are client-cache reads. Refuse to
+        # use a zero/stale cache even when a fresh snapshot has been received.
+        cached=actor.get_transform()
+        cache_position=[float(getattr(cached.location,key)) for key in ('x','y','z')]
+        angle=(float(cached.rotation.yaw)-yaw+180.)%360.-180.
+        if (not all(math.isfinite(value) for value in [*cache_position,angle])
+                or math.dist(position,cache_position)>1e-5 or abs(angle)>1e-5):
+            raise RuntimeError('Actor client pose cache differs from its registered frozen snapshot')
+        if self.world.get_snapshot().frame!=frame:
+            raise RuntimeError('Another client advanced the world during actor initialization')
+        self.last_snapshot=snapshot
+        row=dict(actor_id=actor.id,reason=str(reason),before_frame=before.frame,frame=frame,
+            time=stamp,position_xyz_carla_m=position,yaw_deg=yaw,
+            confirmed_owned_actor_ids=sorted(actors),held_dynamic_actor_ids=held,
+            physical_steps=1,sensors_created=False,event_activated=False,
+            purpose='initialization_registration;not_a_source_capture_or_event_step')
+        self.frames.append(row)
+        self.pending=None
+        self._checkpoint()
+        return snapshot
+
+
 def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=False, video=True,
             interaction_only=False, allow_similar_road=False):
     if type(interaction_only) is not bool:
@@ -614,6 +694,9 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
             tile_stream_distance=streaming['distance_m'] if large_map else None,
             actor_active_distance=streaming['distance_m'] if large_map else None)
         world.set_weather(carla.WeatherParameters.ClearNoon)
+        registry=InitializationRegistry(world,carla,owned,sensors,lambda:events,
+            lambda evidence:atomic_json(output/'initialization_frames.json',evidence),
+            timeout_s=120. if large_map else 30.)
         unusable_site = None
         while True:
             startup('select_site')
@@ -646,12 +729,12 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
                 owned.append(ego)
                 startup('apply_initial_brake', spawn_timeout, ego_actor_id=ego.id)
                 ego.apply_control(carla.VehicleControl(brake=1.))
-                if large_map:
-                    startup('register_streaming_hero', spawn_timeout, ego_actor_id=ego.id)
-                    world.tick(spawn_timeout)
+                startup('register_initial_ego', spawn_timeout, ego_actor_id=ego.id)
+                registry(ego,reason='ego_spawn_and_stationary_streaming_registration')
                 startup('spawn_interaction_actors', spawn_timeout, ego_actor_id=ego.id)
-                events = DemoEvents(world, waypoints, spec, carla, ego=ego)
-                archive.json('demonstration_actors.json', events.spawn())
+                events = DemoEvents(world, waypoints, spec, carla, ego=ego,register_actor=registry)
+                events.spawn()
+                archive.json('demonstration_actors.json',events.finalize_initialization(registry.last_snapshot))
                 break
             except NoWalkableCrossingSurface as exc:
                 if (unusable_site is not None or not allow_similar_road or not spec.get('route_source')
@@ -670,6 +753,7 @@ def capture(spec, output_dir, *, host='127.0.0.1', port=39000, allow_map_load=Fa
             finally:
                 if large_map:
                     client.set_timeout(30.)
+        registry.close()
         startup('register_sensors', ego_actor_id=ego.id)
         if interaction_only:
             interaction_window=InteractionCaptureWindow(spec,waypoints,events.rows)

@@ -55,6 +55,7 @@ class DedicatedSimulator:
         self.restart_limit, self.startup_timeout = restart_limit, startup_timeout
         self.restarts, self.launches, self.process, self.handle = 0, 0, None, None
         self.group, self.birth = None, None
+        self.shutdown_owned = {}
 
     def __enter__(self):
         return self
@@ -107,6 +108,62 @@ class DedicatedSimulator:
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             raise SimulatorManagementError('simulator_gpu_identity_unverified', str(error)) from error
 
+    def _listeners(self):
+        """Read kernel listener/PID evidence; no listener is signaled or taken over."""
+        try:
+            result = subprocess.run(['ss', '-H', '-ltnp'], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    encoding='utf-8', errors='replace', timeout=2., check=True)
+            rows = {row['pid']: row for row in _process_rows()}
+            records = []
+            for line in result.stdout.splitlines():
+                fields = line.split(None, 5)
+                if len(fields) < 5 or not fields[3].rsplit(':', 1)[-1].isdecimal():
+                    continue
+                port = int(fields[3].rsplit(':', 1)[-1])
+                if self.port <= port <= self.port+2:
+                    pids = list(dict.fromkeys(int(value) for value in re.findall(r'pid=(\d+)', line)))
+                    records.append(dict(port=port, owners=[rows.get(pid, {'pid': pid}) for pid in pids]))
+            return dict(listeners=records, source='ss_listening_sockets_and_proc_process_identity')
+        except (OSError, subprocess.SubprocessError) as error:
+            return dict(listeners=[], error=str(error), source='listener_identity_unavailable')
+
+    def _wait_ports_released(self, owned):
+        # Only a verified, owned shutdown gets this finite drain window. Initial
+        # startup still rejects every existing listener immediately.
+        started, clear, reported, unverified = time.monotonic(), 0, False, False
+        while time.monotonic()-started < 10.:
+            try:
+                self._ports_free()
+            except SimulatorManagementError as error:
+                if error.code != 'simulator_port_in_use':
+                    raise
+                clear = 0
+                evidence = self._listeners()
+                owners = [row for listener in evidence['listeners'] for row in listener['owners']]
+                identified = [row for row in owners if 'birth' in row]
+                for row in identified:
+                    if (self.birth is not None and row.get('session') == self.group
+                            and row['birth'] >= self.birth):
+                        owned[row['pid']] = row['birth']  # A late fork remains in the private owned session.
+                if any(owned.get(row['pid']) != row['birth'] for row in identified):
+                    self.event('port_release_refused', evidence=evidence)
+                    raise SimulatorManagementError('simulator_port_in_use',
+                        'A different process owns a collection port after owned CARLA stopped; refusing takeover') from error
+                elapsed = time.monotonic()-started
+                if not reported:
+                    self.event('port_release_waiting', evidence=evidence, owned_processes=owned)
+                    reported = True
+                unverified = not owners or len(identified) != len(owners)
+            else:
+                clear += 1
+                if clear == 2:
+                    self.event('ports_released', elapsed_s=time.monotonic()-started)
+                    return
+            time.sleep(.1)
+        raise SimulatorManagementError('simulator_port_release_unverified' if unverified else 'simulator_port_release_timeout',
+            'Collection ports did not become stably free within 10 seconds' +
+            ('; remaining listener ownership is unverified' if unverified else ''))
+
     def start(self):
         if PLATFORM != 'posix':
             raise SimulatorManagementError('managed_simulator_platform', 'Managed CarlaUE4.sh requires Linux')
@@ -132,6 +189,7 @@ class DedicatedSimulator:
             self.process = subprocess.Popen(command, cwd=str(self.root), env=env, stdin=subprocess.DEVNULL,
                 stdout=self.handle, stderr=subprocess.STDOUT, start_new_session=True)
             self.group = self.process.pid
+            self.shutdown_owned = {}
             self.birth = next((row['birth'] for row in _process_rows() if row['pid'] == self.group), None)
             self.event('started', pid=self.process.pid, log=log.name, command=command,
                 gpu_uuid=self.gpu_uuid, gpu_pci=self.gpu_pci, device=device)
@@ -191,6 +249,9 @@ class DedicatedSimulator:
 
     def stop(self):
         if self.group is not None:
+            self.shutdown_owned.update({row['pid']: row['birth'] for row in self._members()})
+            if self.birth is not None:
+                self.shutdown_owned[self.group] = self.birth
             for value, grace in ((signal.SIGINT, 5.), (signal.SIGTERM, 3.), (getattr(signal, 'SIGKILL', 9), 3.)):
                 self.process.poll()  # Reap the launcher, but also check surviving engine children.
                 if not self._members():
@@ -205,6 +266,7 @@ class DedicatedSimulator:
                     time.sleep(.05)
             if self._members():
                 raise SimulatorManagementError('owned_simulator_stop_failed', 'Owned CARLA process group did not exit')
+            self._wait_ports_released(self.shutdown_owned)
             self.event('stopped', pid=self.group, exit_code=self.process.poll())
             self.group, self.birth = None, None
         if self.handle is not None:
